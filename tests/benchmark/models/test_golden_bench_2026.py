@@ -9,7 +9,7 @@ from emmy.benchmark.command_workload import build_substitution_map, render_comma
 from emmy.benchmark.tasks import enumerate_tasks
 from emmy.recipe import load_recipe
 
-EXP = Path("experiments/golden-bench-2026")
+EXP = Path("experiments/cgo-2027")
 
 
 @pytest.mark.parametrize(
@@ -107,8 +107,8 @@ def test_common_kernel_corpus_is_small_and_identical(project_root) -> None:
         "Cargo.toml",
         "Cargo.lock",
         "crates",
-        "experiments/golden-bench-2026/kernels/recipe.yaml",
-        "experiments/golden-bench-2026/kernels/golden",
+        "experiments/cgo-2027/kernels/recipe.yaml",
+        "experiments/cgo-2027/kernels/golden",
     ]
     assert recipe.command.strict is True
     assert recipe.command.result_files == ["artifacts.tar.gz"]
@@ -172,7 +172,7 @@ def test_quantized_support_check_covers_three_formats(project_root) -> None:
         "Cargo.toml",
         "Cargo.lock",
         "crates",
-        "experiments/golden-bench-2026/quantized_kernels_rtx5090/recipe.yaml",
+        "experiments/cgo-2027/quantized_kernels_rtx5090/recipe.yaml",
     ]
     assert recipe.command.strict is True
 
@@ -308,13 +308,13 @@ def test_neptune_emmy_pytorch_a100_share_one_experiment(project_root) -> None:
         "Cargo.toml",
         "Cargo.lock",
         "crates",
-        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/tuning_neptune_a100x1.tar.gz",
-        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/run.sh",
-        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/run_neptune.py",
-        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/operators.sh",
-        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/run_emmy.sh",
-        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/run_pytorch.py",
-        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/golden",
+        "experiments/cgo-2027/compiler_neptune_emmy_pytorch_a100/tuning_neptune_a100x1.tar.gz",
+        "experiments/cgo-2027/compiler_neptune_emmy_pytorch_a100/run.sh",
+        "experiments/cgo-2027/compiler_neptune_emmy_pytorch_a100/run_neptune.py",
+        "experiments/cgo-2027/compiler_neptune_emmy_pytorch_a100/operators.sh",
+        "experiments/cgo-2027/compiler_neptune_emmy_pytorch_a100/run_emmy.sh",
+        "experiments/cgo-2027/compiler_neptune_emmy_pytorch_a100/run_pytorch.py",
+        "experiments/cgo-2027/compiler_neptune_emmy_pytorch_a100/golden",
     ]
     assert recipe.command.strict is True
     assert recipe.command.result_files == ["artifacts.tar.gz"]

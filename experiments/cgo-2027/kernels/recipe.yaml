@@ -22,8 +22,8 @@ command:
     - Cargo.toml
     - Cargo.lock
     - crates
-    - experiments/golden-bench-2026/kernels/recipe.yaml
-    - experiments/golden-bench-2026/kernels/golden
+    - experiments/cgo-2027/kernels/recipe.yaml
+    - experiments/cgo-2027/kernels/golden
   strict: true
   run: |
     set -euo pipefail
@@ -87,7 +87,7 @@ command:
     record_final_status=0
     if [ -n "$golden" ]; then
       evidence_args=(--strict-evidence --no-record-evidence)
-      cp $repo_dir/experiments/golden-bench-2026/kernels/golden/$golden.golden.json $task_dir/working.json
+      cp $repo_dir/experiments/cgo-2027/kernels/golden/$golden.golden.json $task_dir/working.json
       echo "replaying committed golden $golden" | tee $task_dir/trace.log
       echo "replaying committed measured schedules; this row does not search" | tee $task_dir/tune.log
     else

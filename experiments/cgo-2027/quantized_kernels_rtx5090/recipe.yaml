@@ -11,7 +11,7 @@ command:
     - Cargo.toml
     - Cargo.lock
     - crates
-    - experiments/golden-bench-2026/quantized_kernels_rtx5090/recipe.yaml
+    - experiments/cgo-2027/quantized_kernels_rtx5090/recipe.yaml
   strict: true
   run: |
     set -euo pipefail
