@@ -1162,7 +1162,17 @@ over a dataset `emmy db export` wrote — its golden pools or its measured pools
 prior of the dataset's space, or with the artifact `--offline-file` names. Beside the ranks it re-decides every pool
 with no measurement in scope (`prior/reproduce.py`: the greedy tile lowering against the closest golden row; the cut
 pass with the placement prior deciding against the golden's arm) — the deploy-faithful check the reproduction gate in
-`make test` asserts a rate on, per slice of a repository golden's pools (README, "Fit the priors").
+`make test` asserts a rate on, per slice of a repository golden's pools.
+
+**The reproduction gate.** `tests/compiler/pipeline/search/prior/test_reproduction.py` checks both shipped priors
+against every hardware golden and maintained recipe golden with no measurements in scope. A placement fork must
+choose its recorded arm; a recorded schedule must rank within the better half of its sampled pool. Tests split each
+golden's pools into slices of 16, drawing schedule rows with the same `EMMY_POOL_DRAW` as a greedy compile in the
+suite. A failure names the rows the prior cannot reproduce. A PR that changes a hardware golden refits both priors;
+a recipe golden that fails needs a refit or the recipe tag `prior-pending`. That tag skips its reproduction check
+until a refit reproduces it and removes the tag; the golden remains evidence and training data. Never lower the
+tolerance or exempt a hardware golden. The [refit commands](../../../README.md#fit-the-priors) and
+[routine refresh workflow](../../../.github/ARCHITECTURE.md) document the two maintenance paths.
 
 **Two datasets, two questions, one report.** `search/prior/report.py` assembles both into one serialisable schema
 (`--json`). With `--compare-to`, `eval prior` scores two weights on the same golden pools and compares their median
