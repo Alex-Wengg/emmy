@@ -15,7 +15,8 @@ It has not been run, with or without an image. The Volta lanes below are text-on
 
 ## Four V100 SXM2 16GB (TP4)
 
-Re-qualified 2026-09-15 on a host with NVLink; first qualified 2026-09-05 on a host without it.
+Re-qualified 2026-10-12 (periodic verification) on a host with NVLink; previously re-qualified 2026-09-15, first
+qualified 2026-09-05 on a host without it.
 
 ### Host requirement: NVLink
 
@@ -34,11 +35,24 @@ through NCCL, which can ring over linked pairs only.
 | Item | Value |
 | --- | --- |
 | Model | `Qwen/Qwen3.8-27B-FP8@017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` |
-| GPUs | 4 x NVIDIA Tesla V100 SXM2 16GB, compute capability 7.0, driver 580.173.02, NVLink as above |
+| GPUs | 4 x NVIDIA Tesla V100 SXM2 16GB, compute capability 7.0, driver 580.178.04, NVLink as above |
 | Engine image | `cloudriftai/1cat-vllm-deepseek-v4-flash-0731:1.2.3-d76126608` (vLLM `1.2.3.dev87+gd76126608.d20260810`) |
-| Serving shape | TP4, context 262,144, `gpu_memory_utilization` 0.88 (the recipe now also pins the key/value cache at 4.5 GiB per card, see Memory below), text-only, concurrency cap 4 — the cap this table was measured at; the recipe now ships 16, see Concurrency below |
+| Serving shape | TP4, context 262,144, `gpu_memory_utilization` 0.88 (KV cache pinned at 4.5 GiB per card, see Memory below), text-only, concurrency cap 4 — the cap this table was measured at; the recipe now ships 16, see Concurrency below |
 | Backends | FLASH_ATTN_V100 attention, Triton Gated DeltaNet prefill, TurboMind FP8 dequantization |
 | Workload | 16 prompts, 1,000 input / 1,000 output tokens, client concurrency 4, temperature 0, ignored EOS, 2 warm-ups, three repeats on one server with seeds 0, 1, 2 |
+
+| Metric | 2026-10-12 R1 | R2 | R3 |
+| --- | ---: | ---: | ---: |
+| Successful / failed requests | 16 / 0 | 16 / 0 | 16 / 0 |
+| Benchmark duration | 385.29 s | 395.62 s | 379.31 s |
+| Output token throughput | 41.53 tok/s | 40.44 tok/s | 42.18 tok/s |
+| Total token throughput | 83.05 tok/s | 80.88 tok/s | 84.36 tok/s |
+| Median TTFT | 1,561.76 ms | 1,241.45 ms | 1,565.14 ms |
+| P99 TTFT | 2,838.36 ms | 1,337.62 ms | 1,586.39 ms |
+| Median TPOT | 93.85 ms | 98.40 ms | 93.39 ms |
+| P99 TPOT | 100.24 ms | 100.36 ms | 96.25 ms |
+
+Previous qualification (2026-09-15, driver 580.173.02):
 
 | Metric | Repeat 1 | Repeat 2 | Repeat 3 |
 | --- | ---: | ---: | ---: |
@@ -52,10 +66,12 @@ through NCCL, which can ring over linked pairs only.
 | P99 TPOT | 97.92 ms | 95.23 ms | 104.48 ms |
 | Median inter-token latency | 95.10 ms | 94.39 ms | 103.25 ms |
 
-The third repeat decoded about 9% slower than the first two, and the server's own generation-throughput log drops at
-the same time, so the spread is the host's, not the client's. Per stream that is roughly 10 tokens/s. The KV pool
-holds 288,281 tokens, 1.10x concurrency at the full window. Model load to health took 287.8 s: 7.2 s of weights,
-107.2 s of `torch.compile` and 111.0 s of CUDA graph capture.
+The 2026-10-12 repeats landed inside the prior run's spread: output token throughput 40.4–42.2 tok/s against
+41.4/41.9/38.3, and median TPOT 93–98 ms against 94–103, so the lane is unchanged on this driver. This run's first
+repeat carried a higher P99 time to first token (2,838 ms) than its siblings (1,338/1,586), the same one-repeat tail
+the previous qualification showed (its repeat 1 was 2,758 ms). This run's KV pool held 289,050 tokens, 1.10x
+concurrency at the full window. Model load to health took 348.8 s: 7.3 s of weights, 108.0 s of `torch.compile` and
+112.0 s of CUDA graph capture.
 
 ### Time to first token
 
@@ -88,9 +104,9 @@ Run against this lane's deployed recipe on the NVLink host:
 | Gate | Result |
 | --- | --- |
 | Coherent answers | Pass — `144` for a multiplication with tools offered, a coherent answer from a returned tool result |
-| Reasoning separation | Pass — with thinking on, the `reasoning` field is populated and the call is separate |
-| Context fill | Pass — a planted passphrase was retrieved from a 249,581-token prompt |
-| Tool calling | Pass — every probe in the table below |
+| Reasoning separation | Pass — thinking on populates the `reasoning` field, separate from `content` (2026-10-12) |
+| Context fill | Pass — passphrase from a 247,534-token prompt in 214.6 s (2026-10-12); 249,581-token on 2026-09-15 |
+| Tool calling | Pass — `auto`, `required`, `none`, fed-back result probes (2026-10-12); 80-case matrix on 2026-09-15 |
 
 Reasoning requires `chat_template_kwargs: {"enable_thinking": true}`; Qwen3.8 defaults thinking off and otherwise
 reasons inline in `content`.
