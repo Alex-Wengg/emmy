@@ -98,6 +98,63 @@ def test_reduce_gather_closes_over_an_enclosing_index(computed):
     np.testing.assert_allclose(actual, values["x"][rows] @ values["w"])
 
 
+def test_a_supplied_index_load_closes_over_the_value_its_own_index_reads():
+    """A gather index loaded inside an output sweep, from a row index loaded outside it: the sweep's
+    load is supplied to the reduce as a cone closed over the outer value, never as a slab that would
+    declare that value a coordinate."""
+    from emmy.compiler.dtype import I64
+
+    sweep = Loop(
+        axis=Axis("j", 2),
+        body=Body(
+            (
+                Load(name="selected", input="lookup", index=(Var("idx") + Var("j"),), dtype=I64),
+                Loop(
+                    axis=Axis("k", 3),
+                    body=Body(
+                        (
+                            Load(name="xv", input="x", index=(Var("selected"), Var("k"))),
+                            Load(name="wv", input="w", index=(Var("k"),)),
+                            Assign(name="prod", op="multiply", args=("xv", "wv")),
+                            Accum(name="acc", value="prod", op="add", axes=("k",)),
+                        )
+                    ),
+                ),
+                Write(output="out", index=(Var("m"), Var("j")), value="acc"),
+            )
+        ),
+    )
+    # The second store keeps the sweep from being peeled into a grid axis beside ``m``.
+    body = Body(
+        (
+            Loop(
+                axis=Axis("m", 2),
+                body=Body((Load(name="idx", input="indices", index=(Var("m"),), dtype=I64), sweep, Write(output="rows", index=(Var("m"),), value="idx"))),
+            ),
+        )
+    )
+    graph = Graph()
+    for name, shape in {"indices": (2,), "lookup": (4,), "x": (4, 3), "w": (3,)}.items():
+        tensor = Tensor(name, shape, dtype=I64) if name in {"indices", "lookup"} else Tensor(name, shape)
+        graph.add_node(InputOp(), [], tensor, node_id=name)
+    inputs = {name: graph.buffer(name) for name in graph.nodes}
+    outputs = {"out": Tensor("out", (2, 2)), "rows": Tensor("rows", (2,), dtype=I64)}
+    tile = lift_loop_op(LoopOp(body=body, inputs=inputs, outputs=outputs))
+    assert not {"idx", "selected"} & tile.op.free_axes
+    graph.add_node(LoopOp(body=tile.loop_body, inputs=inputs, outputs=outputs), list(inputs), outputs=list(outputs.values()), node_id="out")
+    graph.inputs, graph.outputs = list(inputs), ["out", "rows"]
+    values = {
+        "indices": np.array([0, 2], dtype=np.int64),
+        "lookup": np.array([3, 1, 0, 2], dtype=np.int64),
+        "x": np.arange(12, dtype=np.float32).reshape(4, 3),
+        "w": np.array([0.5, -1, 2], dtype=np.float32),
+    }
+    backend = NumpyBackend()
+    actual = backend.run(backend.compile(graph), input_data=values)[0].outputs["out"]
+    rows = values["lookup"][values["indices"][:, None] + np.arange(2)]
+    np.testing.assert_allclose(actual, values["x"][rows] @ values["w"])
+
+
 def _tile(body: Body):
     graph = Graph()
     graph.add_node(LoopOp(body=body), [], Tensor("out", (1,)), node_id="out")
