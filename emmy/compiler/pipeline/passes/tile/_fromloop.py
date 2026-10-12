@@ -99,7 +99,8 @@ def _supply(names: set[str], levels: tuple[_Level, ...]) -> tuple[Fold, ...]:
 def _level_values(levels: tuple[_Level, ...]) -> set[str]:
     """The values ``levels`` provide a term formed below them: what their statements define and the
     terms they expose (:func:`_supply` finds each one's provider)."""
-    return {name for level in levels for stmt in level.stmts for name in stmt.defines()} | {name for level in levels for name in level.exposed}
+    defined = {name for level in levels for stmt in level.stmts for name in stmt.defines()}
+    return defined | {name for level in levels for name in level.exposed}
 
 
 def _close(lead: tuple, operands: tuple, body, results: tuple, scope: tuple, levels: tuple) -> tuple[tuple, Lambda]:

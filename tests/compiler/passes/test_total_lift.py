@@ -129,7 +129,13 @@ def test_a_supplied_index_load_closes_over_the_value_its_own_index_reads():
         (
             Loop(
                 axis=Axis("m", 2),
-                body=Body((Load(name="idx", input="indices", index=(Var("m"),), dtype=I64), sweep, Write(output="rows", index=(Var("m"),), value="idx"))),
+                body=Body(
+                    (
+                        Load(name="idx", input="indices", index=(Var("m"),), dtype=I64),
+                        sweep,
+                        Write(output="rows", index=(Var("m"),), value="idx"),
+                    )
+                ),
             ),
         )
     )
