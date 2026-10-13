@@ -12,19 +12,10 @@ from emmy.recipe import load_recipe
 EXP = Path("experiments/golden-bench-2026")
 
 
-# The remaining empty RTX 4090 prefill file needs a record run on that card. Remove the mark only after its
-# measurements pass strict replay and its stored kernels pass the fresh-lowering check.
-_UNRECORDED_PREFILL = pytest.mark.xfail(reason="the prefill golden awaits measurements on an RTX 4090", strict=True)
-
-
 @pytest.mark.parametrize(
     "path",
     [
-        pytest.param(
-            path,
-            marks=_UNRECORDED_PREFILL if path.name == "qwen3-06b-s512_rtx4090.golden.json" else (),
-            id=path.name,
-        )
+        pytest.param(path, id=path.name)
         for path in sorted((Path(__file__).resolve().parents[3] / EXP / "kernels" / "golden").glob("*.golden.json"))
     ],
 )
@@ -83,14 +74,16 @@ def test_common_kernel_corpus_is_small_and_identical(project_root) -> None:
             f"qwen3-06b-s512_{short}",
         }
     assert all(task.variant.params["budget"] == 0 for task in replay_tasks)
-    assert all(task.variant.params["patience"] == 0 for task in replay_tasks)
     assert all(task.variant.params["golden"] == "" for task in searched_tasks)
     assert all(task.variant.params["budget"] == 12 for task in searched_tasks)
-    assert all(task.variant.params["patience"] == 4 for task in searched_tasks)
 
     run = recipe.command.run
     assert "./venv/bin/emmy trace" in run
-    assert "./venv/bin/emmy tune" in run
+    assert "torch==2.13.0" in run
+    assert "./venv/bin/emmy tune" not in run
+    assert '--kernel "$$kernel"' in run
+    assert '--tune "$budget"' in run
+    assert "--record-greedy" in run
     assert "./venv/bin/emmy run" in run
     assert "for repeat in 0 1 2 3 4" in run
     assert "--golden $task_dir/working.json --bench --strict" in run
@@ -160,9 +153,11 @@ def test_quantized_support_check_covers_three_formats(project_root) -> None:
 
     run = recipe.command.run
     assert "./venv/bin/emmy trace" in run
+    assert "torch==2.13.0" in run
     assert "./venv/bin/emmy tune" not in run
-    # Each post-fusion target is benched on its own.
-    assert '--realization "$$seed"' in run
+    # The CLI owns target enumeration; recipes do not parse a private golden schema.
+    assert "--golden $task_dir/working.json --bench" in run
+    assert 'd["configs"]' not in run
     assert "--bench --strict --no-record-evidence" in run
     assert "--bench-backends eager,emmy" in run
     assert "tcompile" not in run
@@ -171,6 +166,9 @@ def test_quantized_support_check_covers_three_formats(project_root) -> None:
         "pyproject.toml",
         "requirements.txt",
         "Makefile",
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates",
         "experiments/golden-bench-2026/quantized_kernels_rtx5090/recipe.yaml",
     ]
     assert recipe.command.strict is True
@@ -208,29 +206,24 @@ def test_large_layer_corpus_is_bounded_and_not_labeled_tp8(project_root) -> None
         assert "--bench-backends eager,emmy" in command
 
 
-def test_convergence_check_is_one_shape_and_three_seeds(project_root) -> None:
+def test_convergence_check_is_one_shape_and_three_runs(project_root) -> None:
     tasks = _kernel_tasks(project_root, "convergence")
     assert len(tasks) == 3
-    assert {task.variant.params["seed"] for task in tasks} == {0, 1, 2}
+    assert {task.variant.params["trial"] for task in tasks} == {0, 1, 2}
     assert all(task.recipe.deploy.gpu == "NVIDIA H200 141GB" for task in tasks)
     assert all(task.recipe.deploy.gpu_count == 1 for task in tasks)
     assert all(task.variant.params["seq_len"] == 512 for task in tasks)
 
     fp8_tasks = _kernel_tasks(project_root, "fp8-convergence")
     assert len(fp8_tasks) == 3
-    assert {task.variant.params["seed"] for task in fp8_tasks} == {0, 1, 2}
+    assert {task.variant.params["trial"] for task in fp8_tasks} == {0, 1, 2}
     assert all(task.variant.params["model_ref"].startswith("RedHatAI/Qwen3-0.6B-FP8-dynamic@") for task in fp8_tasks)
 
 
 def test_search_ablation_is_executable(project_root) -> None:
     tasks = _kernel_tasks(project_root, "search-ablation")
     assert len(tasks) == 4
-    assert {(task.variant.params["budget"], task.variant.params["patience"]) for task in tasks} == {
-        (0, 0),
-        (4, 4),
-        (12, 4),
-        (48, 12),
-    }
+    assert {task.variant.params["budget"] for task in tasks} == {0, 4, 12, 48}
     assert all("--golden $task_dir/working.json --bench --strict" in task.recipe.command.run for task in tasks)
     assert all(task.recipe.deploy.gpu == "NVIDIA H200 141GB" for task in tasks)
     assert all(task.recipe.deploy.gpu_count == 1 for task in tasks)
@@ -300,7 +293,7 @@ def test_neptune_emmy_pytorch_a100_share_one_experiment(project_root) -> None:
     assert "tar -C $task_dir" in run
     # Each row runs exactly one lane for exactly one operator.
     assert 'case "$lane" in' in run
-    assert 'bash /experiment/run.sh "$operator"' in run
+    assert 'bash /experiment/run.sh "$operator" /experiment/tuning.tar.gz' in run
     assert '"$$EXPERIMENT/run_emmy.sh" $repo_dir/venv/bin/emmy "$operator"' in run
     # Tuning is the tune-kernels skill's job: the recipe only replays what it committed.
     assert "emmy tune" not in run
@@ -309,6 +302,10 @@ def test_neptune_emmy_pytorch_a100_share_one_experiment(project_root) -> None:
         "pyproject.toml",
         "README.md",
         "LICENSE",
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates",
+        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/tuning_neptune_a100x1.tar.gz",
         "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/run.sh",
         "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/run_neptune.py",
         "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/operators.sh",
@@ -330,7 +327,8 @@ def test_neptune_emmy_pytorch_a100_share_one_experiment(project_root) -> None:
     assert "operators=(" not in neptune_runner
     assert "sequence_lengths=(256 512 1024 2048 4096 8192 16384 32768)" in neptune_runner
     assert "--n-trials 128" in neptune_runner
-    assert 'nsys profile -o "/results/profiles/$setup" --trace=cuda,nvtx,osrt --wait=primary' in neptune_runner
+    assert 'nsys profile -o "/results/profiles/$setup" --trace=cuda,nvtx' in neptune_runner
+    assert "--sample=none --cpuctxsw=none --cudabacktrace=none --wait=primary" in neptune_runner
     assert 'profile "$operator" "1,$sequence_length" --repeat 15' in neptune_runner
     assert "neptune-setup-status.tsv" in neptune_runner
     assert "tune_status=ok:no-valid-schedule" in neptune_runner
@@ -428,3 +426,95 @@ def test_every_command_variant_renders(project_root) -> None:
             subprocess.run(["bash", "-n"], input=command, text=True, check=True)
             rendered += 1
     assert rendered == 69
+
+
+def test_kernel_tuning_inventory_keeps_file_local_refs(project_root, tmp_path) -> None:
+    """A C name may name several definitions; tuning must select every measured file reference exactly."""
+    import shlex
+    import sys
+
+    from emmy.compiler.pipeline.search.golden import GoldenFile, Kernel, Measurements, Row
+
+    body = {"inputs": [], "outputs": [], "nodes": []}
+    document = GoldenFile(
+        compute_cap=(12, 0),
+        kernels=[Kernel(loop_ir=body, name="k_shared", key=ref, formed=True) for ref in ("k_shared", "k_shared#2", "k_shared#3")],
+        rows=[
+            Row(name="proposal", kernel="k_shared"),
+            *[
+                Row(name=label, kernel=ref, knobs={}, measurements=Measurements(emmy_us=1))
+                for label, ref in (("first", "k_shared#2"), ("first-again", "k_shared#2"), ("second", "k_shared#3"))
+            ],
+        ],
+    )
+    path = document.dump(tmp_path / "working.json")
+    command = load_recipe(_experiment(project_root, "kernels")).command.run
+    inventory_line = next(line for line in command.splitlines() if "GoldenFile.load" in line)
+    script = shlex.split(inventory_line.rstrip().removesuffix("\\"))[2]
+    result = subprocess.run([sys.executable, "-c", script, str(path)], check=True, text=True, capture_output=True)
+    assert result.stdout.splitlines() == ["k_shared#2", "k_shared#3"]
+
+
+@pytest.mark.parametrize("tuning,record,verification", [(0, 0, 0), (3, 0, 0), (0, 4, 0), (0, 0, 5), (3, 4, 5)])
+def test_kernel_recipe_preserves_failures_and_completes_whole_target_checks(
+    project_root, tmp_path, monkeypatch, tuning, record, verification
+):
+    """A rejected candidate or final recording must not discard model diagnostics or any strict replay."""
+    task = next(task for task in _kernel_tasks(project_root, "fp8-common") if task.recipe.deploy.gpu == "NVIDIA GeForce RTX 5090")
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    python = bin_dir / "python"
+    python.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *__version__*) echo 2.13.0 ;;\n"
+        "  *get_device_capability*) echo sm_120 ;;\n"
+        '  *GoldenFile.load*) printf "good\\nbad\\n" ;;\n'
+        "esac\n"
+    )
+    emmy = bin_dir / "emmy"
+    emmy.write_text(
+        "#!/bin/sh\n"
+        'output=trace\nwhile [ "$#" -gt 0 ]; do\n'
+        '  if [ "$1" = --json ]; then shift; output=${1##*/}; fi\n'
+        "  shift\ndone\n"
+        'printf "%s\\n" "$output" >> "$MOCK_CALLS"\n'
+        'case "$output" in\n'
+        '  bad.json) exit "$MOCK_TUNING_STATUS" ;;\n'
+        '  record-final) exit "$MOCK_RECORD_STATUS" ;;\n'
+        '  repeat-2) exit "$MOCK_VERIFICATION_STATUS" ;;\n'
+        "esac\n"
+    )
+    python.chmod(0o755)
+    emmy.chmod(0o755)
+    calls = tmp_path / "calls.txt"
+    for key, value in {
+        "MOCK_CALLS": calls,
+        "MOCK_TUNING_STATUS": tuning,
+        "MOCK_RECORD_STATUS": record,
+        "MOCK_VERIFICATION_STATUS": verification,
+    }.items():
+        monkeypatch.setenv(key, str(value))
+    task_dir = tmp_path / "task"
+    command = render_command(task.recipe.command.run, build_substitution_map(task.variant, [0], str(tmp_path), str(task_dir)))
+    result = subprocess.run(["bash"], input=command, text=True, capture_output=True, timeout=10)
+    assert result.returncode == (verification or record or tuning), result.stderr
+    assert calls.read_text().splitlines() == [
+        "trace",
+        "initial",
+        "record-initial",
+        "good.json",
+        "bad.json",
+        "record-final",
+        "model.json",
+        *(f"repeat-{index}" for index in range(5)),
+    ]
+    assert (task_dir / "tuning.status").read_text().strip() == str(tuning)
+    assert (task_dir / "record-final.status").read_text().strip() == str(record)
+    assert [(task_dir / "verification" / f"repeat-{index}.status").read_text().strip() for index in range(5)] == [
+        "0",
+        "0",
+        str(verification),
+        "0",
+        "0",
+    ]

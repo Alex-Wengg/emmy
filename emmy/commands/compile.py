@@ -218,19 +218,26 @@ def resolve_golden_arg(args) -> None:
         args._golden_document, args._golden_scope = document, [document]
         return
     if (kernel_name := getattr(args, "kernel", None)) is not None:
-        # One kernel of the file as the whole program: its own stored body, a cut piece included, so a schedule pin
-        # reaches it alone and a compile takes seconds where its layer takes minutes.
+        # One kernel as the whole program: its stored body or its exact tile reconstructed from recorded cuts,
+        # so a schedule pin reaches it alone.
         if not golden_file or name or args.code or args.input:
             logger.error("--kernel NAME selects a kernel inside --golden PATH and excludes --realization / --code / positional input")
             sys.exit(2)
+        from emmy.compiler.pipeline.search.golden.restamp import isolated_program  # noqa: PLC0415
+
         document = GoldenFile.load(golden_file)
         found = [k for k in document.kernels if k.ref == kernel_name] or [k for k in document.kernels if kernel_name in k.ref]
-        if len(found) != 1 or not found[0].formed:
-            why = "is formed from no loop op" if len(found) == 1 else f"matches {len(found)} kernels"
-            logger.error("--kernel %r %s.\nKernels: %s", kernel_name, why, ", ".join(sorted(k.ref for k in document.kernels if k.formed)))
+        if len(found) != 1:
+            logger.error(
+                "--kernel %r matches %d kernels.\nKernels: %s", kernel_name, len(found), ", ".join(sorted(k.ref for k in document.kernels))
+            )
             sys.exit(2)
         bindings = next((row.bindings for row in document.rows if row.kernel == found[0].ref), found[0].bindings)
-        args._golden_graph = document.executable(found[0], bindings)
+        try:
+            args._golden_graph = isolated_program(document, found[0], bindings)
+        except ValueError as exc:
+            logger.error("--kernel %r: %s", kernel_name, exc)
+            sys.exit(2)
         args._golden_document, args._golden_scope = document, [document]
         return
     if golden_file and not name:
@@ -349,7 +356,7 @@ def selected_decisions(args) -> dict[str, str]:
 
 
 def _route_pins(document, ref: str) -> dict[str, str]:
-    """Address each recorded cut on the kernel and step where its parent exists."""
+    """Address each recorded decision on the kernel and step where its parent exists."""
     from emmy.compiler.context import Context  # noqa: PLC0415
     from emmy.compiler.pipeline.search.golden.restamp import mint  # noqa: PLC0415
 
@@ -376,6 +383,13 @@ def _route_pins(document, ref: str) -> dict[str, str]:
                     token = parent.name.rsplit("__place_", 1)[1].split("__", 1)[0]
                     scope.insert(0, f"place_{token}")
                 key = "PLACE" + ("@" + "/".join(scope) if scope else "")
+            elif key.partition("@")[0] == "REDUCE":
+                scope = (
+                    "place_" + parent.name.rsplit("__place_", 1)[1]
+                    if "__place_" in parent.name
+                    else "node_" + parent.name.removeprefix("k_")
+                )
+                key = key.partition("@")[0] + "@" + scope
             route[key] = str(value)
         cut = any(str(key).partition("@")[0] == "PLACE" and value == "cut" for key, value in decision.arm.items())
         for child in decision.children:

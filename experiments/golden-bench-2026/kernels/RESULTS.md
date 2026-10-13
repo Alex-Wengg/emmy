@@ -1,9 +1,437 @@
 # Golden-bench kernel corpus
 
-H100 evidence is consolidated in `results_h100x1.tar.gz`, rooted at `2026-10-02_23-00-41/`. Within that root, each
-original bundle has a directory named after its former archive without `.tar.gz`. `ARCHIVE_INDEX.json` records
-those directories and the original archive hashes. H100 member paths below are relative to each bundle directory.
-Previously replaced recipe snapshots remain in Git history.
+The named `results_<platform>.tar.gz` files contain the latest complete recipe runs described below. Older sections
+remain a history of the measurements and their limitations; replaced snapshots, including the consolidated H100
+archive rooted at `2026-10-02_23-00-41/`, remain in Git history.
+
+## Current common-corpus reproduction (2026-10-13)
+
+This run asks whether the recorded Qwen3-0.6B layer still executes correctly and how its whole-forward latency
+compares with current PyTorch. The model revision is `c1899de289a04d12100db370d81485cdf75e47ca`, layer zero, FP16,
+sequence lengths 1 and 512, standard math and deployable O3. Each actual-model diagnostic compares Emmy with eager
+and full-graph `torch.compile` in the same process. Five separate processes then replay the stored golden program
+with generated inputs, fresh tune databases, strict measured evidence, ten warmups and 100 captured iterations.
+The recipe's H200/B200 rows, including the large-layer, convergence and budget-ablation studies, were not run on
+these five available GPUs. Their historical evidence is not refreshed by this reproduction.
+
+The module diagnostics use the recipe's scaled accuracy check. The golden replays use `rtol=atol=0.001` against
+their own eager program. Both checks pass for every row in this table. Their inputs and eager programs differ, so
+the golden replay timings must not be combined with the actual-model baseline to form a speedup.
+
+| GPU | Shape | Actual-model Emmy, µs | Actual-model Inductor, µs | Inductor / Emmy | Strict replay median [range], µs | Launches |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| V100 SXM2 16GB | s1 | 54.218 | 65.521 | 1.209x | 53.736 [53.638–54.028] | 8 |
+| V100 SXM2 16GB | s512 | 494.080 | 606.804 | 1.228x | 494.080 [492.032–496.128] | 21 |
+| A100 SXM4 40GB | s1 | 72.923 | 55.450 | 0.760x | 71.225 [70.770–71.794] | 13 |
+| A100 SXM4 40GB | s512 | 177.152 | 188.761 | 1.066x | 177.493 [177.323–177.835] | 11 |
+| H100 80GB HBM3 | s1 | 38.704 | 29.475 | 0.762x | 36.762 [36.058–37.740] | 13 |
+| H100 80GB HBM3 | s512 | 84.030 | 78.752 | 0.937x | 84.864 [84.293–84.970] | 11 |
+| RTX 4090 24GB | s1 | 23.715 | 31.736 | 1.338x | 23.719 [23.671–23.746] | 14 |
+| RTX 4090 24GB | s512 | 165.365 | 160.172 | 0.969x | 164.523 [164.011–165.717] | 11 |
+| RTX 5090 32GB | s1 | 36.856 | 36.699 | 0.996x | 36.839 [36.826–36.858] | 13 |
+| RTX 5090 32GB | s512 | 129.860 | 136.043 | 1.048x | 130.967 [129.400–131.076] | 11 |
+
+Emmy leads on both V100 shapes, A100 prefill, RTX 4090 decode and RTX 5090 prefill. Inductor leads on A100 decode,
+both H100 shapes and RTX 4090 prefill. RTX 5090 decode is within 0.5% of Inductor in this single measurement.
+The RTX 4090 prefill loss is 3.2%.
+The five strict replays span 0.73% and 0.83% of their minima on V100, 1.45% and 0.29% on A100, 4.66% and 0.80% on
+H100, 0.32% and 1.04% on RTX 4090, and 0.09% and 1.30% on RTX 5090. Each actual-model comparison is one fresh-process
+measurement, so small differences are directional, not confidence intervals. The one-token shape attends to one
+key; it does not model decode against a populated KV cache.
+
+Earlier complete RTX 5090 runs at 09:37 and 10:23 measured decode at 36.822 and 36.814 µs Emmy versus 36.833 and
+32.816 µs Inductor. The final comparison is 36.856 versus 36.699 µs. Emmy spans about 0.12% across these runs, while
+the reference spans 32.816–36.833 µs. These runs do not establish a stable decode margin or isolate the cause of
+that reference variation. All complete attempts are retained.
+
+Each platform completed both common rows and ten strict replays (50 total). They ran PyTorch 2.13.0 and Transformers
+5.14.1. The NVIDIA driver was 580.178.04 except on RTX 4090, which used 580.159.03. V100 used the CUDA 12.6 PyTorch
+wheel and NVCC 12.9.86; RTX 4090 used the CUDA 13.0 wheel with NVCC 12.9.86. A100, H100 and RTX 5090 used CUDA 13.0.
+V100 source was `dd7f4b766`, A100 `f60a7e2fd`, H100 `f28cbad7f`, RTX 4090 `134c5bd4a`, and RTX 5090
+`8af48e53c`; runtime sources and protocol inputs were unchanged at launch. The later partial-merge type fix does
+not affect the recorded V100, A100 or H100 schedules.
+RTX 5090 was the local desktop GPU and shared graphics use; the other cards were remote. The existing measured
+common goldens were replayed, with RTX 4090 recovery described below.
+
+| GPU | Run ID | Archive | Root member |
+| --- | --- | --- | --- |
+| V100 SXM2 16GB | `20261013T061146Z` | `results_v100x1.tar.gz` | `2026-10-13_06-11-46/` |
+| A100 SXM4 40GB | `20261013T061808Z` | `results_a100x1.tar.gz` | `2026-10-13_06-18-08/` |
+| H100 80GB HBM3 | `20261013T061531Z` | `results_h100x1.tar.gz` | `2026-10-13_06-15-31/` |
+| RTX 4090 24GB | `20261013T104811Z` | `results_rtx4090x1.tar.gz` | `2026-10-13_10-48-11/` |
+| RTX 5090 32GB | `20261013T111703Z` | `results_rtx5090x1.tar.gz` | `2026-10-13_11-17-03/` |
+
+Each archive contains two common-corpus system-only YAML records, benchmark logs and matching `_artifacts.tar.gz`
+bundles; the RTX archives also contain their FP8 rows. Within each common bundle, `torch-compile/model.json` holds
+the actual-model comparison;
+`verification/repeat-0` through `verification/repeat-4` hold strict replays. Separate status files, package freezes,
+working goldens, tune databases and cubins preserve the context. All expected records and artifacts are present,
+the archives match the timestamped local files byte for byte, and text evidence passed a credential-pattern scan.
+
+These whole-layer measurements do not reproduce the CGO draft's isolated-kernel figure or its geometric means.
+The earlier recovery tables below also use generated inputs, so their ratios are not compiler-only deltas from
+these actual-model measurements. The current recipe replays measured routes; where no golden is supplied, it uses
+the current per-kernel schedule tuner. Neither establishes the draft's claim that every reported schedule came
+from an automatic LLM-plus-MCTS search within 30 minutes. The paper needs a matching protocol and fresh evidence
+before using these results to update those claims.
+
+The paper checkout reviewed was clean revision `b634d7edf097e47559d93a0b3ae750884930f98c` in the papers repository.
+Its evaluation calls RTX 5090 decode mean the only consistent Inductor loss, while the figure also displays H100
+mean-d at 0.6x and A100 copy-p at 0.9x. The prose needs to acknowledge those losses or establish the narrower
+repeatability claim. The promised five-card per-target supplemental table is also absent. These are internal
+paper issues independent of the new measurements. The quantized rerun does not reproduce the paper's four M=16
+NVFP4 projections against CUTLASS/B12x: its layer-zero sequence-1/512 targets and eager/FP64 references answer a
+different question. The Neptune report separately documents changed win counts and timing statistics.
+
+## Dynamic-FP8 checkpoint reproduction (2026-10-13)
+
+All four final generated-program recordings pass the accepted dtype-scaled accuracy check. All twenty strict
+replays fail, and performance remains well behind the paired references. These results support compiler coverage
+and expose remaining gaps; they do not establish competitive FP8 performance or strict numerical equivalence.
+
+The study uses layer zero of `RedHatAI/Qwen3-0.6B-FP8-dynamic` at revision
+`068a9040b238d65f5c1064f10232bb15b96c0ff0`, sequence lengths 1 and 512, standard math, O3, FP8 MMA, ten warmups,
+100 captured iterations and up to twelve tuning trials per measured kernel. The RTX 5090 runs frozen source
+`8af48e53c`; the RTX 4090 runs `134c5bd4a`, before the scalar feature-encoding fix. This is a checkpoint-derived
+layer study, not a filtered W8A8-only corpus. All times below are microseconds.
+
+The stored traced program uses generated inputs. The separate live-model diagnostic loads decoded checkpoint
+weights for eager and Inductor, while Emmy restores the checkpoint's quantized algebra in its graph. Those live
+references are not native FP8-library kernels. The programs can expose different outputs and select different
+kernel sets, so their times and accuracy verdicts must remain separate. Passing live-model outputs emit only a
+scaled verdict, without maximum/mean absolute or relative errors; those magnitudes cannot be inferred.
+
+### Generated-program recording
+
+The recipe records an initial kernel set, tunes every exact measured reference, then records the full target again.
+Both the initial and final recordings below pass the existing scaled check. Whole-target times use captured
+whole-forward/e2e timing. Inductor times appear only where its paired accuracy check passes.
+
+| Card / shape | Emmy before tuning | Emmy final | Final eager | Final Inductor | Final launches |
+|---|---:|---:|---:|---:|---:|
+| RTX 4090 decode | 4714.496136 | 1449.983954 | 485.944549 | Accuracy failure | 40 |
+| RTX 5090 decode | 2288.032055 | 1309.247971 | 388.718654 | 28.655027 | 37 |
+| RTX 4090 prefill | 276267.852783 | 271806.457520 | 763.480140 | Accuracy failure | 22 |
+| RTX 5090 prefill | 242492.065430 | 238831.008911 | 612.199722 | Accuracy failure | 22 |
+
+RTX 4090 decode Inductor fails on the final output: maximum/mean difference 152 / 1.978190, scaled tolerance 20.32.
+RTX 5090 prefill fails on out6 (maximum/mean difference 0.044557 / 0.006341, tolerance 0.043839) and out7
+(200 / 3.179425, tolerance 20.32). RTX 4090 prefill fails several outputs, including non-finite out8. None supplies
+a valid Inductor latency for its comparison.
+
+### Live decoded-weight comparison
+
+| Card / shape | Emmy | Inductor | Eager | Emmy launches | Scaled result |
+|---|---:|---:|---:|---:|---|
+| RTX 4090 decode | 1171.455979 | 30.691729 | 88.249324 | 16 | Emmy and Inductor pass |
+| RTX 5090 decode | 1048.128009 | 36.807982 | 89.983769 | 16 | Emmy and Inductor pass |
+| RTX 4090 prefill | — | — | — | — | Benchmark GPU stage exceeds 60 s; no accuracy result |
+| RTX 5090 prefill | — | — | — | — | Benchmark GPU stage exceeds 60 s; no accuracy result |
+
+RTX 5090 live prefill spends approximately 37 minutes 47 seconds preparing before its benchmark worker starts.
+At least nine finite compiler-worker batches were observed; this is shared-desktop wall time, not a controlled
+compilation benchmark. No external cutoff was applied. The worker then exceeds the existing 60-second GPU-stage
+limit. Its failure record contains no backend times or accuracy verdict, and its zero launch count is a placeholder,
+not an executed empty program. The recipe preserves the timeout and continues all five strict stored-program replays.
+
+RTX 4090 live prefill likewise reaches the GPU-stage limit after approximately 69 minutes 56 seconds of preparation.
+Eight disjoint compiler-worker groups were observed, without memory pressure. No external preparation cutoff was
+applied. Its failure record retains 37 planned CUDA sources but no backend timing or accuracy result. The zero launch
+count is again a failure placeholder. All five strict stored-program replays follow this diagnostic.
+
+### Strict generated-program diagnostics
+
+Five fresh processes replay each stored program with rtol=atol=0.001 and the existing FP64 comparison. They share
+that row's tuning database; the common corpus instead resets its database for each repeat. Within every FP8 row,
+all five ordered CUDA source-hash lists equal final recording, and all five correctness payloads are identical.
+Those ranges therefore measure unchanged generated code, not repeatability of a fresh tuning search.
+No tolerance changed. Strict failure remains explicit alongside accepted scaled recording.
+
+| Card / shape | Strict outcomes | Median | Range | Range / minimum | Launches |
+|---|---|---:|---|---:|---:|
+| RTX 4090 decode | 5/5 fail | 1448.959947 | 1447.808027–1449.983954 | 0.15029% | 40 |
+| RTX 5090 decode | 5/5 fail | 1307.647943 | 1302.528024–1310.528040 | 0.61419% | 37 |
+| RTX 4090 prefill | 5/5 fail | 271976.348877 | 271246.337891–272936.950684 | 0.62328% | 22 |
+| RTX 5090 prefill | 5/5 fail | 238847.106934 | 238791.748047–238900.573730 | 0.04557% | 22 |
+
+| Card / shape | Aggregate max absolute | Mean absolute | Max relative | First differing FP8 carrier |
+|---|---:|---:|---:|---|
+| RTX 4090 decode | 64 | 0.3262528627 | 14.40625 | 8/2048 elements |
+| RTX 5090 decode | 33.25 | 0.1252638123 | 28.08 | 8/2048 elements |
+| RTX 4090 prefill | 576 | 0.4882392791 | 4827.666667 | 16077/1048576 elements |
+| RTX 5090 prefill | 560 | 0.4859430864 | 3621 | 16117/1048576 elements |
+
+Decode's propagated errors are not all minor. Against FP64, final-output maximum/mean errors are
+65.34845572 / 2.432011118 for RTX 4090 Emmy versus 25.39477657 / 0.5353790235 for eager. RTX 5090 Emmy has
+27.03403693 / 0.5992925403 versus the same eager values: 6.46% higher peak and 11.94% higher mean. Its intermediate
+`mul_11_dynamic_fp8_bits` peak and `mul_12_dynamic_fp8_bits` mean also fail the FP64 comparison.
+
+RTX 5090 prefill requires a different interpretation. Final-output FP64 maximum/mean errors are
+757.488131238 / 8.178886954 for Emmy and 773.173561622 / 8.160183635 for eager: 2.02871% lower peak and 0.22920%
+higher mean, within the existing 1% mean allowance. That final output passes the FP64 comparison. The sole failed
+per-output FP64 condition is the intermediate `reshape_dynamic_fp8_scale` peak, 8.54536403729e-5 versus
+8.10941194012e-5 (+5.37588%); its mean is lower. All other per-output FP64 conditions pass. The carrier mismatches
+and overall strict failure remain; the final output is not the cause of the false FP64 verdict.
+
+RTX 4090 prefill's final-output FP64 maximum/mean errors are 757.488131238 / 8.178884319 for Emmy and
+683.691642523 / 8.150031886 for eager. Mean error is only 0.35402% higher, within the 1% allowance, but peak error
+is 10.79383% higher. That final output fails the FP64 comparison; two intermediate scale outputs also have larger
+peak errors. All five repeats have identical numerical payloads, full schedule lists and 22-source sets, with digest
+`6c433b5067a498fae7213690146126aa781f13e510f02d49f369026cdc5387ab`. The close final mean does not make the stricter
+per-output peak condition pass.
+
+### Tuning coverage and failures in the frozen runs
+
+| Card / shape | Exact refs / JSONs | Candidate records | Timed successfully | Failed candidates | Missing measurements |
+|---|---:|---:|---:|---:|---|
+| RTX 4090 decode | 30 / 28 | 333 | 326 | 7 nested-TILE lowering failures | 2 scalar encoding exceptions |
+| RTX 5090 decode | 29 / 29 | 345 | 338 | 7 nested-TILE lowering failures | None |
+| RTX 4090 prefill | 19 / 18 | 213 | 211 | 2 compilation failures | 1 scalar encoding exception |
+| RTX 5090 prefill | 19 / 19 | 214 | 213 | 1 GPU-stage timeout | None |
+
+Isolated kernels without an eager slice have unchecked backend correctness and no candidate accuracy verdict. These
+candidate times establish search coverage only; full-target scaled recording and strict diagnostics supply the
+accuracy evidence. All 48 RTX 5090 greedy timing records succeed. The seven failed decode candidates on each card
+request a nested TILE that serial reduction lowering cannot realize. The RTX 5090 prefill candidate exceeds the
+existing 60-second GPU-stage limit.
+
+The scalar encoder fix is validated on RTX 5090: the formerly crashing all-empty prefill schedule measures
+285869.720459 us as a candidate, with unchecked correctness. Its scalar component measures 230242.752075 us when
+isolated during final recording. This exposes a severe performance gap. It does not fill the three missing RTX 4090
+measurements on the earlier frozen revision or establish independent numerical correctness.
+
+All four FP8 rows are terminal failures, with final scaled recording successful, every diagnostic attempted and
+all twenty strict replays completed. Failed tuning candidates and strict checks keep each row failed. The last
+RTX 5090 row completed at 13:24:23 UTC and the last RTX 4090 row at 14:56:22 UTC. Both platform invocations exited 1
+and retained their two successful common rows alongside the two failed FP8 rows.
+
+The RTX 4090 archive separately preserves CPU reconstruction of all three failed scalar pools. Each contains one
+schedule with only empty-valued knobs. The frozen encoder raises the original error on each exact pool; the fixed
+encoder returns a `(1, 0)` feature array. The reconstruction took 56 seconds without initializing CUDA. It validates
+the narrow encoder repair, without filling the missing GPU measurements.
+
+Both RTX archives retain four terminal system-only records, their declared artifacts, all strict repeats, earlier
+complete attempts and source evidence. Byte comparisons preserve the collected raw files unchanged; gzip and Git LFS
+checks pass. Recursive credential-pattern scans found no matches. The final archive digests are:
+
+| Platform | Archived files | Scanned file payloads, including nested archives | SHA-256 |
+| --- | ---: | ---: | --- |
+| RTX 4090 | 287 | 1,968 | `f6a2d615f0c6f7b1ed553a652607f978531f1d9cba752c07535be43b21baf6d7` |
+| RTX 5090 | 119 | 2,887 | `2193e14407b9c25399517643e3b4cb71903af272f522c90bbc4005f00616b2e1` |
+
+Scan counts include repeated payloads. The RTX 4090 count excludes the integrity receipt written after its scan.
+
+The RTX 5090 archive also preserves the final recipe-comment comparison. The kernels recipe is identical after
+YAML parsing to both frozen RTX revisions, and the quantized recipe to its measured revision and `8af48e53c`.
+Command and matrix bytes are unchanged in all four comparisons. Only reference descriptions in header comments changed.
+
+## Compiler validation (2026-10-13)
+
+The final remote H100 full suite at merged revision `19df91525` completed with 6,935 passes, 879 skips and six
+failures in 2,455.86 seconds. All 206 prior reproduction checks passed, as did the repaired FP16 partial-merge,
+paged-buffer ABI and read-only golden replay checks. No full test suite ran locally.
+
+The six failures in that run are the fixed-slot MoE serving tests. Their stored H100 schedule is found by evidence
+lookup, then refused because serial lowering cannot realize its nested TILE decision. The same refusal reproduces
+on base revision `f5c11ed5f`; the fixture and refusal remain unchanged. The result is a failed full-suite run with
+known baseline failures, not a green GPU suite. These serving failures do not change the kernel results above.
+
+Runtime source is identical between the full-suite revision and `134c5bd4a`; the latter adds recipe control-flow
+checks that preserve whole-target diagnostics after rejected tuning candidates. The later two-line tuner fix at
+`8af48e53c` accepts a valid scalar schedule with zero feature columns. Six focused CPU tests and reconstruction of
+the exact failing FP8 pool pass. That fix leaves kernel lowering and untuned replay unchanged, but can change FP8
+selection by allowing the previously omitted candidate to be measured. It was not in the remote full-suite run.
+CPU CI at `8af48e53c`, including that fix, passed 6,421 tests with 1,407 skips in 1,165.26 seconds; lint,
+native-runtime checks and the package dry run also passed. Its log and workflow metadata are in the RTX 5090 archive's
+`cpu-ci-8af48e53c/` directory. The H100 archive preserves the remote suite, baseline reproductions, focused validation
+and the earlier successful CPU CI at `134c5bd4a` (6,418 passes, 1,407 skips).
+Its six original benchmark files remain byte-identical; 72 validation files are under
+`2026-10-13_06-15-31/validation-2026-10-13/`. The updated archive SHA-256 is
+`290d5b888d8fe73fe0ff11eb3dc5e7a1e6eb334033b24c1d0be5df03a9416a5d`.
+
+### Upstream scheduling change during the final run
+
+Upstream `53a5c8b50` landed while the final RTX 4090 row was running. It rejects unsupported nested-TILE schedules
+when they are offered and retains prior ranking at unaffected nodes when greedy retries exhaust. It changes offered
+candidate pools and fallback selection, without changing CUDA ABI, kernel identity, golden format or numerical checks.
+The named frozen benchmarks and the `19df91525` GPU suite do not measure the combined newer source. Preparation time,
+candidate failures, selected kernels and GPU test outcomes may differ; the new rule alone does not establish that
+the observed timeouts or numerical failures are fixed. The prior reproduction results below are also scoped to their
+named revisions because the offered pools changed.
+
+The subsequent CPU workflow tested synthetic merge `6dc31a68a94ba2e86638f59d82a761e140610268`, whose parents are
+main `53a5c8b50` and PR head `9fb6523b6`. That PR head differs from `8af48e53c` only in the H100 evidence archive.
+The test checkout confirms the actual merge revision. All 6,424 tests passed, with 1,407 skips and one fork
+warning, in 1,148.10 seconds. All 206 distinct prior reproduction nodes passed without failures or skips. Native
+runtime, lint and packaging checks also passed. The RTX 5090 archive's `cpu-ci-9fb6523b6/` directory preserves
+workflow metadata, merge-parent proof and all four job logs. This establishes CPU compatibility with newer main;
+it does not add a GPU timing or accuracy measurement on that combined source.
+
+## Priors after the measurement recovery (2026-10-13)
+
+Both priors were refitted from a fresh import of all repository goldens at revision `fd2fa726d`, using feature
+version 8, seed zero, a pool sample of 2,000 and five folds grouped by shape. The schedule dataset contains 1,203
+groups and 1,416 positives, up from 1,166 and 1,378 in the shipped artifact. Placement contains 2,972 groups and
+3,877 positives, up from 2,884 and 3,759. These are coverage counts, not performance improvements.
+
+The default 200-tree schedule fit failed one of 206 prior checks. A recorded H100 reduction ranked 33 of 59,
+outside the unchanged top-half threshold. The row was present in training; its optimistic rank was also 33.
+Increasing only the tree count to 500 moved it to rank 10 of 59. Depth 6, learning rate 0.3, 500 negatives, one
+round and five folds remained unchanged. Placement retained its successful default 500-tree fit. The complete
+named gate then passed all 206 nodes in 506.21 seconds. No tolerance, label or measurement was changed.
+
+| GPU | Schedule train top1 | Schedule holdout top1 | Placement train top1 | Placement holdout top1 |
+| --- | ---: | ---: | ---: | ---: |
+| A100 40GB | 69/115 | 49/115 | 318/318 | 294/318 |
+| RTX 4080 | 5/8 | 0/8 | 8/8 | 8/8 |
+| RTX 4090 | 124/155 | 94/155 | 332/332 | 318/332 |
+| RTX 5090 | 298/442 | 182/442 | 1160/1160 | 1111/1160 |
+| H100 80GB | 101/149 | 69/149 | 327/327 | 306/327 |
+| RTX PRO 6000 Max-Q | 6/9 | 2/9 | 9/9 | 8/9 |
+| V100 SXM2 16GB | 139/182 | 95/182 | 435/435 | 387/435 |
+| V100 SXM3 32GB | 118/143 | 78/143 | 383/383 | 375/383 |
+
+The persisted schedule fit places 860/1,203 training groups first and 1,173 in the top ten; held-out counts are
+569 and 1,017. Placement places every training group first and 2,807/2,972 held-out groups first. Holdout gains
+are not uniform: RTX 5090 schedule top1 falls from 184/442 in the 200-tree candidate to 182/442, and V100 SXM3
+from 82/143 to 78/143. These ranking metrics do not measure latency or speedup.
+
+Both default CLI evaluations completed. Placement reproduced all 1,517 emitted decisions. The live-H100 greedy
+schedule diagnostic exactly matched 6/105 full matmul schedules, versus 3/105 for the 200-tree candidate. The
+named schedule gate checks top-half rank coverage; it does not require exact greedy reproduction. Placement is
+checked exactly. These results must not be combined into a claim that every recorded schedule is reproduced.
+
+Schedule export skipped 176 entries: 175 kernels formed from no loop op and one unchanged V100 recipe schedule
+absent from its candidate pool. Eleven newly measured 4090 cut pieces are among the excluded entries. Placement
+skipped 535 pools: 218 formed from no loop op and 317 without a kernel-set fork. The existing physical-plausibility
+filter rejected 18 performance records, including ten unchanged 4090 native-FP8 fast-math measurements. Its
+FP32-based peak check does not recognize the FP8 work carried by their U8/F32 inputs. None of the 50 new 4090
+measurements is among those ten. Excluded entries are not counted as reproduced.
+
+The final 4090 archive preserves both candidates, import/export manifests, explicit exclusion inventories,
+per-group metrics, the failed gate, the successful gate and both evaluations in
+`prior-refit-fd2fa726d-final.tar.gz`. Its SHA-256 is
+`808ca3961b338912e19109b5fd2ecdcae2d042d1f7226fea0486aca75ab2c1e6`.
+The validated schedule and placement digests are respectively
+`7d92cb055a980028d4227f6c5463e9bcbd19b3c522ccb054232eac7612c9426f` and
+`1505e523cbfe262118b5381d72f7e39fb8676186bebb657e2a8bc7cb4541771e`.
+
+## RTX 4090 missing-data recovery (2026-10-13)
+
+The exact-card performance corpus contains the hardware golden and the common sequence-1 and sequence-512 files.
+Every original missing performance row was attempted. The audit also included hardware roots with no rows, which
+the missing-data listing previously omitted. Five AWQ roots remain unmeasured after bounded attempts; explicit
+standard seed rows now expose them. The separate serving integration fixture intentionally contains schedules
+without timings and is outside this performance corpus.
+
+All 177 original hardware measurements remain unchanged. The hardware file now has 227 measured rows, 199 kernels,
+45 routing decisions and 264 total rows. Five rows have neither a kernel measurement nor a whole-row latency.
+The common decode file has 17 measured rows, 23 kernels and nine routing decisions. The formerly empty common
+prefill file has 11 measured rows, 17 kernels and six routing decisions. Neither common file has an unmeasured
+performance proposal. A seed with a whole-row latency is not counted as a per-kernel measurement.
+
+Recovery used an RTX 4090 with 24 GB memory, driver 580.159.03, NVCC 12.9.86, Python 3.12.3,
+Torch 2.13.0+cu130 and Transformers 5.14.1. Compilation used deployable O3 and explicit standard math. FP8 MMA was
+disabled for the admitted standard rows; the archive records its equivalence with the unset default when fast
+math is false. Donor schedules supplied inputs only: their timings were removed before exact-card measurement.
+These stored-program checks use generated inputs and are separate from the actual-model recipe measurements.
+
+### Common Qwen3 routes
+
+The prefill proposal came from the RTX 5090 sequence-512 golden. Its RTX 4090 record measured 165.035 µs Emmy and
+169.469 µs Inductor. Independent replay with a fresh tune database, no manual pins and strict evidence measured
+164.864 µs Emmy, 169.783 µs Inductor and 379.923 µs eager. The combined strict comparison passed at
+rtol=atol=0.001, with maximum absolute difference 0.001953125 and maximum relative difference 0.00190735.
+The hardware corpus received the same independently measured route for its matching target. The prefill freshness
+test's expected-failure mark was removed after replay and fresh-lowering checks passed.
+
+Decode pieces were measured separately and checked through whole-layer routes. The first unpinned strict record
+used fourteen launches and matched eager exactly: 24.162 µs Emmy, 32.831 µs Inductor and 170.034 µs eager. The last
+missing partial piece measured 2.143 µs within a 23.8 µs whole-layer route, again with exact eager output.
+These recovery measurements do not replace the final recipe's repeat protocol.
+
+### Standard Ministral measurements
+
+All six recovered standard routes passed the existing dtype-scaled eager check. They use scalar or cooperative
+schedules. Each record used five warmups and twenty iterations; the table reports captured whole-target latency,
+not a sum of isolated kernel timings. Small numerical differences are retained as measurements and reported here.
+
+| Target | Emmy, µs | Inductor, µs | Eager, µs | Launches | Strict verdict | Max absolute difference | Mean absolute difference |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| post-sym | 89,289.726 | 2,603.554 | 8,916.656 | 5 | Fail | 0.052246094 | 0.006234536 |
+| post32 | 6,509.568 | 1,391.969 | 7,481.789 | 5 | Fail | 0.042968750 | 0.006005058 |
+| post4096 | 744,582.153 | 15,173.878 | 26,392.158 | 5 | Pass via FP64 | 0.054687500 | 0.006258074 |
+| pre-sym | 12,543.936 | 297.430 | 958.704 | 4 | Pass elementwise | 0.0009765625 | 0.0000449962 |
+| pre32 | 1,290.240 | 92.155 | 718.291 | 4 | Pass elementwise | 0.0009765625 | 0.0000452794 |
+| pre4096 | 75,002.876 | 1,691.287 | 4,395.912 | 4 | Pass via FP64 | 0.005859375 | 0.0000452132 |
+
+Strict diagnostics were read-only checks with one warmup and one iteration. Their kernel source digests match the
+recorded candidates. They establish accuracy, not replacement timings. Strict uses rtol=atol=0.001 and the existing
+FP64 fallback: an output exceeding elementwise tolerance may pass when its maximum error is no greater than eager
+and its mean error is at most 1% above eager against FP64. Post4096 and pre4096 passed this fallback. Post-sym and
+post32 had lower mean error but higher peak error than eager against FP64, so their strict verdict remains failed.
+No tolerance changed.
+
+These schedules are much slower than Inductor. They fill missing standard-mode evidence and preserve the existing
+fast-math measurements. Earlier native-FP8 proposals and strict failures remain in the archive; their measurements
+were not promoted or attributed to the scalar schedules.
+
+### AWQ measurements and remaining gaps
+
+The original Qwen3.8 AWQ matmul proposal was recovered with an exact-identity V100 schedule after an initial greedy
+attempt exceeded the 110-second diagnostic cap. Its RTX 4090 strict eager record measured 1,238.016 µs Emmy,
+61.440 µs Inductor and 781.280 µs eager. Maximum absolute difference was 0.00244140625 and mean absolute difference
+was 0.000001158; the combined strict tolerance passed.
+
+The original matmul-reduce seed acquired a 2,974.720 µs whole-row latency. Its existing 2,766.848 µs per-kernel
+measurement remains unchanged. Its stored program has no runnable eager slice. Fresh-database checks against
+measured greedy execution on the same inputs matched exactly, at 2,972.096 and 2,962.432 µs. This establishes
+schedule replay, not independent framework accuracy; the missing Inductor comparison remains explicit.
+
+Three previously empty targets now have records. Cumsum passed strict eager comparison at 18.822 µs versus
+4.464 µs Inductor and 4.386 µs eager, with maximum absolute difference 0.00000572205 and mean difference
+0.00000044489. Slice/unsqueeze measured 51,423.744 µs and matmul_ede7bd measured 2,354.784 µs. The latter two lack a
+runnable Torch slice and passed only same-input greedy replay. No independent correctness or speedup claim is made
+for them. Only schedules were transferred from their exact-identity V100 donors.
+
+The eight originally empty roots come from philbert440/Qwen3.8-27B-W4A16-AWQ at revision
+`7908d42a71077a5e4dc458f273682b12dfe384a0`, layer zero, sequence 512, hidden size 5120. Hardware programs 58 and 59
+match programs 0 and 1 of the maintained V100 recipe; the former includes five zero-width pads, removed in the
+latter. A scan of 2,124 kernels in all other readable hardware, recipe and experiment goldens found no measured
+schedule or route donor for these five remaining roots:
+
+| Target | Terminal result |
+| --- | --- |
+| k_conv1d_linear_mean_reduce_ddd84e | GPU watchdog at 60 seconds; strict benchmark failed |
+| k_linear_matmul_mean_reduce_a4d772 | Command exceeded the 110-second diagnostic cap |
+| k_matmul_reduce_81b2ae | Command exceeded the 110-second diagnostic cap |
+| k_conv1d_linear_mean_reduce_8f3082 | GPU watchdog at 60 seconds; strict benchmark failed |
+| k_linear_matmul_mean_reduce_591c0d | Command exceeded the 110-second diagnostic cap |
+
+### Recovery provenance
+
+The final RTX 4090 recipe archive includes `recovery-2026-10-13/` beneath its timestamp root. It retains CLI JSON,
+logs, statuses, donor inputs without measurements, recorded working files, strict diagnostics, source digests,
+software metadata and focused freshness checks. Recovery tune databases and compiled-kernel caches are excluded.
+
+| Evidence | Members beneath recovery-2026-10-13/ |
+| --- | --- |
+| Prefill record and independent replay | prefill-record.json, prefill-proof, prefill.working.json |
+| Decode and pieces | decode-unpinned-record.json, selected-partial-record, route-record-*, piece-* |
+| Admitted Ministral records | focused-record-ministral3-14b-fp8.*, post4096-final-record, focused/*.json |
+| Scalar strict accuracy | strict-scalar-proof-ministral3-14b-fp8.* and matching logs/statuses |
+| Earlier native-FP8 failures | baseline-ff169903c/standard-*, default-ministral3-14b-fp8.* |
+| Original AWQ records | focused-record-qwen38-27b-awq.*, awq-reduce-strict-proof/ |
+| Previously empty roots | empty-*, empty-targets/*.json; empty-ede7bd-final-record is the admitted matmul record |
+| Machine, versions and precision | nvidia-smi.txt, requirements.freeze.txt, standard-regime-equivalence.txt |
+| Source and validation | README.md, initial-stage.json, source.json, recovery-current-source.txt, focused-source.txt, validation/ |
+
+The initial stage was `f5c11ed5f`. Prefill recovery used `ff169903c`; route recovery used the fixes at `dcce60206`.
+Ministral post-sym and post32 used `7841211ed`. The other Ministral records, AWQ records, empty-root attempts and
+scalar strict diagnostics used `72776182b`. The earlier pre32 baseline was deliberately interrupted to synchronize
+fixes and is labeled interrupted. Freshness checks passed for hardware programs 39, 40, 50, 52, 53, 54, 56, 57,
+58 and 59 and the common decode file. Final programs 58 and 59 passed together in 28.84 seconds; the final matmul
+row-only addition passed program 58 again in 24.53 seconds.
 
 ## Golden recordings recovered from the replay repair (2026-10-10)
 

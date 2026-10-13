@@ -153,8 +153,9 @@ both correctness and timing; otherwise a shape-dependent cuBLAS algorithm can ro
 a kernel that accumulates at full width. The worker restores the prior precision and split-K settings after each
 job, including failures. `--strict-evidence` (`run`, `compile`, `serve`; `EMMY_STRICT_EVIDENCE`) is the
 deploy-side strictness: a fork no measured row decides raises `EvidenceError` naming the kernel instead of deploying
-a prediction. BF16 inputs and constants bind through the compiler's raw `uint16` carrier, and
-backend output bits are decoded to numeric values before every command-layer correctness check. The eager forward
+a prediction. BF16 inputs and constants bind through the compiler's raw `uint16` carrier. BF16, packed FP4 and FP8
+output carriers are decoded to numeric values on both sides of every command-layer correctness check, including
+the FP64 reference; different encodings of signed zero therefore compare equal. The eager forward
 that serves as the correctness reference runs inside `correctness_oracle`, which turns torch's reduced-precision GEMM
 reductions off: with them on, the FP16 GEMM at K = 15360 leaves one element in ten of its own output outside
 `rtol=atol=1e-3` of an FP64 product, and a kernel nearer the truth than eager failed `--strict` for eager's error.
@@ -284,7 +285,8 @@ there is no repeat or child-process orchestration layer. Invoke `emmy run` again
 observations are required. Which rows bench as pinned rows: a realization named explicitly is benched regardless of
 measurement state — the realization corpus and the perf lane replay unmeasured cases this way. A whole-target latency
 without schedule knobs or a kernel measurement supplies no pinned comparison; `--pin-route` still follows its recorded
-ancestors. The whole-file walk pins only measured
+ancestors. Recorded cuts and reduction splits are scoped to the parent kernel where they were taken; layout
+decisions retain their buffer scope. The whole-file walk pins only measured
 rows of the complete target. Every pinned row (a golden row and an
 `--ab` hand row alike) is MEASURED under a hand pin published to the
 environment for that one compile, then recorded (see `--record` and the bench-to-DB recording below); deploying it
@@ -321,16 +323,17 @@ pipeline ARCHITECTURE's Part 7 has the spelling). Recording a set the file descr
 so without the pin the greedy row is the compiler's own pick, whole, and the rows this writes are what price the
 decision for a compile nothing pins. `--record-greedy` turns on strict evidence, so a golden never holds a schedule the
 prior chose as if it were measured. A new candidate is therefore measured first with `--bench`, which writes its
-per-kernel rows into the tune DB, and is then recorded with that same DB in scope. A `run --golden PATH` bench also
-writes, as tune-DB routing rows, the kernel-set decisions its greedy compile took, when the same bench measured every
-piece of the decision; a piece that is itself cut again counts as measured when the decision that cuts it is written
-too. It writes none under `--no-record-evidence`, outside the deployable regime, or when the greedy isolated re-bench
-is not clean or records no perf rows. In a nested cut (a cut one of whose pieces is cut again) the piece cut again
-never runs as a kernel, so only the decision that cuts it gives it a price. A cut route no golden stores is therefore
-recorded with no pinned decisions or schedules: `--bench`, then `--record-greedy`. A `--record-greedy` run benches no
-proposal (a row with no schedule and no measurement, such as a trace inventory's seed) as a pinned comparison: beside
-the pick it would compile the arm its route spells (on a whole-target row, the fused kernel) with nothing measured to
-schedule it, and strict evidence refuses that.
+per-kernel rows into the tune DB, and is then recorded with that same DB in scope. This includes a fresh whole-file
+walk with no measured rows: its successful greedy comparison is re-benched in isolation to record each kernel. A
+`run --golden PATH` bench also writes, as tune-DB routing rows, the kernel-set decisions its greedy compile took,
+when the same bench measured every piece of the decision; a piece that is itself cut again counts as measured when
+the decision that cuts it is written too. It writes none under `--no-record-evidence`, outside the deployable
+regime, or when the greedy isolated re-bench is not clean or records no perf rows. In a nested cut (a cut one of
+whose pieces is cut again) the piece cut again never runs as a kernel, so only the decision that cuts it gives it a
+price. A cut route no golden stores is therefore recorded with no pinned decisions or schedules: `--bench`, then
+`--record-greedy`. A `--record-greedy` run benches no proposal (a row with no schedule and no measurement, such as a
+trace inventory's seed) as a pinned comparison: beside the pick it would compile the arm its route spells (on a
+whole-target row, the fused kernel) with nothing measured to schedule it, and strict evidence refuses that.
 Both recording modes refuse any integrity flag on a pinned comparison or the greedy isolated re-bench, a rejected
 strict answer, or an unrealized env pin (`record_refusal`). The run reports the reason and exits nonzero before writing
 golden rows, target latency, or bench evidence; its diagnostic JSON is preserved. Under `EMMY_KNOBS` the recorded pick
@@ -357,10 +360,13 @@ or an `--ab` row) still benches.
 the log latencies measured so far. Each row benches exactly as an `--ab` row does, so its clean rows land in the tune DB
 through the same recording and the next compile picks the fastest; a row that fails, does not realize, or is flagged
 counts as a failure, never as a time. A program with several scheduled kernels is refused, because a bare pin reaches
-them all. `--kernel NAME` (with `--golden PATH`) runs one kernel of the file — a cut piece included — as the whole
-program, built from its stored body (`GoldenFile.executable`): tuning a layer's kernel then compiles in seconds where
-the layer takes minutes, and its rows file under the identity the layer's compile reads. Unless evidence recording is
-off (`--no-record-evidence`, a non-deployable regime, a bench below the tune bench standard), its `--bench` re-benches
+them all. `--kernel NAME` (with `--golden PATH`) selects a file-local kernel reference (`Kernel.ref`, which
+can distinguish kernels sharing one C name) and runs that kernel alone. A formed kernel uses its stored body
+(`GoldenFile.executable`). A derived cut piece replays its recorded parent decisions through the shared golden
+restamp replay, then takes a single-node slice of the exact live TileOp. Missing or stale routes and missing or
+ambiguous exact identities are refused; relifting a derived body could tune a different kernel. The isolated rows
+file under the identity the layer's compile reads. Unless evidence recording is off (`--no-record-evidence`, a
+non-deployable regime, a bench below the tune bench standard), its `--bench` re-benches
 the greedy pick in isolation, even with no pinned row beside it, and stores the kernel-set decisions the compile took
 into the tune DB, as a realization's bench does: a cut or split of the kernel itself, pinned with `EMMY_KNOBS`, becomes a
 routing row whose parent is that kernel, and a strict compile of its layer prices the kernel through it. A kernel can

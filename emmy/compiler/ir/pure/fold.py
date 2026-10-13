@@ -1158,15 +1158,15 @@ class Fold:
                 *zip(extra_edges, _slots(extra_params, extra_edges), strict=True),
             ]
             body, results, inits = list(pivot.lift.body), list(pivot.lift.results), list(pivot.init)
-            for name, index, init in added:
+            for name, index, init in tuple(added):
                 taken = {n for stmt in body for n in stmt.defines()} | {p for _, slot in held for p in slot}
-                cone = recipe.channels[index].injection
-                names = {param: roles[param] for param in cone.params}
+                injection = recipe.channels[index].injection
+                names = {param: roles[param] for param in injection.params}
                 # Statement by statement, so a channel BINDS what the body already computes rather
                 # than spelling it again: softmax's denominator and its expectation share the whole
                 # weight prefix, and instantiating each cone whole put two ``exp(s)`` in one lift.
                 have = {(stmt.op, stmt.args): stmt.name for stmt in body if isinstance(stmt, Assign)}
-                for stmt in cone.body:
+                for stmt in injection.body:
                     spelled = stmt.rewrite(lambda read, names=names: names.get(read, read))
                     if isinstance(spelled, Assign) and (prior := have.get((spelled.op, spelled.args))) is not None:
                         names[stmt.name] = prior
@@ -1178,8 +1178,31 @@ class Fold:
                     taken.add(fresh)
                     if isinstance(spelled, Assign):
                         have[(spelled.op, spelled.args)] = fresh
-                results.append(names[cone.results[0]])
+                if name in pview.states:
+                    slot = pview.states.index(name)
+                    bound_roles = {**roles, recipe.lift.params[0]: x}
+                    injected = injection.rename(lambda read, bound_roles=bound_roles, name=name: bound_roles.get(read, f"{name}__{read}"))
+                    candidate = replace(
+                        self, lift=Lambda.closing(self.lift.params, Body((*found[0].body, *injected.body)), injected.results)
+                    )
+                    contribution = cone(candidate, injected.results[0])
+                    if old != new:
+                        contribution = (contribution[0].rename({old: new}), contribution[1])
+                    # A shared dependent can reach the pivot again through another score cone.
+                    # Reuse its state only when both copies inject the same value into the same channel.
+                    if (
+                        slot == 0
+                        or pivot.twist.channels[slot - 1] != index
+                        or pivot.init[slot] != init
+                        or not same(cone(pivot, pivot.lift.results[slot]), contribution)
+                    ):
+                        raise ValueError(f"conflicting definitions of twisted state {name!r}")
+                    added.remove((name, index, init))
+                    continue
+                results.append(names[injection.results[0]])
                 inits.append(init)
+            if not added:
+                return pivot
             # An operand the lift no longer names is nobody's — the recipe's own contribution
             # replaced the statements that read it.
             read = {name for stmt in body for name in stmt.deps()} | set(results)
@@ -1269,6 +1292,7 @@ class Fold:
 
         Propagate demand through narrowed lifts. Shared terms keep the union of their readers'
         requests, so lowering never emits overlapping carriers with duplicate accumulator names.
+        Interior stores keep the defining subtree's reads, without demanding its enclosing results.
         """
         taken: dict[int, tuple[str, ...]] = {}
         pending = [(self, self.exposes)]
@@ -1279,10 +1303,10 @@ class Fold:
             if taken.get(id(term)) == names:
                 continue
             taken[id(term)] = names
-            narrowed = term.exposing(names) if names else None
+            narrowed = term if _writes_under(term, stored) else term.exposing(names) if names else None
             read = narrowed.step().ssa_uses | set(narrowed.exposes) if narrowed is not None else set()
             for edge in term.operands:
-                keep = edge.exposes if _writes_under(edge, stored) else tuple(name for name in edge.exposes if name in read)
+                keep = tuple(name for name in edge.exposes if name in read or name in stored)
                 pending.append((edge, keep))
         return taken
 
@@ -1359,10 +1383,17 @@ class Fold:
                     origin.update((name, (id(term), "observed")) for name in term.exposes[len(term.base.results) :])
             pending.extend(reversed(term.operands))
         owned: dict[tuple[int, str], list[OutputSpec]] = {}
-        taken = self.read_components(frozenset(name for spec in stores for name in spec.write.values))
+        stored = frozenset(name for spec in stores for name in spec.write.values)
+        taken = self.read_components(stored)
 
         def placed(term: Fold) -> tuple[Fold, ...]:
-            return tuple(edge.exposing(taken[id(edge)]) for edge in term.operands if taken[id(edge)])
+            # An interior store retains its defining subtree, without exporting every state of
+            # its enclosing carrier to a cut workspace.
+            return tuple(
+                edge if _writes_under(edge, stored) else edge.exposing(taken[id(edge)])
+                for edge in term.operands
+                if taken[id(edge)] or _writes_under(edge, stored)
+            )
 
         for spec in stores:
             key = origin.get(spec.write.values[0])

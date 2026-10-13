@@ -196,6 +196,46 @@ def _args(path, **overrides):
     return SimpleNamespace(**values)
 
 
+@pytest.mark.parametrize("corruption", [None, "missing_route", "stale_arm", "stale_body"])
+def test_kernel_selector_reconstructs_only_the_exact_measured_cut_piece(tmp_path, caplog, corruption):
+    from emmy.commands.compile import resolve_golden_arg
+    from emmy.compiler.ir.tile import TileOp
+    from emmy.compiler.pipeline.search.autotune import schedule_space
+    from emmy.compiler.pipeline.search.golden import evidence_db
+
+    path = tmp_path / "working.json"
+    document = _working_placement_route(path)
+    [kernel] = [kernel for kernel in document.kernels if not kernel.formed]
+    assert any(row.kernel == kernel.ref and row.measured for row in document.rows)
+    if corruption == "missing_route":
+        document.routing.clear()
+    elif corruption == "stale_arm":
+        document.routing[0] = replace(document.routing[0], arm={"PLACE@missing": "cut"})
+    elif corruption == "stale_body":
+        [other] = inventory_document(_relu_graph(), (8, 9)).kernels
+        document.kernels[:] = [replace(k, loop_ir=other.loop_ir) if k.ref == kernel.ref else k for k in document.kernels]
+    document.dump(path, overwrite=True)
+    args = _args(path, realization=None, kernel=kernel.ref)
+    if corruption:
+        with pytest.raises(SystemExit) as exc:
+            resolve_golden_arg(args)
+        assert exc.value.code == 2
+        assert "no recorded route" in caplog.text if corruption == "missing_route" else "stale recorded route" in caplog.text
+        return
+
+    resolve_golden_arg(args)
+    graph = args._golden_graph
+    [node] = [node for node in graph.nodes.values() if isinstance(node.op, TileOp)]
+    assert node.op.with_io(graph, node).identity_key(structural=False, with_io=True) == kernel.exact_identity
+    assert set(graph.inputs) == {"x", "wn"}, "the parent's scalar constants stay bound in the isolated kernel"
+    assert set(graph.outputs) == set(kernel.op().outputs)
+    with sole_evidence([document]), pinned_knobs({"FAST_MATH": False}):
+        ctx = Context.from_target((8, 9))
+        op, rows = schedule_space(graph, ctx, evidence_db(None, ctx))
+    assert rows and op.identity_key(structural=False, with_io=True) == kernel.exact_identity
+    assert args._golden_scope == [document]
+
+
 def test_compile_working_file_uses_exact_loop_target(run_cli, tmp_path):
     path = tmp_path / "working.json"
     _working_loop(path)
@@ -843,6 +883,7 @@ def test_a_walk_recording_the_greedy_pick_still_times_it_isolated(monkeypatch, t
     # A strict file walk also needs the reference when only the cut pieces have measured rows.
     # It has no whole-target pin and is not recording anything.
     args.record_greedy = False
+    args.no_record_evidence = True
     returned["accuracy_error"] = None
     seen.clear()
     with pytest.raises(SystemExit) as exit_code:
@@ -1220,7 +1261,9 @@ async def _fake_isolated(_backend, compiled, **_kwargs):
     return run_module._GoldenBench(sample, compiled, _timed(compiled), [], "ok")
 
 
-def _bench_fresh_seed(monkeypatch, tmp_path, *, record_greedy: bool) -> tuple:
+def _bench_fresh_seed(
+    monkeypatch, tmp_path, *, record_greedy: bool, whole_file=False, no_record_evidence=False, failure=None, warmup=5, compile_flags=""
+) -> tuple:
     """``run --golden PATH --realization working.route --bench`` on a proposal (a row with no schedule and no
     measurement, such as a trace inventory's seed) of a norm into a matmul, the greedy compile cut and split
     (standing in for whatever the prior picks on a fresh target). A pinned row compiled under strict evidence fails
@@ -1234,14 +1277,38 @@ def _bench_fresh_seed(monkeypatch, tmp_path, *, record_greedy: bool) -> tuple:
     monkeypatch.setenv("EMMY_FAST_MATH", "0")
     db_path = tmp_path / "autotune.db"
     monkeypatch.setenv("EMMY_TUNE_DB", str(db_path))
-    monkeypatch.setenv("EMMY_NVCC_FLAGS", "")  # the deployable regime: bench evidence is recorded only there
+    monkeypatch.setenv("EMMY_NVCC_FLAGS", compile_flags)
     path = tmp_path / "working.json"
     document = inventory_document(_norm_matmul_graph(), (8, 9))
     [row] = document.rows
     replace(document, rows=[replace(row, name="working.route", pins={"FAST_MATH": False})]).dump(path, overwrite=True)
-    args = _run_args(path, realization="working.route", record=False, record_greedy=record_greedy, strict_correctness=False)
+    args = _run_args(
+        path,
+        realization="working.route",
+        record=False,
+        record_greedy=record_greedy,
+        strict_correctness=failure == "accuracy",
+        no_record_evidence=no_record_evidence,
+        _explicit_realization=not whole_file,
+    )
+    args.warmup = warmup
     resolve_golden_arg(args)
     monkeypatch.setattr(compile_module, "selected_decisions", lambda _args: {**_CUT, **_SPLIT})
+
+    class FakeBackend(_TimedBackend):
+        async def benchmark_compare_async(self, graph, **kwargs):
+            result = await super().benchmark_compare_async(graph, **kwargs)
+            result["accuracy_error"] = "eager correctness failed" if failure in {"accuracy", "scaled-accuracy"} else None
+            result["run_io"] = result["run_io"] if kwargs["want_ref"] else None
+            result["greedy_error"] = "greedy timing failed" if failure == "timing" else None
+            return result
+
+    async def fake_isolated(_backend, compiled, **kwargs):
+        assert record_greedy or run_module._records_evidence(args), "ineligible file walks need no isolated evidence job"
+        assert failure is None, "a failed greedy comparison is not evidence"
+        assert kwargs["ref"] is not None, "recorded kernels must reuse the comparison's inputs"
+        return await _fake_isolated(_backend, compiled, **kwargs)
+
     benched: list[str] = []
 
     async def fake_pinned(_backend, _source, samples, **_kwargs):
@@ -1249,12 +1316,16 @@ def _bench_fresh_seed(monkeypatch, tmp_path, *, record_greedy: bool) -> tuple:
         refused = "compile failed: strict evidence: no measured row vouches for any offered candidate"
         return [run_module._GoldenBench(sample, None, None, [refused], "bench_fail") for sample in samples]
 
-    monkeypatch.setattr(run_module, "_bench_greedy_isolated", _fake_isolated)
+    monkeypatch.setattr(run_module, "_bench_greedy_isolated", fake_isolated)
     monkeypatch.setattr(run_module, "_bench_golden_variants", fake_pinned)
     monkeypatch.setattr(run_module, "_print_kernel_stats", lambda *_args, **_kwargs: None)
     target_mod.set_target((8, 9))
     try:
-        run_module._handle_run_ir(args, _TimedBackend, _FakeDump)
+        if failure in {None, "scaled-accuracy"}:
+            run_module._handle_run_ir(args, FakeBackend, _FakeDump)
+        else:
+            with pytest.raises(SystemExit):
+                run_module._handle_run_ir(args, FakeBackend, _FakeDump)
     finally:
         target_mod.set_target(None)
     return path, db_path, benched
@@ -1273,6 +1344,46 @@ def test_run_bench_records_the_greedy_compiles_routing_rows(monkeypatch, tmp_pat
     finally:
         db.close()
     assert len(arms) == 2 and _CUT in arms, "the cut and the split of its piece"
+
+
+@pytest.mark.parametrize("mode", ["record", "opt-out", "non-deployable", "substandard", "accuracy", "scaled-accuracy", "timing"])
+def test_whole_file_bench_records_fresh_route_only_after_a_valid_measurement(monkeypatch, tmp_path, mode):
+    """A fresh whole-file bench makes its cut/split deployable; excluded regimes and failed checks publish no evidence."""
+    from emmy import config
+    from emmy.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.pipeline.search.policy.greedy import EvidenceError
+
+    compile_flags = "-Xcicc -O1" if mode == "non-deployable" else ""
+    ctx = Context.from_target((8, 9), gpu_name="NVIDIA GeForce RTX 4090", compile_flags=compile_flags, cold_cache=False)
+    monkeypatch.setattr(Context, "probe", classmethod(lambda cls: ctx))
+    path, db_path, benched = _bench_fresh_seed(
+        monkeypatch,
+        tmp_path,
+        record_greedy=False,
+        whole_file=True,
+        no_record_evidence=mode == "opt-out",
+        failure=mode if mode in {"accuracy", "scaled-accuracy", "timing"} else None,
+        warmup=1 if mode == "substandard" else 5,
+        compile_flags=compile_flags,
+    )
+    assert not benched, "a file walk does not treat its unmeasured proposal as a pinned comparison"
+    document = GoldenFile.load(path)
+    assert not document.routing and not any(row.measured for row in document.rows), "the benchmark writes only the DB"
+    [target] = document.targets()
+    db = SearchDB(db_path)
+    try:
+        with evidence_scope([]), pinned_knobs({"FAST_MATH": False}), config.strict_evidence_override(True):
+            if mode != "record":
+                assert not list(db.iter_routing())
+                with pytest.raises(EvidenceError):
+                    Pipeline.build(CUDA_PASSES).run(target.program({}), ctx=ctx, db=db)
+            else:
+                arms = [route.arm for route in db.iter_routing()]
+                assert len(arms) == 2 and _CUT in arms
+                replay = Pipeline.build(CUDA_PASSES).run(target.program({}), ctx=ctx, db=db)
+                assert len(_cuda_nodes(replay)) == 3, "the measured norm and the matmul's partial/final kernels"
+    finally:
+        db.close()
 
 
 def test_record_greedy_benches_no_seed_row_without_a_schedule(monkeypatch, tmp_path):
@@ -1571,6 +1682,24 @@ def test_recorded_route_addresses_successive_remainders_and_cut_producers(monkey
     if bare:
         expected = dict.fromkeys(("PLACE", "PLACE@step.1", "PLACE@place_aaaa", "PLACE@place_aaaa/step.1", "PLACE@place_bbbb"), "cut")
     assert _route_pins(document, "final") == expected
+
+
+@pytest.mark.parametrize("name,scope", [("k_root", "node_root"), ("k_root__place_aaaa", "place_aaaa")])
+def test_recorded_split_route_only_pins_its_parent(name, scope):
+    from emmy.commands.compile import _route_pins
+
+    decision = SimpleNamespace(parent="root", arm={"REDUCE": "g8k"}, children=("partial", "final"))
+    document = SimpleNamespace(path_to=lambda _: [decision], kernel=lambda _: SimpleNamespace(name=name))
+    assert _route_pins(document, "partial") == {f"REDUCE@{scope}": "g8k"}
+
+
+def test_recorded_layout_route_preserves_each_source_buffer():
+    from emmy.commands.compile import _route_pins
+
+    arm = {"LAYOUT@weight": "m16n8", "LAYOUT@other_weight": "plain"}
+    decision = SimpleNamespace(parent="root", arm=arm, children=("packed",))
+    document = SimpleNamespace(path_to=lambda _: [decision], kernel=lambda _: SimpleNamespace(name="k_root"))
+    assert _route_pins(document, "packed") == arm
 
 
 def test_ab_rows_compile_under_the_pinned_route(monkeypatch):

@@ -1184,7 +1184,7 @@ def _comparison_outputs(outputs: dict, graph) -> dict:
     """Decode physical carriers before command-layer correctness checks."""
     import numpy as np  # noqa: PLC0415
 
-    from emmy.compiler.dtype import decode_bf16, decode_f4x2  # noqa: PLC0415
+    from emmy.compiler.dtype import decode_bf16  # noqa: PLC0415
 
     if not hasattr(graph, "buffer"):
         return outputs
@@ -1196,10 +1196,10 @@ def _comparison_outputs(outputs: dict, graph) -> dict:
             if decoded is outputs:
                 decoded = dict(outputs)
             decoded[name] = decode_bf16(arr)
-        elif dtype.name == "f4e2m1x2" and arr.dtype == np.uint8:
+        elif dtype.name in _QUANTIZED_FORMATS and arr.dtype == np.uint8:
             if decoded is outputs:
                 decoded = dict(outputs)
-            decoded[name] = decode_f4x2(arr)
+            decoded[name] = _quantized_values(arr, dtype.name)
     return decoded
 
 
@@ -1329,7 +1329,7 @@ def _exact_outputs(frontend, input_tensors: dict, result_outputs: dict) -> dict:
     except Exception as exc:  # noqa: BLE001 — no FP64 evaluation leaves the elementwise verdict standing
         logger.warning("FP64 reference unavailable (%s) — the strict check stays elementwise", exc)
         return None
-    return _eager_outputs_by_name(result_outputs, out[: len(result_outputs)] if isinstance(out, tuple) else out)
+    return _eager_outputs_by_name(result_outputs, out[: len(result_outputs)] if isinstance(out, tuple) else out, frontend)
 
 
 #: How far above the reference's mean absolute error, relative to it, a candidate's may sit against the exact values
@@ -1480,7 +1480,7 @@ def _eager_outputs_by_name(outputs: dict, eager_out, graph=None) -> dict:
     for name, ref in zip(outputs, refs, strict=True):
         if hasattr(ref, "detach"):
             tensor = ref.detach()
-            if graph is not None and graph.buffer(name).dtype.name == "f4e2m1x2":
+            if graph is not None and graph.buffer(name).dtype.name in _QUANTIZED_FORMATS:
                 import torch  # noqa: PLC0415
 
                 tensor = tensor.contiguous().view(torch.uint8)
@@ -3122,16 +3122,9 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         stats_sym_env = _collect_sym_env(([frontend] if frontend is not None else []) + [graph])
         torch_available = captured = False
         pinned = _pinned_samples_for_ir(args, embedded)
-        # ``--record-greedy`` writes the greedy pick from its per-kernel ISOLATED re-bench, and
-        # proves it against the greedy's own outputs where no Torch twin exists. Both used to ride
-        # on the pinned-row path below, so a walk over a fresh trace inventory — which holds no
-        # verified row to pin — benched every target and recorded none of them.
-        record_greedy = bool(getattr(args, "record_greedy", False))
-        # The bench evidence (``_record_bench_evidence``) stores the greedy compile's kernel-set decisions only beside
-        # the pick's isolated re-bench, so an embedded golden re-benches the pick even with no pinned row beside it: a
-        # ``--kernel`` run, or a realization whose rows ``resolve_golden_arg`` benches none of. A piece's own kernel-set
-        # decision, benched alone, is then recorded too.
-        records_evidence = embedded is not None and _records_evidence(args)
+        # Golden write-back and default bench-to-DB evidence both need isolated per-kernel timings,
+        # including a fresh file walk with no measured row to compare as a pinned schedule.
+        measure_greedy = bool(getattr(args, "record_greedy", False) or (embedded is not None and _records_evidence(args)))
         try:
             try:
                 resp = await backend.benchmark_compare_async(
@@ -3142,7 +3135,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
                     warmup=args.warmup,
                     iters=args.iters,
                     seed=args.seed,
-                    want_ref=bool(tail and (same_input_greedy or pinned or record_greedy or args.ab or getattr(args, "tune", None))),
+                    want_ref=bool(tail and (same_input_greedy or pinned or measure_greedy or args.ab or getattr(args, "tune", None))),
                     strict_accuracy=strict_correctness and not same_input_greedy,
                 )
             except RuntimeError as exc:
@@ -3167,10 +3160,11 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
                     _record_greedy_failure(args, backend, graph, resp["greedy_error"])
             ref_key = uuid.uuid4().hex if ab_ref is not None else None
             if not pinned and tail and greedy_fail is None:
-                if record_greedy or records_evidence:
-                    greedy_iso = await _bench_greedy_isolated(
-                        backend, graph, warmup=args.warmup, iters=args.iters, ref=ab_ref, ref_key=ref_key
-                    )
+                if measure_greedy:
+                    if same_input_greedy or accuracy_error is None:
+                        greedy_iso = await _bench_greedy_isolated(
+                            backend, graph, warmup=args.warmup, iters=args.iters, ref=ab_ref, ref_key=ref_key
+                        )
                 elif embedded is not None:
                     _note_below_standard(args)
             if pinned and tail:
@@ -3216,7 +3210,10 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             elif not pinned and args.ab and tail:
                 if greedy_fail:
                     logger.error("%s — greedy row marked bench_fail; --ab rows still bench in the worker", greedy_fail)
-                greedy_iso = await _bench_greedy_isolated(backend, graph, warmup=args.warmup, iters=args.iters, ref=ab_ref, ref_key=ref_key)
+                if greedy_iso is None:
+                    greedy_iso = await _bench_greedy_isolated(
+                        backend, graph, warmup=args.warmup, iters=args.iters, ref=ab_ref, ref_key=ref_key
+                    )
                 ab_benches = await _bench_ab_variants_ir(
                     backend, path, tail, args.ab, warmup=args.warmup, iters=args.iters, db=db, ref=ab_ref, ref_key=ref_key
                 )
