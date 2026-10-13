@@ -57,8 +57,11 @@ def test_reason_keeps_a_row_of_either_precision_regime(monkeypatch) -> None:
     assert freeze_reason(_row("k", us=500.0, knobs=_ROW), _STAMPS) is None
     assert freeze_reason(_row("k", us=500.0, knobs=_ROW, flags="--use_fast_math"), _STAMPS) is None
     assert freeze_reason(_row("k", us=500.0, knobs=_ROW, flags="-lineinfo --use_fast_math"), _STAMPS) is None
-    assert REGIME_PINS[""] == {"FAST_MATH": False}
-    assert REGIME_PINS["--use_fast_math"] == {"FAST_MATH": True}
+    assert REGIME_PINS[""] == dict.fromkeys(("FAST_MATH", "FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA", "COLD_CACHE"), False)
+    assert REGIME_PINS["--use_fast_math"] == {
+        **dict.fromkeys(("FAST_MATH", "FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA"), True),
+        "COLD_CACHE": False,
+    }
     assert regime_of("-lineinfo --use_fast_math") == "--use_fast_math" and regime_of("-lineinfo") == ""
 
 
@@ -80,6 +83,36 @@ def test_freeze_preserves_cold_and_hot_rows_of_the_same_kernel(tmp_path):
     assert len(rows) == 2 * len(hot_rows)
     assert {r.stats.median for r in rows if r.cold_cache} == {700.0}
     assert {r.stats.median for r in rows if not r.cold_cache} == {500.0}
+
+
+@pytest.mark.parametrize("name", ["FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA"])
+def test_freeze_and_offline_pools_preserve_independent_precision(tmp_path, monkeypatch, name):
+    from emmy.compiler.pipeline.search.db.export import golden_pools
+    from emmy.compiler.pipeline.search.ranking import pool_context
+    from emmy.compiler.pipeline.search.space import precision_pins
+
+    # Ambient policy must not become a recorded row's context during import or reconstruction.
+    monkeypatch.setenv("EMMY_FAST_MATH", "1")
+    monkeypatch.setenv(f"EMMY_{name}", "0")
+    source = tuned_db(None, CASES[:1], us=500.0)
+    original = list(source.iter_perf_rows())
+    for row in original:
+        source.record_perf_row(dataclasses.replace(row, precision={"FAST_MATH": False, name: True}))
+    [document] = freeze_documents(source)[0].values()
+    path = tmp_path / "freeze.json"
+    document.dump(path)
+    restored = SearchDB()
+    import_file(restored, path, source="golden:freeze")
+    rows = list(restored.iter_perf_rows())
+    assert len(rows) == 2 * len(original)
+    assert {row.precision[name] for row in rows} == {False, True}
+    pools, dropped = golden_pools(restored)
+    assert not dropped and len(pools) == len(rows)
+    for pool in pools:
+        ctx = pool_context(pool)
+        assert ctx.precision_pins() == precision_pins(pool.pins)
+        assert len(list(restored.iter_perf(ctx))) == len(original)
+        assert pool.regime == regime_of(ctx.compile_flags, ctx.cold_cache, ctx.precision_pins())
 
 
 def test_reason_drops_a_failed_bench() -> None:
@@ -202,7 +235,10 @@ def test_both_precision_lanes_freeze_as_pinned_rows_and_import_apart(tmp_path) -
     documents, _dropped = freeze_documents(db)
     [document] = documents.values()
     assert sorted(row.pins["FAST_MATH"] for row in document.rows) == [False, True]
-    assert {tuple(row.pins) for row in document.rows} == {("FAST_MATH",)}
+    assert all(
+        row.pins == dict.fromkeys(("FAST_MATH", "FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA"), row.pins["FAST_MATH"]) | {"COLD_CACHE": False}
+        for row in document.rows
+    )
     write_freeze(path, tmp_path / "freeze")
     db.close()
     again = SearchDB()

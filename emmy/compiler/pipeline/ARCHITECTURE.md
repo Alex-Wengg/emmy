@@ -873,7 +873,12 @@ tables hold compilable kernels, the decisions that minted them, and measurements
 - **`context`** — one row per backend, card and regime: the card (`Context.hardware_id`, the PCIe product name — two
   SKUs off one die, H100 and H200, RTX 5090 and RTX PRO 6000, share a compute capability, and without it their rows
   would meet under the keep-best upsert), the target as the backend spells it (`sm_120`), the cicc opt level and the
-  residual compiler flags (`""` in the plain regime, so `""` and `-Xcicc -O3` are one regime), and `cold_cache`.
+  residual compiler flags (`""` in the plain regime, so `""` and `-Xcicc -O3` are one regime), every effective
+  precision decision, and `cold_cache`. Independent overrides of the `FAST_MATH` umbrella partition evidence even
+  when they leave nvcc flags unchanged. The context captures these inputs before compilation; A/B recording
+  reconstructs it inside each row's replay-pin scope. Omitted independent pins inherit the recorded umbrella.
+  Publishing a recorded regime spells those effective defaults explicitly, so ambient overrides cannot leak in;
+  equivalent omitted and explicit defaults share one regime without rewriting the stored row's pins.
   Cold measurements evict L2 before each timed launch. The replayable `COLD_CACHE` golden input pin carries that
   regime through import, freeze and export; an omitted pin means hot. Neither regime prices the other's rows.
 - **`schedule`** / **`schedule_knob`** — one row per distinct schedule row, the in-kernel choices a leaf kernel was
@@ -931,11 +936,12 @@ behind.
   from its stored definition (`freeze.kernel_ops`): an `ok` row on a card the GPU registry knows, at the deployable
   opt level, whose kernel still lowers (one that does not is dropped as a stale kernel), that passes the two
   physical-plausibility checks (`implausible_value_reason`, which reads the row's
-  `bindings` as the size a symbolic axis ran at, and `impossible_kernel_reason`). The fast-math flag alone decides
-  which of the two precision regimes a row is in (`regime_of`), and no other compiler flag is stored or gated on. A
-  failed bench is not a measurement (the tune DB keeps it), and a row a compile imported from a golden file is the
-  file's. The opt-level gate is what keeps a freeze a fair yardstick: a freeze is the corpus a reported prior number
-  is computed over, so rows from a regime nothing deploys in would put half a card's pools in a lane no one runs.
+  `bindings` as the size a symbolic axis ran at, and `impossible_kernel_reason`). The effective precision decisions
+  and cache mode define its regime (`regime_of`), including independent overrides; other compiler flags are not
+  stored or gated on. A failed bench is not a measurement (the tune DB keeps it), and a row a compile imported from
+  a golden file is the file's. The opt-level gate is what keeps a freeze a fair yardstick: a freeze is the corpus
+  a reported prior number is computed over, so rows from a regime nothing deploys in would put half a card's pools
+  in a lane no one runs.
   `measured_groups` inherits the same filter, and keys its pools by regime, so an analysis over a live DB agrees with
   one over a freeze.
 - **Freezing the same DB twice yields the same bytes**: rows sort by content, and the golden dump is deterministic.
@@ -1056,7 +1062,9 @@ the arm its routing row spells through the same `pins.spelled_arm` the deploy re
 splice watcher). The watcher matches fresh children to stored references by exact identity before replaying the
 next decision; unmatched children pair in relative order for re-keying. A reordered child keeps its measured rows,
 and a changed child identity cannot close its placement fork. Where the stored path has no decision,
-the replay keeps the piece fused. What it keeps is decided per entry, never guessed: a kernel that kept its identity
+the replay keeps the piece fused and follows the path's explicit layout choices, so an earlier sibling cannot
+default to a conflicting layout. A reader fixed in the other layout still refuses the path. What it keeps is
+decided per entry, never guessed: a kernel that kept its identity
 keeps its entry — body and name (one identity can be minted by several parents, each spelling the body's buffers its
 own way); one the fresh lowering re-keys — the stored body and the fresh one are two kernels, their exact identities,
 both computed now, differ — takes the fresh body under the stored name and `ref`; a piece two
@@ -1265,10 +1273,13 @@ still train as one pool. `emmy db export` runs this ONE builder and writes its g
 enumerates pools `jobs` at a time, one pool per worker process: a pool's draw is a pure function of its tree and the
 seed, and the results are folded in the pools' order, so the groups are the same at any count; the library default is
 one process (the suite runs its own workers) and the CLI asks for every core. A pool's context is
-`Context.from_target(cap, gpu_name=…, compile_flags=…, cold_cache=…)` — the card the rows were measured on with its
-known SM count and smem specs, and the regime's flags and cache mode — never the host's. The host's context makes golden
-ranks machine-dependent, because the occupancy features then describe tiles for a GPU that is not the one the row came
-from. A golden that lowers to several kernels is one pool per piece, each holding the rows measured on it.
+`Context.from_target(cap, gpu_name=…, compile_flags=…, precision=…, cold_cache=…)` — the card the rows were measured
+on with its known SM count and smem specs, and the regime's flags, precision decisions and cache mode — never the
+host's. Import, freeze and export preserve those decisions; incompatible DB and dataset versions must be rebuilt.
+Offline pools publish every effective precision and cache pin, so ambient overrides cannot change their candidates.
+The host's context makes golden ranks machine-dependent, because the occupancy features then describe tiles for a
+GPU that is not the one the row came from. A golden that lowers to several kernels is one pool per piece, each
+holding the rows measured on it.
 
 The export packs the pools over the FULL featurization, and a fit trains on every column it packed: the featurizer
 (`search/features.Featurizer`) is the one definition of what both priors read, at fit and at deploy, so no
