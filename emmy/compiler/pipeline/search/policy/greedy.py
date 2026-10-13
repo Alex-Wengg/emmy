@@ -659,6 +659,7 @@ def greedy_decide(
     prior: object = _LOAD_PRIOR,
     placement_prior: object = _LOAD_PRIOR,
     db: object | None = None,
+    unranked: frozenset[str] = frozenset(),
 ) -> Callable[[ForkPoint], object]:
     """The greedy compile pick as a :meth:`Run.resolve` ``decide`` callback, in two kinds of decision that never
     price one through the other.
@@ -671,8 +672,11 @@ def greedy_decide(
 
     A **schedule fork** descends directly to exact evidence when available, otherwise streams the complete rows
     in bounded chunks (:func:`_stream_tiers`), skips ``blocked`` tile identities, and takes the prior's global
-    argmin. The prior is the ``OfflinePrior`` ``load_prior`` builds. Without a prior (a failed load, or the
-    explicit ``prior=None`` resolve), measured schedules still win; unmeasured forks fall to emission order.
+    argmin. The prior is the ``OfflinePrior`` ``load_prior`` builds. Without a prior (a failed load, or
+    ``prior=None``), measured schedules still win; unmeasured forks fall to emission order — the first leaf the
+    enumeration produces that ``blocked`` does not list. ``unranked`` names the nodes where the per-node fallback
+    of ``GreedyStrategy`` (when the retries run out or have nothing left to block) takes that emission-order
+    pick while the prior ranks every other node.
     Stamps the pick's measured or predicted µs on ``fp.score``, so the resolve trace carries the per-fork price.
 
     ``blocked`` (``{node_id: {tile_identity, ...}}``) lists the picks a previous compile
@@ -755,14 +759,24 @@ def greedy_decide(
                 fp.score = price
                 decisions[dkey] = (dict(row), price)
                 return leaf
-        if the_prior is None:
+        if the_prior is None or fp.node_id in unranked:
             # No prior on this resolve — a failed ``load_prior`` (corrupt/unreadable
-            # checkpoint) or ``Pipeline.run``'s explicit emission-order fallback
-            # (``prior=None``): emission order (option-0, first leaf).
-            leaves = fp.leaves()
-            first = next(leaves)
+            # checkpoint) — or none at this node, which ``GreedyStrategy``'s per-node
+            # fallback left ``unranked``: emission order (the first leaf the enumeration
+            # produces), past the leaves a retry blocked. When every leaf is blocked the
+            # first one stands, and the node stays un-lowered for the loud failure.
+            node_blocked = blocked.get(fp.node_id) if blocked else None
+            leaves = (leaf for leaf in fp.leaves() if node_blocked is None or not _tile_blocked(leaf_knobs(leaf), node_blocked))
+            first = next(leaves, None)
+            if first is None:
+                return next(fp.leaves())
             if next(leaves, None) is not None:
-                _require_evidence(fp, "no prior loaded; emission order would decide")
+                _require_evidence(
+                    fp,
+                    "no prior loaded; emission order would decide"
+                    if the_prior is None
+                    else "emission order would decide at a node the retries could not settle",
+                )
             return first
         # Greedy benches nothing, so it must pick the globally best COMPLETE
         # tile, not a partial branch (the prior is blind at a partial ``BM/BN``

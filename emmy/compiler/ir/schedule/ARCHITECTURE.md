@@ -97,12 +97,14 @@ the choice types and key spellings through the package.
 whose values its sites offer where it names them. `ClassicScheduleContext` is the immutable `c + p + t` prefix over
 that problem. Everything a schedule choice cannot change is derived from the tile and the target and memoized on the
 term it derives from — a contraction's `ContractionFacts` on the Fold root (`TileOp.contractions`), the packed operand
-readings, the placement and the two site relations the binder dictates (`shared_roots`, `chain_pairs`) on the
-TileOp, and a node choice's supports on the site that offers it. The compatibility rules — worker inventory,
-physical-axis agreement, fragment seams, the shared-root and chain rules — are stated in `refusals` beside the
+readings, the placement and the three site relations the binder dictates (`shared_roots`, `chain_pairs`,
+`nested_tiles`) on the TileOp, and a node choice's supports on the site that offers it. The compatibility rules —
+worker inventory, physical-axis agreement, fragment seams, the shared-root, chain and nested-tile rules — are stated
+in `refusals` beside the
 per-choice ones, as one function of a pick and a RELATION: what a prefix has decided that those rules read (the
 inventory it claimed, its axis and fragment agreements, and the decided nodes only where a rule reads them — every
-one while no inventory is claimed, all of them at a shared root or a chain member). The context carries that
+one while no inventory is claimed, all of them at a shared root, a chain member or either end of a nested tile).
+The context carries that
 relation and composes it; the kernel-level rules (raster eligibility, resource limits, the producer band) stay with
 it. A node site holds one record per node choice with the facts that are the tile's alone — the inventory it
 claims, its placed geometry and axis agreements, the seam claims that read no transport — and, derived only when
@@ -170,7 +172,7 @@ member catalog: the untiled tiers bind it as a fold beside the root, and reading
 cooperative reduce evaluating a 16384-wide statistic once per thread. The contraction per-cell tier reads that same
 projection, so a contraction inherits those readings rather than restating them.
 
-Two binder facts are relations between sites rather than node domains, so they compose in `extend` beside the worker
+Three binder facts are relations between sites rather than node domains, so they compose in `extend` beside the worker
 and physical-axis agreements. The binder builds a kernel around several scheduled roots only where the projection
 partitions its outputs by root (`ops.projection_regions` — each store reads exactly one root's region); where it does
 not, one root is the kernel's root and every other reduce lowers serially, so the context refuses a second scheduled
@@ -181,7 +183,15 @@ used to be offered, ranked first, and refused at materialize; the row that coope
 And a chain binds only in the binder's
 untiled arm, so the context refuses a partitioned chain member beside an output-tiled root: there the fill evaluates
 the cone per cell, statistic included, and the member's partition would realize as nothing — an unreproducible pin
-rather than a refusal.
+rather than a refusal. And the binder lowers a `TILE` below a kernel root (a node the binder builds the kernel
+around, `ops.kernel_roots`) only inside a root it output-tiles, that is, lowers through the tier that tiles its
+`(m, n)` output — and even there only where that tier folds the nested site (the chunked carrier's score). Any other
+root lowers its subtree serially, which would drop the tile, so the context refuses a tiled site below a root that is
+not output-tiled (`nested_tiles`), checked at whichever site of the pair is decided second. The NVFP4 scale — the
+maximum over each 16-element NVFP4 scale group of the gate/up contraction's output — used to be offered such rows,
+the prior ranked one tiled variant after another first, and the greedy compile spent a whole resolve (one pipeline
+pass over the whole program under the current blocklist) on each refusal at materialize until its retry budget ran
+out.
 
 A CHUNKED carrier's seam is stricter than an ordinary consumer's. The ordinary need tolerates an untiled producer;
 this one is built on the fragment, since the chunk's score IS the producer's tile — so the producer must be
