@@ -428,7 +428,7 @@ def test_every_command_variant_renders(project_root) -> None:
             assert "/task" in command
             subprocess.run(["bash", "-n"], input=command, text=True, check=True)
             rendered += 1
-    assert rendered == 81
+    assert rendered == 101
 
 
 def test_kernel_tuning_inventory_keeps_file_local_refs(project_root, tmp_path) -> None:

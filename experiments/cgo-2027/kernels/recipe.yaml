@@ -1,4 +1,4 @@
-# One bounded model-derived corpus and its diagnostics. Every row is an ordinary matrix task on a shared per-GPU VM;
+# Model-derived layers, standalone operators and their diagnostics. Every row is an ordinary matrix task on a shared per-GPU VM;
 # the study field keeps the headline common corpus, large-shape supplement, convergence check, and ablation separate.
 #
 # A row that names a `golden` replays `golden/<golden>.golden.json` instead of tracing and searching: those
@@ -47,6 +47,78 @@ command:
       exit "$$final_status"
     }
     trap finalize EXIT
+
+    if [ "$study" = "isolated" ]; then
+      # This prospective corpus uses explicit frontend boundaries, not the historical figure's unidentified bars.
+      # Reuse an already-qualified runtime. This lane never installs packages or changes a shared environment.
+      runtime_root=$$(dirname "$$(readlink -f ./venv)")
+      if ! compgen -G 'emmy/emmy_runtime*.so' > /dev/null; then
+        cp "$$runtime_root"/emmy/emmy_runtime*.so emmy/
+      fi
+      ./venv/bin/python -c 'import emmy.emmy_runtime, torch; assert torch.__version__.split("+")[0] == "2.13.0"'
+      while IFS= read -r config_var; do unset "$$config_var"; done < <(compgen -v EMMY_)
+      export EMMY_GOLDEN_FILE= EMMY_KNOBS= EMMY_NVCC_FLAGS=
+      export EMMY_FAST_MATH=0 EMMY_FAST_EXP=0 EMMY_F16_MMA_F32_ACC=0 EMMY_FP8_MMA=0
+      export EMMY_BENCH_RUN_TIMEOUT_S=45
+      export EMMY_CUBIN_CACHE=$task_dir/cubins
+      export PATH=$$PWD/venv/bin:$$PATH
+      devices="$gpu_device_ids"
+      export CUDA_VISIBLE_DEVICES=$${devices%%,*}
+      case "$$CGO_KERNEL_CASE" in
+        norm-p|norm-d)
+          cat > $task_dir/program.py <<'PY'
+    class Norm(nn.Module):
+        def forward(self, x, weight):
+            u = x.float()
+            v = u * torch.rsqrt((u * u).mean(dim=-1, keepdim=True) + 1e-6)
+            return v.to(x.dtype) * weight
+    torch.manual_seed(0)
+    PY
+          printf 'Norm()(torch.randn(1, %s, 1024, dtype=torch.float16), torch.ones(1024, dtype=torch.float16))\n' \
+            "$seq_len" >> $task_dir/program.py
+          ;;
+        mean-d)
+          cat > $task_dir/program.py <<'PY'
+    class Mean(nn.Module):
+        def forward(self, z):
+            return z.mean(dim=-1, keepdim=True)
+    torch.manual_seed(0)
+    Mean()(torch.randn(1, 1, 1024, dtype=torch.float16).float().square())
+    PY
+          ;;
+        cast-p)
+          cat > $task_dir/program.py <<'PY'
+    class Cast(nn.Module):
+        def forward(self, v):
+            return v.to(torch.float16)
+    torch.manual_seed(0)
+    Cast()(torch.randn(1, 512, 1024, dtype=torch.float32))
+    PY
+          ;;
+        *) exit 2 ;;
+      esac
+      sha256sum $task_dir/program.py emmy/compiler/pipeline/search/prior/weights/*.json \
+        emmy/emmy_runtime*.so Cargo.toml Cargo.lock > $task_dir/input-sha256.txt
+      nvidia-smi -q > $task_dir/gpu-before.txt
+      nvcc --version > $task_dir/nvcc.txt
+      verification_status=0
+      for repeat in 0 1 2 3 4; do
+        export EMMY_TUNE_DB=$task_dir/verification/repeat-$$repeat.db
+        export EMMY_DUMP_DIR=$task_dir/verification/dump-$$repeat
+        if timeout --signal=TERM --kill-after=5s 115s ./venv/bin/emmy run \
+          --code "$$(cat $task_dir/program.py)" --bench --strict --no-record-evidence \
+          --bench-backends eager,tcompile,emmy --warmup 10 --iters 100 \
+          --json $task_dir/verification/repeat-$$repeat.json 2>&1 | tee $task_dir/verification-$$repeat.log; then
+          repeat_status=0
+        else
+          repeat_status=$$?
+          verification_status=$$repeat_status
+        fi
+        printf '%s\n' "$$repeat_status" > $task_dir/verification/repeat-$$repeat.status
+      done
+      nvidia-smi -q > $task_dir/gpu-after.txt
+      exit "$$verification_status"
+    fi
 
     [ -d venv ] || make setup
     # Keep the reference compiler version fixed across newly provisioned and existing hosts.
@@ -167,6 +239,28 @@ command:
   timeout: 86400
 
 matrices:
+  # Fixed standalone boundaries on the five paper GPUs. No tuning, golden evidence or evidence writes;
+  # the frozen compiler and priors select schedules. Inspect repeat source hashes before pooling timings.
+  - cross:
+      study: isolated
+      model_ref: standalone
+      layer: 0
+      budget: 0
+      trial: 0
+      fp8_mma: 0
+      golden: ""
+      deploy.gpu:
+        - "NVIDIA Tesla V100 SXM2 16GB"
+        - "NVIDIA A100 40GB"
+        - "NVIDIA H100 80GB"
+        - "NVIDIA GeForce RTX 4090"
+        - "NVIDIA GeForce RTX 5090"
+      deploy.gpu_count: 1
+      command.env.CGO_KERNEL_CASE: "$operator"
+      zip:
+        operator: [norm-p, norm-d, mean-d, cast-p]
+        seq_len: [512, 1, 1, 512]
+
   # Headline common corpus: identical model, layer, sequence lengths, budget, and correctness gate on every GPU.
   - cross:
       study: common
