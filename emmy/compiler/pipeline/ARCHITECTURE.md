@@ -1036,18 +1036,21 @@ per kernel-set decision the splice watcher reported (`search/inventory.py`), and
 the tile kernel it lowered from, its realized schedule and later storage choices, its own isolated launch timing —
 under the seed row's input regime with the compile's own precision gates laid over it (`pins.measured_regime_pins`)
 and the greedy comparison row as `same-input-greedy` reference. A row of the same kernel, sizes, regime and schedule
-takes the new timings. Matching includes later decisions and ignores only declared OFF defaults, so recording fills
-an existing proposal while preserving its name. Recorded this way, a strict-evidence compile picks the same kernel
-set again from the file's rows alone (no tune DB, no prior). A routing row the unpinned cut pass does not take again is
+takes the new timings. Matching includes later decisions and ignores only declared OFF defaults; precision pins
+compare by their effective regime, so recording fills an existing proposal while preserving its name and stored
+pin spelling. Recorded this way, a strict-evidence compile picks the same kernel set again from the file's rows alone
+(no tune DB, no prior). A routing row the unpinned cut pass does not take again is
 refused before anything is written, since the next restamp would drop it. A composed cut leaves its children open,
 so a cut pinned on one of them (`PLACE@place_<token>/…`) records as a later decision on that child. Each measured row
 carries `tried`: the schedules of its kernel the tune DB held at its sizes and regime on the card
 (`bench_record.measured_schedules`) —
 the search behind the row, which nothing else in the file can tell, and which goes with the measurement when a restamp
 demotes the row. `--record` writes a row's per-card latencies (`golden.record_latency`), the corpus's ratchet. A record
-run always times `torch.compile`, and `--record-greedy` writes the same block onto the seed row: the whole pick's time
-beside `torch.compile` and eager, the number `emmy golden list` reads a gap against `torch.compile` from. A row's `note`
-is free text a person writes about it, never a label computed from the numbers. Both writers refuse a canonical path:
+run requests `torch.compile`, and `--record-greedy` writes the same block onto the seed row: the whole pick's time
+beside `torch.compile` and eager, the number `emmy golden list` reads a gap against `torch.compile` from. An isolated
+`--kernel REF --realization NAME --record-greedy` refreshes only the selected kernel's measurement; its timing cannot
+stand for the target and never writes that latency block. A row's `note` is free text a person writes about it, never
+a label computed from the numbers. Both writers refuse a canonical path:
 a re-record works on a copy.
 
 **One builder writes every kernel entry.** `golden.definition` builds every entry — a trace inventory's, a record
