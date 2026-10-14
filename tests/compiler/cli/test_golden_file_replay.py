@@ -187,6 +187,7 @@ def test_restamp_matches_reordered_children_before_rekeying(tmp_path, changed):
 def _args(path, **overrides):
     values = {
         "realization": "working.relu",
+        "kernel": None,
         "golden": str(path),
         "code": None,
         "input": None,
