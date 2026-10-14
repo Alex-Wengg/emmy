@@ -50,11 +50,12 @@ command:
 
     if [ "$study" = "isolated" ]; then
       # This prospective corpus uses explicit frontend boundaries, not the historical figure's unidentified bars.
-      # Reuse an already-qualified runtime. This lane never installs packages or changes a shared environment.
-      runtime_root=$$(dirname "$$(readlink -f ./venv)")
-      if ! compgen -G 'emmy/emmy_runtime*.so' > /dev/null; then
-        cp "$$runtime_root"/emmy/emmy_runtime*.so emmy/
-      fi
+      # This private runtime captures complete timing batches. It never changes the shared environment.
+      runtime_cache=$$HOME/.cache/emmy/cgo-2027-runtime/79ccb2cec069b7c2d106ad26577c1c4604935b31
+      runtime_library=emmy_runtime.cpython-312-x86_64-linux-gnu.so
+      printf '%s  %s\n' 0fcb53578875cc28b56acbe9303d05f20114fcabc1e6778a5b8ae21c29ee44b9 \
+        "$$runtime_cache/$$runtime_library" | sha256sum --check
+      cp "$$runtime_cache/$$runtime_library" emmy/
       ./venv/bin/python -c 'import emmy.emmy_runtime, torch; assert torch.__version__.split("+")[0] == "2.13.0"'
       while IFS= read -r config_var; do unset "$$config_var"; done < <(compgen -v EMMY_)
       export EMMY_GOLDEN_FILE= EMMY_KNOBS= EMMY_NVCC_FLAGS=
