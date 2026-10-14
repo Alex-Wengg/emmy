@@ -247,7 +247,9 @@ def resolve_golden_arg(args) -> None:
                     if all(key not in choice or values_equal(key, value, choice[key]) for key, value in live.items())
                 ]
             if len(rows) != 1:
-                logger.error("--kernel with --realization requires one exact owned row; explicit regime/schedule pins must resolve duplicates")
+                logger.error(
+                    "--kernel with --realization requires one exact owned row; explicit regime/schedule pins must resolve duplicates"
+                )
                 sys.exit(2)
             args._golden_rows = rows
             bindings = rows[0].bindings

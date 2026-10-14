@@ -2,8 +2,8 @@
 
 import pytest
 
-from emmy.compiler.ir.axis import Axis
 from emmy.compiler.dtype import F32
+from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import Literal, Var
 from emmy.compiler.ir.stmt import Body, Cond, Loop
 from emmy.compiler.ir.stmt.leaves import Assign, Let, Write

@@ -319,7 +319,9 @@ def test_isolated_row_pins_remain_live_through_the_run_boundary(tmp_path, monkey
     document = _working_loop(path, state="proposal", pins={"FAST_MATH": False})
     parser = argparse.ArgumentParser()
     run.register_run_command(parser.add_subparsers())
-    args = parser.parse_args(["run", "--golden", str(path), "--kernel", document.kernels[0].ref, "--realization", "working.relu", "--bench"])
+    args = parser.parse_args(
+        ["run", "--golden", str(path), "--kernel", document.kernels[0].ref, "--realization", "working.relu", "--bench"]
+    )
     seen = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(run, "_handle_run_ir", lambda *_args: seen.append((config.knob_raw("WORK"), precision_pins())))
