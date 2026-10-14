@@ -1,7 +1,10 @@
 # Model-derived layers, standalone operators and their diagnostics. Every row is an ordinary matrix task on a shared per-GPU VM;
 # the study field keeps the headline common corpus, large-shape supplement, convergence check, and ablation separate.
 #
-# A row that names a `golden` replays `golden/<golden>.golden.json` instead of tracing and searching: those
+# Committed common rows compare the live checkpoint layer with eager, torch.compile and Emmy in five fresh processes,
+# using the accepted golden as evidence and the existing dtype-scaled accuracy gate. They do not tune or re-record.
+# Historical strict stored-program replays are separate evidence. The other lanes below retain that replay protocol:
+# a row that names a `golden` replays `golden/<golden>.golden.json` instead of tracing and searching: those
 # schedules were measured and committed beside this recipe, and the row only re-measures them
 # at deployable -O3. Rows with `golden: ""` trace, measure the greedy pick, then tune each measured kernel. Both paths end in the same
 # fresh-process `emmy run --golden ... --bench --strict` repeats against eager and Emmy, so the two lanes produce
@@ -48,8 +51,7 @@ command:
     }
     trap finalize EXIT
 
-    if [ "$study" = "isolated" ]; then
-      # This prospective corpus uses explicit frontend boundaries, not the historical figure's unidentified bars.
+    if [ "$study" = "isolated" ] || { [ "$study" = "common" ] && [ -n "$golden" ]; }; then
       # This private runtime captures complete timing batches. It never changes the shared environment.
       runtime_cache=$$HOME/.cache/emmy/cgo-2027-runtime/79ccb2cec069b7c2d106ad26577c1c4604935b31
       runtime_library=emmy_runtime.cpython-312-x86_64-linux-gnu.so
@@ -57,15 +59,19 @@ command:
         "$$runtime_cache/$$runtime_library" | sha256sum --check
       cp "$$runtime_cache/$$runtime_library" emmy/
       ./venv/bin/python -c 'import emmy.emmy_runtime, torch; assert torch.__version__.split("+")[0] == "2.13.0"'
+      fast_exp=0
+      if [ "$study" = "common" ]; then fast_exp=$${EMMY_FAST_EXP:-0}; fi
       while IFS= read -r config_var; do unset "$$config_var"; done < <(compgen -v EMMY_)
       export EMMY_GOLDEN_FILE= EMMY_KNOBS= EMMY_NVCC_FLAGS=
-      export EMMY_FAST_MATH=0 EMMY_FAST_EXP=0 EMMY_F16_MMA_F32_ACC=0 EMMY_FP8_MMA=0
+      export EMMY_FAST_MATH=0 EMMY_FAST_EXP=$$fast_exp EMMY_F16_MMA_F32_ACC=0 EMMY_FP8_MMA=0
       export EMMY_BENCH_RUN_TIMEOUT_S=45
       export EMMY_CUBIN_CACHE=$task_dir/cubins
       export PATH=$$PWD/venv/bin:$$PATH
       devices="$gpu_device_ids"
       export CUDA_VISIBLE_DEVICES=$${devices%%,*}
-      case "$$CGO_KERNEL_CASE" in
+      if [ "$study" = "isolated" ]; then
+        # These prospective frontend boundaries do not reconstruct the historical figure's unidentified bars.
+        case "$$CGO_KERNEL_CASE" in
         norm-p|norm-d)
           cat > $task_dir/program.py <<'PY'
     class Norm(nn.Module):
@@ -97,8 +103,16 @@ command:
     PY
           ;;
         *) exit 2 ;;
-      esac
-      sha256sum $task_dir/program.py emmy/compiler/pipeline/search/prior/weights/*.json \
+        esac
+        input_file=$task_dir/program.py
+        run_args=(--code "$$(cat "$$input_file")" --strict)
+      else
+        input_file=$task_dir/working.json
+        cp $repo_dir/experiments/cgo-2027/kernels/golden/$golden.golden.json "$$input_file"
+        export EMMY_GOLDEN_FILE=$$input_file
+        run_args=("$model_ref" --layer "$layer" --seq-len "$seq_len" --strict-evidence)
+      fi
+      sha256sum "$$input_file" emmy/compiler/pipeline/search/prior/weights/*.json \
         emmy/emmy_runtime*.so Cargo.toml Cargo.lock > $task_dir/input-sha256.txt
       nvidia-smi -q > $task_dir/gpu-before.txt
       nvcc --version > $task_dir/nvcc.txt
@@ -107,7 +121,7 @@ command:
         export EMMY_TUNE_DB=$task_dir/verification/repeat-$$repeat.db
         export EMMY_DUMP_DIR=$task_dir/verification/dump-$$repeat
         if timeout --signal=TERM --kill-after=5s 115s ./venv/bin/emmy run \
-          --code "$$(cat $task_dir/program.py)" --bench --strict --no-record-evidence \
+          "$${run_args[@]}" --bench --no-record-evidence \
           --bench-backends eager,tcompile,emmy --warmup 10 --iters 100 \
           --json $task_dir/verification/repeat-$$repeat.json 2>&1 | tee $task_dir/verification-$$repeat.log; then
           repeat_status=0

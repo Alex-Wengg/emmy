@@ -116,6 +116,83 @@ def test_common_kernel_corpus_is_small_and_identical(project_root) -> None:
     assert "tar -C $task_dir" in run
 
 
+@pytest.mark.parametrize("fast_exp", ["0", "1"])
+def test_common_layer_repeats_preserve_precision_and_failures(project_root, tmp_path, monkeypatch, fast_exp):
+    """The live-model lane keeps its scaled gate and every repeat after a failed process."""
+    import json
+    import sys
+
+    task = next(
+        task
+        for task in _kernel_tasks(project_root, "common")
+        if task.recipe.deploy.gpu == "NVIDIA H100 80GB" and task.variant.params["seq_len"] == (512 if fast_exp == "1" else 1)
+    )
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("python", "nvidia-smi", "nvcc", "sha256sum"):
+        stub = bin_dir / name
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+    emmy = bin_dir / "emmy"
+    emmy.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "output = pathlib.Path(sys.argv[sys.argv.index('--json') + 1])\n"
+        "env = {k: v for k, v in os.environ.items() if k.startswith('EMMY_')}\n"
+        "output.write_text(json.dumps({'args': sys.argv[1:], 'env': env}))\n"
+        "sys.exit(7 if output.stem == 'repeat-2' else 0)\n"
+    )
+    emmy.chmod(0o755)
+    native = tmp_path / "runtime" / "emmy_runtime.cpython-312-x86_64-linux-gnu.so"
+    native.parent.mkdir()
+    native.write_bytes(b"private runtime fixture")
+    (tmp_path / "emmy").mkdir()
+    golden = tmp_path / EXP / "kernels" / "golden" / f"{task.variant.params['golden']}.golden.json"
+    golden.parent.mkdir(parents=True)
+    golden.write_text("{}")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("EMMY_FAST_EXP", fast_exp)
+    for key in ("FAST_MATH", "F16_MMA_F32_ACC", "FP8_MMA"):
+        monkeypatch.setenv(f"EMMY_{key}", "1")
+    monkeypatch.setenv("EMMY_KNOBS", "WORK=t32")
+    task_dir = tmp_path / "task"
+    command = render_command(task.recipe.command.run, build_substitution_map(task.variant, [0], str(tmp_path), str(task_dir)))
+    cache_line = next(line for line in command.splitlines() if line.strip().startswith("runtime_cache="))
+    command = command.replace(cache_line, f"  runtime_cache={native.parent}")
+    result = subprocess.run(["bash"], input=command, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 7, result.stderr
+    for repeat in range(5):
+        record = json.loads((task_dir / "verification" / f"repeat-{repeat}.json").read_text())
+        assert record["args"] == [
+            "run",
+            task.variant.params["model_ref"],
+            "--layer",
+            "0",
+            "--seq-len",
+            str(task.variant.params["seq_len"]),
+            "--strict-evidence",
+            "--bench",
+            "--no-record-evidence",
+            "--bench-backends",
+            "eager,tcompile,emmy",
+            "--warmup",
+            "10",
+            "--iters",
+            "100",
+            "--json",
+            str(task_dir / "verification" / f"repeat-{repeat}.json"),
+        ]
+        env = record["env"]
+        assert env["EMMY_FAST_EXP"] == fast_exp
+        assert [env[f"EMMY_{key}"] for key in ("FAST_MATH", "F16_MMA_F32_ACC", "FP8_MMA")] == ["0", "0", "0"]
+        assert env["EMMY_KNOBS"] == env["EMMY_NVCC_FLAGS"] == ""
+        assert env["EMMY_GOLDEN_FILE"] == str(task_dir / "working.json")
+        assert env["EMMY_TUNE_DB"] == str(task_dir / "verification" / f"repeat-{repeat}.db")
+        assert (task_dir / "verification" / f"repeat-{repeat}.status").read_text().strip() == ("7" if repeat == 2 else "0")
+    assert (task_dir / "working.json").read_bytes() == golden.read_bytes()
+    assert (task_dir / "status.txt").read_text() == "study=common\nstatus=7\n"
+
+
 def test_native_fp8_kernel_corpus_is_separate_and_identical(project_root) -> None:
     tasks = _kernel_tasks(project_root, "fp8-common")
     assert len(tasks) == 8
