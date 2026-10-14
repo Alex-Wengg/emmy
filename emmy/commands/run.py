@@ -3373,7 +3373,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         )
     if getattr(args, "record", False) or getattr(args, "record_greedy", False):
         # Missing inventory rows are not rejected answers: a fresh recording may create them.
-        refusal = record_refusal(
+        refusal = "; ".join(strict_errors or []) or record_refusal(
             _cuda_knob_dicts(graph),
             accuracy_error if strict_correctness else None,
             _cuda_kernel_names(graph),
