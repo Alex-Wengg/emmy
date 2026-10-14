@@ -1035,7 +1035,7 @@ program first, since a kernel at a size is a kernel of its own.
 per kernel-set decision the splice watcher reported (`search/inventory.py`), and one measured row per CUDA kernel —
 the tile kernel it lowered from, its realized schedule and later storage choices, its own isolated launch timing —
 under the seed row's input regime with the compile's own precision gates laid over it (`pins.measured_regime_pins`)
-and the greedy comparison row as `same-input-greedy` reference. The isolated and reference timings are medians from
+and the greedy comparison row as `same-input-greedy` reference. The isolated median and reference timing come from
 that invocation. The DB can retain a faster historical median; it is not substituted beside the current reference.
 A row of the same kernel, sizes, regime and schedule
 takes the new timings. Matching includes later decisions and ignores only declared OFF defaults; precision pins
