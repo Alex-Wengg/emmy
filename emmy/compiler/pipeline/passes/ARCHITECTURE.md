@@ -515,6 +515,13 @@ linear's result under its reshape, composed into the consumer's operand map). Wh
 transient too, the transient buffer is then the value's only storage, so it becomes public and its rounding is spelled
 like any other; a composition whose consumer writes a public buffer keeps its spelling.
 
+Static scalar binding also happens before fusion. `095_bind_scalar_constants` replaces a load from a finite FP32
+`ConstantOp.value` with a typed `Let` holding its storage-rounded literal. The value then belongs to the Loop body
+and its exact identity, and the unused input leaves the kernel ABI. This is an exact representation of an immutable
+compile-time value, not a schedule choice. Runtime inputs, externally bound constants, transformed or checkpoint
+sources, other storage types and nonfinite values retain their loads. Their literal representation is not covered
+by this rule. Signed zero remains distinct through normalization, fusion and identity.
+
 FP16/BF16 matmul decomposition declares its product at FP32 before reduction. Widening only the accumulator loses
 precision or overflows at each half-precision multiply, even when the dot product is representable. The explicit
 product dtype survives loop lowering and fusion, so scalar and tensor-core schedules implement the same wide product.
