@@ -280,9 +280,13 @@ All five cards verify 433 staged source, recipe and runtime-build files against 
 freeze and use the same private native binary identified above. Their software inventories confirm PyTorch 2.13.0,
 Triton 3.7.1 and Transformers 5.14.1; the CUDA compiler and driver versions in the table also hold for these runs.
 Explicit imports, both prior hashes, input hashes, package inventories and post-run artifact byte checks are
-retained. The final PR adds only formatting, import ordering and an explicit synchronous callback binding after
-the measured freeze; normalized AST checks and 130 generated-source comparisons establish the recorded
-correspondence. The measured source remains the exact reproduction target.
+retained. After the measured freeze, formatting, import ordering and an explicit synchronous callback binding
+preserve compiler behavior, as checked by normalized ASTs and 130 generated-source comparisons. Later CI repairs
+update four test fixtures and freshen an unrelated DeepSeek recipe golden; compiler code, common-corpus inputs
+and both priors remain byte-identical across those repairs. The DeepSeek change removes one stale timing while
+retaining its schedule, and its four prior-reproduction slices pass with the shipped weights. These later changes
+are recorded separately from the frozen fourteen-file refit input. The measured source remains the exact
+reproduction target.
 
 The final RTX 5090 common and Norm-D tasks ran after the controller failure, in separate services with a 12 GiB
 host-memory cap and swap disabled. Their observed memory peaks were 5.4 and 1.3 GiB, respectively. All fifteen
@@ -321,8 +325,8 @@ records are under `norm-d/<card>/<timestamp>/` and `common/<card>/<timestamp>/`.
 `norm-d/profiling/`; migration evidence is under `common/migration/`. Each new record retains its artifact bundle,
 five repeat statuses and every available receipt, input and source hashes, schedules, environment, database and
 capture/accuracy checks. Missing receipts are identified above. Final source and artifact checks are under
-`provenance/`, including `gcp-final/`, `recovery/` and `rtx5090-final/`. Prior fit evidence is under `priors/refit/`,
-with its exact input source snapshot under `priors/source/`.
+`provenance/`, including `gcp-final/`, `recovery/`, `rtx5090-final/` and `post-ci-source/`. Prior fit evidence is under
+`priors/refit/`, with its exact input source snapshot under `priors/source/`.
 
 FP8 failures remain under `rtx4090/2026-10-13_10-48-11/` and `rtx5090/2026-10-13_11-17-03/`. Their bundles contain
 `torch-compile/model.json` and strict `verification/repeat-0` through `repeat-4` evidence, sometimes extensionless
@@ -338,12 +342,12 @@ succeeded and six failed. The fifteen current tasks cover 75 attempted repeats, 
 exits. The V100 prefill timeout has no JSON receipt; the three V100 Norm-D exits of 141 retain diagnostic receipts.
 The two original recovered `running` records remain provenance and are not additional experiment tasks.
 
-All 11,065 direct regular files were verified byte-for-byte against the staged source, including each bundle;
+All 11,075 direct regular files were verified byte-for-byte against the staged source, including each bundle;
 the 39 bundles contain 39,238 regular members. The root manifest records every other direct file's size and SHA-256.
 An independent audit verifies the final measurements and evidence joins. All 86 retained historical members are
-byte-identical; 44 superseded common-run members are replaced. Credential-prefix checks scanned 10,885 direct
-text files and 37,580 nested text files without a match. Binary files, including the source snapshot pack, were
+byte-identical; 44 superseded common-run members are replaced. Credential-prefix checks scanned 10,914 direct
+text files and 37,645 nested text files without a match. Binary files, including the source snapshot pack, were
 excluded from text scanning; their byte hashes remain recorded.
 
-Archive size: **72,543,140 bytes**. SHA-256:
-`2a6cd9f5a911ca503a928e2dcbf8c638d9043e480ff58f4d7d186fcd406ff4a8`.
+Archive size: **72,553,419 bytes**. SHA-256:
+`9eb5c9e5740394f41092d1095beb4c7f959e72df73ab165a3adae3ef90657ec6`.
