@@ -16,10 +16,10 @@ from emmy.compiler.ir.axis import Axis, Window
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.cuda.ir import CudaOp
 from emmy.compiler.ir.elementwise import ElementwiseImpl
-from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.expr import Literal, Var
 from emmy.compiler.ir.frontend.ir import SdpaOp, SoftmaxOp
 from emmy.compiler.ir.pure.fold import Fold
-from emmy.compiler.ir.stmt import Assign, Load, Write
+from emmy.compiler.ir.stmt import Assign, Let, Load, Write
 from emmy.compiler.ir.tensor.ir import ElementwiseOp
 from emmy.compiler.ir.tile import OutputSpec, Placement, TileOp
 from emmy.compiler.ir.tile.path import resolve
@@ -105,6 +105,30 @@ def _computed_operand_graph(side: str) -> Graph:
     graph.add_node(tile, ["computed", "direct"], Tensor("out", (8, 8), "f16"), node_id="out")
     graph.inputs, graph.outputs = ["computed", "direct"], ["out"]
     return graph
+
+
+def test_a_typed_literal_operand_keeps_its_cut_arm_and_workspace_dtype() -> None:
+    """Replacing a scalar load by a typed binding keeps the same legal contraction boundary."""
+    graph = _computed_operand_graph("a")
+    root = graph.nodes["out"]
+    _, _, k = root.op.axes
+    computed = projection(
+        (slab("raw", "computed", "m", "k"), projection((), (Let("scale", Literal(2.0), dtype=F16),), ("scale",))),
+        (Assign("scaled", "multiply", ("raw", "scale")),),
+        ("scaled",),
+    )
+    root.op = replace(root.op, op=contraction(k, computed, (slab("direct", "direct", "k", "n"), "acc")))
+    root.op = root.op.with_io(graph, root)
+    match = Match(graph=graph, root_node_id=root.id, rule=Rule(name="test", pattern=[]))
+    seam = next(seam for seam in cuttable_seams(root.op) if seam.node == computed)
+    assert seam.dtypes == (F16,)
+
+    arms = _CUT.rewrite(match, root)
+    arm = next(arm for arm in arms if dict(arm.knobs) == {seam.spelling: "cut"})
+    fragment = arm.materialize()
+    pieces = [node for node in fragment.nodes.values() if isinstance(node.op, TileOp)]
+    assert len(pieces) == 2
+    assert all(tensor.dtype == F16 for node in pieces for tensor in node.outputs)
 
 
 def _mimo_graph() -> Graph:
@@ -1936,12 +1960,13 @@ def test_a_recorded_route_selects_the_arm_spelling_its_whole_cut_set() -> None:
     assert single is not None and list(single[1]) == [one]
 
 
-@pytest.mark.parametrize("computed_scale", [False, True])
-def test_storage_frontier_recomputes_the_encode_scale_in_the_consumer(computed_scale):
+@pytest.mark.parametrize("scale_kind", ["load", "computed", "literal"])
+def test_storage_frontier_recomputes_the_encode_scale_in_the_consumer(scale_kind):
     """A scale computed before the encode can also feed the decode without fusing the encode."""
     from emmy.compiler.dtype import F8E4M3, F32
 
     m, n, k = Axis("m", 2), Axis("n", 3), Axis("k", 16)
+    computed_scale = scale_kind == "computed"
     scale = Load(name="scale_value", input="scale", index=(Var("m"), Var("k") / 8), dtype=F32)
     operands = ()
     if computed_scale:
@@ -1952,6 +1977,8 @@ def test_storage_frontier_recomputes_the_encode_scale_in_the_consumer(computed_s
             ("scale_value",),
         )
         operands = (scale,)
+    elif scale_kind == "literal":
+        scale = Let("scale_value", Literal(0.25), dtype=F32)
     quantized = projection(
         operands,
         (
@@ -1990,6 +2017,8 @@ def test_storage_frontier_recomputes_the_encode_scale_in_the_consumer(computed_s
     assert sum(tensor.dtype == F8E4M3 for node in pieces for tensor in node.outputs) == 1
     if computed_scale:
         assert sum("scale" in node.inputs for node in pieces) == 1, "both encode and decode reuse the separately computed scale"
+    elif scale_kind == "literal":
+        assert all("scale" not in node.inputs for node in pieces), "both sides keep the literal without a device input"
     for node in pieces:
         node.op.op.lower(bound=frozenset(), stores=node.op.output_specs, axes=node.op.axes)
 

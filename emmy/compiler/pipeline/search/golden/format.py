@@ -418,8 +418,9 @@ class GoldenFile(Wire):
 
     def upsert_row(self, row: Row) -> Row:
         """Store ``row``, replacing the row of the same kernel, sizes, regime and schedule when one is stored —
-        including later decisions but ignoring explicit OFF defaults. Keep its name, so a listing still lands."""
+        including later decisions but ignoring explicit OFF defaults. Keep its name and equivalent input pins."""
         from emmy.compiler.pipeline.knob import is_off_value, values_equal  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.space import precision_pins  # noqa: PLC0415
 
         def knobs(r: Row) -> dict:
             return {key: value for key, value in (r.knobs or {}).items() if not is_off_value(family_of(key), value)}
@@ -428,13 +429,15 @@ class GoldenFile(Wire):
         for index, stored in enumerate(self.rows):
             existing = knobs(stored)
             if (
-                (stored.kernel, stored.bindings, stored.pins) == (row.kernel, row.bindings, row.pins)
+                (stored.kernel, stored.bindings) == (row.kernel, row.bindings)
+                and (stored.pins | precision_pins(stored.pins)) == (row.pins | precision_pins(row.pins))
                 and existing.keys() == wanted.keys()
                 and all(values_equal(key, value, wanted[key]) for key, value in existing.items())
             ):
                 self.rows[index] = merged = replace(
                     row,
                     name=stored.name,
+                    pins=stored.pins,
                     latency=row.latency if row.latency is not None else stored.latency,
                     note=row.note if row.note is not None else stored.note,
                 )

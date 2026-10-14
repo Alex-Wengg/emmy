@@ -479,7 +479,7 @@ class TileOp(Op):
         self._validate_schedule()
 
     def _rowless_unit_row(self) -> None:
-        """Give a rowless matvec one physical row after output sweeps join the grid."""
+        """Give either matvec orientation its missing physical axis after sweeps join the grid."""
         from emmy.compiler.ir.tile.ops import kernel_roots
 
         views = tuple(root.as_contraction() for root in kernel_roots(self.op))
@@ -490,10 +490,13 @@ class TileOp(Op):
             or not free
             or any(
                 view is None
-                or view.left_axes
-                or (not view.shared_axes and not (single_column or (len(free) > 1 and {axis.name for axis in free} == view.right_axes)))
+                or (view.left_axes and view.right_axes)
+                or (
+                    not view.shared_axes
+                    and not (single_column or (len(free) > 1 and {axis.name for axis in free} == view.left_axes | view.right_axes))
+                )
                 or (view.shared_axes and len(free) < 2)
-                or free[-1].name not in view.right_axes
+                or free[-1].name not in view.left_axes | view.right_axes
                 for view in views
             )
             or any(axis.name == "_um" for axis in free)

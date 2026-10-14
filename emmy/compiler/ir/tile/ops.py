@@ -30,7 +30,7 @@ from emmy.compiler.ir.schedule.classic import (
     classic_node_key,
     classic_stage_key,
 )
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Select, refs_axis, stmt_axis_names
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Let, Load, Loop, Select, refs_axis, stmt_axis_names
 from emmy.compiler.ir.stmt.base import Stmt, dtype_promote
 from emmy.compiler.ir.tile.ir import apply_output_specs
 from emmy.compiler.ir.tile.path import UnknownSiteError, sites
@@ -55,7 +55,7 @@ def cone_stat_dtypes(pro: tuple, stats: tuple[str, ...], inputs) -> dict[str, ob
         elif isinstance(stmt, Assign):
             args = [env.get(name) for name in stmt.args]
             env[stmt.name] = stmt.dtype or (get_dtype(dtype_promote(stmt.op.name, [d.name for d in args])) if all(args) else None)
-        elif isinstance(stmt, Init):
+        elif isinstance(stmt, (Init, Let)):
             env[stmt.name] = stmt.dtype
         else:
             env.update((name, None) for name in stmt.defines())
@@ -99,7 +99,7 @@ def edge_dtypes(edge, inputs, cache: dict[int, tuple] | None = None, scope: dict
         elif isinstance(stmt, Assign):
             args = [env.get(name) for name in stmt.args]
             env[stmt.name] = stmt.dtype or (get_dtype(dtype_promote(stmt.op.name, [dtype.name for dtype in args])) if all(args) else None)
-        elif isinstance(stmt, Init):
+        elif isinstance(stmt, (Init, Let)):
             env[stmt.name] = stmt.dtype
         elif isinstance(stmt, Select):
             branch_dtypes = [env.get(branch.value) for branch in stmt.branches]
@@ -328,6 +328,8 @@ class Sched:
             right = min((order[name] for name in view.right_axes if name in order), key=rank, default=None)
             if left is None and not view.left_axes:
                 left = next((pair for name, pair in order.items() if name not in node.free_axes and pair[1].extent == 1), None)
+            if right is None and not view.right_axes:
+                right = next((pair for name, pair in order.items() if name not in node.free_axes and pair[1].extent == 1), None)
             if left is not None and right is not None:
                 return (left[1], right[1])
             first, second = mn
