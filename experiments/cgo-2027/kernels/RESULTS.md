@@ -1,6 +1,6 @@
 # Common-kernel study: latest results
 
-This report separates the standalone operator measurements from the retained whole-layer and dynamic-FP8 studies.
+This report separates the corrected standalone and whole-layer measurements from retained dynamic-FP8 failures.
 The standalone corpus defines four explicit computations on five GPUs; it does not recover the unidentified
 boundaries behind the paper's old isolated-kernel bars. The single [results archive](results.tar.gz) contains the
 corresponding records, complete command artifacts, correctness checks and source provenance. The recipe and ten
@@ -50,8 +50,8 @@ repeat is attempted even if another fails. This protocol preserves failures inst
 The timing change is [PR #1169](https://github.com/cloudrift-ai/emmy/pull/1169). Previously, PyTorch replayed a
 one-forward graph repeatedly from Python inside an event window, while Emmy captured the full batch. Host submission
 gaps could inflate PyTorch latency. The first standalone run exposed this mismatch; its timings are excluded.
-The corrected runs use unchanged generated kernels and schedules. Older whole-layer measurements below predate
-the timing fix and require new paired measurements before supporting performance claims.
+The corrected standalone runs use unchanged generated kernels and schedules. The whole-layer comparison below
+also uses the corrected timing protocol and replaces its earlier measurements.
 
 This is a hot-cache throughput-derived latency experiment with fixed inputs, not a request-latency or cold-cache
 study. Fresh processes do not imply empty on-disk compiler caches. GPU clocks are not locked, and the local 5090
@@ -107,7 +107,7 @@ not establish results for GEMM, attention, a tuned kernel corpus, FP8 projection
 
 The next optimization target is Norm-D: its gap appears on every GPU, with a median paired Emmy/Inductor latency
 ratio of about 1.38x on A100 and RTX 5090. Compare the selected reduction schedule and memory operations with Inductor,
-then measure candidates under this corrected protocol. Whole-layer claims separately require a corrected rerun.
+then measure candidates under this corrected protocol. Whole-layer results measure a different, tuned workload.
 
 ### Standalone source and systems
 
@@ -139,71 +139,88 @@ and an exact `--filter 'deploy.gpu=GPU_NAME'`, with `PYTHONPATH` set to the chec
 the full denominator; do not substitute a hardware alias or select only favorable operators. Compilation and
 accuracy checks are included in each bounded process, but excluded from reported latency.
 
-## Common FP16 corpus: historical measurements
-
-The retained whole-layer results below use the earlier timing harness. Their correctness receipts remain useful;
-their performance ratios are unqualified until both backends are remeasured with complete captured batches.
+## Common FP16 corpus: corrected whole-layer measurements
 
 The workload is pretrained `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, layer zero,
-FP16, batch one and sequence lengths 1 and 512. These are captured whole-forward latencies, with deployable O3,
-hot-cache timing, ten warmups and 100 iterations. Emmy and full-graph `torch.compile` share the module, weights and
-inputs within each actual-model invocation. Each table row is one invocation, not a repeated estimate of its margin.
+FP16, batch one and sequence lengths 1 and 512. Compiler and recipe source is frozen at
+`6399aac0b5fbf82ff761a75fc6c710d00a016ee3`. Its compiler implementation matches the standalone source above;
+the later revision changes the common recipe and documentation. The private native runtime is identical.
 
-All common rows use standard math except H100 sequence 512, which enables `FAST_EXP`. `FAST_MATH`,
-`F16_MMA_F32_ACC` and `FP8_MMA` remain disabled. H100's accepted prefill uses the measured TMA gate/up schedule.
-Later H100 profiling and candidate trials did not replace this accepted run.
+Each shape runs five fresh actual-model processes. Emmy and full-graph Inductor share the module, pretrained
+weights and inputs in each process. The ten committed per-card goldens supply measured schedules under
+`--strict-evidence`; there is no tuning or evidence recording. Each process has a fresh database containing only
+the scoped golden's imported measurements. Golden inputs and the ordered generated-source/schedule vectors stay
+unchanged across repeats.
 
-| GPU | Sequence | Emmy, µs | PyTorch, µs | PyTorch / Emmy | Launches |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| V100 SXM2 16GB | 1 | 54.218 | 65.521 | 1.208x | 8 |
-| V100 SXM2 16GB | 512 | 494.080 | 606.804 | 1.228x | 21 |
-| A100 SXM4 40GB | 1 | 50.595 | 55.501 | 1.097x | 14 |
-| A100 SXM4 40GB | 512 | 178.005 | 188.738 | 1.060x | 11 |
-| H100 80GB HBM3 | 1 | 27.100 | 29.400 | 1.085x | 14 |
-| H100 80GB HBM3 | 512 | 81.999 | 77.805 | 0.949x | 11 |
-| RTX 4090 24GB | 1 | 23.715 | 31.736 | 1.338x | 14 |
-| RTX 4090 24GB | 512 | 165.365 | 160.172 | 0.969x | 11 |
-| RTX 5090 32GB | 1 | 36.856 | 36.699 | 0.996x | 13 |
-| RTX 5090 32GB | 512 | 129.860 | 136.043 | 1.048x | 11 |
+These are whole-forward latencies, not sums of separately timed kernels. Both backends capture complete batches
+before timing and submit one graph per event window. Each backend normalizes by its own calibrated batch size.
+The protocol uses deployable O3, hot caches, ten requested warmups and 100 measured iterations, with matched
+exclusion of extended warmup. All common rows use standard math except H100 sequence 512, which enables
+`FAST_EXP`; `FAST_MATH`, `F16_MMA_F32_ACC` and `FP8_MMA` remain disabled. H100 prefill retains its measured TMA
+gate/up schedule. Clocks are not locked, and RTX 5090 also serves desktop graphics.
 
-The earlier table reported seven of ten wins, but the timing mismatch prevents using that count as performance
-evidence. Sequence one attends to one key; it does not measure decode with a populated KV cache.
+The table gives median backend latencies and the median of paired Inductor/Emmy ratios, with the observed ratio
+range. Each invocation is capped at 115 seconds plus five seconds for termination. Every repeat is attempted.
 
-### Correctness and repeatability
+| GPU | Sequence | Emmy, µs | Inductor, µs | Paired speedup [range] | Launches | Clean repeats |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| V100 SXM2 16GB | 1 | 58.907 | 69.947 | 1.187 [1.173–1.197] | 8 | 5/5 |
+| V100 SXM2 16GB | 512 | 496.128 | 618.261 | 1.246 [1.244–1.247] | 21 | **4/5; task failed** |
+| A100 SXM4 40GB | 1 | 49.775 | 54.462 | 1.094 [1.088–1.111] | 14 | 5/5 |
+| A100 SXM4 40GB | 512 | 176.640 | 186.984 | 1.059 [1.057–1.064] | 11 | 5/5 |
+| H100 80GB HBM3 | 1 | 28.163 | 33.435 | 1.192 [1.094–1.206] | 14 | 5/5 |
+| H100 80GB HBM3 | 512 | 80.716 | 77.340 | 0.958 [0.954–0.962] | 11 | 5/5 |
+| RTX 4090 24GB | 1 | 23.102 | 48.111 | 2.080 [2.076–2.095] | 14 | 5/5 |
+| RTX 4090 24GB | 512 | 164.352 | 159.544 | 0.972 [0.970–0.973] | 11 | 5/5 |
+| RTX 5090 32GB | 1 | 35.757 | 34.300 | 0.955 [0.954–0.977] | 13 | 5/5 |
+| RTX 5090 32GB | 512 | 130.871 | 134.167 | 1.023 [1.018–1.027] | 11 | 5/5 |
 
-All ten actual-model comparisons pass the existing dtype-scaled eager check for both backends. Five fresh-process
-strict replays per common shape use generated inputs and their own eager program, with `rtol=atol=0.001`, fresh
-tuning databases and strict measured evidence. Their inputs differ from the actual-model comparison, so their
-latencies must not be divided into the PyTorch times above to construct speedups.
+Six of nine complete rows favor Emmy in every repeat. H100 prefill, RTX 4090 prefill and RTX 5090 sequence one
+remain slower. V100 prefill favors Emmy in its four clean observations, but its incomplete row is excluded from
+that count. These are tuned whole-layer results for one model and two shapes; they do not contradict the losses
+in the four untuned standalone operators. Sequence one attends to one key, not a populated decode KV cache.
 
-| GPU | Sequence | Strict replay median [range], µs |
-| --- | ---: | ---: |
-| V100 | 1 | 53.736 [53.638–54.028] |
-| V100 | 512 | 494.080 [492.032–496.128] |
-| A100 | 1 | 50.269 [50.252–50.570] |
-| A100 | 512 | 177.493 [177.323–177.835] |
-| H100 | 1 | 23.612 [23.289–24.080] |
-| H100, fast exponential | 512 | 82.594 [82.213–83.045] |
-| RTX 4090 | 1 | 23.719 [23.671–23.746] |
-| RTX 4090 | 512 | 164.523 [164.011–165.717] |
-| RTX 5090 | 1 | 36.839 [36.826–36.858] |
-| RTX 5090 | 512 | 130.967 [129.400–131.076] |
+### Accuracy, failures and variation
 
-The 50 principal strict receipts all pass. Ten additional A100/H100 decode receipts cover alternate stored pin
-spellings, and five additional H100 prefill receipts cover the standard-math TMA regime; these also pass. They are
-not additional workload shapes. The standard H100 prefill median is 83.239 µs [83.116–83.510].
+All fifty raw comparisons contain captured timings for all three backends and passing dtype-scaled eager checks
+for Emmy and full-graph Inductor. These are scaled checks, not strict `1e-3` live-model verdicts. Forty-nine
+processes exit successfully. V100 prefill repeat zero exits 124 after writing its complete JSON receipt; that
+observation is retained but excluded from the table's qualified medians. The task remains failed. No repeat was
+rerun or replaced, and the timeout database's WAL is retained with the raw bundle.
 
-A separate H100 strict live-model diagnostic at source `27cecb6f4` failed on 5 of 524,288 values: maximum absolute
-error 0.00391, mean absolute error 4.96e-5 and maximum relative error 0.488. Its command, log and source attestation
-are retained as a qualification limitation. This is not a strict live-model verdict from the final `911ca5739`
-run, and there is no matched standard-math observation establishing the cause. The accepted actual-model results
-use the scaled check; passing stored-program replays do not establish strict live-model equivalence.
+H100 sequence one has the widest Emmy range: 27.715–30.584 µs, or 10.19% of its median. Its speedup stays above
+one in every repeat. The ranges are descriptive, not confidence intervals. Source and schedule invariance does
+not eliminate clock, cache or host variation.
+
+A retained H100 strict live-model diagnostic at older source `27cecb6f4` failed on 5 of 524,288 values: maximum
+absolute error 0.00391 and mean absolute error 4.96e-5. Its command, log and source attestation remain as a
+qualification limitation. It is not a strict verdict on the corrected source, and no matched standard-math
+observation establishes the cause. Earlier stored-program strict replays do not prove live-model equivalence.
+
+### Source and reproduction
+
+All five runs use the frozen source above, Python 3.12.3, PyTorch 2.13.0, Transformers 5.14.1 and Triton 3.7.1.
+The operating systems, CUDA wheels, NVCC versions and drivers are the same as in the standalone systems table.
+Each run uses one physical card; all 432 staged source files and each downloaded command bundle were verified.
+
+| GPU | Common run ID |
+| --- | --- |
+| V100 | `20261014T051107Z` |
+| A100 | `20261014T051701Z` |
+| H100 | `20261014T051706Z` |
+| RTX 4090 | `20261014T051116Z` |
+| RTX 5090 | `20261014T051124Z` |
+
+Save the archive, check out `6399aac0b5fbf82ff761a75fc6c710d00a016ee3`, and prepare the recorded runtime as in the
+standalone reproduction instructions. Run `emmy bench experiments/cgo-2027/kernels --filter study=common` with
+`--local` or the retained host's `--ssh`, an exact `--filter 'deploy.gpu=GPU_NAME'`, and `PYTHONPATH` set to the
+checkout. The recipe copies the committed golden for each shape without modifying it.
 
 ## Dynamic-FP8 checkpoint results: historical failures
 
 These runs also predate the timing fix. They retain failure and coverage evidence, not qualified speed comparisons.
 
-The final RTX runs also measure layer zero of `RedHatAI/Qwen3-0.6B-FP8-dynamic` revision
+The retained RTX runs measure layer zero of `RedHatAI/Qwen3-0.6B-FP8-dynamic` revision
 `068a9040b238d65f5c1064f10232bb15b96c0ff0`, sequences 1 and 512, standard math with FP8 MMA, O3, ten warmups,
 100 iterations and up to twelve tuning trials per measured kernel. This is a checkpoint-derived layer study.
 The live eager and PyTorch references load decoded weights; they are not native FP8-library kernels.
@@ -212,19 +229,12 @@ All four final generated-program recordings pass the accepted scaled check. Ever
 has failed terminal status: all twenty strict replays fail, and both live prefill comparisons exceed the existing
 60-second GPU-stage limit. Those failures and their logs remain in the archive.
 
-| GPU | Sequence | Final generated-program Emmy, µs | Paired eager, µs | Paired PyTorch, µs | Strict replays |
-| --- | ---: | ---: | ---: | ---: | --- |
-| RTX 4090 | 1 | 1449.984 | 485.945 | Accuracy failure | 5/5 fail |
-| RTX 4090 | 512 | 271806.458 | 763.480 | Accuracy failure | 5/5 fail |
-| RTX 5090 | 1 | 1309.248 | 388.719 | 28.655 | 5/5 fail |
-| RTX 5090 | 512 | 238831.009 | 612.200 | Accuracy failure | 5/5 fail |
-
-| GPU | Sequence | Live-model Emmy, µs | Live-model PyTorch, µs | Outcome |
-| --- | ---: | ---: | ---: | --- |
-| RTX 4090 | 1 | 1171.456 | 30.692 | Both pass scaled accuracy |
-| RTX 4090 | 512 | — | — | GPU-stage timeout; no accuracy or timing result |
-| RTX 5090 | 1 | 1048.128 | 36.808 | Both pass scaled accuracy |
-| RTX 5090 | 512 | — | — | GPU-stage timeout; no accuracy or timing result |
+| GPU | Sequence | Strict generated-program replays | Live-model outcome |
+| --- | ---: | --- | --- |
+| RTX 4090 | 1 | 5/5 fail | Both backends pass scaled accuracy |
+| RTX 4090 | 512 | 5/5 fail | GPU-stage timeout |
+| RTX 5090 | 1 | 5/5 fail | Both backends pass scaled accuracy |
+| RTX 5090 | 512 | 5/5 fail | GPU-stage timeout |
 
 The generated and live programs can expose different outputs and select different kernels; their timings and
 accuracy verdicts are separate comparisons. Strict failures include FP8 carrier differences and FP64 comparison
@@ -232,19 +242,10 @@ failures. RTX 5090 prefill's final output passes the FP64 allowance, but an inte
 overall strict verdict remains failure. These runs support coverage analysis, not competitive FP8 performance or
 strict numerical equivalence. No tolerance changed and no failed backend supplies a valid comparison latency.
 
-## Historical source and system provenance
-
-Each GPU uses one physical card. The whole-layer runs retain their original source revisions; rebasing the
-paper branch does not remeasure them at the new compiler head. All runs use PyTorch 2.13.0 and Transformers 5.14.1.
-RTX 5090 shares local desktop graphics use; the other four cards are remote.
-
-| GPU | Run ID | Source revision | CUDA wheel / NVCC | NVIDIA driver |
-| --- | --- | --- | --- | --- |
-| V100 | `20261013T061146Z` | `dd7f4b766` | 12.6 / 12.9.86 | 580.178.04 |
-| A100 | `20261013T175052Z` | `97949ef00` | 13.0 / 13.0.88 | 580.178.04 |
-| H100 | `20261013T202915Z` | `911ca5739` | 13.0 / 13.0.88 | 580.178.04 |
-| RTX 4090 | `20261013T104811Z` | `134c5bd4a` | 13.0 / 12.9.86 | 580.159.03 |
-| RTX 5090 | `20261013T111703Z` | `8af48e53c` | 13.0 / 13.0.88 | 580.178.04 |
+These four failed tasks are the latest FP8 observations, not reruns with the corrected compiler. RTX 4090 uses
+run `20261013T104811Z`, source `134c5bd4a`; RTX 5090 uses run `20261013T111703Z`, source `8af48e53c`.
+Both use PyTorch 2.13.0 and Transformers 5.14.1, with the CUDA and driver versions in the systems table above.
+Their raw timings remain in the evidence archive but are not reported as qualified speed comparisons.
 
 The recipe's H200/B200 rows, larger layers, convergence and budget-ablation studies were not measured in this
 reproduction. These whole-layer results do not reproduce the paper's isolated-kernel figure or geometric means,
@@ -255,27 +256,29 @@ protocol to the retained evidence. The [Neptune comparison](../compiler_neptune_
 ## Archive
 
 `results.tar.gz` is the only results archive for this study. It holds 34 terminal experiment records and their
-34 complete command artifact bundles: twenty successful corrected standalone rows, ten historical common rows
-and four failed historical FP8 rows. All 75 payloads from the previous consolidated archive remain byte-identical.
-The 144 direct files include logs, source attestations, the private native runtime and a manifest with sizes and
-SHA-256 hashes. The command bundles contain 13,580 regular payload files in total.
+34 complete command artifact bundles: twenty successful standalone rows, nine successful common rows, one failed
+common row and four failed historical FP8 rows. The corrected common runs replace the superseded whole-layer
+records and bundles. Standalone evidence, the four FP8 failures and the separate H100 strict diagnostic are
+retained byte-for-byte. Source attestations, the private native runtime and file hashes accompany the raw results.
 
-| GPU | Corrected standalone directory | Historical whole-layer directory |
+| GPU | Corrected standalone directory | Corrected whole-layer directory |
 | --- | --- | --- |
-| V100 | `isolated/v100/2026-10-14_04-49-55/` | `v100/2026-10-13_06-11-46/` |
-| A100 | `isolated/a100/2026-10-14_04-49-23/` | `a100/2026-10-13_17-50-52/` |
-| H100 | `isolated/h100/2026-10-14_04-49-26/` | `h100/2026-10-13_20-29-15/` |
-| RTX 4090 | `isolated/rtx4090/2026-10-14_04-49-56/` | `rtx4090/2026-10-13_10-48-11/` |
-| RTX 5090 | `isolated/rtx5090/2026-10-14_04-49-31/` | `rtx5090/2026-10-13_11-17-03/` |
+| V100 | `isolated/v100/2026-10-14_04-49-55/` | `common/v100/2026-10-14_05-11-07/` |
+| A100 | `isolated/a100/2026-10-14_04-49-23/` | `common/a100/2026-10-14_05-17-01/` |
+| H100 | `isolated/h100/2026-10-14_04-49-26/` | `common/h100/2026-10-14_05-17-06/` |
+| RTX 4090 | `isolated/rtx4090/2026-10-14_04-49-56/` | `common/rtx4090/2026-10-14_05-11-16/` |
+| RTX 5090 | `isolated/rtx5090/2026-10-14_04-49-31/` | `common/rtx5090/2026-10-14_05-11-24/` |
 
-Each experiment record has a matching `_artifacts.tar.gz` beside it. For standalone runs,
+Each experiment record has a matching `_artifacts.tar.gz` beside it. For both corrected studies,
 `verification/repeat-0.json` through `repeat-4.json` each contain all three backends and the paired correctness
-verdicts. `program.py`, input hashes, generated-source dumps, status files, package freezes, fresh databases,
-device reports and cubins retain the execution context. The frozen recipe is under `isolated/protocol/`, source
-and remote-byte attestations under `isolated/provenance/`, and runtime build/import receipts under
-`isolated/runtime/`.
+verdicts. Standalone programs, common working goldens, input hashes, generated-source dumps, status files,
+package freezes, fresh databases, device reports and cubins retain the execution context. The frozen recipes
+are under `isolated/protocol/` and `common/protocol/`, source and remote-byte attestations under each study's
+`provenance/`, and runtime build/import
+receipts under `isolated/runtime/`.
 
-Inside historical command bundles, `torch-compile/model.json` holds the actual-model comparison;
+The retained FP8 tasks remain under `rtx4090/2026-10-13_10-48-11/` and `rtx5090/2026-10-13_11-17-03/`.
+Inside those historical command bundles, `torch-compile/model.json` holds the actual-model comparison;
 `verification/repeat-0` through `repeat-4` contain strict replays, sometimes as extensionless JSON files and
 sometimes as directories of target JSON files. Working goldens and tuning databases remain with those runs.
 
@@ -284,5 +287,5 @@ Its source is distinct from the final recipe run, as described above. The prelim
 timing is excluded. No superseded platform snapshots, previous results archives or exploratory optimization
 rounds are nested in this archive. Older committed snapshots remain available in Git history.
 
-Archive size: 11,474,358 bytes. SHA-256:
-`a8581d5edf481ea5d1fbedd381c4c0041a3c2fa3491a1bc4b3f6da1952956581`.
+Archive size: 40,234,075 bytes. SHA-256:
+`efe8722b4eb87727abd329ea23d5e30ae8b95037618cbf4e48f79d0e2244acb1`.
