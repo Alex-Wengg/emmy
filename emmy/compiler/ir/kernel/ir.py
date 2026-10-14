@@ -2572,7 +2572,9 @@ class RegStore(Stmt):
                     env[st.name] = f"{st.name}_e{i}"
                     ctx.ssa_dtypes[env[st.name]] = "f32"
                 else:
-                    local = st.rewrite(lambda name, st=st, i=i: f"{name}_e{i}" if name == st.name else env.get(name, name), Sigma(coord))
+                    local = st.rewrite(
+                        lambda name, st=st, i=i, env=env: f"{name}_e{i}" if name == st.name else env.get(name, name), Sigma(coord)
+                    )
                     rendered = local.render(replace(ctx, indent=0))[0]
                     lines.append(f"const {rendered}")
                     env[st.name] = f"{st.name}_e{i}"
