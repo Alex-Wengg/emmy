@@ -67,7 +67,9 @@ CTX_PREFIX = "H_"
 # must be rebuilt.
 # Version 9 reads declared Let dtypes on operand edges. Existing stored kernels with typed literal bindings can
 # thereby gain a tensor-core schedule and change S_warp_eligible without changing their exact kernel identity.
-FEATURIZER_VERSION = 9
+# Version 10 admits either physical matvec orientation. A missing right axis can now gain a unit matrix
+# coordinate, changing schedule eligibility without changing the stored computation or exact identity.
+FEATURIZER_VERSION = 10
 
 # The features that name a candidate's regime rather than describe it — the ``S_ext_n_symbolic_axis`` stamp a
 # masked-tile (symbolic-axis) kernel carries. The stamp VOCABULARY belongs here with the rest of the feature

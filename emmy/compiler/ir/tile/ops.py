@@ -328,6 +328,8 @@ class Sched:
             right = min((order[name] for name in view.right_axes if name in order), key=rank, default=None)
             if left is None and not view.left_axes:
                 left = next((pair for name, pair in order.items() if name not in node.free_axes and pair[1].extent == 1), None)
+            if right is None and not view.right_axes:
+                right = next((pair for name, pair in order.items() if name not in node.free_axes and pair[1].extent == 1), None)
             if left is not None and right is not None:
                 return (left[1], right[1])
             first, second = mn
