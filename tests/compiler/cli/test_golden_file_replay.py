@@ -1468,6 +1468,54 @@ def test_isolated_record_fills_only_the_named_proposal_without_target_latency(mo
     assert [r for r in after.rows if r.name != row.name] == [r for r in document.rows if r.name != row.name]
 
 
+@pytest.mark.parametrize("captured", [False, True])
+def test_strict_isolated_record_requires_captured_comparison_before_write(monkeypatch, tmp_path, captured):
+    import numpy as np
+
+    from emmy.commands import run
+    from emmy.commands.compile import golden_regime, resolve_golden_arg, selected_decisions
+    from emmy.compiler import target
+
+    path = tmp_path / "working.json"
+    document = _working_placement_route(path)
+    kernel = next(kernel for kernel in document.kernels if not kernel.formed)
+    row = next(row for row in document.rows if row.kernel == kernel.ref and row.measured)
+    document.rows[:] = [replace(stored, measurements=None) if stored == row else stored for stored in document.rows]
+    document.dump(path, overwrite=True)
+    before = path.read_bytes()
+    args = _run_args(path, kernel=kernel.ref, realization=row.name, record=False, record_greedy=True, strict_correctness=True)
+    resolve_golden_arg(args)
+
+    class Backend(_TimedBackend):
+        async def benchmark_compare_async(self, graph, **kwargs):
+            result = await super().benchmark_compare_async(graph, **kwargs)
+            result["captured"] = result["result"].captured = captured
+            result["run_io"] = ({"x": np.array([1.0])}, {"y": np.array([1.0])})
+            return result
+
+    monkeypatch.setattr(run, "_bench_greedy_isolated", _fake_isolated)
+    monkeypatch.setattr(run, "_print_kernel_stats", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run, "_record_bench_evidence", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("EMMY_NVCC_FLAGS", "")
+    target.set_target((8, 9))
+    try:
+        with pinned_knobs(golden_regime(args) | selected_decisions(args)):
+            if captured:
+                run._handle_run_ir(args, Backend, _FakeDump)
+            else:
+                with pytest.raises(SystemExit) as exc:
+                    run._handle_run_ir(args, Backend, _FakeDump)
+                assert exc.value.code == 1
+    finally:
+        target.set_target(None)
+    if not captured:
+        assert path.read_bytes() == before
+    else:
+        [written] = GoldenFile.load(path).rows_of(row.name)
+        assert written.measured and written.latency == row.latency
+        assert written.measurements.reference_backend == "same-input-greedy"
+
+
 def _bench_fresh_seed(
     monkeypatch, tmp_path, *, record_greedy: bool, whole_file=False, no_record_evidence=False, failure=None, warmup=5, compile_flags=""
 ) -> tuple:
