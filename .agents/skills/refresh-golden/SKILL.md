@@ -121,7 +121,9 @@ the same-input greedy execution, not eager PyTorch, and its timing never becomes
 
 Equivalent aliases may be filled from one successful guarded record only when their complete evidence keys match.
 Keep each authored row, preserve unchanged measurements, and verify the recorded schedule and captured DB measurement
-against the raw result. The writer may update the first equivalent row rather than the selected alias.
+against the raw result. The writer may update the first equivalent row rather than the selected alias. Preserve the
+writer's isolated median beside its same-run reference. The DB may retain a faster median from an earlier run; verify
+its exact key and capture status independently, but do not substitute that median beside a later reference.
 
 Then qualify the containing targets separately with eager PyTorch and `torch.compile`, restoring invalidated
 whole-target latencies on working copies. Use `--record` for a measured root or `--record-greedy` for an unmeasured

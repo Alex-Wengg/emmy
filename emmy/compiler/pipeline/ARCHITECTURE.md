@@ -1030,12 +1030,14 @@ the compatibility gate. `emmy trace` writes a working golden: every kernel a pro
 and one unmeasured row per kernel and template (`golden.working.inventory`); a template with sizes specializes the
 program first, since a kernel at a size is a kernel of its own.
 
-**A record run writes what the DB holds.** `run --golden PATH --realization NAME --bench --record-greedy`
+**A record run writes the measured kernel set.** `run --golden PATH --realization NAME --bench --record-greedy`
 (`golden.record_greedy_pick`) writes the kernel set the greedy compile picked: the kernels it minted, one routing row
 per kernel-set decision the splice watcher reported (`search/inventory.py`), and one measured row per CUDA kernel —
 the tile kernel it lowered from, its realized schedule and later storage choices, its own isolated launch timing —
 under the seed row's input regime with the compile's own precision gates laid over it (`pins.measured_regime_pins`)
-and the greedy comparison row as `same-input-greedy` reference. A row of the same kernel, sizes, regime and schedule
+and the greedy comparison row as `same-input-greedy` reference. The isolated and reference timings are medians from
+that invocation. The DB can retain a faster historical median; it is not substituted beside the current reference.
+A row of the same kernel, sizes, regime and schedule
 takes the new timings. Matching includes later decisions and ignores only declared OFF defaults; precision pins
 compare by their effective regime, so recording fills an existing proposal while preserving its name and stored
 pin spelling. Recorded this way, a strict-evidence compile picks the same kernel set again from the file's rows alone
