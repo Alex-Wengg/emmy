@@ -1960,12 +1960,13 @@ def test_a_recorded_route_selects_the_arm_spelling_its_whole_cut_set() -> None:
     assert single is not None and list(single[1]) == [one]
 
 
-@pytest.mark.parametrize("computed_scale", [False, True])
-def test_storage_frontier_recomputes_the_encode_scale_in_the_consumer(computed_scale):
+@pytest.mark.parametrize("scale_kind", ["load", "computed", "literal"])
+def test_storage_frontier_recomputes_the_encode_scale_in_the_consumer(scale_kind):
     """A scale computed before the encode can also feed the decode without fusing the encode."""
     from emmy.compiler.dtype import F8E4M3, F32
 
     m, n, k = Axis("m", 2), Axis("n", 3), Axis("k", 16)
+    computed_scale = scale_kind == "computed"
     scale = Load(name="scale_value", input="scale", index=(Var("m"), Var("k") / 8), dtype=F32)
     operands = ()
     if computed_scale:
@@ -1976,6 +1977,8 @@ def test_storage_frontier_recomputes_the_encode_scale_in_the_consumer(computed_s
             ("scale_value",),
         )
         operands = (scale,)
+    elif scale_kind == "literal":
+        scale = Let("scale_value", Literal(0.25), dtype=F32)
     quantized = projection(
         operands,
         (
@@ -2014,6 +2017,8 @@ def test_storage_frontier_recomputes_the_encode_scale_in_the_consumer(computed_s
     assert sum(tensor.dtype == F8E4M3 for node in pieces for tensor in node.outputs) == 1
     if computed_scale:
         assert sum("scale" in node.inputs for node in pieces) == 1, "both encode and decode reuse the separately computed scale"
+    elif scale_kind == "literal":
+        assert all("scale" not in node.inputs for node in pieces), "both sides keep the literal without a device input"
     for node in pieces:
         node.op.op.lower(bound=frozenset(), stores=node.op.output_specs, axes=node.op.axes)
 
