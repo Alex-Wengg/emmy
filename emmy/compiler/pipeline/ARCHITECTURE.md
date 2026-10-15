@@ -1228,9 +1228,10 @@ pass with the placement prior deciding against the golden's arm) — the deploy-
 
 **The reproduction gate.** `tests/compiler/pipeline/search/prior/test_reproduction.py` checks both shipped priors
 against every hardware golden and maintained recipe golden with no measurements in scope. A placement fork must
-choose its recorded arm; a recorded schedule must rank within the better half of its sampled pool. Tests split each
-golden's pools into slices of 16, drawing schedule rows with the same `EMMY_POOL_DRAW` as a greedy compile in the
-suite. A failure names the rows the prior cannot reproduce. A PR that changes a hardware golden refits both priors;
+choose its recorded arm, at every fork of the golden's path to its kernel set; a recorded schedule must rank within
+the better half of its sampled pool. Tests split each golden's pools into slices of 16 — a placement slice walks with
+every decision of its golden in scope — drawing schedule rows with the same `EMMY_POOL_DRAW` as a greedy compile in
+the suite. A failure names the rows the prior cannot reproduce. A PR that changes a hardware golden refits both priors;
 a recipe golden that fails needs a refit or the recipe tag `prior-pending`. That tag skips its reproduction check
 until a refit reproduces it and removes the tag; the golden remains evidence and training data. Never lower the
 tolerance or exempt a hardware golden. The [refit commands](../../../README.md#fit-the-priors) and
