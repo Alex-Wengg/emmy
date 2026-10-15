@@ -343,7 +343,7 @@ def test_sibling_producer_fusion_prunes_unused_later_group(live_dependents: int)
     before = graph.copy()
     parent = graph.nodes["a"].op.with_io(graph, graph.nodes["a"])
 
-    _fuse_sibling_producers(graph, ("a", "b", "c", "d"), parent)
+    _fuse_sibling_producers(graph, {name: f"PLACE@{name}" for name in ("a", "b", "c", "d")}, parent)
 
     assert len([node for node in graph.nodes.values() if isinstance(node.op, TileOp)]) == 1 + bool(live_dependents)
     assert all(graph.producer(name) is None for name in ("c", "d")[live_dependents:])
@@ -451,6 +451,20 @@ def _routed(document, arm: dict, *, measured: bool = True, target=None):
     for piece in pieces:
         document.rows.append(Row(name=f"sdpa.{piece.exact_identity[:12]}", kernel=piece.ref, knobs={}, measurements=stand_in))
     return document, route
+
+
+def test_a_piece_carries_the_token_of_its_seam_on_its_parent() -> None:
+    """A cut piece's name token is one rule: its parent's structural identity and the seam's canonical key, digested
+    (``seam_token``), and ``place_token`` reads it back off the name — what a ``place_<token>`` pin and a recorded
+    route address the piece by. The target itself carries no token."""
+    from emmy.compiler.pipeline.passes.tile._cut import place_token, seam_token
+
+    document, route = _routed(_sdpa_document(), {"PLACE@map.1/twist.1/inner": "cut"})
+    assert route is not None
+    [target] = document.targets()
+    tokens = {place_token(document.kernel(ref).name) for ref in route.children}
+    assert seam_token(target.op(), "PLACE@map.1/twist.1/inner") in tokens
+    assert place_token(target.name) is None and None in tokens, "the same-name remainder carries no token"
 
 
 def test_a_recorded_cut_is_taken_again_and_a_stale_route_mints_nothing() -> None:
@@ -1919,8 +1933,13 @@ def test_restamp_invalidates_whole_target_latency_when_a_descendant_changes(chan
     other = document.add_kernel(replace(unrelated.targets()[0], traced=1))
     document.rows.append(Row(name="unrelated", kernel=other.ref))
     measurement = Measurements(emmy_us=1.0, reference_us=2.0, reference_backend="torch")
-    latency = {"test card": Latency(emmy_us=3.0, tcompile_us=4.0)}
-    document.rows[:] = [replace(row, knobs={}, measurements=measurement, latency=latency) for row in document.rows]
+
+    def timed(row: Row) -> dict:  # the whole recorded set of the row's target, as a record run names it
+        path = document.path_to(row.kernel)
+        return {"test card": Latency(emmy_us=3.0, tcompile_us=4.0, kernels=document.kernel_set(path[0].parent if path else row.kernel))}
+
+    document.rows[:] = [replace(row, knobs={}, measurements=measurement, latency=timed(row)) for row in document.rows]
+    latencies = {row.name: row.latency for row in document.rows}
     changed = nested.children[0]
     if change == "child":
         document.kernels[:] = [
@@ -1935,7 +1954,7 @@ def test_restamp_invalidates_whole_target_latency_when_a_descendant_changes(chan
     assert report.changed is (change != "none")
     assert fresh.kernel(document.targets()[0].ref) == document.targets()[0], "the root itself did not change"
     for row in fresh.rows:
-        assert row.latency == (None if change != "none" and row.kernel in affected else latency)
+        assert row.latency == (None if change != "none" and row.kernel in affected else latencies[row.name])
         assert row.measurements == (None if change == "child" and row.kernel == changed else measurement)
     assert bool(report.cleared_latencies) is (change != "none")
     assert all("unrelated" not in line for line in report.lines())

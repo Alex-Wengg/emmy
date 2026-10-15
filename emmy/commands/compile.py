@@ -358,8 +358,10 @@ def _hand_pins(keys) -> dict:
 def selected_decisions(args) -> dict:
     """For a named isolated row, its schedule; under ``--pin-route``, the decisions that mint the named rows — their routes
     and cross-CTA splits, as one hand pin — so the compile takes the kernel set the file describes; empty otherwise,
-    and empty where the rows' routes disagree on a seam. The pin is the same hand pin ``EMMY_KNOBS`` publishes, so
-    one already set on a seam with another value is a conflict, refused."""
+    and empty where the rows' routes disagree on a seam. A named row that benches as no pinned row (a whole-target
+    latency with no schedule and no measurement) pins the decisions that mint the kernel set its latency names. The
+    pin is the same hand pin ``EMMY_KNOBS`` publishes, so one already set on a seam with another value is a
+    conflict, refused."""
     from emmy.compiler.pipeline.knob import values_equal  # noqa: PLC0415
 
     isolated = bool(getattr(args, "kernel", None) and getattr(args, "realization", None))
@@ -373,9 +375,11 @@ def selected_decisions(args) -> dict:
         if isolated
         else [row for row in getattr(args, "_golden_rows", ()) if all(row != getattr(sample, "record", None) for sample in samples)]
     )
-    routes.extend(
-        _route_pins(source, row.kernel) for source in (getattr(args, "_golden_scope", None) or ()) for row in rows if row in source.rows
-    )
+    for source in getattr(args, "_golden_scope", None) or ():
+        for row in rows:
+            if row in source.rows:
+                timed = dict.fromkeys(ref for latency in (row.latency or {}).values() for ref in latency.kernels)
+                routes.extend(_route_pins(source, ref) for ref in (timed or {row.kernel: None}))
     for route in routes:
         for key, value in route.items():
             if decisions.setdefault(str(key), str(value)) != str(value):
@@ -389,8 +393,11 @@ def selected_decisions(args) -> dict:
 
 
 def _route_pins(document, ref: str) -> dict[str, str]:
-    """Address each recorded decision on the kernel and step where its parent exists."""
+    """Address each recorded decision on the kernel and step where its parent exists. A piece is addressed by the
+    token its fresh name carries (``place_token``): the stored path is minted again for the names, because a stored
+    name keeps the token of the parent that first minted the piece, and a restamp keeps it through a re-key."""
     from emmy.compiler.context import Context  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.tile._cut import place_token  # noqa: PLC0415
     from emmy.compiler.pipeline.search.golden.restamp import mint  # noqa: PLC0415
 
     path = document.path_to(ref)
@@ -412,17 +419,12 @@ def _route_pins(document, ref: str) -> dict[str, str]:
                 scope = [key.partition("@")[2]] if "@" in key else []
                 if stage:
                     scope.insert(0, f"step.{stage}")
-                if "__place_" in parent.name:
-                    token = parent.name.rsplit("__place_", 1)[1].split("__", 1)[0]
+                if (token := place_token(parent.name)) is not None:
                     scope.insert(0, f"place_{token}")
                 key = "PLACE" + ("@" + "/".join(scope) if scope else "")
             elif key.partition("@")[0] == "REDUCE":
-                scope = (
-                    "place_" + parent.name.rsplit("__place_", 1)[1]
-                    if "__place_" in parent.name
-                    else "node_" + parent.name.removeprefix("k_")
-                )
-                key = key.partition("@")[0] + "@" + scope
+                token = place_token(parent.name)
+                key = "REDUCE@" + (f"place_{token}" if token is not None else "node_" + parent.name.removeprefix("k_"))
             route[key] = str(value)
         cut = any(str(key).partition("@")[0] == "PLACE" and value == "cut" for key, value in decision.arm.items())
         for child in decision.children:

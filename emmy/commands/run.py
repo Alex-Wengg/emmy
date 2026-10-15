@@ -698,8 +698,7 @@ def _record_greedy_pick(args, graph, bench, greedy_iso, taken, results: dict) ->
     from emmy.commands.compile import resolve_tune_db  # noqa: PLC0415
     from emmy.compiler.context import Context  # noqa: PLC0415
     from emmy.compiler.pipeline.search.bench_record import measured_schedules  # noqa: PLC0415
-    from emmy.compiler.pipeline.search.golden import GoldenFile, record_greedy_pick, record_latency  # noqa: PLC0415
-    from emmy.compiler.pipeline.search.golden.working import seed_row  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import Latency, record_greedy_pick  # noqa: PLC0415
     from emmy.compiler.pipeline.search.inventory import distinct_decisions  # noqa: PLC0415
 
     isolated = greedy_iso.bench if greedy_iso is not None and greedy_iso.status == "ok" else None
@@ -717,31 +716,24 @@ def _record_greedy_pick(args, graph, bench, greedy_iso, taken, results: dict) ->
     ctx = Context.probe()
     tried = measured_schedules(resolve_tune_db(), ctx, [node.op for node in nodes])
     decisions = distinct_decisions(taken)
+    tcompile_us, eager_us = _torch_timings(results)
+    latency = None
+    if getattr(args, "kernel", None):
+        pass  # An isolated piece's timing is not its containing target's latency.
+    elif not tcompile_us or not results.get("Emmy"):
+        logger.warning("--record-greedy: no torch.compile timing for %s; the seed row keeps no latency", args.realization)
+    else:
+        latency = (ctx.hardware_id(), Latency(emmy_us=results["Emmy"], tcompile_us=tcompile_us, eager_us=eager_us))
     written = record_greedy_pick(
         args.golden,
         args.realization,
         decisions=decisions,
         kernels=[(node.op, us(mine), us(theirs), n) for node, mine, theirs, n in zip(nodes, *launches, tried, strict=True)],
         reference_backend="same-input-greedy",
+        latency=latency,
     )
     logger.info(
         "recorded the greedy pick of %s: %d decision(s) stored as routing rows, %d row(s)", args.realization, len(decisions), len(written)
-    )
-    if getattr(args, "kernel", None):
-        return  # An isolated piece's timing is not its containing target's latency.
-    tcompile_us, eager_us = _torch_timings(results)
-    if not tcompile_us or not results.get("Emmy"):
-        logger.warning("--record-greedy: no torch.compile timing for %s; the seed row keeps no latency", args.realization)
-        return
-    record_latency(
-        args.golden,
-        args.realization,
-        hardware_id=ctx.hardware_id(),
-        emmy_us=results["Emmy"],
-        tcompile_us=tcompile_us,
-        eager_us=eager_us,
-        knobs=(seed := seed_row(GoldenFile.load(args.golden), args.realization)).knobs or {},
-        pins=seed.pins,
     )
 
 
@@ -1464,17 +1456,32 @@ def _quantized_values(raw, fmt: str):
     return decode_f4x2(raw) if fmt == "f4e2m1x2" else decode_f8(raw, fmt)
 
 
+def _adjacent_codes(ours, theirs, fmt: str):
+    """Where ``ours`` is ``theirs`` or one of the two values beside it on the format's grid of representable values:
+    the one step a value near the midpoint between two codes rounds either way across. A non-finite reference value
+    accepts only itself."""
+    import numpy as np  # noqa: PLC0415
+
+    grid = _quantized_values(np.arange(256, dtype=np.uint8), fmt)
+    grid = np.unique(grid[np.isfinite(grid)])
+    at = np.searchsorted(grid, theirs)
+    beside = (ours == grid[np.maximum(at - 1, 0)]) | (ours == grid[np.minimum(at + 1, len(grid) - 1)])
+    return (ours == theirs) | (np.isfinite(theirs) & beside)
+
+
 def _strict_eager_proof(frontend, input_tensors: dict, outputs: dict, lowered, taps: dict) -> tuple[dict, dict, object]:
     """The ``_strict_correctness_proof`` verdict on the compiled program's ``outputs`` (the candidate) against the
     eager evaluation of ``frontend`` on the same inputs.
 
     ``taps`` holds the candidate's values at the quantize nodes (``_quantize_nodes``). The eager reference adopts them
-    and computes everything after each quantize node from them, so the check covers every computation except the
-    rounding at those nodes, which it leaves out of the verdict. Comparing bytes there would fail correct programs: a
-    value near the midpoint between two codes rounds either way, and the layers after it amplify that one step past
-    the tolerance. The verdict's ``quantize_nodes`` reports, per node, how many values the reference rounds
-    differently from the candidate. Returns the verdict, the reference outputs by name, and a zero-argument callable
-    for their FP64 evaluation."""
+    and computes everything after each quantize node from them, so the tolerance check covers every computation
+    except the rounding at those nodes, which the proof judges code by code instead: the candidate's value must be the
+    reference's or one of the two values beside it on the format's grid (``_adjacent_codes``). Comparing bytes there
+    would fail correct programs — a value near the midpoint between two codes rounds either way, and the layers after
+    it amplify that one step past the tolerance — while a value further away fails the proof like any other mismatch,
+    naming the node and the count. The verdict's ``quantize_nodes`` reports, per node, how many values the reference
+    rounds differently from the candidate and how many of those lie beyond one code. Returns the verdict, the
+    reference outputs by name, and a zero-argument callable for their FP64 evaluation."""
     import numpy as np  # noqa: PLC0415
     import torch  # noqa: PLC0415
 
@@ -1497,18 +1504,24 @@ def _strict_eager_proof(frontend, input_tensors: dict, outputs: dict, lowered, t
 
     proof = _strict_correctness_proof(outputs, eager_values, exact_out=exact_values)
     if taps:
-        rounding = {}
+        rounding, faults = {}, []
         for name, reference in zip(taps, out[len(outputs) :], strict=True):
             fmt = frontend.nodes[name].output.dtype.name
             ours, theirs = _quantized_values(taps[name], fmt), _quantized_values(reference.cpu().numpy(), fmt)
-            differ = ours != theirs
+            differ, beyond = ours != theirs, ~_adjacent_codes(ours, theirs, fmt)
             rounding[name] = {
                 "values": int(differ.size),
                 "rounded_differently": int(differ.sum()),
+                "beyond_one_code": int(beyond.sum()),
                 "max_abs_difference": float(np.abs(ours - theirs)[differ].max()) if differ.any() else 0.0,
             }
             logger.info("quantize node %s: %d/%d values rounded differently", name, rounding[name]["rounded_differently"], differ.size)
+            if beyond.any():
+                faults.append(f"quantize node {name!r}: {int(beyond.sum())}/{differ.size} values more than one code from the eager value")
         proof["quantize_nodes"] = rounding
+        if faults:
+            proof["status"] = "fail"
+            proof["error"] = "; ".join([proof["error"], *faults] if "error" in proof else faults)
     return proof, eager_values, exact_values
 
 
@@ -2692,7 +2705,7 @@ def _random_input_values(rng, shape, dtype, *, name: str | None = None):
         return rng.integers(0, 2, shape, dtype=np.uint8).astype(np.float32)
     if name in WEIGHT_INPUTS:
         return rng.standard_normal(shape, dtype=np.float32) * 0.02
-    if canonical in {"f4e2m1x2", "f8e4m3", "f8e5m2"}:
+    if canonical in _QUANTIZED_FORMATS:
         return _random_source_values(rng, shape, dtype, name=name)
     if canonical == "u8" and name is not None and "scale" in name:
         # MXFP4 boundary scales are E8M0 bytes with bias 127. Arbitrary u8 codes span
