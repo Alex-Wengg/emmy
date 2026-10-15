@@ -19,17 +19,19 @@ def _summary(gpu: str, regret1: dict, regret10: dict) -> dict:
     return {"axes": {"half": "current", "gpu": gpu, "H_opt": 3}, "groups": 4, "metrics": {"regret1": regret1, "regret10": regret10}}
 
 
-def test_each_card_with_a_regret_is_one_clause_and_dropped_rows_are_counted():
+def test_each_card_with_a_regret_is_one_clause_without_the_metrics_it_lacks_and_dropped_rows_are_counted():
     report = {
         "header": {"rows": 320, "groups": 12, "dropped": {"implausible value": 2}},
         "summaries": [
             _summary(V100, {"median": 9.4, "worst": 56.6, "groups": 5}, {"median": 1.0, "worst": 2.4, "groups": 2}),
             _summary("NVIDIA GeForce RTX 5090", _NONE, _NONE),
+            _summary("NVIDIA H100 80GB", {"median": 1.137, "worst": 813.442, "groups": 41}, _NONE),
         ],
     }
     assert _line(report) == (
         "Measured pools: 12 over 320 rows. NVIDIA Tesla V100 SXM2 16GB: regret@1 9.4x median, 56.6x worst (5); "
-        "regret@10 1.0x median, 2.4x worst (2). Dropped before grouping: 2 implausible value"
+        "regret@10 1x median, 2.4x worst (2). NVIDIA H100 80GB: regret@1 1.14x median, 813.44x worst (41). "
+        "Dropped before grouping: 2 implausible value"
     )
 
 
