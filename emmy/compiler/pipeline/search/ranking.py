@@ -398,15 +398,18 @@ def _resolve_placement(pool: GoldenPool, ctx: Context, routes: list, decide):
 
 def _recorded_kernel_set(
     pool: GoldenPool, ctx: Context, decisions: dict[str, dict], cuts: dict[str, tuple[str, ...]], unmatched: list[str]
-) -> Counter:
-    """The kernel set the golden left below the pool's kernel, by exact identity with multiplicity. The walk that
-    follows the golden ends in it: at a placement fork the recorded arm — ``cuts``, the seams each decision cuts,
-    registers a several-seam decision as one composed route under its kernel's identity, so the one decision a
-    pinned compile consumed those seams as is one arm, and a decision on a piece is found by identity; a kernel
-    with no decision stays fused, and every kernel stays unsplit and folded, since a cut is decided before either.
-    A kernel whose recorded cut is not on offer (a stale spelling) is named in ``unmatched`` and kept whole."""
+) -> tuple[Counter, frozenset[str]]:
+    """The kernel set the golden left below the pool's kernel, by exact identity with multiplicity, and the kernels
+    it cut on the way there. The walk that follows the golden ends in it: at a placement fork the recorded arm —
+    ``cuts``, the seams each decision cuts, registers a several-seam decision as one composed route under its
+    kernel's identity, so the one decision a pinned compile consumed those seams as is one arm, and a decision on
+    a piece is found by identity; a kernel with no decision stays fused, and every kernel stays unsplit and
+    folded, since a cut is decided before either. A kernel whose recorded cut is not on offer (a stale spelling)
+    is named in ``unmatched`` and kept whole."""
     from emmy.compiler.pipeline.pipeline import NO_OPTION, _structural_domain  # noqa: PLC0415
     from emmy.compiler.pipeline.search.pins import KERNEL_SET_DOMAINS, spelled_arm  # noqa: PLC0415
+
+    cut: set[str] = set()
 
     def decide(fp):
         leaves = list(fp.leaves())
@@ -420,11 +423,14 @@ def _recorded_kernel_set(
         if arm is None:
             unmatched.append(identity[:12])
             return leaves[0]
+        if "cut" in arm[1].values():
+            cut.add(identity)
         return arm[0]
 
     routes = [(identity, keys) for identity, keys in cuts.items() if len(keys) > 1]
     terminal = _resolve_placement(pool, ctx, routes, decide)
-    return Counter(key for op, _ in features.kernel_pieces(terminal) if (key := op.identity_key(structural=False, with_io=True)))
+    left = Counter(key for op, _ in features.kernel_pieces(terminal) if (key := op.identity_key(structural=False, with_io=True)))
+    return left, frozenset(cut)
 
 
 def walk_placement(
@@ -437,10 +443,11 @@ def walk_placement(
     kernel set the golden left (:func:`_recorded_kernel_set`), and the remainder re-enters the walk owing what is
     still to carve, until it is itself a piece of that set and stays whole; a split or layout fork's positive is
     the arm the golden recorded on that kernel (``decisions``: a kernel's exact identity to the kernel-set arm
-    recorded on it; unsplit and folded where none is). Without ``prior`` the walk takes a positive arm; with a
-    placement ``prior`` it takes the arm the prior ranks first, which is what a deploy would do at that fork, and
-    leaves the golden's path where that arm is no positive. ``own`` keeps only the forks of the pool's own kernel
-    and the placement forks of the remainders its cut leaves, which is all a reproduction verdict reads."""
+    recorded on it; unsplit and folded where none is). An arm carving a kernel the golden cut on the way to its
+    set is positive too: that kernel's own fork carries the walk on. The walk takes the first positive at every
+    fork, so its forks are the dataset's groups; a placement ``prior`` records at each of them the arm it ranks
+    first, which a deploy would take there. ``own`` keeps only the forks of the pool's own kernel and the placement
+    forks of the kernels its cut leaves to cut further, which is all a reproduction verdict reads."""
     from emmy.compiler.ir.tile import TileOp  # noqa: PLC0415
     from emmy.compiler.pipeline.fork import leaf_knobs  # noqa: PLC0415
     from emmy.compiler.pipeline.knob import family_of  # noqa: PLC0415
@@ -450,13 +457,14 @@ def walk_placement(
     featurizer = features.Featurizer.of(ctx)
     forks: list[PlacementFork] = []
     unmatched: list[str] = []
-    # The seams each recorded decision cuts, by its kernel's identity; a kernel the golden cut is walked further.
+    # The seams each recorded decision cuts, by its kernel's identity.
     cuts = {
         identity: tuple(sorted(k for k, v in arm.items() if family_of(k) == "PLACE" and v == "cut")) for identity, arm in decisions.items()
     }
     cuts = {identity: keys for identity, keys in cuts.items() if keys}
-    continued = frozenset(cuts)
-    recorded = _recorded_kernel_set(pool, ctx, decisions, cuts, unmatched) if pool.kernel.exact_identity in cuts else None
+    recorded, continued = (
+        _recorded_kernel_set(pool, ctx, decisions, cuts, unmatched) if pool.kernel.exact_identity in cuts else (None, frozenset())
+    )
     # What the golden's kernel set still holds below a kernel the walk cuts further, by its graph node id.
     pending: dict[str, Counter] = {}
 
@@ -494,14 +502,12 @@ def walk_placement(
             featurizer.features(root, row, pieces=leaf.expand()[0] if leaf.structural else root)
             for leaf, row in zip(leaves, rows, strict=True)
         ]
-        pick = positives[0]
-        if prior is not None:
-            scores = prior.mean_scores_features(feats)
-            pick = min(range(len(leaves)), key=scores.__getitem__)
+        followed = positives[0]
+        pick = followed if prior is None else min(range(len(leaves)), key=prior.mean_scores_features(feats).__getitem__)
         forks.append(PlacementFork(tier, feats, labels, positives, pick))
-        if tier == "place" and pick in positives and carved[pick] is not None:
-            left = owed - carved[pick]
-            fragment = leaves[pick].expand()[0]
+        if tier == "place" and carved[followed] is not None:
+            left = owed - carved[followed]
+            fragment = leaves[followed].expand()[0]
             for node_id, node in fragment.nodes.items():
                 if isinstance(node.op, TileOp) and (
                     node.op.name == root.name or node.op.with_io(fragment, node).identity_key(structural=False, with_io=True) in continued
@@ -509,7 +515,7 @@ def walk_placement(
                     # The remainder and a piece the golden cut in its turn are cut further; the splice promotes
                     # a piece onto the buffer it replaces.
                     pending[node_id] = pending[node_id.removesuffix("__placed")] = left
-        return leaves[pick]
+        return leaves[followed]
 
     _resolve_placement(pool, ctx, [], decide)
     return forks, unmatched
