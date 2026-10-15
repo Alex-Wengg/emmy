@@ -46,7 +46,7 @@ from emmy.compiler.ir.pure.fold import (
 from emmy.compiler.ir.pure.lam import Lambda
 from emmy.compiler.ir.schedule.packing import match_packed_pair_node
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Assign, Body, Load, Write
+from emmy.compiler.ir.stmt import Assign, Body, Let, Load, Write
 from emmy.compiler.ir.stmt.passes import rewrite as rewrite_stmt
 from emmy.compiler.ir.tile import OutputSpec, Placement, TileOp
 from emmy.compiler.ir.tile.ops import (
@@ -129,7 +129,7 @@ def storage_frontier(node: Fold) -> Frontier | None:
         return None
     lift = node.applied
     body = lift.body
-    if any(not isinstance(stmt, (Load, Assign)) for stmt in body):
+    if any(not isinstance(stmt, (Load, Assign, Let)) for stmt in body):
         return None
     computed = {name for stmt in body if isinstance(stmt, Assign) for name in stmt.defines()}
     decodes = [

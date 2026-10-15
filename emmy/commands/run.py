@@ -267,6 +267,9 @@ def handle_run(args):
     if args.record_greedy and not (args.golden and args.bench):
         logger.error("--record-greedy requires --golden PATH and --bench")
         sys.exit(2)
+    if getattr(args, "kernel", None) and (args.record or (args.record_greedy and not args.realization)):
+        logger.error("isolated kernel recording requires --realization NAME --record-greedy; --record is a whole-target latency")
+        sys.exit(2)
     if (args.ab or getattr(args, "tune", None)) and args.bench and not getattr(args, "no_record_evidence", False):
         # A sweep exists to leave its rows in the tune DB for a later record; below the bench standard
         # it records nothing, and a record run that copies that DB would silently fall to the prior.
@@ -380,13 +383,15 @@ def _handle_run_once(args):
         sys.exit(1)
 
     if ir_path is not None or hasattr(args, "_golden_graph"):
-        from emmy.commands.compile import golden_regime  # noqa: PLC0415
+        from emmy.commands.compile import golden_regime, selected_decisions  # noqa: PLC0415
 
         if ir_path is not None:
             args.ir = ir_path
         regime = golden_regime(args)
         if getattr(args, "cold_cache", False):
             regime["COLD_CACHE"] = True
+        if args.kernel:
+            regime.update(selected_decisions(args))  # Keep the selected row's pins live for the existing record guards.
         with pinned_knobs(regime):
             _handle_run_ir(args, CudaBackend, CompilerDump)
         return
@@ -722,6 +727,8 @@ def _record_greedy_pick(args, graph, bench, greedy_iso, taken, results: dict) ->
     logger.info(
         "recorded the greedy pick of %s: %d decision(s) stored as routing rows, %d row(s)", args.realization, len(decisions), len(written)
     )
+    if getattr(args, "kernel", None):
+        return  # An isolated piece's timing is not its containing target's latency.
     tcompile_us, eager_us = _torch_timings(results)
     if not tcompile_us or not results.get("Emmy"):
         logger.warning("--record-greedy: no torch.compile timing for %s; the seed row keeps no latency", args.realization)
@@ -3366,7 +3373,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         )
     if getattr(args, "record", False) or getattr(args, "record_greedy", False):
         # Missing inventory rows are not rejected answers: a fresh recording may create them.
-        refusal = record_refusal(
+        refusal = "; ".join(strict_errors or []) or record_refusal(
             _cuda_knob_dicts(graph),
             accuracy_error if strict_correctness else None,
             _cuda_kernel_names(graph),
