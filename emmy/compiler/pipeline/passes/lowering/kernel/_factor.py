@@ -60,9 +60,9 @@ from emmy.compiler.ir.schedule.classic.schedule import binds_root
 from emmy.compiler.ir.schedule.views import cone_seam
 from emmy.compiler.ir.sigma import Sigma
 from emmy.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop, Write
-from emmy.compiler.ir.stmt.body import _exposed_defines
 from emmy.compiler.ir.tile import FoldMove, Level, Reduce, ReduceStage
-from emmy.compiler.ir.tile.ir import apply_output_specs, observed_result_names
+from emmy.compiler.ir.tile.boundary import apply_output_specs
+from emmy.compiler.ir.tile.ir import observed_result_names
 from emmy.compiler.ir.tile.ops import UnbindableProjection, chain_members, projection_regions, sched_of, tiled_edges
 from emmy.compiler.pipeline.passes.lowering.kernel._atom import (
     clamp_last,
@@ -388,6 +388,13 @@ def _merge_root_tiles(tiles: tuple[Tile, ...]) -> Tile:
     return replace(first, body=Body(body))
 
 
+def _scope_bindings(stmt: Stmt) -> set[str]:
+    """The names ``stmt`` binds in the scope it sits in: its own defines, plus the accumulators a
+    loop exports (each ``Accum`` of its immediate body), which the code after the loop reads. Every
+    other name bound inside exists only in that nested scope."""
+    return set(stmt.defines()) | {child.name for body in stmt.nested() for child in body if isinstance(child, Accum)}
+
+
 def _one_value_per_name(stmts) -> list:
     """Re-spell a name a later statement binds to a DIFFERENT value than the one already in scope.
 
@@ -404,6 +411,15 @@ def _one_value_per_name(stmts) -> list:
     nvcc refuses would have read. Exported accumulators count as bindings too: a partial copy of
     a reduction is a different loop even when some outputs retain their original names.
     Nothing moves while the two agree.
+
+    A different value is a statement not equal to the one already bound to the name. Each nested
+    body is a C scope of its own and starts from the bindings around it. A binding inside it that
+    equals the bound statement is an identical recomputation: it keeps the name, and C shadowing
+    declares it again in the inner scope (the Qwen3.8 NVFP4 decode conv/in-proj kernel recomputes
+    its gate inside a nested loop after reading the outer gate). The pass re-spells a different
+    statement ``<name>__s<N>`` at its own binding, so the loop's reads ahead of it keep the outer
+    name. Re-spelling the whole loop at the enclosing scope instead would rename those reads too,
+    to a name declared only later or in a sibling scope.
     """
 
     def sweep(stmts, bound: dict[str, object], rename: dict[str, str]) -> list:
@@ -411,17 +427,22 @@ def _one_value_per_name(stmts) -> list:
         for stmt in stmts:
             spelled = stmt.rename(lambda name: rename.get(name, name)) if rename else stmt
             if spelled.nested():
-                # Each nested body is a C scope of its own: it reads the names spelled around it
-                # and re-spells a second value of a name INSIDE it, and what it binds stays inside
-                # (a projection distributed over a reduce's lanes is one sweep loop holding a
-                # sibling's copy of the root's cell beside the projection's own).
-                spelled = spelled.with_bodies(tuple(Body(sweep(list(body), {}, dict(rename))) for body in spelled.nested()))
-            for original in sorted(_exposed_defines(spelled)):
+                # Each nested body is a C scope of its own: it sees the bindings around it except the
+                # statement's own accumulators, and the spellings; it re-spells a second value of a
+                # name INSIDE it, and what it binds stays inside (a projection distributed over a
+                # reduce's lanes is one sweep loop holding a sibling's copy of the root's cell beside
+                # the projection's own). The code below compares the accumulators the statement exports
+                # at its own scope, with the earlier loop that bound the same accumulator there. Inside,
+                # an identical copy of a reduce loop would see its ``Accum`` clash with that loop.
+                exported = _scope_bindings(spelled)
+                around = {name: value for name, value in bound.items() if name not in exported}
+                spelled = spelled.with_bodies(tuple(Body(sweep(list(body), dict(around), dict(rename))) for body in spelled.nested()))
+            for original in sorted(_scope_bindings(spelled)):
                 name = rename.get(original, original)
                 if bound.get(name, spelled) != spelled:
                     rename[original] = f"{original}__s{len(rename)}"
                     spelled = spelled.rename(lambda name: rename.get(name, name))
-            for name in _exposed_defines(spelled):
+            for name in _scope_bindings(spelled):
                 bound[name] = spelled
             out.append(spelled)
         return out
@@ -661,7 +682,7 @@ def _bind(op, ctx: Ctx, tail: tuple, out_val: str, store=None, *, output_specs: 
 # ways across per-thread register accumulators (ILP). The serial reduce ``Loop`` becomes a
 # :class:`StridedLoop` of step ``coop·reg``; for ``reg > 1`` its body is replicated ``reg`` times
 # (each copy offset by ``r·coop`` and folding its own accumulator). After the loop: the REG tree
-# folds the ``reg`` accumulators into one (:func:`merge_stmts`), then — if ``coop > 1`` — the
+# folds the ``reg`` accumulators into one (:meth:`Fold.merge`), then — if ``coop > 1`` — the
 # cross-thread combine (:func:`emit_combine`), then the projection. The op tree + ``lower`` are
 # shared with the other tiers; only the partition changes.
 
@@ -763,13 +784,6 @@ def _restage_loads(stmts: list[Stmt], buf: str, smem: str, n_grid: int, grid_var
     return out
 
 
-def merge_stmts(fold: Fold, other: tuple[str, ...]) -> list[Stmt]:
-    """The fold's cross-partition merge into ``other`` at the kernel's accumulator precision —
-    the term's own derivation (:meth:`Fold.merge`) with every ``Accum`` stamped f32, the carrier
-    policy every Fold state lowers at."""
-    return [replace(stmt, dtype=F32) if isinstance(stmt, Accum) else stmt for stmt in fold.merge(other)]
-
-
 def emit_combine(
     fold: Fold, t: str, n_threads: int, *, warp_size: int = 32, segmented: bool = False, inner: tuple[str, int] | None = None
 ) -> list[Stmt]:
@@ -855,15 +869,15 @@ def emit_combine(
 def combine_tail(fold: Fold, *, reg: int, coop: int, lane) -> list[Stmt]:
     """The algebra-driven **partial merge** that follows a partitioned reduce loop — the one place the
     two partial-fold geometries are assembled: the REG-tree fold of the ``reg`` ILP register copies
-    into copy 0 (:func:`merge_stmts`), then — when threads cooperate (``lane`` is a lane :class:`Axis`,
+    into copy 0 (:meth:`Fold.merge`), then — when threads cooperate (``lane`` is a lane :class:`Axis`,
     not ``None``) — the cross-thread :func:`emit_combine`. Both reassign the carried state **in place**
     (the survivor SSA names hold the full reduction), so the post-reduce projection reads them directly.
 
     Algebra-generic (the ⊕ read off ``fold``'s stored combine): a monoid reduce and a
     contraction's degenerate additive fold identically, so a cooperative reduce and a (future)
-    cooperative-K contraction share this tail. ``merge_stmts`` keys a twisted combine's temps on
+    cooperative-K contraction share this tail. ``Fold.merge`` keys a twisted combine's temps on
     the copy name, so each fold's internals are already unique."""
-    merge: list[Stmt] = [st for r in range(1, reg) for st in merge_stmts(fold, tuple(f"{n}__r{r}" for n in fold.combine.results))]
+    merge: list[Stmt] = [st for r in range(1, reg) for st in fold.merge(tuple(f"{n}__r{r}" for n in fold.combine.results))]
     if lane is not None:
         merge += emit_combine(fold, t=lane.name, n_threads=coop)
     return merge
@@ -967,7 +981,7 @@ def _tile_reduce_axis_transposed(
         stores += [Cond(cond=BinaryExpr("<", cell, out_ext), body=tuple(store))] if overhang else store
     strided = StridedLoop(axis=axis, start=start, step=Literal(stride, "int"), body=Body(tuple(body)), unroll=_lane_unroll(axis, stride))
 
-    merge: list[Stmt] = [st for r in range(1, reg) for st in merge_stmts(op, tuple(f"{n}__r{r}" for n in view.states))]
+    merge: list[Stmt] = [st for r in range(1, reg) for st in op.merge(tuple(f"{n}__r{r}" for n in view.states))]
     if k_co is not None:
         merge += emit_combine(_column_states(op, columns), t=k_co.name, n_threads=k_ways, inner=(n_lane.name, lanes_n))
 
@@ -1169,7 +1183,7 @@ def _tile_reduce_axis(
     # The per-cell reduce loop is the node's own lowering (``Fold.lower``) off the :class:`Fold`
     # **node** — the walk reaches any nested contraction as a node. The algebra
     # is read off the ``Fold`` node itself (``as_reduction`` / ``merge`` — a contraction's K fold
-    # and a monoid's reduce fold both answer it, so the algebra-generic :func:`merge_stmts` /
+    # and a monoid's reduce fold both answer it, so the algebra-generic :meth:`Fold.merge` /
     # :func:`emit_combine` machinery folds either). An operand that does not index the fold's axis
     # is hoisted ahead of the loop and leads the region; the enclosing zero-axis ``Fold``'s
     # projection is ``tail`` (already walked).
@@ -1240,7 +1254,7 @@ def _scan_fold(op: Fold, rloop: Loop, plan: Reduce, lane: Axis) -> list[Stmt]:
     body.append(
         WarpShuffle(state=state, state_b=op.combine.params[len(state) :], combine_states=tuple(op.combine.body), length=width, prefix=True)
     )
-    body.extend(merge_stmts(op, previous))
+    body.extend(op.merge(previous))
     observed = [stmt.rewrite(lambda name: name, sigma=Sigma({axis.name: coordinate})) for stmt in rloop.body[last + 1 :]]
     body.extend([Cond(cond=valid, body=tuple(observed))] if padded else observed)
     body.append(WarpBroadcast(state=state, length=width))

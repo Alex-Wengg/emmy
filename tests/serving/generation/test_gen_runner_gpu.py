@@ -121,9 +121,11 @@ def test_bf16_runner_keeps_residual_and_constants_in_bf16(tmp_path):
         got = stitched()
         reference = eager.model(input_ids=ids[None], use_cache=False).last_hidden_state[0]
         again = stitched()
-    # Compare on the same card: CPU and CUDA BF16 kernels can round differently.
-    # This tolerance still catches a BF16 transport or cast error.
-    torch.testing.assert_close(got, reference, atol=5e-3, rtol=5e-3)
+    # Compare on the same card: CPU and CUDA BF16 kernels can round differently, and a sum the compiler
+    # reassociates can land a BF16 value one or two ulps from eager's (two of 128 elements on an A100 and a
+    # V100 at 2.4). Two BF16 ulps still catch a BF16 transport or cast error.
+    ulp = torch.finfo(torch.bfloat16).eps
+    torch.testing.assert_close(got, reference, atol=2 * ulp * reference.abs().max().item(), rtol=2 * ulp)
     assert torch.equal(got, again)
 
     wide = torch.full((2, config.hidden_size), 70000.0, dtype=torch.bfloat16, device="cuda")
@@ -800,9 +802,9 @@ def test_serving_split_computes_the_declared_w4a4_program(tmp_path, monkeypatch)
     stamped, lowered = [], []
     real_compile = CudaBackend.compile
 
-    def capture(self, graph):
+    def capture(self, graph, *, ctx=None):
         stamped.append(graph.copy())  # the loader's spellings are all in; the passes have not run
-        lowered.append(real_compile(self, graph))
+        lowered.append(real_compile(self, graph, ctx=ctx))
         return lowered[-1]
 
     monkeypatch.setattr(CudaBackend, "compile", capture)
@@ -873,9 +875,9 @@ def test_serving_split_runs_a_dynamic_fp8_checkpoint_weight_only(tmp_path, monke
     stamped = []
     real_compile = CudaBackend.compile
 
-    def capture(self, graph):
+    def capture(self, graph, *, ctx=None):
         stamped.append(graph.copy())
-        return real_compile(self, graph)
+        return real_compile(self, graph, ctx=ctx)
 
     monkeypatch.setattr(CudaBackend, "compile", capture)
     prog, _plan = _compile_split(wrapper, [x], None, F16, ckpt=(str(ckpt), id_to_key))
@@ -934,9 +936,9 @@ def test_bf16_nvfp4_post_matches_numpy(tmp_path, monkeypatch, signed):
     stamped, lowered = [], []
     real_compile = CudaBackend.compile
 
-    def capture(self, graph):
+    def capture(self, graph, *, ctx=None):
         stamped.append(graph.copy())
-        lowered.append(real_compile(self, graph))
+        lowered.append(real_compile(self, graph, ctx=ctx))
         return lowered[-1]
 
     monkeypatch.setattr(CudaBackend, "compile", capture)
@@ -1027,14 +1029,15 @@ def test_bf16_nvfp4_native_mma_matches_numpy_with_quantization_tolerance(tmp_pat
     stamped, lowered = [], []
     real_compile = CudaBackend.compile
 
-    def capture(self, graph):
+    def capture(self, graph, *, ctx=None):
         stamped.append(graph.copy())
-        lowered.append(real_compile(self, graph))
+        lowered.append(real_compile(self, graph, ctx=ctx))
         return lowered[-1]
 
     monkeypatch.setattr(CudaBackend, "compile", capture)
     tile = "mma_m16n8k64_e2m1_f32/f1x2/k4"
-    with pinned_knobs({"TILE": tile, "WORK": "w2x2", "STAGE": "d2/smem-tma", "REDUCE": ""}):
+    # The activation encoder has its own reduction schedule; these pins name the matrix output.
+    with pinned_knobs({"TILE@node_add": tile, "WORK@node_add": "w2x2", "STAGE@node_add": "d2/smem-tma", "REDUCE@node_add": ""}):
         prog, _ = _compile_split(wrapper, list(examples), None, BF16, ckpt=(str(ckpt), id_to_key))
     assert any((getattr(node.op, "knobs", None) or {}).get("TILE") == tile for node in lowered[0].nodes.values())
 

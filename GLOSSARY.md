@@ -50,10 +50,18 @@ describe how a term is used in Emmy; they are not meant to replace a full textbo
 - **Compiler** — A program that translates code from one form into another. Emmy translates PyTorch model operations
   into CUDA code.
 - **Operation (op)** — One unit of computation, such as add, matrix multiplication, softmax, or RMSNorm.
+- **Affine statement** — The Loop IR statement `name = offset + Σ coefficient·arg`: one statement for a sum, a
+  difference, a negation or a product with a literal. Normalization folds every such chain into one, so two spellings
+  of the same sum are one kernel.
 - **Graph** — A representation of a program as nodes connected by data-flow edges. A node usually represents an
   operation; an edge means that one operation uses a value produced by another.
 - **Node** — One item in a graph. In Emmy, it stores an operation, the names of the input buffers it reads (usually
   the producing node's ID), one or more output tensors, and optional hints.
+- **Twin** — One width version of a serving wrapper's program (a GDN layer's state program, an attention layer's pre
+  or post program): M=1, decode bucket, prefill bucket, or symbolic (any width). A wrapper's twins bind the same
+  checkpoint tensors and share one device copy of each.
+- **Folded / source layout** — The two ways a kernel can read a transposed weight: through the transposed copy the
+  loader stores (`<w>`, folded) or from the checkpoint's own layout with its reads reversed (`<w>__source`, source).
 - **Multi-output node (MIMO)** — One graph node or kernel that writes several output buffers. Independent terminal
   branches may fuse into one MIMO kernel while retaining one output port per observable value.
 - **Output-owning cut** — A placement cut whose piece writes one of the kernel's OWN output buffers rather than a
@@ -124,7 +132,8 @@ describe how a term is used in Emmy; they are not meant to replace a full textbo
 - **Tracing** — Observing a PyTorch program with example inputs to capture the operations and data flow that it
   performs.
 - **Lowering** — Moving from a high-level representation to a more detailed, machine-oriented one while preserving
-  the program's meaning.
+  the program's meaning. Lowering Tensor IR to Loop IR gives each tensor primitive an explicit loop nest; fusion then
+  merges loop nests where their structure permits it.
 - **Total lift** — The loop→tile boundary: one mechanical conversion that turns every inner reduction loop into a
   Fold tree, turns each local output loop's projection into a zero-axis term evaluated over its sweep axis, peels outer
   parallel loops into placement, and

@@ -6,19 +6,22 @@ afterwards.
 
 ## `010_materialize` — bind the schedule to threads (and expand the contraction)
 
-`010_materialize` is a thin wrapper: after the split-survivor assert it makes **one** call to
-`_factor.factorize(tile, root)`, the entry to the recursive emitter, then passes the finished body through
-`_drop_repeated_declarations` — the emitted body's one legality guard. Operand cones splice INDEPENDENTLY
-(`Fold.spliced_step`), so two sibling cones reading one shared broadcast constant each carry their own copy of its
-`buf[0]` `Load`, under the same SSA name and at the same address; flattened into one loop body that is two C
-declarations of one name, which nvcc rejects (*already declared in the current scope*). The repeat binds nothing new,
-so it is dropped with NO rewrite — which is what keeps the guard narrow enough to run over a WHOLE kernel body. The
-renaming forms (`_atom._dedup_loads`, `stmt.dedup_loads`) collapse two DIFFERENT names at one address, which needs a
-memory-effect reading neither has: a `Write` or an async fill between two identical loads of a staged buffer makes the
-second a different value. A same-name repeat cannot hide such a reload, since a rebind in one C scope is already
-illegal. A same-dtype `copy` of a value already bound to what its name holds is the same repeat in another spelling
-(a placement cut drops a workspace read's identity cast in one cone and keeps it in a sibling), and is dropped too. A
-name re-bound to a DIFFERENT address is left alone: that is an SSA fault and must surface as one.
+`010_materialize` is a thin wrapper: after the split-survivor assert it makes **one** call to `_factor.factorize(tile,
+root)`, the entry to the recursive emitter, spells every `Affine` statement of the finished body as its binary
+`Assign`s over `Let`-bound literals — Kernel IR evaluates one operation at a time, so no kernel pass meets a sum —
+then passes it through `_drop_repeated_declarations` — the emitted body's one legality guard. Operand cones splice
+INDEPENDENTLY (`Fold.spliced_step`), so two sibling cones reading one shared broadcast constant each carry their own
+copy of its `buf[0]` `Load`, under the same SSA name and at the same address; flattened into one loop body that is two
+C declarations of one name, which nvcc rejects (*already declared in the current scope*). The repeat binds nothing
+new, so it is dropped with NO rewrite — which is what keeps the guard narrow enough to run over a WHOLE kernel body.
+The renaming forms (`_atom._dedup_loads`, `stmt.normalize.place_values`) collapse two DIFFERENT names at one address,
+which needs a memory-effect reading neither has: a `Write` or an async fill between two identical loads of a staged
+buffer makes the second a different value. A same-name repeat cannot hide such a reload, since a rebind in one C scope
+is already illegal. A same-dtype `copy` of a value already bound to what its name holds is the same repeat in another
+spelling (a placement cut drops a workspace read's identity cast in one cone and keeps it in a sibling), and is
+dropped too. A name re-bound to a DIFFERENT address is left alone: that is an SSA fault and must surface as one.
+Repeated `Let` bindings follow the same rule: their expression representation and declared dtype must agree. Signed
+zero remains distinct, and an incompatible repeated declaration still surfaces as an SSA fault.
 
 When a projection recomputes only some outputs of an already bound reduction, its smaller loop is a distinct
 statement. Its exported accumulators receive distinct names through the same positional renaming used for other
@@ -123,9 +126,13 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 
 ### The one factorizer
 
-The scalar binding arm refuses a row that selects a contraction tile inside the subtree it lowers serially.
-The existing rejected-row path retries another schedule; when a pin leaves none that lower, compilation raises
-`LoweringError` naming the enclosing fold and the ignored tile's site.
+The scalar binding arm refuses a row that selects a contraction tile inside the subtree it lowers serially. The
+schedule offer applies the same rule (`TileOp.nested_tiles`), so an enumerated row should not reach this refusal,
+and a pin that names such a tile is refused at the offer with the rule's reason. The binder keeps the check for the
+cases the offer does not see: a root whose row tiles it but that still lowers serially here (its tile has no placed
+`(m, n)` axes, or the grid has fewer than two axes), a `TILE` at that root itself, and a root the binder peels to
+under that schedule that differs from the one `ops.kernel_roots` reads from the term. The greedy's rejected-row
+path then retries another schedule.
 
 `_factor.factorize(tile, root)` is the **entry** every `TileOp` root lowers through: it builds the ambient `Ctx` and
 binds a wholly serial tree directly, so shared carriers are lowered together. A schedule that tiles an output or
@@ -749,6 +756,8 @@ A strided loop's variable counts as a multiple of the alignment its start and st
 starts at `lane * n` reads its run as one vector even though the variable's own coefficient is one.
 
 `030_stamp_types` resolves element dtypes, including the common branch type of a `Select` used by later statements.
+Register-partial merges use the same accumulator policy as streaming updates: selecting folds retain the input dtype,
+while accumulating folds promote to f32. A merge reassigns the existing carrier and cannot change its declaration.
 Integer algebra is always restamped from its typed operands, repairing a
 stale float stamp that a structurally cloned, previously untyped body can carry. `050_vectorize_loads` /
 `080_vectorize_stores` /
@@ -801,6 +810,8 @@ under the default fast-math regime. Structural body normalization stays independ
 
 `085_fast_exp` follows the enabled `FAST_MATH` default, unless an explicit `FAST_EXP` pin overrides it. It lowers
 `exp` through `__expf`, promoting half inputs and rounding back afterward, and records the policy for idempotence.
+The rewrite includes generated `RegStore` epilogue lambdas, each traversed in its own SSA scope. Host evaluation
+continues to use `exp`; only CUDA evaluation uses the approximate intrinsic.
 `100_loopify` remains off by default (`EMMY_LOOPIFY=N`), a generic **loop re-roller** iterated to a fixpoint.
 Loopify folds a maximal run of ≥ `N` congruent per-fragment statements —
 an mma body's per-fragment epilogue (`FragmentApply`), its load+mma pairs, the fragment `RegStore`s, the A-fragment

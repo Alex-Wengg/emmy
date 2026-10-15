@@ -173,7 +173,8 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   operation or search key survives decomposition.
 - `release.py` — shell-free parsing of one pinned `models/<slug>.env` plus derivation of the release identity and
   exact compiler realization matrix. Trace and eval share it, so model, revision, GPU, canonical file, decode,
-  prefill, M=1, warm shapes, symbolic fallbacks and input pin regimes cannot drift across independent flags.
+  prefill, M=1, warm shapes, symbolic fallbacks and input pin regimes (the `:fm` lanes, the cache regime `SERVE_ENV`
+  declares) cannot drift across independent flags.
 - `gen_runner.py` — `EmmyGenRunner` (Phase 2; sibling to `EmmyForwardRunner`). Carves SDPA out of every
   decoder layer (`build_attention_split_wrapper`; Gemma-nano PLE blocks — `hidden_size_per_layer_input` — are
   rejected loudly there: the carve has no seam for the `per_layer_input` multiply), compiles **two dynamic-`num_tokens`
@@ -231,8 +232,17 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   **weights are shared**: `_compile_split` binds constants through a per-wrapper device cache
   (`_bind_plan_constants` — one upload per `(source_path, load_ops, plan dtype)`, the same device tensor lent to both
   builds when their logical dtypes agree), so
-  the decode twin adds no weight copy. **`EMMY_GEN_DECODE_BUCKET=0`** (`config.gen_decode_bucket`) still disables the
-  twin entirely at the cost of decode speed. A further static **M=1** twin pair (`EMMY_GEN_M1_TIER`, default on)
+  the decode twin adds no weight copy. The cut pass may store a transposed weight folded or in its source layout, a
+  choice per kernel. The per-wrapper scope (`twins.LayoutScope`) keeps one layout per weight: before any twin
+  compiles it settles folded every weight a twin reads with no layout fork, the runner builds the twins narrowest
+  first (M=1 when that tier is on, else the decode bucket; then the prefill bucket; the symbolic program last), and
+  each later twin compiles with the layouts settled so far (`settled_layouts`). A dropped tier takes its layouts and
+  device copies back out, and a plan that would still bind a weight in a second layout is refused (`LayoutConflict`,
+  never a reason to drop a tier). `emmy eval golden` and the `emmy run --golden` target walk order twins with
+  `twins.twins_in_build_order`, from the checkpoint tensors each program binds and its input and output sizes; the
+  serving test suite's golden (`tests/serving/regen.py`) replays the layouts the runner settled.
+  **`EMMY_GEN_DECODE_BUCKET=0`** (`config.gen_decode_bucket`) still disables the twin entirely at the cost of decode
+  speed. A further static **M=1** twin pair (`EMMY_GEN_M1_TIER`, default on)
   routes true single-token decode onto gemv-class matvec programs, and `EMMY_GEN_ALIAS_ATTN` lets
   vLLM's paged attention write directly into the post program's `attn_out` input backing — since A4 for EVERY
   tier (`post_attn_backing` routes rows exactly like `forward_layer_post_device`: M=1, decode bucket, exact
@@ -474,11 +484,11 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   measured; `--strict-evidence` (`EMMY_STRICT_EVIDENCE`) fails the boot on a fork nothing measured decides — and only
   evidence recorded against the *serving graph* carries serving. An isolated snippet does not:
   fusion inside a real block produces a different graph (`F.rms_norm(x) @ w` binds a cone the in-model op does not).
-  Cache regimes may differ between programs in the same file: decode can use cold measurements while prefill
-  retains hot measurements. Before compiling a plan template, the runner matches its freshly lowered root
-  identities to the measured golden roots in the live precision lane and selects their one cache regime.
-  Mixed regimes within that program, or incomplete coverage of a cold program, are refused. An explicit
-  `COLD_CACHE` pin remains authoritative. This selects evidence during compilation; serving inserts no eviction.
+  The cache regime is the serving config's declaration, never an inference from the rows: `EMMY_COLD_CACHE=1` in
+  `SERVE_ENV` puts a `COLD_CACHE` pin on every lane's rows, `serve.sh` exports it before the server starts, and the
+  runner compiles every plan template under the live knob, reading that regime's rows only. A row recorded in the
+  other regime is no evidence, and the release audit `emmy eval golden` counts it as a missing row. The regime
+  selects evidence; serving inserts no eviction.
   So the evidence path is the **twins**. `emmy trace CHECKPOINT --serving-twins --serving-config PATH` captures
   every distinct structural target once as symbolic Loop IR and attaches the exact config-derived realization
   matrix. `emmy run --golden PATH --bench --record` (or `--record-greedy`) measures and records each binding and

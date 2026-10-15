@@ -12,6 +12,16 @@ from pathlib import Path
 from emmy.compiler.pipeline.search.golden import GoldenFile, Measurements, write_trace_inventories
 
 
+class _Twin:
+    """A captured twin that a stubbed compile returns as itself; it binds no constant and has no inputs or outputs."""
+
+    inputs: list = []
+    outputs: list = []
+
+    def loadable_constants(self):
+        return []
+
+
 def test_eval_golden_requires_exact_file_and_serving_config(run_cli, tmp_path):
     rc, stdout, stderr = run_cli("eval", "golden")
     assert rc == 2
@@ -49,15 +59,24 @@ def test_serving_config_derives_standard_and_fast_math_realizations(tmp_path):
     }
 
 
-def _release_golden(path: Path, twins: dict[str, tuple[int, list[tuple[str, dict, bool]]]]) -> None:
-    """A release golden for ``twins``: each twin a relu of its own size, traced into the file under its name, with a
-    measured row per ``(template, bindings, fast math)`` the config reaches it at."""
+def _relu(size: int):
     from emmy.commands.trace import trace_inline_code
+
+    return trace_inline_code(f"torch.relu(torch.randn({size}))")["graph"]
+
+
+def _release_golden(path: Path, twins: dict[str, tuple[int, list[tuple[str, dict, bool]]]], cold: frozenset[str] = frozenset()) -> None:
+    """A release golden for ``twins``: each twin a relu of its own size, traced into the file under its name, with a
+    measured row per ``(template, bindings, fast math)`` the config reaches it at — measured cold where ``cold``
+    names the template."""
     from emmy.compiler.context import Context
 
-    graphs = {twin: trace_inline_code(f"torch.relu(torch.randn({size}))")["graph"] for twin, (size, _rows) in twins.items()}
+    graphs = {twin: _relu(size) for twin, (size, _rows) in twins.items()}
     templates = {
-        twin: [{"name": name, "bindings": bindings, "pins": {"FAST_MATH": fast}} for name, bindings, fast in rows]
+        twin: [
+            {"name": name, "bindings": bindings, "pins": {"FAST_MATH": fast, **({"COLD_CACHE": True} if name in cold else {})}}
+            for name, bindings, fast in rows
+        ]
         for twin, (_size, rows) in twins.items()
     }
     ctx = Context.from_target((8, 9), gpu_name="NVIDIA GeForce RTX 4090")
@@ -95,7 +114,7 @@ def test_eval_golden_audits_file_scoped_static_release(monkeypatch, tmp_path):
     ctx = Context.from_target((8, 9), gpu_name="NVIDIA GeForce RTX 4090")
     monkeypatch.setattr(Context, "probe", staticmethod(lambda: ctx))
     captured = {"compiles": []}
-    twin = object()
+    twin = _Twin()
 
     def fake_capture(source, **kwargs):
         captured["capture"] = (source, kwargs)
@@ -108,6 +127,7 @@ def test_eval_golden_audits_file_scoped_static_release(monkeypatch, tmp_path):
         return graph
 
     monkeypatch.setattr(twins, "capture_twin_graphs", fake_capture)
+    monkeypatch.setattr(twins, "fork_less_weights", lambda _graph, _ctx: set())  # a stub twin lowers to nothing
     monkeypatch.setattr(Pipeline, "run", fake_run)
 
     eval_cmd.handle_eval_golden(SimpleNamespace(golden=str(golden), serving_config=str(config)))
@@ -166,8 +186,9 @@ def test_eval_golden_fails_when_a_twin_is_not_decided_by_the_golden_rows(monkeyp
     )
     ctx = Context.from_target((8, 9), gpu_name="NVIDIA GeForce RTX 4090")
     monkeypatch.setattr(Context, "probe", staticmethod(lambda: ctx))
-    undecided = object()
-    monkeypatch.setattr(twins, "capture_twin_graphs", lambda source, **kwargs: {"pre1": object(), "post1": undecided})
+    undecided = _Twin()
+    monkeypatch.setattr(twins, "capture_twin_graphs", lambda source, **kwargs: {"pre1": _Twin(), "post1": undecided})
+    monkeypatch.setattr(twins, "fork_less_weights", lambda _graph, _ctx: set())  # a stub twin lowers to nothing
 
     def fake_run(self, graph, *, ctx=None, **_kwargs):
         if graph is undecided:
@@ -210,8 +231,9 @@ def test_eval_golden_compiles_a_static_twin_only_in_the_lanes_that_warm_its_widt
     )
     ctx = Context.from_target((8, 9), gpu_name="NVIDIA GeForce RTX 4090")
     monkeypatch.setattr(Context, "probe", staticmethod(lambda: ctx))
-    graphs = {"pre8": object(), "pre64": object(), "pre-sym": object()}
+    graphs = {"pre8": _Twin(), "pre64": _Twin(), "pre-sym": _Twin()}
     monkeypatch.setattr(twins, "capture_twin_graphs", lambda source, **kwargs: dict(graphs))
+    monkeypatch.setattr(twins, "fork_less_weights", lambda _graph, _ctx: set())  # a stub twin lowers to nothing
     compiled = []
 
     def fake_run(self, graph, *, ctx=None, **_kwargs):
@@ -225,6 +247,83 @@ def test_eval_golden_compiles_a_static_twin_only_in_the_lanes_that_warm_its_widt
     eval_cmd.handle_eval_golden(SimpleNamespace(golden=str(golden), serving_config=str(config)))
 
     assert sorted(compiled) == [("pre-sym", "False"), ("pre-sym", "True"), ("pre64", "True"), ("pre8", "False")]
+
+
+def _audited_release(tmp_path, monkeypatch, twins: dict, cold: frozenset[str], env: str = ""):
+    """A width-1 static release of ``twins`` (rows of the ``cold`` templates measured cold) whose server runs under
+    ``env``, and whose audit compiles fresh traces of the same programs. Returns the golden's and the serving config's
+    paths, and the list each serving-matrix compile appends its twin, the context's cache regime (``cold_cache``), the
+    ``COLD_CACHE`` pin and strict evidence to."""
+    import emmy.serving.twins as twins_mod
+    from emmy import config as emmy_config
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline import Pipeline
+
+    golden = tmp_path / "golden.json"
+    _release_golden(golden, twins, cold)
+    config = tmp_path / "release.env"
+    config.write_text(
+        f'SERVE_MODEL=org/model\nSERVE_GPU="NVIDIA GeForce RTX 4090"\nSERVE_GOLDEN_FILE={golden}\n'
+        "SERVE_STATIC_ONLY=1\nSERVE_MAX_NUM_BATCHED_TOKENS=1\nSERVE_DECODE_BUCKET=1\n"
+        "SERVE_PREFILL_CAPACITY=1\nSERVE_PREFILL_BUCKET=0\nSERVE_M1_TIER=1\nSERVE_CAPTURE_SIZES=[1]\n"
+        f'SERVE_ENV="{env}"\n'
+    )
+    # The context ``serve`` probes: the golden's card under the live knobs, which the audit pins per lane.
+    monkeypatch.setattr(Context, "probe", staticmethod(lambda: Context.from_target((8, 9), gpu_name="NVIDIA GeForce RTX 4090")))
+    monkeypatch.delenv("EMMY_COLD_CACHE", raising=False)
+    fresh = {twin: _relu(size) for twin, (size, _rows) in twins.items()}
+    monkeypatch.setattr(twins_mod, "capture_twin_graphs", lambda source, **kwargs: dict(fresh))
+    monkeypatch.setattr(twins_mod, "fork_less_weights", lambda _graph, _ctx: set())  # a stub twin lowers to nothing
+    compiled = []
+
+    def run(self, graph, *, ctx=None, **kwargs):
+        twin = next(name for name, program in fresh.items() if program is graph)
+        compiled.append((twin, ctx.cold_cache, emmy_config.knob_raw("COLD_CACHE"), emmy_config.strict_evidence()))
+        return graph
+
+    monkeypatch.setattr(Pipeline, "run", run)
+    return golden, config, compiled
+
+
+def test_eval_golden_compiles_each_lane_in_the_cache_regime_the_config_declares(monkeypatch, tmp_path):
+    """The serving config declares the cache regime its server runs under (``EMMY_COLD_CACHE`` in ``SERVE_ENV``), so
+    every lane's rows carry the ``COLD_CACHE`` pin and the audit compiles each twin under that pin, in the context
+    ``serve`` probes under it, strictly."""
+    from types import SimpleNamespace
+
+    import emmy.commands.eval as eval_cmd
+
+    twins = {"pre1": (8, [("m1", {"num_tokens": 1}, False)]), "post1": (64, [("m1", {"num_tokens": 1}, False)])}
+    golden, config, compiled = _audited_release(tmp_path, monkeypatch, twins, frozenset({"m1"}), env="EMMY_COLD_CACHE=1")
+
+    eval_cmd.handle_eval_golden(SimpleNamespace(golden=str(golden), serving_config=str(config)))
+
+    assert sorted(compiled) == [("post1", True, "True", True), ("pre1", True, "True", True)]
+
+
+def _row_in_another_cache_regime_is_missing(tmp_path, monkeypatch, caplog, *, env: str, cold: frozenset[str]) -> None:
+    """A row is evidence in its own regime only: one recorded in the other cache regime than the config declares is a
+    missing row, and the audit fails before it compiles anything."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    import emmy.commands.eval as eval_cmd
+
+    twins = {"pre1": (8, [("m1", {"num_tokens": 1}, False)])}
+    golden, config, compiled = _audited_release(tmp_path, monkeypatch, twins, cold, env=env)
+    with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as exc:
+        eval_cmd.handle_eval_golden(SimpleNamespace(golden=str(golden), serving_config=str(config)))
+    assert exc.value.code == 1
+    assert any("pre1: missing row" in r.getMessage() for r in caplog.records) and not compiled
+
+
+def test_eval_golden_counts_a_hot_row_as_missing_under_a_cold_declaration(monkeypatch, tmp_path, caplog):
+    _row_in_another_cache_regime_is_missing(tmp_path, monkeypatch, caplog, env="EMMY_COLD_CACHE=1", cold=frozenset())
+
+
+def test_eval_golden_counts_a_cold_row_as_missing_without_a_cold_declaration(monkeypatch, tmp_path, caplog):
+    _row_in_another_cache_regime_is_missing(tmp_path, monkeypatch, caplog, env="", cold=frozenset({"m1"}))
 
 
 def test_eval_prior_golden_ranks_an_exported_datasets_golden_pools(tmp_path, caplog, monkeypatch):

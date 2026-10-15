@@ -50,6 +50,20 @@ def parse_reduce(spec: str) -> Reduce | None:
         return None
 
 
+def fork_ahead(tile, decision: Mapping) -> bool:
+    """Whether the kernel-set fork a stored decision (a routing row's arm) was taken at still lies ahead of ``tile``,
+    which is when the decision's price is a price of ``tile``. A decision ``tile`` has taken already — a placement
+    once its placement is decided, the layout of a constant it already reads folded, a split once it declined the
+    split — left another kernel and prices that one; so does the other arm of a fork ``tile`` is the kept arm of."""
+    for key in decision:
+        family = family_of(str(key))
+        if (family == "PLACE" and tile.placement_decided) or (family == "REDUCE" and tile.split_consumed):
+            return False
+        if family == "LAYOUT" and str(key).partition("@")[2] in tile.layout_decided:
+            return False
+    return True
+
+
 def spelled_arm(options, row) -> tuple[object, dict[str, str]] | None:
     """The kernel-set arm a knob row spells among a cut-pass fork's ``options``, as ``(option, its
     knobs)`` — or ``None`` when the row decides nothing at this fork.
@@ -167,8 +181,8 @@ def unreproducible_pin_flag(
         # A kernel pin is its family's bare pin, asked of the kernels it names (``kernel_names``, launch
         # order beside ``kernel_knobs``: each kernel's name and graph node id, the two names the compile's
         # ``kernel_pin`` reads -- a cut piece's node id carries its ordinal, its kernel name does not);
-        # without names, of every kernel, as a bare pin is. A placement
-        # receipt names a seam, never a kernel, so a kernel-scoped PLACE pin keeps its scope and matches none.
+        # without names, of every kernel, as a bare pin is. A placement receipt names a local seam;
+        # a kernel-scoped PLACE pin instead needs the exact source-key receipt from the cut pass.
         name = fam if kernel_scoped(label) and fam != "PLACE" else label
         if fam in {"PLACE", "LAYOUT"}:
             if placement_knobs is None:
@@ -177,7 +191,7 @@ def unreproducible_pin_flag(
             # A child-site pin addresses a named piece, while the structural
             # receipt uses a site name local to that piece. The cut pass records
             # an exact source-key/value receipt only after applying its choice.
-            if fam == "PLACE" and "/" in (axis_of(label) or "") and applied_place_pins is not None:
+            if fam == "PLACE" and label != "PLACE" and applied_place_pins is not None:
                 if label in applied_place_pins and values_equal(label, want, applied_place_pins[label]):
                     continue
         elif kernel_scoped(label) and kernel_names is not None:
@@ -272,12 +286,7 @@ def place_keys_tracked() -> bool:
 def unmatched_place_pins(resolved: set[str]) -> list[str]:
     """The live scoped ``PLACE`` pins no kernel of a compile resolved (:func:`tracking_place_keys`)."""
     return sorted(
-        name
-        for name, _ in family_pins("PLACE", kernels=True)
-        if family_of(name) == "PLACE"
-        and name != "PLACE"
-        and (not kernel_scoped(name) or "/" in (axis_of(name) or ""))
-        and name not in resolved
+        name for name, _ in family_pins("PLACE", kernels=True) if family_of(name) == "PLACE" and name != "PLACE" and name not in resolved
     )
 
 
@@ -308,26 +317,23 @@ def composed_cuts_for(kernel: str | None) -> list[tuple[str, ...]]:
     return out
 
 
-def recorded_cut_for(kernel: str | None) -> bool:
-    """Whether a measured placement cut continues on this exact fresh piece."""
-    return kernel is not None and any(recorded == kernel and keys for recorded, keys in _COMPOSED_ROUTES)
-
-
 def measured_regime_pins() -> dict[str, bool]:
-    """The effective precision and cache regime, recorded as golden input pins.
+    """The effective regime, recorded as golden input pins: the umbrella always, a precision-trading knob when it is
+    pinned on its own, any other regime knob when it is off its default — the spelling ``space.regime_pins`` reads
+    back as the live regime.
 
     A recorded row's ``pins`` is the regime a replay republishes (:func:`pinned_knobs`), so a row
     measured under one of these has to carry it: the reduced-accumulate and native-fp8 cells are
     not offered without it, and the row would otherwise name a candidate no later compile enumerates
     — measured evidence for a pick nothing can take again."""
-    from emmy.compiler.pipeline.search.space import F16_MMA_F32_ACC, FAST_MATH, FP8_MMA, cold_cache, precision_pin  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.space import FAST_MATH, PRECISION_KNOBS, REGIME_KNOBS, regime_pin  # noqa: PLC0415
 
-    live = ((knob, knob.raw()) for knob in (FAST_MATH, F16_MMA_F32_ACC, FP8_MMA))
-    return {
-        FAST_MATH.name: precision_pin(FAST_MATH),
-        **{knob.name: knob.parse(raw) for knob, raw in live if raw is not None},
-        **({"COLD_CACHE": True} if cold_cache() else {}),
-    }
+    def recorded(knob) -> bool:
+        if knob in PRECISION_KNOBS:
+            return knob is FAST_MATH or knob.raw() is not None
+        return regime_pin(knob) != knob.hints[0]
+
+    return {knob.name: regime_pin(knob) for knob in REGIME_KNOBS if recorded(knob)}
 
 
 @contextlib.contextmanager

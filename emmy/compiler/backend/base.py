@@ -159,9 +159,10 @@ class Backend(ABC):
 
         Default implementation walks ``compiled`` (a ``Graph``) in topological
         order and dispatches every compute node through ``op.forward``. Inputs
-        and ``ConstantOp`` overrides come from ``input_data``; scalar
-        ``ConstantOp``s without overrides materialize as single-element float32
-        arrays. ``LoopOp.forward`` plugs into this same walk, so post-fusion
+        and externally bound ``ConstantOp``s (``value=None``) come from
+        ``input_data``. A ``ConstantOp.value`` is fixed at compile time; changing
+        it requires recompilation, since lowering may already have consumed it.
+        ``LoopOp.forward`` plugs into this same walk, so post-fusion
         graphs interpret identically — used by ``NumpyBackend`` and
         ``LoopBackend``. Backends with native runtimes (e.g. CUDA) override.
         """
@@ -207,9 +208,12 @@ class Backend(ABC):
             if isinstance(node.op, InputOp):
                 continue
 
+            # A body op's ``forward`` zips its arrays with its own input order, which a bare op derives from its body;
+            # the node's edge order is the same set, so bind by name.
+            order = list(node.op.inputs) if set(getattr(node.op, "inputs", ())) == set(node.inputs) else list(node.inputs)
             args = [
                 decode_bf16(values[inp]) if not isinstance(node.op, BitcastOp) and compiled.buffer(inp).dtype == BF16 else values[inp]
-                for inp in node.inputs
+                for inp in order
             ]
             if isinstance(node.op, ElementwiseOp) and dtype_np.kind == "f":
                 args = [a.astype(np.promote_types(a.dtype, dtype_np), copy=False) if a.dtype.kind == "f" else a for a in args]

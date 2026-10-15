@@ -55,9 +55,11 @@ class GreedyStrategy(SearchStrategy):
       re-ranks; once no row of the piece binds, the cut that minted it is retired at its own
       fork — that one splice withdrawn, every other kernel-set decision still taken from the
       evidence — and the pieces' blocklists go with it.
-    * **Prior-off re-resolve** — when the blocklist budget exhausts, one final resolve without
-      the schedule prior drops the extrapolation that overflowed. Kernel-set forks still use
-      measured arms and the placement prior, and ``blocked`` rides along.
+    * **Prior-off re-resolve** — when the retry budget runs out or the retries have nothing left to
+      block, one final resolve drops the schedule prior at the nodes still un-lowered, and with it the
+      extrapolation that overflowed: those nodes take the first leaf the enumeration produces that
+      ``blocked`` does not list. Every other schedule fork keeps the prior, and kernel-set forks
+      still use measured arms and the placement prior.
     * **Loud failure** — a node the settled terminal left un-lowered raises
       :class:`~emmy.compiler.pipeline.pipeline.LoweringError` instead of a downstream
       ``CudaBackend`` mystery. What counts as un-lowered is the whole terminal when the
@@ -107,18 +109,18 @@ class GreedyStrategy(SearchStrategy):
                 stuck = _stuck(terminal, rejections, lowers_to_cuda=complete)
                 if not stuck or not _retire(blocked, trace, stuck):
                     break
-            # The prior-ranked tiles all overflowed ``validate(ctx)`` within the retry budget — an
-            # *online* prior can extrapolate a large tile onto a small shape, and the blocklist
-            # retry exhausts before reaching an in-budget leaf. Re-resolve WITHOUT the schedule prior
-            # (the emission-order pick): the point is dropping the extrapolation that overflowed, not
-            # the quality of what emission order lands on. When that leaf overflows too the
-            # re-resolve stays un-lowered and ``_raise_on_unlowered`` fires below, exactly as
-            # before.
-            if _stuck(terminal, rejections, lowers_to_cuda=complete):
+            # The retries ran out, or had nothing left to block, with a node still un-lowered — an
+            # *online* prior can extrapolate a large tile onto a small shape, and the retry budget
+            # runs out before reaching an in-budget leaf. Re-resolve WITHOUT the schedule prior
+            # at the nodes still un-lowered (the emission-order pick): the point is dropping the
+            # extrapolation that overflowed, not the quality of what emission order lands on. Every
+            # other kernel keeps its prior-ranked pick. When that leaf overflows too the re-resolve
+            # stays un-lowered and ``_raise_on_unlowered`` fires below.
+            if stuck := _stuck(terminal, rejections, lowers_to_cuda=complete):
                 resolved.clear()
                 rejections = []
                 run = Run(pipeline=pipeline, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
-                terminal, trace = run.resolve(graph.copy(), greedy_decide(blocked=blocked, prior=None, db=db))
+                terminal, trace = run.resolve(graph.copy(), greedy_decide(blocked=blocked, db=db, unranked=frozenset(stuck)))
         _raise_on_unlowered(terminal, rejections, lowers_to_cuda=complete)
         if report_pins:
             for key in unmatched_place_pins(resolved):
@@ -133,7 +135,7 @@ class GreedyStrategy(SearchStrategy):
         )
         terminal.hints.set(
             PLACEMENT_APPLIED_PINS_HINT,
-            {key: value for key, value in family_pins("PLACE", kernels=True) if key in resolved and "/" in (axis_of(key) or "")},
+            {key: value for key, value in family_pins("PLACE", kernels=True) if key in resolved and axis_of(key) is not None},
         )
         logger.info("compile: total %.2fs (deterministic resolve)", time.monotonic() - t_start)
         return terminal

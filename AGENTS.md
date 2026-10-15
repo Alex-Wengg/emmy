@@ -87,9 +87,10 @@ or evidence, and nothing under `ir/` imports the pipeline that holds them.
   is a pass in the wrong place.
 - **A pass may call a normalization step; normalization never calls a pass.**
 - **Nothing is added to normalization to make a kernel faster.** A canonical form moves every kernel identity and
-  every golden; whether a transform pays is the knob's evidence question. An exact simplification that always removes
-  work and never adds any is a canonical form, like constant folding: it gives the same bits for every input, inf and
-  NaN included, so there is nothing to decide.
+  every golden; whether a transform pays is the knob's evidence question. A simplification that always removes work
+  and never adds any is a canonical form, like constant folding or the fold of a sum into one `Affine` statement:
+  it decides nothing, and it is exact up to the reassociation of a sum and the rounding of a literal reciprocal,
+  which every reduce schedule and fast-math division already take.
 
 The IR `ARCHITECTURE.md` owns the design; `tests/architecture/test_layering.py` guards the module's single entry
 point and the `ir/` → pipeline import boundary.
@@ -283,6 +284,9 @@ These are invariants — they hold for every doc change, no exceptions:
 - **`ARCHITECTURE.md` files describe concepts, invariants, and the few key entry-point modules — not every file.** Do
   NOT add exhaustive per-file "module tree" tables or `file.py:123` line-number citations; they churn on every refactor
   and rot immediately. Name a module/symbol only when it is a genuine entry point, and refer to it by name, not line.
+- **README.md is for external users and people starting development with Emmy.** Prioritize getting started,
+  practical examples, and the essentials for new contributors. Keep internal details to a minimum so they do not
+  overwhelm new users and contributors. Link to subsystem and contributor documentation for deeper explanations.
 - **README.md routes; AGENTS.md does not duplicate.** README is the canonical architecture index. Each subsystem's
   detail lives in its nearest `ARCHITECTURE.md`; do not repeat links, CLI details, environment variables, or reference
   lists here.

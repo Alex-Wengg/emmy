@@ -5,10 +5,11 @@ import pytest
 
 from emmy.compiler.dtype import F16, F32, I32
 from emmy.compiler.ir.elementwise import ElementwiseImpl
-from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.expr import Literal, Var
 from emmy.compiler.ir.kernel.ir import RegStore
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Assign, RenderCtx, Write
+from emmy.compiler.ir.stmt import Assign, Let, RenderCtx, Write
+from emmy.compiler.pipeline import RuleSkipped
 from emmy.compiler.pipeline.passes.lowering.kernel._atom import _warp_epilogue
 from tests.compiler.helpers import requires_cuda, requires_sm, requires_sm90
 
@@ -107,6 +108,66 @@ def test_untyped_copy_keeps_the_existing_f32_epilogue() -> None:
     assert epilogue.body[0].dtype is None
     assert "const float result_e0 = _c[0];" in source
     assert "__float2half(_c[0])" not in source
+
+
+def test_typed_literal_binding_survives_fragment_epilogue_rendering() -> None:
+    source, epilogue = _render(
+        Let("scale", Literal(0.125), dtype=F32),
+        Assign("result", "multiply", ("acc", "scale")),
+    )
+    assert epilogue.body[0] == Let("scale", Literal(0.125), dtype=F32)
+    assert "const float scale_e0 = 0.125f;" in source
+    assert "const float result_e0 = _c[0] * scale_e0;" in source
+
+
+def test_fragment_epilogue_substitutes_binding_coordinates_and_rejects_unbound_values() -> None:
+    source, _ = _render(Let("column", Var("n"), dtype=I32), Assign("result", "multiply", ("acc", "column")))
+    assert "const int column_e0 = n + (_t * 2 + 0);" in source
+    with pytest.raises(RuleSkipped, match="projection epilogue reads.*missing"):
+        _render(Let("scale", Var("missing"), dtype=F32), Assign("result", "multiply", ("acc", "scale")))
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+@pytest.mark.parametrize("fast_exp", [None, False, True])
+def test_fast_exp_policy_reaches_generated_fragment_epilogues(monkeypatch, fast_math, fast_exp) -> None:
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.context import Context
+    from emmy.compiler.ir.cuda import CudaOp
+    from emmy.compiler.ir.kernel import KernelOp
+    from emmy.compiler.pipeline import FINAL_LOWERING_PASS, KERNEL_PASSES, Pipeline
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    monkeypatch.delenv("EMMY_FAST_EXP", raising=False)
+    graph = graph_from_code("F.silu(torch.randn(64, 64, dtype=torch.float16) @ torch.randn(64, 128, dtype=torch.float16))")[0]
+    pins = {
+        "PLACE": "fuse",
+        "WORK": "w4x1",
+        "TILE": "wgmma_m64n128k16_f16_f32/f1x16/k4",
+        "REDUCE": "",
+        "STAGE": "d1/smem-async",
+        "FAST_MATH": fast_math,
+    }
+    if fast_exp is not None:
+        pins["FAST_EXP"] = fast_exp
+    with pinned_knobs(pins):
+        ctx = Context.from_target((9, 0))
+        lowered = Pipeline.build(KERNEL_PASSES).run(graph, ctx=ctx)
+        (kernel,) = [node.op for node in lowered.nodes.values() if isinstance(node.op, KernelOp)]
+        stores = [stmt for stmt in kernel.body.iter() if isinstance(stmt, RegStore)]
+        assert stores and any(store.run for store in stores), "fixture must reach the grouped fragment stores"
+        enabled = fast_math if fast_exp is None else fast_exp
+        expected = "exp_fast" if enabled else "exp"
+        for store in stores:
+            for cell in (store, *store.run):
+                assert cell.epilogue is not None
+                ops = [stmt.op.name for stmt in cell.epilogue.body if isinstance(stmt, Assign)]
+                assert expected in ops and ("exp" if enabled else "exp_fast") not in ops
+        compiled = Pipeline.build([FINAL_LOWERING_PASS]).run(lowered, ctx=ctx)
+    (source,) = [node.op.kernel_source for node in compiled.nodes.values() if isinstance(node.op, CudaOp)]
+    assert ("__expf(" in source) == enabled
+    assert "wgmma.mma_async" in source
+    values = np.array([-12, -1, 0, 1, 12], dtype=np.float32)
+    np.testing.assert_array_equal(ElementwiseImpl(expected)(values), np.exp(values))
 
 
 def test_transposed_fragment_store_uses_both_output_strides() -> None:

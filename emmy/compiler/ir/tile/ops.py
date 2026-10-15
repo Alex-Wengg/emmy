@@ -30,9 +30,9 @@ from emmy.compiler.ir.schedule.classic import (
     classic_node_key,
     classic_stage_key,
 )
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Select, refs_axis, stmt_axis_names
+from emmy.compiler.ir.stmt import Accum, Affine, Assign, Body, Init, Let, Load, Loop, Select, refs_axis, stmt_axis_names
 from emmy.compiler.ir.stmt.base import Stmt, dtype_promote
-from emmy.compiler.ir.tile.ir import apply_output_specs
+from emmy.compiler.ir.tile.boundary import apply_output_specs
 from emmy.compiler.ir.tile.path import UnknownSiteError, sites
 
 
@@ -52,14 +52,24 @@ def cone_stat_dtypes(pro: tuple, stats: tuple[str, ...], inputs) -> dict[str, ob
         if isinstance(stmt, Load):
             tensor = inputs.get(stmt.input) if inputs else None
             env.update((name, tensor.dtype if tensor is not None else None) for name in stmt.names)
-        elif isinstance(stmt, Assign):
-            args = [env.get(name) for name in stmt.args]
-            env[stmt.name] = stmt.dtype or (get_dtype(dtype_promote(stmt.op.name, [d.name for d in args])) if all(args) else None)
-        elif isinstance(stmt, Init):
+        elif isinstance(stmt, (Assign, Affine)):
+            env[stmt.name] = _promoted(stmt, env)
+        elif isinstance(stmt, (Init, Let)):
             env[stmt.name] = stmt.dtype
         else:
             env.update((name, None) for name in stmt.defines())
     return {nm: dt for nm in stats if (dt := env.get(nm)) is not None}
+
+
+def _promoted(stmt: Assign | Affine, env: dict) -> object:
+    """The dtype ``stmt`` computes at: its stamp, else the promotion of its named operands — a literal operand takes
+    the dtype of the computation and constrains nothing; ``None`` while an operand is untyped."""
+    if stmt.dtype is not None:
+        return stmt.dtype
+    args = [env.get(name) for name in stmt.deps()]
+    if not args or not all(args):
+        return None
+    return get_dtype(dtype_promote(stmt.op.name if isinstance(stmt, Assign) else "add", [dtype.name for dtype in args]))
 
 
 def edge_dtypes(edge, inputs, cache: dict[int, tuple] | None = None, scope: dict | None = None) -> tuple:
@@ -96,10 +106,9 @@ def edge_dtypes(edge, inputs, cache: dict[int, tuple] | None = None, scope: dict
             env.update((name, tensor.dtype if tensor is not None else None) for name in stmt.names)
         elif isinstance(stmt, Fold):
             env.update(zip(stmt.exposes, edge_dtypes(stmt, inputs, cache, env), strict=True))
-        elif isinstance(stmt, Assign):
-            args = [env.get(name) for name in stmt.args]
-            env[stmt.name] = stmt.dtype or (get_dtype(dtype_promote(stmt.op.name, [dtype.name for dtype in args])) if all(args) else None)
-        elif isinstance(stmt, Init):
+        elif isinstance(stmt, (Assign, Affine)):
+            env[stmt.name] = _promoted(stmt, env)
+        elif isinstance(stmt, (Init, Let)):
             env[stmt.name] = stmt.dtype
         elif isinstance(stmt, Select):
             branch_dtypes = [env.get(branch.value) for branch in stmt.branches]
@@ -324,10 +333,13 @@ class Sched:
                 )
                 return min((abs(step[0]) for step in steps if step is not None and step[0]), default=float("inf")), -position
 
-            left = min((order[name] for name in view.left_axes if name in order), key=rank, default=None)
-            right = min((order[name] for name in view.right_axes if name in order), key=rank, default=None)
-            if left is None and not view.left_axes:
-                left = next((pair for name, pair in order.items() if name not in node.free_axes and pair[1].extent == 1), None)
+            # An operand role with no axes of its own takes the unit coordinate the placement added for it.
+            unit = next((pair for name, pair in order.items() if name not in node.free_axes and pair[1].extent == 1), None)
+
+            def side(axes):
+                return min((order[name] for name in axes if name in order), key=rank, default=None) if axes else unit
+
+            left, right = side(view.left_axes), side(view.right_axes)
             if left is not None and right is not None:
                 return (left[1], right[1])
             first, second = mn
@@ -352,11 +364,14 @@ class Sched:
         ax = self.axis_of(parent.node.axis) if parent is not None else None
         if ax is None:
             return None
-        pair = (free[-2], ax.window.parent if ax.window is not None else ax)
+        stream = ax.window.parent if ax.window is not None else ax
         # Under a CHUNKED carrier the orientation is the CONSUMER's, not the term's: the tier
         # builds a ``(row, chunk)`` tile per chunk whichever operand the canonical form put in A,
-        # so the enclosing axis is N here even when A's own axis is the one that would take M.
-        return pair if parent.node.chunked() else orient(pair)
+        # so inherit its placed row axis even when batch axes follow it in the free-axis order.
+        if parent.node.chunked():
+            consumer = self._mn_for(parent.node)
+            return (consumer[0], stream) if consumer is not None else None
+        return orient((free[-2], stream))
 
 
 def sched_of(tile) -> Sched:

@@ -53,7 +53,8 @@ def golden_pools(db: SearchDB, kernel_op: Callable | None = None) -> tuple[list[
         if reason is not None:
             dropped[reason.split(":")[0]] += 1
         else:
-            buckets[(row.gpu, divmod(row.cc, 10), regime_of(row.flags, row.cold_cache), row.kernel, knobs_json(row.bindings))].append(row)
+            regime = regime_of(row.cold_cache, row.precision)
+            buckets[(row.gpu, divmod(row.cc, 10), regime, row.kernel, knobs_json(row.bindings))].append(row)
     pools = []
     for (gpu, cap, regime, identity, _bindings), rows in sorted(buckets.items()):
         rows.sort(key=lambda r: knobs_json(r.knobs))
@@ -68,20 +69,27 @@ def placement_pools(db: SearchDB, pools: list[GoldenPool]) -> list[GoldenPool]:
     kernel: every kernel a golden cut or split, on the card and at the sizes it did it (``taken``; of two decisions
     on one kernel there, the one over more seams), then every golden pool (a piece a cut minted included — it is a
     kernel with forks of its own, walked from its own definition). Nothing is priced: what the golden did is the
-    label."""
+    label. Each pool carries the constant inputs its own file's program binds on the kernel at its sizes (the
+    ``constant`` rows the import filed under the pool's source; a piece, or a target the file keeps no program for,
+    has none and reads every input as an activation), so the placement walk offers the forks a deploy sees — the
+    layout fork of a transposed weight among them."""
     kernels = {k.exact_identity: k for k in db.iter_kernels()}
-    out: dict[tuple, GoldenPool] = {}
+    out: dict[tuple, tuple[GoldenPool, str]] = {}
 
-    def add(pool: GoldenPool) -> None:
-        out.setdefault((pool.kernel.exact_identity, pool.gpu, pool.regime, knobs_json(pool.bindings)), pool)
+    def add(pool: GoldenPool, source: str) -> None:
+        out.setdefault((pool.kernel.exact_identity, pool.gpu, pool.regime, knobs_json(pool.bindings)), (pool, source))
 
-    taken = sorted((decision for decision in db.iter_taken() if decision[-1].startswith("golden:")), key=lambda decision: -len(decision[5]))
-    for gpu, cc, flags, kernel, bindings, arm, cold_cache, source in taken:
+    taken = sorted((decision for decision in db.iter_taken() if decision[-1].startswith("golden:")), key=lambda decision: -len(decision[4]))
+    for gpu, cc, kernel, bindings, arm, cold_cache, precision, source in taken:
         row = GoldenRow({k: str(v) for k, v in arm.items()}, math.nan, source)  # a mark: a decision has no time
-        add(GoldenPool(gpu, divmod(cc, 10), regime_of(flags, cold_cache), kernels[kernel], bindings, (row,)))
+        add(GoldenPool(gpu, divmod(cc, 10), regime_of(cold_cache, precision), kernels[kernel], bindings, (row,)), source)
     for pool in pools:
-        add(replace(pool, rows=()))
-    return list(out.values())
+        add(replace(pool, rows=()), pool.rows[0].source)
+    constants = db.constants()
+    return [
+        replace(pool, placement_constants=constants.get((source, pool.kernel.exact_identity, knobs_json(pool.bindings)), {}))
+        for pool, source in out.values()
+    ]
 
 
 def kernel_sig(feats: Mapping) -> str:
@@ -124,7 +132,7 @@ def measured_groups(rows, kernel_op: Callable) -> tuple[list[MeasuredGroup], dic
         if reason is not None:
             dropped[reason.split(":")[0]] += 1
         else:
-            buckets[(r.gpu, kernel_sig(stamps(kernel_op(r))), float(r.opt), regime_of(r.flags, r.cold_cache))].append(r)
+            buckets[(r.gpu, kernel_sig(stamps(kernel_op(r))), float(r.opt), regime_of(r.cold_cache, r.precision))].append(r)
 
     groups = []
     for (gpu, sig, h_opt, regime), grp in sorted(buckets.items()):
@@ -136,7 +144,15 @@ def measured_groups(rows, kernel_op: Callable) -> tuple[list[MeasuredGroup], dic
     return groups, dict(dropped)
 
 
-def export_dataset(db: SearchDB, *, source: str, pool_sample: int, seed: int, space: str = "schedule", jobs: int | None = None) -> Dataset:
+def export_dataset(
+    db: SearchDB,
+    *,
+    source: str,
+    pool_sample: int,
+    seed: int,
+    space: str = "schedule",
+    jobs: int | None = None,
+) -> Dataset:
     """Every row of ``db`` as a dataset of one ``space``. The schedule space: the golden pools enumerated under
     their own card's context and packed (``sample`` candidates drawn per pool during enumeration, 0 for every
     row), and the measured pools. The placement space: each kernel's placement forks, the arms featurized and

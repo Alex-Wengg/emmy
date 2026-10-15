@@ -65,8 +65,9 @@ operand-edge sites, each site's projection or reduction view, and each contracti
 (`cone_seam`) splits the cone's edges at the K axis into a row-invariant prologue, a per-chunk statistic (a reduce
 that reads K only through one block guard, such as a grouped activation scale's maximum) and a per-cell body. Only
 external reads cross these parts; a value defined inside the consuming body is not bridged. Equal folds shared by
-cell edges lower once through `Body.coalesce`, so attention's output and row sum do not redeclare the same states in
-a replicated fill.
+the edges of one part lower once through `Body.coalesce`: attention's output and row sum do not redeclare the same
+states in a replicated fill, and two row-invariant edges over one norm statistic do not fold it twice in the stat
+prologue.
 `ir/schedule/views` supplies the vocabulary (`node_view`, `Projection`, `Reduction`, `Contraction`,
 `ContractionFacts`) and the one derivation that is not a projection of the site table, `contraction_facts`; the tile
 layer reads through them. The composition context publishes the schedule-facing API (`node`, `site`, `operand`,
@@ -97,12 +98,14 @@ the choice types and key spellings through the package.
 whose values its sites offer where it names them. `ClassicScheduleContext` is the immutable `c + p + t` prefix over
 that problem. Everything a schedule choice cannot change is derived from the tile and the target and memoized on the
 term it derives from — a contraction's `ContractionFacts` on the Fold root (`TileOp.contractions`), the packed operand
-readings, the placement and the two site relations the binder dictates (`shared_roots`, `chain_pairs`) on the
-TileOp, and a node choice's supports on the site that offers it. The compatibility rules — worker inventory,
-physical-axis agreement, fragment seams, the shared-root and chain rules — are stated in `refusals` beside the
+readings, the placement and the three site relations the binder dictates (`shared_roots`, `chain_pairs`,
+`nested_tiles`) on the TileOp, and a node choice's supports on the site that offers it. The compatibility rules —
+worker inventory, physical-axis agreement, fragment seams, the shared-root, chain and nested-tile rules — are stated
+in `refusals` beside the
 per-choice ones, as one function of a pick and a RELATION: what a prefix has decided that those rules read (the
 inventory it claimed, its axis and fragment agreements, and the decided nodes only where a rule reads them — every
-one while no inventory is claimed, all of them at a shared root or a chain member). The context carries that
+one while no inventory is claimed, all of them at a shared root, a chain member or either end of a nested tile).
+The context carries that
 relation and composes it; the kernel-level rules (raster eligibility, resource limits, the producer band) stay with
 it. A node site holds one record per node choice with the facts that are the tile's alone — the inventory it
 claims, its placed geometry and axis agreements, the seam claims that read no transport — and, derived only when
@@ -168,9 +171,11 @@ Whether a fill takes a root's cone over is the
 SCHEDULE's answer and not the term's, so a contraction a tier could fold whole still offers its own row statistic the
 member catalog: the untiled tiers bind it as a fold beside the root, and reading the tier off the term left a
 cooperative reduce evaluating a 16384-wide statistic once per thread. The contraction per-cell tier reads that same
-projection, so a contraction inherits those readings rather than restating them.
+projection, so a contraction inherits those readings rather than restating them. A deferred split's finalizer is
+another root fold: it offers the same legal serial, register-partial and cooperative choices over its workspace
+states. Their cost is measured; the number of partial states does not restrict the legal domain.
 
-Two binder facts are relations between sites rather than node domains, so they compose in `extend` beside the worker
+Three binder facts are relations between sites rather than node domains, so they compose in `extend` beside the worker
 and physical-axis agreements. The binder builds a kernel around several scheduled roots only where the projection
 partitions its outputs by root (`ops.projection_regions` — each store reads exactly one root's region); where it does
 not, one root is the kernel's root and every other reduce lowers serially, so the context refuses a second scheduled
@@ -181,7 +186,15 @@ used to be offered, ranked first, and refused at materialize; the row that coope
 And a chain binds only in the binder's
 untiled arm, so the context refuses a partitioned chain member beside an output-tiled root: there the fill evaluates
 the cone per cell, statistic included, and the member's partition would realize as nothing — an unreproducible pin
-rather than a refusal.
+rather than a refusal. And the binder lowers a `TILE` below a kernel root (a node the binder builds the kernel
+around, `ops.kernel_roots`) only inside a root it output-tiles, that is, lowers through the tier that tiles its
+`(m, n)` output — and even there only where that tier folds the nested site (the chunked carrier's score). Any other
+root lowers its subtree serially, which would drop the tile, so the context refuses a tiled site below a root that is
+not output-tiled (`nested_tiles`), checked at whichever site of the pair is decided second. The NVFP4 scale — the
+maximum over each 16-element NVFP4 scale group of the gate/up contraction's output — used to be offered such rows,
+the prior ranked one tiled variant after another first, and the greedy compile spent a whole resolve (one pipeline
+pass over the whole program under the current blocklist) on each refusal at materialize until its retry budget ran
+out.
 
 A CHUNKED carrier's seam is stricter than an ordinary consumer's. The ordinary need tolerates an untiled producer;
 this one is built on the fragment, since the chunk's score IS the producer's tile — so the producer must be
@@ -224,6 +237,11 @@ refuse that kernel.
 `stage_moves` offers the `STAGE` product of transport, ring depth and register depth. A node's stage filter keeps the
 8-deep ring to `wgmma` tiles, the only ones it has paid on; elsewhere it would only multiply the candidates every
 compile prices.
+
+The synchronous fill checks copied-operand cover when constructing its slabs, including materialized multi-channel
+contractions. A copied N-contiguous slab needs complete N tiles: clamping a vector's start to the last scalar breaks
+alignment and crosses the row. A transposed B copies along K and can clamp whole outer N rows. Dividing tiles remain
+available on the same fused contraction.
 
 `TileOp.stage_edges` offers a transport at every operand of every contracting site, a chunked carrier's included —
 which tier then puts which operand on a slab is the tier's own business. The chunked site used to be excluded on the

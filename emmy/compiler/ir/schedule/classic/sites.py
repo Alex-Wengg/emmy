@@ -611,7 +611,13 @@ class ClassicNodeSite(Site[ClassicSchedule]):
         any pinned value the pick spells (:func:`note_pin_refusal`), so the pin check can name the rule."""
         tile = self.problem.tile
         why = _relation_refusal(
-            self.id, pick, relation, roots=tile.shared_roots, pairs=tile.chain_pairs, allowed_works=self.problem.allowed_works
+            self.id,
+            pick,
+            relation,
+            roots=tile.shared_roots,
+            pairs=tile.chain_pairs,
+            nests=tile.nested_tiles,
+            allowed_works=self.problem.allowed_works,
         )
         if why is None or not any(key in self.problem.row for key in self.keys):
             return why
@@ -772,9 +778,8 @@ class ClassicProblem(ScheduleProblem[ClassicSchedule]):
     allow_f16_accumulate: bool = True
     allow_fp8: bool = True
     validate_pins: bool = True
-    #: A split's finalize reads a bare WORK / RASTER / REDUCE pin as the partial's: it spells its
-    #: reduce serially only and its work at the thread level, so a warp WORK or a band names its
-    #: sibling, and the finalize keeps its own catalog instead of offering nothing.
+    #: A split's finalize tolerates a bare WORK / RASTER / REDUCE pin its own domain cannot take:
+    #: it may name the partial's row, so the finalize keeps its catalog instead of offering nothing.
     tolerate_kernel_pins: bool = False
     #: The kernel's paged buffers, ``{name: (axis, page, start)}`` — the graph's ``cuda.paged_buffers``
     #: hint, which the lowering virtualizes into a page table. No fixed base address stands behind

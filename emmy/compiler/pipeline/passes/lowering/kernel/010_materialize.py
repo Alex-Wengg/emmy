@@ -30,7 +30,7 @@ from emmy.compiler.ir.kernel import KernelOp
 from emmy.compiler.ir.kernel.ir import ELEM_COL, ELEM_ROW, FRAG_COL, FRAG_ROW
 from emmy.compiler.ir.schedule.register import RegisterMaterialization
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Assign, Body, Load, Write
+from emmy.compiler.ir.stmt import Affine, Assign, Body, Let, Load, Write
 from emmy.compiler.ir.stmt.body import free_names
 from emmy.compiler.ir.tile import TileOp
 from emmy.compiler.ir.tile.ops import UnbindableProjection, reduce_plan, sched_of
@@ -57,7 +57,8 @@ def rewrite(match: Match, root: Node, ctx=None) -> KernelOp | None:
         materialized = factorize(tile, root, sm_count=getattr(ctx, "sm_count", 0))
         if not resident:
             materialized = _pointwise_strip(tile, materialized)
-        body = _drop_repeated_declarations(Body((materialized,)))
+        # Kernel IR evaluates one operation at a time: a sum is its binary spelling from here on.
+        body = _drop_repeated_declarations(Body((materialized,)).map(lambda s: s.as_assigns() if isinstance(s, Affine) else s))
         unbound = _unbound_names(tile, root, body)
         assert not unbound, f"materialize: kernel {tile.name!r} reads names it never binds: {sorted(unbound)}"
         kernel = KernelOp(body=body, name=tile.name, serial=() if resident else tuple(tile.place.serial))
@@ -166,12 +167,14 @@ def _pointwise_strip(tile: TileOp, materialized):
 
 def _binding(stmt) -> tuple | None:
     """What ``stmt`` binds its name TO, or ``None`` when it binds something this guard cannot
-    compare. A scalar ``Load`` binds an ADDRESS; an ``Assign`` binds an EXPRESSION over names the
-    scope has already bound. Both are repeatable: a second, identical one computes the same value."""
+    compare. A scalar ``Load`` binds an ADDRESS; ``Assign`` and ``Let`` bind EXPRESSIONS over names the
+    scope has already bound. A second, identical binding computes the same value."""
     if isinstance(stmt, Load) and stmt.is_scalar:
         return (stmt.input, tuple(e.pretty() for e in stmt.index))
     if isinstance(stmt, Assign):
         return (stmt.op.name, stmt.args, stmt.dtype)
+    if isinstance(stmt, Let):
+        return (Let, stmt.value.pretty(), stmt.dtype)  # spelled, so a negative zero stays distinct from zero
     return None
 
 
@@ -190,15 +193,16 @@ def _drop_repeated_declarations(body: Body) -> Body:
     Operand cones splice INDEPENDENTLY (``Fold.spliced_step``), so two sibling cones over one
     shared value each carry their own copy of the statements that bind it, under the same SSA
     names. Flattened into one loop body those are two C declarations of one name, which nvcc
-    rejects (*already declared in the current scope*). Both repeatable kinds occur: the ``Load``
+    rejects (*already declared in the current scope*). Repeated bindings include the ``Load``
     of a broadcast constant — eleven of them on DeepSeek-V4's MXFP4 expert kernel, whose decode
     applies eleven shared constants to both halves of the fused ``gate_up`` weight — and the
     ``Assign`` that DERIVES a value from one, which the same model's post block reaches whenever a
-    placement cut lands two cones of one reciprocal at the kernel's own scope.
+    placement cut lands two cones of one reciprocal at the kernel's own scope. Static scalar ``Let``
+    bindings repeat in the same way when both cones carry their own denominator or epsilon.
 
     The repeat binds nothing new, so it is dropped with NO rewrite: every downstream use already
     names the survivor. That is what keeps the guard narrow, and narrow is what makes it safe over
-    a WHOLE kernel body. The renaming forms (``_atom._dedup_loads``, ``stmt.dedup_loads``) collapse
+    a WHOLE kernel body. The renaming forms (``_atom._dedup_loads``, ``stmt.normalize.place_values``) collapse
     two DIFFERENT names at one address, which needs the memory-effect reasoning neither does: a
     ``Write`` or an async fill between two identical loads of a staged buffer makes the second a
     different value. A same-name repeat cannot hide such a reload — a rebind in one C scope is

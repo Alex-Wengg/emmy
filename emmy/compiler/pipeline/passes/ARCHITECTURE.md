@@ -63,9 +63,9 @@ deleted gate is a template for its return, so it is deleted with the code rather
 The transform a knob, a pin or an evidence row decides lives in the pass that reads that decision, and nowhere else.
 Body normalization (`ir/stmt/normalize.py`) is the opposite kind of code: the canonical form every Loop IR body
 takes at construction and every identity digest takes, which can answer to nothing the pipeline chooses, and `ir/`
-imports no pipeline module. A pass may call a normalization step as a mechanical helper (`040_split_invariant_divides`
-calls `hoist_loop_invariants`); moving a pass's transform into the normalization module so another pass can reuse it
-inverts that direction and leaves a transform no normalization step runs. The IR `ARCHITECTURE.md` owns the
+imports no pipeline module. A pass may call a normalization step as a mechanical helper; moving a pass's transform into the normalization
+module so another pass can reuse it inverts that direction and leaves a transform no normalization step runs
+(`040_split_invariant_divides` owns the loop-invariant hoist it applies to a kernel body). The IR `ARCHITECTURE.md` owns the
 normalization contract; `tests/architecture/test_layering.py` guards both sides.
 
 ## Quantization is not a concept past the decomposition band
@@ -106,9 +106,10 @@ its folded layout beside the source storage layout, with its loads addressed thr
 equal read expressions can choose the source layout together. The source arm forms a fresh kernel so its schedule row
 cannot be mistaken for the folded arm's row. Only after those choices does the pass offer the unsplit tree beside every
 cross-CTA reduce split the head Fold admits. A selected cut or split replaces the kernel with fresh unmapped pieces.
-Every structural fork declares its output redirects before deferred materialization. A worker returns the
-fragment, so mutations of its local match cannot tell the parent how to reconnect secondary output ports.
-Each piece is
+A structural arm carries the redirect of the kernel's buffers onto its fragment's outputs as data
+(`DeferredFork.output`), set where the arm is enumerated and applied to the match by the engine when the arm is
+spliced: an arm built on a forked worker returns only its fragment, so nothing its builder did to a local match
+reaches the parent, and nothing has to. Each piece is
 FORMED AGAIN as a kernel of its own: its tile is lowered to a loop body, normalized like any lowered loop (which is
 where a statement repeated on both sides of the seam folds to one), and lifted through the same entry as
 `010_lift`, so its sites are the ones its own body earns rather than a slice of the parent's tree — a gate/up piece
@@ -132,6 +133,8 @@ A zero-axis cut workspace stores the component types inferred from its producer'
 explicit copies and casts. A later consumer output encode cannot choose that earlier value's type. Reduction
 workspaces hold f32 carrier states unless every reader converts a component to the same narrower type; that shared
 conversion can be performed once by the producer. A seam with an undetermined component type is not offered.
+An interior store retains the subtree and internal carrier state needed to perform it. It does not demand every
+result of an enclosing carrier: a cut exports only components consumed across the boundary.
 A zero-axis cone of only gmem loads is already materialized, even when it returns several values, and is not cut.
 A seam stands for a VALUE, not only an object: cones computing one value fold into one seam, each duplicate carried
 as a sibling with its capture correspondence, and the cut replaces every one with workspace loads spelled through its
@@ -140,7 +143,9 @@ under the captured axes substituted by position (hygienically: a loop inside the
 again keeps its own variable) — the tile-node shape does not decide it, because fusion keeps one
 definition of a value while the lifted tree holds one cone per scope that reads it, and those cones bind the same
 coordinate under different names and in different operand orders (the o_proj result feeds the norm's statistic
-inside a reduce and the residual add at the kernel's free axis). The identity is taken per exposed component, so a
+inside a reduce and the residual add at the kernel's free axis). Per-component pruning closes dependencies to a
+fixpoint: reading a carried state's previous value also keeps its later update, so a coupled carrier never leaves
+an unresolved state name in the comparison. The identity is taken per exposed component, so a
 lone contraction is a CHANNEL of the twin that folds it beside another over the same input (k under the QK-norm's
 reduce, beside the k/v pair): the twin is the representative, the sibling records which component is its value,
 and reads that channel of the shared workspace. A cone that reads a captured coordinate only through one expression
@@ -203,12 +208,16 @@ cross-CTA split receipts survive the round trip. Packed storage retains its requ
 consumes its one root-most cut the same way and may join scoped cuts in that single decision. A further cut can be
 pinned on a named child with `PLACE@place_<token>/<site>=cut`, where the site is relative to that child. For example,
 `PLACE@place_abc123/map.1/inner=cut` addresses only that piece; the other children settle to fuse. The
-`place_<token>` name comes from the preceding cut's emitted kernel identity. A later cut of the SAME-NAME remainder
+`place_<token>` is one rule, `_cut.seam_token`: the parent's structural identity and the seam's canonical key digested
+(a seam set's keys joined for the producers one decision fuses), and `_cut.place_token` reads it back off a kernel
+name, so a pin, a recorded route and the cut pass address a piece the same way. A later cut of the SAME-NAME remainder
 uses `PLACE@step.<n>/<site>=cut`, where `n` counts earlier cuts of that remainder from one; for example,
 `PLACE@step.1/map.1/map=cut` applies after the first cut, while `PLACE@step.2/map.2/map=cut` applies after
 the second. These explicit stages let a cut expose the next site's path without selecting an unpinned prerequisite.
 A named child's same-name remainder uses `PLACE@place_<token>/step.<n>/<site>=cut` for the same staged decision;
 its stage starts at zero when the child is minted, and a consumed child pin cannot run again on that remainder.
+Omitting the site suffix names that child's or remainder's root-most cut, as with `PLACE@place_abc123=cut` or
+`PLACE@step.1=cut`. The consumed key retains its full scope, so that cut cannot apply to another piece or step.
 A missing stage or a child pin that no piece resolves is rejected by the realized-pin audit. A scoped pin whose site
 path does not exist on a kernel addresses another kernel of the graph; a kernel none of the pins address fuses,
 deterministic, so the unpinned placement fork never returns under a pin-driven compile. A pin that resolves to an edge no cut
@@ -219,9 +228,10 @@ never becomes a pin — the deploy's evidence pick takes one of the pass's own o
 row that names several of a kernel's seams (the composed decision a pinned compile consumed them as, written by
 `run --record-greedy`) can only be taken if that composition is on the ballot, so beside its single seams the pass
 offers one composed arm per such route registered for the kernel's exact identity (`pins.composed_routes`, filled by
-the greedy strategy from the decisions the DB stores and by a golden's restamp from its own routing rows). Only
-fresh pieces that have their own measured later placement route remain open; the others stay decided. This bounds
-the deploy's search while letting a recorded child or same-name remainder cut replay.
+the greedy strategy from the decisions the DB stores and by a golden's restamp from its own routing rows). Every
+fresh piece remains open for its own placement decision, including a child of a composed cut. Deploy consults that
+piece's evidence; restamp follows the stored route path on the fresh pieces and fuses where the path has no later cut.
+An old child identity never decides whether the fresh child may expose another fork.
 `040_schedule` is the classic schedule boundary. The model under `ir/schedule` factors a kernel into sites — one
 per node, the kernel site last — and each site projects its own catalog: direct, plain-reduction, scalar-contraction,
 precision-gated tensor-core, materialized-operand copy, computed-operand and multi-channel smem compute-fill, and
@@ -494,7 +504,7 @@ How to comply:
 - **When generalizing an existing rule, normalize its incidental divergences** (one dtype rule, one index rule)
   and name the behavioral deltas explicitly in the commit — don't preserve two behaviors behind one entry point.
 
-Multi-source `IndexMapOp` lifting preserves predicate dtype: an explicit source predicate is substituted unchanged,
+Lowering a multi-source `IndexMapOp` preserves predicate dtype: an explicit source predicate is substituted unchanged,
 and an unconditional fallback is a boolean `Literal(True, "bool")`. The rendered CUDA condition remains `1`, while
 Loop IR persistence and vectorized reference evaluation retain the boolean type required by `Select`.
 
@@ -508,9 +518,16 @@ linear's result under its reshape, composed into the consumer's operand map). Wh
 transient too, the transient buffer is then the value's only storage, so it becomes public and its rounding is spelled
 like any other; a composition whose consumer writes a public buffer keeps its spelling.
 
+Static scalar binding also happens before fusion. `095_bind_scalar_constants` replaces a load from a finite FP32
+`ConstantOp.value` with a typed `Let` holding its storage-rounded literal. The value then belongs to the Loop body
+and its exact identity, and the unused input leaves the kernel ABI. This is an exact representation of an immutable
+compile-time value, not a schedule choice. Runtime inputs, externally bound constants, transformed or checkpoint
+sources, other storage types and nonfinite values retain their loads. Their literal representation is not covered
+by this rule. Signed zero remains distinct through normalization, fusion and identity.
+
 FP16/BF16 matmul decomposition declares its product at FP32 before reduction. Widening only the accumulator loses
 precision or overflows at each half-precision multiply, even when the dot product is representable. The explicit
-product dtype survives lifting and fusion, so scalar and tensor-core schedules implement the same wide product.
+product dtype survives loop lowering and fusion, so scalar and tensor-core schedules implement the same wide product.
 
 SiLU widens FP16/BF16 inputs to FP32, computes `x / (1 + exp(-x))`, and narrows once to the output dtype. Replacing
 division with multiplication by a separately rounded reciprocal can change the final FP16 result.
@@ -778,8 +795,19 @@ that canonical input:
 
 - **A transposed constant may keep source storage.** The folded transpose and source layout are separate arms after
   placement. The source arm replaces the constant input and reverses each two-dimensional read, then forms a fresh
-  kernel. Equal read expressions permit a joint source arm for several weights. A measured row on each resulting
-  kernel prices the choice; no shape or expected-speed rule decides it.
+  kernel. The replacement constant keeps its original binding name and source metadata. Equal read expressions permit
+  a joint source arm for several weights. A measured row on each resulting kernel prices the choice; no shape or
+  expected-speed rule decides it. The cut pass offers a layout fork per kernel; the first kernel to decide fixes the
+  layout for the program, so the arm is priced over the program: the rows of every reader the decision settles, each
+  as the kernel that layout leaves it, all-or-nothing (`layout_readers`, `reader_kernel`). Every other reader is then
+  offered that layout only, and a reader the cut pass no longer offers a
+  layout fork (a kernel the pass no longer decides at all — the rule's own gate, `takes_kernel_set_decision`, is the
+  offer's first test — one that carries a state, a read other than through 2-D indices) keeps it folded, because
+  serving holds one device copy per layout, and outranks a settled layout. Across programs that share a weight's
+  copy, a compile under `settled_layouts` offers a settled weight in its layout only, and equal reads settled source
+  together as their one joint arm, the decision they were taken as; the golden replay compiles a recorded route under
+  the layouts the route recorded the same way. Unlike a `LAYOUT` pin, it constrains a fork only where one arises. `fork_less_reads` names the weights some kernel reads with no layout fork; a family of
+  programs settles those folded before any of them decides.
 
 - **The cross-CTA reduce split is structural.** Splitting the reduce axis across CTAs into a partial and finalize
   changes which kernels exist, so `030_cut` offers it after stored-edge placement and transposed-constant layout,
@@ -790,12 +818,11 @@ that canonical input:
 for the partial and, when required, the finalize. The partial keeps the same `Fold(init, combine)` over an axis
 slice; the finalize identity-lifts stored state tuples through that same monoid. This is one carrier-independent
 path for additive and exp-family folds. Each piece has an identity of its own and chooses its own schedule.
-The finalize's reduce enumerates serially only: it merges the partitions of a split that already happened, over an
-axis that windows its whole parent, one partial per split per cell — its parallelism is the cells, and a band over
-the few partials would pay a barrier per cell (the A100's prior picked one at seven times the serial row's time).
-The finalize also reads a bare `WORK`, `RASTER` or `REDUCE` pin as the partial's — a warp `WORK` or a `coop` band
-names the sibling that can spell it — and keeps its own domain instead of refusing every row; the post-compile pin
-check still asks that some kernel realized the pin. The partial and every other kernel keep the refusal.
+The finalize merges one stored state per split per cell and offers the ordinary legal reduction schedules, including
+serial, register-partial and cooperative folds. Evidence decides whether distributing those partials pays.
+The finalize tolerates a bare `WORK`, `RASTER` or `REDUCE` pin its own domain cannot take: it may name the partial's
+row, so the finalize keeps its catalog instead of refusing every row. The post-compile pin check still asks that
+some kernel realized the pin. The partial and every other kernel keep the refusal.
 
 A selected cross-CTA split is recorded structurally by an axis `Window`. The scheduler refuses to repartition an
 axis that is already a slice, including partition axes nested inside the complete Fold tree. The one-kernel atomic arm

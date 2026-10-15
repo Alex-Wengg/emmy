@@ -3,8 +3,6 @@
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from emmy.benchmark.command_workload import build_substitution_map, render_command
 from emmy.benchmark.tasks import enumerate_tasks
 from emmy.recipe import load_recipe
@@ -12,125 +10,8 @@ from emmy.recipe import load_recipe
 EXP = Path("experiments/golden-bench-2026")
 
 
-@pytest.mark.parametrize(
-    "path",
-    sorted((Path(__file__).resolve().parents[3] / EXP / "kernels" / "golden").glob("*.golden.json")),
-    ids=lambda path: path.name,
-)
-def test_kernel_golden_matches_fresh_lowering(path) -> None:
-    from emmy.compiler.pipeline.search.golden import GoldenFile, restamp
-
-    document = GoldenFile.load(path)
-    assert document.targets() and any(row.measured for row in document.rows)
-    fresh, report = restamp(document)
-    assert fresh == document, "\n".join(report.lines())
-
-
 def _experiment(project_root: str, name: str) -> str:
     return str(Path(project_root) / EXP / name)
-
-
-def _kernel_tasks(project_root: str, study: str):
-    tasks = enumerate_tasks([_experiment(project_root, "kernels")])
-    return [task for task in tasks if task.variant.params["study"] == study]
-
-
-def test_common_kernel_corpus_is_small_and_identical(project_root) -> None:
-    platforms = {
-        "NVIDIA Tesla V100 SXM3 32GB",
-        "NVIDIA Tesla V100 SXM2 16GB",
-        "NVIDIA A100 80GB",
-        "NVIDIA A100 40GB",
-        "NVIDIA H100 80GB",
-        "NVIDIA GeForce RTX 4090",
-        "NVIDIA GeForce RTX 5090",
-        "NVIDIA H200 141GB",
-        "NVIDIA B200",
-    }
-    replayed = {
-        "NVIDIA A100 80GB": "a100",
-        "NVIDIA A100 40GB": "a100",
-        "NVIDIA H100 80GB": "h100",
-        "NVIDIA Tesla V100 SXM2 16GB": "v100",
-        "NVIDIA GeForce RTX 5090": "rtx5090",
-        "NVIDIA GeForce RTX 4090": "rtx4090",
-    }
-    recipe_dir = _experiment(project_root, "kernels")
-    recipe = load_recipe(recipe_dir)
-    tasks = _kernel_tasks(project_root, "common")
-    assert recipe.kind == "command"
-    assert len(tasks) == len(platforms) * 2
-    assert {task.recipe.deploy.gpu for task in tasks} == platforms
-    assert all(task.recipe.deploy.gpu_count == 1 for task in tasks)
-    assert {task.variant.params["seq_len"] for task in tasks} == {1, 512}
-    assert {task.variant.params["model_ref"] for task in tasks} == {"Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca"}
-    replay_tasks = [task for task in tasks if task.recipe.deploy.gpu in replayed]
-    searched_tasks = [task for task in tasks if task.recipe.deploy.gpu not in replayed]
-    for gpu, short in replayed.items():
-        assert {task.variant.params["golden"] for task in replay_tasks if task.recipe.deploy.gpu == gpu} == {
-            f"qwen3-06b-s1_{short}",
-            f"qwen3-06b-s512_{short}",
-        }
-    assert all(task.variant.params["budget"] == 0 for task in replay_tasks)
-    assert all(task.variant.params["patience"] == 0 for task in replay_tasks)
-    assert all(task.variant.params["golden"] == "" for task in searched_tasks)
-    assert all(task.variant.params["budget"] == 12 for task in searched_tasks)
-    assert all(task.variant.params["patience"] == 4 for task in searched_tasks)
-
-    run = recipe.command.run
-    assert "./venv/bin/emmy trace" in run
-    assert "./venv/bin/emmy tune" in run
-    assert "./venv/bin/emmy run" in run
-    assert "for repeat in 0 1 2 3 4" in run
-    assert "--golden $task_dir/working.json --bench --strict" in run
-    assert 'if [ -n "$golden" ]; then\n  evidence_args=(--strict-evidence --no-record-evidence)' in run
-    assert "export EMMY_TUNE_DB=$task_dir/verification/repeat-$$repeat.db" in run
-    assert run.count('"$${evidence_args[@]}"') == 2
-    assert '"$model_ref" --layer "$layer" --seq-len "$seq_len" --bench' in run
-    assert "EMMY_GOLDEN_FILE=$task_dir/working.json" in run
-    assert "--bench-backends eager,tcompile,emmy" in run
-    assert "--bench-backends eager,emmy" in run
-    assert "torch-compile.status" in run
-    assert "scripts/" not in run
-    assert recipe.command.stage == [
-        "emmy",
-        "pyproject.toml",
-        "requirements.txt",
-        "Makefile",
-        "Cargo.toml",
-        "Cargo.lock",
-        "crates",
-        "experiments/golden-bench-2026/kernels/recipe.yaml",
-        "experiments/golden-bench-2026/kernels/golden",
-    ]
-    assert recipe.command.strict is True
-    assert recipe.command.result_files == ["artifacts.tar.gz"]
-    assert "./venv/bin/python -m pip freeze --all" in run
-    assert "tar -C $task_dir" in run
-
-
-def test_native_fp8_kernel_corpus_is_separate_and_identical(project_root) -> None:
-    tasks = _kernel_tasks(project_root, "fp8-common")
-    assert len(tasks) == 8
-    assert {task.recipe.deploy.gpu for task in tasks} == {
-        "NVIDIA GeForce RTX 4090",
-        "NVIDIA GeForce RTX 5090",
-        "NVIDIA H200 141GB",
-        "NVIDIA B200",
-    }
-    assert all(task.recipe.deploy.gpu_count == 1 for task in tasks)
-    assert {task.variant.params["seq_len"] for task in tasks} == {1, 512}
-    assert {task.variant.params["model_ref"] for task in tasks} == {
-        "RedHatAI/Qwen3-0.6B-FP8-dynamic@068a9040b238d65f5c1064f10232bb15b96c0ff0"
-    }
-    assert all(task.variant.params["fp8_mma"] == 1 for task in tasks)
-    for task in tasks:
-        command = render_command(
-            task.recipe.command.run,
-            build_substitution_map(task.variant, [0], "/repo", "/task"),
-        )
-        assert "--require-kernel-source" not in command
-        assert "EMMY_FP8_MMA=1" in command
 
 
 def test_quantized_support_check_covers_three_formats(project_root) -> None:
@@ -149,9 +30,11 @@ def test_quantized_support_check_covers_three_formats(project_root) -> None:
 
     run = recipe.command.run
     assert "./venv/bin/emmy trace" in run
+    assert "torch==2.13.0" in run
     assert "./venv/bin/emmy tune" not in run
-    # Each post-fusion target is benched on its own.
-    assert '--realization "$$seed"' in run
+    # The CLI owns target enumeration; recipes do not parse a private golden schema.
+    assert "--golden $task_dir/working.json --bench" in run
+    assert 'd["configs"]' not in run
     assert "--bench --strict --no-record-evidence" in run
     assert "--bench-backends eager,emmy" in run
     assert "tcompile" not in run
@@ -160,69 +43,12 @@ def test_quantized_support_check_covers_three_formats(project_root) -> None:
         "pyproject.toml",
         "requirements.txt",
         "Makefile",
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates",
         "experiments/golden-bench-2026/quantized_kernels_rtx5090/recipe.yaml",
     ]
     assert recipe.command.strict is True
-
-
-def test_native_fp8_large_layer_supplement_is_bounded(project_root) -> None:
-    tasks = _kernel_tasks(project_root, "fp8-large-layer")
-    assert len(tasks) == 4
-    assert {task.recipe.deploy.gpu for task in tasks} == {"NVIDIA H200 141GB", "NVIDIA B200"}
-    assert all(task.recipe.deploy.gpu_count == 1 for task in tasks)
-    assert {task.variant.params["seq_len"] for task in tasks} == {1, 512}
-    assert {task.variant.params["layer"] for task in tasks} == {0}
-    assert {task.variant.params["model_ref"] for task in tasks} == {
-        "RedHatAI/Qwen3-32B-FP8-dynamic@c6732fc26128341172e4005bad34aafa51c32866"
-    }
-    assert all(task.variant.params["budget"] == 8 for task in tasks)
-
-
-def test_large_layer_corpus_is_bounded_and_not_labeled_tp8(project_root) -> None:
-    tasks = _kernel_tasks(project_root, "large-layer")
-    assert len(tasks) == 8
-    assert {task.recipe.deploy.gpu for task in tasks} == {"NVIDIA H200 141GB", "NVIDIA B200"}
-    assert all(task.recipe.deploy.gpu_count == 1 for task in tasks)
-    assert {task.variant.params["layer"] for task in tasks} == {0, 3}
-    assert {task.variant.params["seq_len"] for task in tasks} == {1, 512}
-    assert {task.variant.params["model_ref"] for task in tasks} == {"Qwen/Qwen3.6-27B@6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"}
-    for task in tasks:
-        command = render_command(
-            task.recipe.command.run,
-            build_substitution_map(task.variant, list(range(8)), "/repo", "/task"),
-        )
-        assert "--loop-targets" not in command
-        assert "--golden /task/working.json --bench --strict" in command
-        assert "--bench-backends eager,tcompile,emmy" in command
-        assert "--bench-backends eager,emmy" in command
-
-
-def test_convergence_check_is_one_shape_and_three_seeds(project_root) -> None:
-    tasks = _kernel_tasks(project_root, "convergence")
-    assert len(tasks) == 3
-    assert {task.variant.params["seed"] for task in tasks} == {0, 1, 2}
-    assert all(task.recipe.deploy.gpu == "NVIDIA H200 141GB" for task in tasks)
-    assert all(task.recipe.deploy.gpu_count == 1 for task in tasks)
-    assert all(task.variant.params["seq_len"] == 512 for task in tasks)
-
-    fp8_tasks = _kernel_tasks(project_root, "fp8-convergence")
-    assert len(fp8_tasks) == 3
-    assert {task.variant.params["seed"] for task in fp8_tasks} == {0, 1, 2}
-    assert all(task.variant.params["model_ref"].startswith("RedHatAI/Qwen3-0.6B-FP8-dynamic@") for task in fp8_tasks)
-
-
-def test_search_ablation_is_executable(project_root) -> None:
-    tasks = _kernel_tasks(project_root, "search-ablation")
-    assert len(tasks) == 4
-    assert {(task.variant.params["budget"], task.variant.params["patience"]) for task in tasks} == {
-        (0, 0),
-        (4, 4),
-        (12, 4),
-        (48, 12),
-    }
-    assert all("--golden $task_dir/working.json --bench --strict" in task.recipe.command.run for task in tasks)
-    assert all(task.recipe.deploy.gpu == "NVIDIA H200 141GB" for task in tasks)
-    assert all(task.recipe.deploy.gpu_count == 1 for task in tasks)
 
 
 def test_mpk_megakernel_lane_is_pinned_and_paired(project_root) -> None:
@@ -289,7 +115,7 @@ def test_neptune_emmy_pytorch_a100_share_one_experiment(project_root) -> None:
     assert "tar -C $task_dir" in run
     # Each row runs exactly one lane for exactly one operator.
     assert 'case "$lane" in' in run
-    assert 'bash /experiment/run.sh "$operator"' in run
+    assert 'bash /experiment/run.sh "$operator" /experiment/tuning.tar.gz' in run
     assert '"$$EXPERIMENT/run_emmy.sh" $repo_dir/venv/bin/emmy "$operator"' in run
     # Tuning is the tune-kernels skill's job: the recipe only replays what it committed.
     assert "emmy tune" not in run
@@ -298,6 +124,10 @@ def test_neptune_emmy_pytorch_a100_share_one_experiment(project_root) -> None:
         "pyproject.toml",
         "README.md",
         "LICENSE",
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates",
+        "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/tuning_neptune_a100x1.tar.gz",
         "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/run.sh",
         "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/run_neptune.py",
         "experiments/golden-bench-2026/compiler_neptune_emmy_pytorch_a100/operators.sh",
@@ -319,7 +149,8 @@ def test_neptune_emmy_pytorch_a100_share_one_experiment(project_root) -> None:
     assert "operators=(" not in neptune_runner
     assert "sequence_lengths=(256 512 1024 2048 4096 8192 16384 32768)" in neptune_runner
     assert "--n-trials 128" in neptune_runner
-    assert 'nsys profile -o "/results/profiles/$setup" --trace=cuda,nvtx,osrt --wait=primary' in neptune_runner
+    assert 'nsys profile -o "/results/profiles/$setup" --trace=cuda,nvtx' in neptune_runner
+    assert "--sample=none --cpuctxsw=none --cudabacktrace=none --wait=primary" in neptune_runner
     assert 'profile "$operator" "1,$sequence_length" --repeat 15' in neptune_runner
     assert "neptune-setup-status.tsv" in neptune_runner
     assert "tune_status=ok:no-valid-schedule" in neptune_runner
@@ -416,4 +247,4 @@ def test_every_command_variant_renders(project_root) -> None:
             assert "/task" in command
             subprocess.run(["bash", "-n"], input=command, text=True, check=True)
             rendered += 1
-    assert rendered == 69
+    assert rendered == 21

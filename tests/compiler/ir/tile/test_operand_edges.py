@@ -14,16 +14,28 @@ the step into an ``Accum`` per carried component.
 
 from __future__ import annotations
 
+import pytest
+
 from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import F16, F32, I32
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.elementwise import ElementwiseImpl
-from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.expr import Literal, Var
 from emmy.compiler.ir.pure import Fold
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Let, Load, Loop
+from emmy.compiler.ir.tile.ops import cone_stat_dtypes, edge_dtypes
 from tests.compiler.terms import contraction, projection, reduction, slab
 
 M_AXIS, N_AXIS, K_AXIS = Axis("m", Dim(256)), Axis("n", Dim(256)), Axis("k", Dim(256))
 SCOPE = (M_AXIS, N_AXIS, K_AXIS)
+
+
+@pytest.mark.parametrize("dtype", [F16, F32, I32, None])
+def test_typed_literal_bindings_keep_their_edge_and_cone_statistic_dtypes(dtype):
+    body = (Let("constant", Literal(2.0), dtype=dtype), Assign("product", "multiply", ("constant", "constant")))
+    edge = projection((), body, ("product",))
+    assert edge_dtypes(edge, {}) == (dtype,)
+    assert cone_stat_dtypes(body, ("constant", "product"), {}) == ({} if dtype is None else {"constant": dtype, "product": dtype})
 
 
 def _matmul() -> Fold:
@@ -221,7 +233,7 @@ def test_a_sweep_drops_pure_members_not_read_by_its_stores() -> None:
     )
     tile = lift_loop_op(LoopOp(body=(first, second)))
     assert {load.input for load in loaded_buffers(tile.op)} == {"x", "y"}
-    assert [(spec.write.output, len(spec.sweep)) for spec in tile.output_specs] == [("a", 1), ("b", 1)]
+    assert sorted((spec.write.output, len(spec.sweep)) for spec in tile.output_specs) == [("a", 1), ("b", 1)]
     assert tile.output_specs[0].sweep != tile.output_specs[1].sweep
 
 

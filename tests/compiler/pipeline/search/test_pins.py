@@ -3,11 +3,14 @@ evidence pick and the golden replay."""
 
 from __future__ import annotations
 
+import pytest
+
 from emmy.compiler.pipeline.fork import DeferredFork
 from emmy.compiler.pipeline.search.pins import spelled_arm, unreproducible_pin_flag
 
 
-def test_recorded_precision_pins_preserve_the_default_and_overrides(monkeypatch):
+@pytest.mark.parametrize("override", ["FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA"])
+def test_recorded_precision_pins_preserve_the_default_and_overrides(monkeypatch, override):
     from emmy.compiler.pipeline.search.golden import regime_live
     from emmy.compiler.pipeline.search.pins import measured_regime_pins
 
@@ -17,9 +20,9 @@ def test_recorded_precision_pins_preserve_the_default_and_overrides(monkeypatch)
     assert regime_live({"FAST_MATH": True})
     assert not regime_live({"FAST_MATH": False})
     monkeypatch.setenv("EMMY_FAST_MATH", "0")
-    monkeypatch.setenv("EMMY_F16_MMA_F32_ACC", "1")
+    monkeypatch.setenv(f"EMMY_{override}", "1")
     recorded = measured_regime_pins()
-    assert recorded == {"FAST_MATH": False, "F16_MMA_F32_ACC": True}
+    assert recorded == {"FAST_MATH": False, override: True}
     assert regime_live(recorded)
     assert not regime_live({"FAST_MATH": False})
 
@@ -147,8 +150,8 @@ def test_a_family_pinned_off_is_realized_by_a_kernel_that_never_stamps_it() -> N
     assert unreproducible_pin_flag({"TILE": "f4"}, per_cell) is not None
 
 
-def test_piece_site_pin_requires_applied_local_receipt_and_resolved_source() -> None:
-    original = "PLACE@place_abc123/map.1/inner"
+@pytest.mark.parametrize("original", ("PLACE@place_abc123/map.1/inner", "PLACE@place_abc123", "PLACE@step.1"))
+def test_piece_site_pin_requires_applied_local_receipt_and_resolved_source(original: str) -> None:
     local = [{"PLACE@map.1/inner": "cut"}]
     assert unreproducible_pin_flag({original: "cut"}, [{}], placement_knobs=local, applied_place_pins={original: "cut"}) is None
     assert unreproducible_pin_flag({original: "cut"}, [{}], placement_knobs=local, applied_place_pins={}) is not None

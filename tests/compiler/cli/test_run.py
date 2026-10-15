@@ -727,7 +727,8 @@ def test_strict_correctness_proof_weighs_a_rounding_flip_against_fp64():
 def test_strict_proof_adopts_the_candidates_fp4_codes_at_an_activation_quantize(tmp_path):
     """A candidate whose 4-bit activation codes sit one step from the reference's fails the strict check without
     adoption, though both rounded correctly. The check that adopts the candidate's codes at the quantize node passes
-    it, reports the differing code, and still fails a real error after the node."""
+    it, reports the differing code, still fails a real error after the node, and fails a code two steps away at the
+    node itself."""
     import torch
 
     from emmy.commands.run import _graft_candidate, _quantize_nodes, _strict_eager_proof
@@ -768,6 +769,34 @@ def test_strict_proof_adopts_the_candidates_fp4_codes_at_an_activation_quantize(
     wrong = {"y": outputs["y"].copy()}
     wrong["y"].flat[5] += 0.01 * float(np.abs(outputs["y"]).max())
     assert _strict_eager_proof(g, inputs, wrong, g, taps)[0]["status"] == "fail"
+
+    far = {**taps, bits: taps[bits].copy()}
+    far[bits].flat[0] = (int(taps[bits].flat[0]) & 0xF0) | (code + 2 if code & 7 < 6 else code - 2)
+    proof = _strict_eager_proof(g, inputs, outputs, g, far)[0]
+    assert proof["status"] == "fail" and f"quantize node {bits!r}: 1/" in proof["error"], proof
+    assert proof["quantize_nodes"][bits]["beyond_one_code"] == 1
+
+
+def test_quantize_tap_codes_pass_within_one_code_and_fail_beyond():
+    """The strict proof accepts a tap value that is the reference's code or one of the two beside it on the format's
+    grid, and rejects one two codes away: in either direction, across zero, at the largest magnitude, for every
+    quantized format."""
+    from emmy.commands.run import _adjacent_codes, _quantized_values
+
+    def decode(codes, fmt):
+        return _quantized_values(np.array(codes, dtype=np.uint8), fmt)
+
+    cases = {
+        # reference codes, codes one step from them, codes two steps from them (e2m1 packs two codes per byte)
+        "f4e2m1x2": ([0x21, 0x08], [0x12, 0x19], [0x03, 0x2A]),
+        "f8e4m3": ([0x40, 0x00, 0x7E], [0x41, 0x01, 0x7D], [0x42, 0x02, 0x7C]),
+        "f8e5m2": ([0x40, 0x00], [0x3F, 0x81], [0x3E, 0x02]),
+    }
+    for fmt, (reference, near, far) in cases.items():
+        theirs = decode(reference, fmt)
+        assert _adjacent_codes(theirs, theirs, fmt).all(), fmt
+        assert _adjacent_codes(decode(near, fmt), theirs, fmt).all(), fmt
+        assert not _adjacent_codes(decode(far, fmt), theirs, fmt).any(), fmt
 
 
 def test_unreproducible_pin_flag(monkeypatch):
@@ -1206,6 +1235,32 @@ def test_ab_json_labels_each_row_with_its_lane(tmp_path, monkeypatch):
     # The filter a sweep applies: only same-lane rows are comparable to the greedy.
     same_lane = [p for p in rec["pinned"] if p["lane"] == rec["greedy"]["lane"]]
     assert len(same_lane) == 1 and same_lane[0]["lane"] == "std"
+
+
+def test_ab_evidence_captures_each_rows_precision_scope(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from emmy.commands import compile as compile_mod
+    from emmy.commands import run as run_mod
+    from emmy.compiler.pipeline.search import bench_record
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    seen = []
+    monkeypatch.setattr(run_mod, "_records_evidence", lambda _args: True)
+    monkeypatch.setattr(compile_mod, "resolve_tune_db", lambda: tmp_path / "bench.db")
+
+    def record(_path, ctx, _graph, _bench):
+        seen.append(ctx)
+        return 1
+
+    monkeypatch.setattr(bench_record, "record_bench_perf", record)
+    samples = run_mod._ab_samples(["FAST_EXP=false,WORK=t32", "FAST_EXP=true,WORK=t64"])
+    benches = [run_mod._GoldenBench(sample, object(), object(), [], "ok") for sample in samples]
+    with pinned_knobs({"FAST_MATH": False}):
+        run_mod._record_bench_evidence(SimpleNamespace(), benches, None)
+    assert [ctx.precision_pins()["FAST_EXP"] for ctx in seen] == [False, True]
+    assert seen[0].compile_flags == seen[1].compile_flags
+    assert seen[0].structural_key() != seen[1].structural_key()
 
 
 _NCU_CSV = """"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"
@@ -1663,27 +1718,52 @@ def test_bind_inputs_preserves_bf16_bits_for_inputs_and_constants():
     )
 
 
-def test_packed_fp4_correctness_decodes_signed_zero_but_rejects_other_codes():
+@pytest.mark.parametrize(
+    "fmt,codes,reference,changed",
+    [
+        ("f4e2m1x2", [0x88, 0x21], [0x00, 0x21], [0x22, 0x31]),
+        ("f8e4m3", [0x80, 0x38], [0x00, 0x38], [0x39, 0x40]),
+        ("f8e5m2", [0x80, 0x3C], [0x00, 0x3C], [0x3D, 0x40]),
+    ],
+)
+def test_quantized_correctness_decodes_signed_zero_but_rejects_other_codes(fmt, codes, reference, changed):
     import numpy as np
 
-    from emmy.commands.run import _check_accuracy, _comparison_outputs, _eager_outputs_by_name, _quantized_outputs, _wrong_answer_flag
+    from emmy.commands.run import (
+        _check_accuracy,
+        _comparison_outputs,
+        _eager_outputs_by_name,
+        _exact_outputs,
+        _quantized_outputs,
+        _strict_correctness_proof,
+        _wrong_answer_flag,
+    )
     from emmy.compiler import dtype as dt
     from emmy.compiler.graph import Graph, Tensor
     from emmy.compiler.ir.base import InputOp
 
     graph = Graph()
-    graph.add_node(op=InputOp(), inputs=[], output=Tensor("packed", (1, 2), dt.F4E2M1x2), node_id="packed")
+    graph.add_node(op=InputOp(), inputs=[], output=Tensor("packed", (1, 2), fmt), node_id="packed")
     graph.inputs = graph.outputs = ["packed"]
 
-    emmy = _comparison_outputs({"packed": np.array([[0x88, 0x21]], dtype=np.uint8)}, graph)
-    eager = _eager_outputs_by_name(emmy, torch.tensor([[0x00, 0x21]], dtype=torch.uint8), graph)
+    emmy = _comparison_outputs({"packed": np.array([codes], dtype=np.uint8)}, graph)
+    tensor = torch.tensor([reference], dtype=torch.uint8)
+    eager = _eager_outputs_by_name(emmy, tensor, graph)
+    exact = _exact_outputs(graph, {"packed": tensor}, emmy)
+    np.testing.assert_array_equal(exact["packed"], eager["packed"])
     quantized = _quantized_outputs(emmy, graph)
-    assert quantized == frozenset({"packed"})
+    assert quantized == (frozenset({"packed"}) if fmt == "f4e2m1x2" else frozenset())
     assert _wrong_answer_flag(emmy, eager, quantized) is None
     assert _check_accuracy(emmy, eager) is None
-    for changed in (0x22, 0x31):
-        bad = _comparison_outputs({"packed": np.array([[0x88, changed]], dtype=np.uint8)}, graph)
+    assert _strict_correctness_proof(emmy, eager, exact_out=exact)["status"] == "pass"
+    if fmt != "f4e2m1x2":
+        torch_format = torch.float8_e4m3fn if fmt == "f8e4m3" else torch.float8_e5m2
+        native = _eager_outputs_by_name(emmy, tensor.view(torch_format), graph)
+        np.testing.assert_array_equal(native["packed"], eager["packed"])
+    for code in changed:
+        bad = _comparison_outputs({"packed": np.array([[codes[0], code]], dtype=np.uint8)}, graph)
         assert _wrong_answer_flag(bad, eager, quantized) is not None
+        assert _strict_correctness_proof(bad, eager, exact_out=exact)["status"] == "fail"
 
     opaque = Graph()
     opaque.add_node(op=InputOp(), inputs=[], output=Tensor("packed", (1, 2), dt.U8), node_id="packed")

@@ -25,12 +25,12 @@ from emmy.compiler.ir.expr import Var
 from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.ir.pure import Fold, Lambda
 from emmy.compiler.ir.pure.twist import SOFTMAX, WELFORD
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Let, Load, Loop, Write
+from emmy.compiler.ir.stmt import Accum, Affine, Assign, Body, Let, Load, Loop, Write
 from emmy.compiler.ir.tile import TileOp
 from emmy.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pipeline
 from emmy.compiler.pipeline.passes.tile._fromloop import lift_loop_op
-from emmy.compiler.pipeline.passes.tile._twist import _hoist_invariant, rewrite_twisted
-from tests.compiler.terms import projection, slab
+from emmy.compiler.pipeline.passes.tile._twist import _hoist_invariant, _replace, rewrite_twisted
+from tests.compiler.terms import contraction, projection, reduction, slab
 
 
 def _carrier(weight_of: str) -> Fold:
@@ -187,6 +187,35 @@ def test_a_cat_in_the_query_cone_still_twists() -> None:
 
     assert len(fold.init) == 3
     assert fold.chunked(), "the rotary predicate must preserve the tensor-core attention channel"
+
+
+@pytest.mark.parametrize("different", [None, "buffer", "coordinate"])
+def test_twist_compares_operand_values_independently_of_coordinate_parameter_order(different) -> None:
+    def score(suffix: str) -> Fold:
+        weights = slab(f"w{suffix}", "other" if suffix and different == "buffer" else "w", "d", "k")
+        # The same load can close its captured coordinates in either order. Neither order is
+        # an index permutation; changing the actual coordinates must still reject the recipe.
+        if suffix:
+            weights = replace(weights, lift=replace(weights.lift, params=tuple(reversed(weights.lift.params))))
+        values = slab(f"x{suffix}", "x", "k" if suffix and different == "coordinate" else "row", "d")
+        return contraction("d", values, (weights, f"score{suffix}"))
+
+    first, second = score(""), score("2")
+    maximum = Fold(
+        operands=(first,),
+        lift=Lambda(("k", "score"), Body(()), ("score",)),
+        init=(float("-inf"),),
+        base=Lambda.componentwise(("maximum",), ("maximum",)),
+    )
+    denominator = reduction(
+        "k",
+        (maximum, second),
+        (Affine("shift", ("score2", "maximum"), (1.0, -1.0)), Assign("total__v", "exp", ("shift",))),
+        ("total",),
+    )
+    axes = {axis.name: axis for axis in (Axis("row", 4), Axis("d", 3), Axis("k", 5))}
+
+    assert (denominator.fuse(SOFTMAX, axes) is not None) == (different is None)
 
 
 def test_a_score_on_its_own_slab_still_injects_the_streamed_value() -> None:
@@ -399,3 +428,14 @@ def test_a_refusing_sibling_cluster_says_why(caplog) -> None:
         Pipeline.build(LOOP_PASSES + ["tile/lift", "tile/cut", "tile/schedule"]).run(graph, ctx=Context.from_target((12, 0)))
     declines = [r.message for r in caplog.records if "declined" in r.message]
     assert declines, "a refusing max/sum sibling pair must name the predicate that refused"
+
+
+def test_replacing_shared_components_rebinds_every_reader() -> None:
+    """Two old edges may land on the same fused component under different reader names."""
+    first, second = slab("first", "x", "j"), slab("second", "x", "j")
+    reader = projection((first, second), (Assign("sum", "add", ("first", "second")),))
+    rewritten = _replace(reader, {id(second): (first, {0: 0})})
+    assert rewritten.operands == (first,)
+    assert rewritten.lift.params == ("first",)
+    assert rewritten.lift.body == Body((Assign("sum", "add", ("first", "first")),))
+    assert rewritten.free_axes == reader.free_axes

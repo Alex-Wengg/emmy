@@ -105,10 +105,52 @@ Evidence: the decode profile, its overlap correction, and the serving reports in
 - **Paired projections.** GDN1's recorded 118/45 us scalar pieces have interleaved weight columns with no supported
   tensor-core tile. They need lowering/geometry coverage. GDN16 conv `9c264f27ab60` remains about 37 us with
   `t32x4,coop/r4` FM or `coop/r2` STD.
+- **Width-1 FP4 linears.** #1172 records native FP4 tile rows for the gdn1 MLP down projection (`k_linear_7f95ba`,
+  `w1x2, e2m1/f1x2/k8, d2/smem-tma`) and the GDN out_proj piece (`k_linear_mean_reduce_6fee7a__place_154114dfce`,
+  `w8x1, e2m1/f1x1/k8, d2/smem-async`), in both lanes. Serving: 34.2 and 13.7 us per launch against 116 and 37.8;
+  strict decode 36.0 tok/s against 29.2 on main a951e6c0.
+  - **Missing baseline.** That 29.2 was measured on main a951e6c0 on another box, before #1169/#1173/#1174/#1170/#1177.
+    No strict serving run of main 45e754bc exists, so how much of the 6.8 tok/s gain is #1172's is not measured. The
+    nsys profile attributes 5.1 of the step's 6.6 ms drop to the two kernels. To measure: the 2026-10-13 strict setup
+    (recipe golden, `--strict-evidence`, `EMMY_GEN_DECODE_BUCKET=16 EMMY_GEN_PREFILL_BUCKET=64 EMMY_GEN_M1_TIER=0
+    EMMY_FAST_MATH=1`, `--max-num-batched-tokens 64 --no-enable-prefix-caching`, eager) on main, then on #1172.
+  - **Tune depth.** The recorded rows say `tried: 1`: main's tune-DB version moved between the two box sessions and
+    the lane DBs were re-created empty, so the earlier 41-row tune of the down projection is not in the evidence.
+    `w1x1, f1x4/k8` and the width-16 twin's `w1x4, f1x1/k8` measured within the run-to-run spread of the winner.
 - **Helper isolation.** `run --kernel` fails with "formed from no loop op" for post16 `2be605e4c8fc` and post64
   `fe562a43c467`. These helpers need an isolation path before individual tuning.
 - **Numerical acceptance.** Whole-program strict checks across FP4 activation quantization still need a decision.
   Selected-kernel checks and successful serving probes do not justify relaxed tolerances or a whole-layer pass claim.
+
+## Cache regime in the golden
+
+A recorded row carries its cache regime as the `COLD_CACHE` input pin (in the row's `pins`); a row without it counts
+as hot. Nothing records which cache regime a program should use. Whoever records passes `--cold-cache` to `emmy run
+--bench --record-greedy` by hand (for this recipe: decode programs cold, prefill hot; `--record` refuses cold mode).
+Serving reads the cache regime back from the rows (`program_cold_cache` in
+`emmy/compiler/pipeline/search/golden/evidence.py`, from #1136).
+
+- **One cache regime per program.** A program compiles under one cache regime, and a compile reads only evidence of
+  that regime, golden and tune-DB rows alike. So serving startup refuses two kinds of program: one whose roots mix hot
+  and cold rows, and a cold program with a root that has no measured rows. Pinning `EMMY_COLD_CACHE` skips both
+  checks. A root here is one lifted target: a fused subgraph, which the compiler may cut into pieces. A restamp
+  (rewriting the golden onto the compiler's current lowering) can drop a row or turn it into an unmeasured proposal; a
+  cold program then fails on coverage. Re-recording that root without `--cold-cache` only turns the failure into a
+  mixed-regime one, and the record run does not warn. Every knob pick and every cut decision lies within one root, so
+  choosing the cache regime per root would never compare hot and cold timings, and it would remove this failure. Open:
+  whether to keep all-cold coverage as a deliberate rule, so that "decode is cold-tuned" holds for every root.
+- **Declare the intended cache regime.** `recipes/Qwen3.8-27B-NVFP4/serving-rtx5090.env` could name each program's
+  cache regime. Recording would then pick `--cold-cache` itself, and `emmy eval golden` would flag rows in the wrong
+  cache regime.
+- **The release audit reads hot rows only.** `emmy eval golden` compiles every program in the hot cache regime, so a
+  decode program recorded cold-only fails the audit while `emmy serve` deploys it. The audit should select each
+  program's cache regime the way serving does.
+- **`COLD_CACHE` is a measurement condition, not a compiler choice.** `emmy/compiler/pipeline/search/space.py`
+  declares it as an unfeatured `Knob` (it never enters the cost model's features), next to but not in
+  `PRECISION_KNOBS`. It reuses their plumbing: golden input pins and a field of the compile `Context`. `FAST_MATH` is
+  the precedent, but `FAST_MATH` also changes the generated code and the forks the search offers. `COLD_CACHE` changes
+  only how the bench times a kernel and which evidence a compile reads. A separate type for such pins would take it
+  out of the tuning knobs, where nothing stops code from treating it as a choice to tune.
 
 ## GDN serving follow-ups
 
@@ -130,6 +172,133 @@ Evidence: the decode profile, its overlap correction, and the serving reports in
 - **Packs.** No pack containing GDN programs has been saved and loaded. The old pack-hit detection bug is fixed.
 
 ## NVFP4 compiler and harness gaps
+
+- **`run --kernel` fills a cut piece's FP4 decode tables with random values.** Reproducer (sm_120, fast math):
+  `emmy run --golden <copy of the Qwen3.8 golden> --kernel k_linear_mean_reduce_6fee7a__place_154114dfce --bench
+  --ab 'WORK=w4x1,TILE=mma_m16n8k64_e2m1_f32/f1x1/k8,STAGE=d3/smem-async,REDUCE='`. Expected: the tile row matches
+  the scalar row to within bf16 rounding. Observed: `wrong-answer: rel err 8.971 vs greedy output`, the same for
+  every tile schedule. The isolated program of a cut piece takes every tensor as a graph input, including the FP4
+  decode tables (`*_f4_pairs`, bf16[256,2]) and the per-tensor scales, and the bench fills inputs with random values.
+  The scalar kernel reads the random tables; the tile hardcodes the e2m1 values. An uncut kernel keeps them as named
+  checkpoint constants and is not affected. So `--kernel` can time such a piece but not vouch for it, and `--tune`
+  through `--kernel` counts every tile row as a failure. A row named with `--realization` beside `--kernel` is
+  compared with the same-input greedy run of its own schedule, which hides the problem rather than checking it.
+  Workaround: check through the target (`--realization <target row> --pin-route --strict`, the schedule pinned on
+  the piece's compile token). Fix: the isolated program should keep a cut piece's constant tensors as constants.
+- **`--record-greedy` spells every precision gate in a row's pins; `emmy eval golden` compares pins exactly.**
+  `EMMY_FAST_MATH=1 EMMY_KNOBS="PLACE=fuse,WORK=w1x2,TILE=mma_m16n8k64_e2m1_f32/f1x2/k8,STAGE=d2/smem-tma,REDUCE=,LOOPIFY=0,RASTER=,SHARED_CARRY=0"
+  emmy run --golden W.json --realization gdn1-dense-linear@nvfp4.k_linear_7f95ba.m1.fm.ab7077b55776 --bench
+  --record-greedy` wrote `"pins": {"FAST_MATH": true, "FAST_EXP": true, "F16_MMA_F32_ACC": true, "FP8_MMA": true}`;
+  every other row spells `{"FAST_MATH": true}`. Both are one regime (`regime_pins` in
+  `emmy/compiler/pipeline/search/space.py` agrees). `emmy eval golden` keeps a lane's rows by `row.pins ==
+  dict(pins)`, so it leaves such rows out and audits the lane on the remaining rows only, still passing. Reproducer
+  (CPU only) on #1172's commit 85932305, before the rows were re-spelled:
+
+  ```bash
+  git show 85932305:recipes/Qwen3.8-27B-NVFP4/golden/rtx5090_sm120.json > /tmp/G.json
+  python -c '
+  from emmy.compiler.pipeline.search.golden.format import GoldenFile
+  doc = GoldenFile.load("/tmp/G.json", repository=False)
+  for fm in (True, False):
+      rows = [r for r in doc.rows if r.name.endswith((".30d0b06d6934", ".93c9779d7ebf")) and r.pins["FAST_MATH"] == fm]
+      print(fm, len(rows), "in the lane,", sum(r.pins == {"FAST_MATH": fm} for r in rows), "kept by the audit")'
+  # True 2 in the lane, 0 kept by the audit
+  # False 2 in the lane, 0 kept by the audit
+  ```
+
+  #1172 commit 44986bca re-spelled the four rows to `{"FAST_MATH": <lane>}` by hand (checked equal under
+  `regime_pins`); then 2 rows per lane are kept and the audit passes 9/9 in both lanes. Fix in one place: the writer
+  stores the umbrella spelling, or the audit compares `regime_pins`.
+- **Nested TILE and STAGE stamps that the binder drops under an output-tiled root.** In the Qwen3.8 NVFP4 gdn16
+  recurrence piece `k_linear_matmul_mean_reduce_…__place_84c2d13867__place_149fbfea8c__partial`, both the main and the
+  greedy-fix picks stamp `TILE` on the two nested contractions and `STAGE=d2/smem-tma` on one of them, yet the
+  generated CUDA runs those folds as serial per-cell loops and uses no shared memory. The binder accepts the stamps
+  silently; the offer-time refusal covers only nested tiles under a root that is not output-tiled. Likely fix: offer
+  a nested tile only where the binder realizes it (a chunked carrier's score), refuse the rest at the offer.
+
+- **A `--kernel` bench records no routing rows.** `emmy run --golden W.json --kernel PIECE --bench` with a `PLACE@…=cut`
+  pin benches the cut set but writes neither its decision nor the set's timing, so a piece's own cut cannot be recorded
+  that way (`_record_bench_evidence` gets no decisions on the `--kernel` path). Reproducer: the gdn1 conv piece
+  `k_conv1d_linear_mean_reduce_970a92__place_f8a6aa5436` with `PLACE@inner.1/map.10/map.1/map.1/inner=cut`.
+- **A `PLACE` pin below an unpinned root drops to the fused kernel.** Pinning a seam inside a piece without the root
+  arm prints "PLACE pin … names no seam of any kernel in this compile", compiles the root fused, and records a
+  `bench_fail` row, even when the golden stores a measured root route. A seam three levels below the root is
+  unreachable even under a root pin: the middle piece's fork offers only its uncut arm. Reproducer: the gdn16 conv
+  parent `k_conv1d_linear_mean_reduce_0e5142`, piece `__place_6208ad3c2c__place_69523dba28`.
+- **The gdn16 conv parent recomputes the qkv projection once per conv tap.** The cut pass offers the projection seam,
+  but `_channel_copies` finds no copies at width 16: the token-axis pad from 16 to 64 guards every source coordinate
+  (`(a1 < 16) ? … : 0`), weight column included, and no tap reads the token coordinate plainly. Width 64 needs no
+  pad, so its taps merge and its conv parent costs 268 µs; the gdn16 one costs about 5 ms at best. Prototyped fix:
+  drop a guard on a coordinate interval analysis proves in range, and let `_read_at` map a copy through a
+  representative expression that is the identity on the copy's addresses.
+  Status: decided; scheduled as its own PR after the 2026-10-13 golden and the one-layout-per-weight change merge.
+  Measured cost, strict serving on 2026-10-13: gdn16 runs 6.2 ms per layer per call, about 0.30 s per 16-token
+  prefill piece over the 48 gated DeltaNet layers. A prompt's tail after its last full 64-token chunk runs 0 to 3 such
+  pieces (about 1.5 on average), so TTFT rose from 0.71 to 1.05 s at 227 tokens (two pieces) and from 0.49 to 0.61 s
+  warm at 25 tokens, while 1027 tokens (no piece) got faster. Under 1 ms per layer would save about 0.25 s per piece
+  (estimate); decode does not change. Without prefix caching a chat is prefilled whole on every turn, so the saving is
+  a fixed amount per request; with prefix caching it would apply to every reply's short tail. Cost: the guard change
+  re-keys kernels in the RTX 4090 and the V100 FP8 and GPTQ goldens, whose rows lose their measurements until a record
+  run on those cards; gdn16 then needs re-recording on the RTX 5090.
+
+- **Promoting a working golden keeps rows a repository golden refuses.** The 2026-10-13 golden was promoted with 52
+  rows that spell no schedule (`knobs: null`): the trace inventory's seed rows on targets that a routing row splits
+  into pieces (those never run as one kernel, so no schedule can be recorded for them), and seed rows a measured row
+  of the same kernel and pins had superseded. `GoldenFile.check` refuses any repository row without knobs, so the
+  file did not load at all until they were dropped by hand. Promotion should drop such rows itself. It kept one more
+  leftover: the gdn16 matmul's first greedy record (`TILE=f26x12`, 450 µs) beside the tuned row of the same name,
+  kernel and pins (`TILE=f4x8`, 19.5 µs). A compile picks the faster row, but the slower one is noise in the file.
+- **A split target's whole time has no row to land on.** `--record-greedy` writes the whole pick's time beside
+  `torch.compile` onto the seed row, the one row of a split target that names the target itself, and that row is
+  exactly what promotion must drop. `run --golden COPY --realization PIECE_ROW --bench --record` then cannot restore
+  it: it benches the piece row's pinned config, which fails (gdn16 conv: a strict-evidence refusal on another piece,
+  or a 10 s bench timeout without `--strict-evidence`) and records nothing. So the gdn16 and gdn64 conv targets
+  (`k_conv1d_linear_mean_reduce_0e5142`: 5.06 ms against 89 µs for `torch.compile`;
+  `k_conv1d_linear_mean_reduce_5f1430`: about 250 µs against 105 µs) show no gap in `emmy golden list`. The record
+  run should write a split target's whole time onto its pieces' rows (or a row the format accepts without a schedule).
+- **A re-trace leaves shared kernels filed under the old program.** When a fresh trace lowers to a kernel the file
+  already stores, `GoldenFile.add_kernel` keeps the stored entry with its old `traced` index and its body spelled in
+  the old program's buffer names. Dropping the old program then needs each shared target moved by hand: its body
+  re-spelled from the fresh program and its `traced`, `origins` and `bindings` taken from it. Otherwise
+  `emmy golden check` drops the target and its whole kernel set. The inventory writer could move a shared target to
+  the newest program itself.
+
+- **Layout picks can double a weight.** Each kernel decides its constant's layout on its own (the layout fork the cut
+  pass offers, `030_cut.py` → `layout_forks`), and the runner keeps one device copy per load-op chain
+  (`gen_runner._bind_plan_constants`). When pieces of one program, or its width twins, disagree on a weight's layout,
+  serving holds both copies. On main 8d2e4be7 with prior-chosen GDN routes, each GDN layer binds `in_proj_qkv` and
+  `in_proj_z` both transposed and in source layout: 482 MiB per layer against the 322 MiB the checkpoint stores, 7.5 GiB
+  over 48 layers, and the 5090 boot runs out of memory before the LM head. Nothing in the compiler prices the second
+  copy. Options: price it in the layout fork, or decide a constant's layout once per program and its twins. Until then,
+  check a recorded route for mixed layouts on these weights before promoting it.
+- **A nested-TILE refusal re-resolves the whole program, one row at a time.** `_factor.py` refuses a non-off TILE at a
+  contraction nested in a serially lowered reduction (`UnbindableProjection`), and `GreedyStrategy.run` blocks that one
+  row identity and resolves the whole program again, up to `_MAX_GREEDY_RETRIES = 8`, then resolves once with the
+  schedule prior off. The prior ranks the next tiled variant at the same site first, so the refusals repeat. On the
+  NVFP4 GDN programs this costs about 20 resolves where 3 would do (layer 0 compiles in about 47 min instead of about
+  7), and gdn1 exhausts the budget and ships with emission-order schedules. Strict compiles from a recorded golden do
+  not hit it. Options: drop the refused class when rows are offered, or block every tiled row at that nested site.
+
+The next two gaps showed up on 2026-10-12, recording the gdn1 conv parent `k_conv1d_linear_mean_reduce_970a92`
+(program 0, `num_tokens=1`, fast-math) with no stored route. Reproducer: a copy of the golden with a proposal (a row
+with no schedule and no measurement, such as a trace inventory's seed) on that kernel, a fresh `EMMY_TUNE_DB`, then
+`emmy run --golden COPY --realization <proposal> --bench`. With no stored route the placement prior picks a 34-kernel
+nested cut taking 63.6 ms. Two of its FP4 scale pieces take 23.6 ms and 25.8 ms: they are the pieces whose rows the
+kernel binder refuses in the second gap (the same `__place_09e8091d31…__place_c7631c8efe` and
+`__place_5d87ea182b…__place_317e0a44d4` tokens), running on the row the re-ranking fell back to.
+
+- **The default bench budget drops slow picks.** At the default `--warmup 10 --iters 100` the greedy isolated re-bench
+  ran past the 10 s GPU budget (`benchmark run stage exceeded 10.0s of GPU time`) and was marked `bench_fail`, so the
+  run recorded no perf rows and no routing rows. A smaller setting, `--warmup 5 --iters 20`, fits and
+  records. A record of a route nothing has priced yet should fit the budget whatever the pick costs, for example by
+  sizing the iterations from the greedy comparison's own time.
+- **The greedy compile re-ranks past the same binder refusals over and over.** Each run printed the same two lines
+  eight times: `reshape_6_static_fp4_scale_bits__place_09e8091d31_0__place_c7631c8efe_0` and
+  `…__place_5d87ea182b_0__place_317e0a44d4_0` "left un-lowered (k:010_materialize: kernel binder refuses this row's
+  projection ownership: serial lowering of reduce cannot realize TILE at reduce.1/inner) — re-ranking it past the
+  refused row". One non-strict run then spent about 21 min, mostly compiling (1256–1374 s wall). The watcher also
+  reported 216 kernel-set decisions for 24 distinct ones, which suggests the whole compile repeats. Find out why a
+  refused row is offered again, and cache the refusal across those repeats.
 
 A nested contraction's tile can be lost when a serial carrier lowers its subtree through `Fold.lower`. The scalar
 binder now refuses such a selected tile instead of qualifying scalar CUDA as native. Supporting it requires binding
@@ -157,7 +326,34 @@ Five authored serving rows still lack required keys, so their schedule replay ha
 | sm80, sm90 | `g008.k_linear_reduce_00d191.ec5e55ae07bc` on each card | REDUCE/STAGE/TILE |
 | sm120 | `g040.k_conv1d_linear_mean_reduce_c59d7d.cddc7092cef7` | STAGE/TILE |
 
+## Golden record run settles weight layouts differently from serving
+
+`emmy run --golden PATH` (the record and bench walk) compiles a golden's target kernels one at a time. Within a
+family of twins, the first target in the file's row order that reads a transposed weight settles its layout (folded or
+source) for every later target and wider twin. Serving compiles each twin whole, narrowest first, and there the first
+kernel the cut pass visits decides. When two kernels of one twin prefer different layouts, the walk can settle the
+other layout and record rows for kernels serving never compiles.
+
+Safe for now: `emmy eval golden --serving-config` compiles each twin whole in serving's order, so a golden whose
+rows miss serving's layout fails that audit loudly, naming the kernel. On both Qwen3.8 5090 goldens (the repository
+one and #1160's) a compile-only walk agrees with serving on every weight it settles (`linear_wt`, `linear_2_wt`,
+`linear_3_wt` folded); it never settles `linear_1_wt`, because no target in its compile binds it transposed.
+
+Proposed fix: before compiling a twin's targets, compile the twin whole under its family's settled layouts, in
+serving's order, and record its layouts into the scope; then compile the targets under them. Cost: one more
+whole-program compile per twin and pin set in the walk.
+
 ## Ideas from earlier work, unverified
+
+- **A symbolic-width GDN prefill program is a Tile IR change, not a wrapper.** With `Dim.DYNAMIC` on the token axis
+  (T in 2..64), main's GDN layer gets through the frontend and the Loop passes after six generic frontend fixes
+  (symbolic pad widths, a symbolic size `torch.export` leaves unsimplified, a symbolic slice start, a composite slice
+  size, a select on a symbolic-size chunk axis, a padded conv1d of symbolic length). It then stops at the tile stage:
+  the pad mask, the conv bound and the history offset T..T+3 read the token count inside a kernel body, and Tile IR
+  treats a symbolic size only as a loop extent. The frontend has no scan primitive, so a traced program covers one
+  chunk (T <= 64) per call, and symbolic rows are keyed at hint 512, not 64. The model's chunk rule zero-pads after
+  the gate transform, so its pad rows are neutral; zeroing the raw inputs would not be. Kept as an option if tuned
+  fixed widths (1, 16, 64) leave the prompt tail dominant.
 
 - #1082's corrected GDN64 input route cuts the unsplit norm first, then uses `LAYOUT@linear_wt=source`.
   It measured 1.162/1.206 ms FM/STD standalone; FM whole-program continuation still lacks a measured cut decision.

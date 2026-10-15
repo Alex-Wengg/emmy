@@ -19,6 +19,7 @@ from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.loop import (
     Accum,
+    Affine,
     Assign,
     Axis,
     Load,
@@ -44,6 +45,11 @@ def _elementwise_fns(op: LoopOp) -> list[str]:
     return [s.op.name for s in op.body.iter() if isinstance(s, Assign)]
 
 
+def _affine_shapes(op: LoopOp) -> list[tuple[tuple[float, ...], float]]:
+    """Every Affine's sorted coefficients and offset: the folded form a sum, difference or negation takes."""
+    return sorted((tuple(sorted(s.coefficients)), s.offset) for s in op.body.iter() if isinstance(s, Affine))
+
+
 def _splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: str) -> LoopOp | None:
     """Pairwise fixture over the production N-way entry point."""
     writes = producer.writes
@@ -55,6 +61,52 @@ def _splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: str) -> LoopOp 
     )
 
 
+def test_splicing_independent_row_sums_keeps_lexically_reused_accumulators_distinct() -> None:
+    def rows(buffer: str, extent: int) -> Loop:
+        return Loop(
+            Axis("row", extent),
+            (
+                Loop(
+                    Axis("k", 3),
+                    (Load("value", buffer, (Var("row"), Var("k"))), Accum("total", "value", axes=("k",))),
+                ),
+                Write(f"{buffer}_sum", (Var("row"),), "total"),
+            ),
+        )
+
+    op = LoopOp(body=(rows("x", 2), rows("y", 4)))
+    accums = [stmt.name for stmt in op.body.iter() if isinstance(stmt, Accum)]
+    assert len(set(accums)) == 2
+    merged = splice_loops({"root": op}, {}, roots=(("root", "x_sum"), ("root", "y_sum")))
+    assert merged is not None
+    inputs = {"x": np.arange(6, dtype=np.float32).reshape(2, 3), "y": np.arange(12, dtype=np.float32).reshape(4, 3) - 4}
+    results = dict(zip(merged.outputs, merged.forward(*(inputs[name] for name in merged.inputs)), strict=True))
+    for name, values in inputs.items():
+        np.testing.assert_array_equal(results[f"{name}_sum"], values.sum(-1))
+
+
+def test_normalization_preserves_explicit_state_through_a_conditional_update() -> None:
+    from emmy.compiler.dtype import F32
+    from emmy.compiler.ir.stmt import Cond, Init
+
+    op = LoopOp(
+        body=(
+            Init("total", 10.0, dtype=F32),
+            Loop(
+                Axis("k", 4),
+                (
+                    Load("x", "x", (Var("k"),)),
+                    Cond(BinaryExpr("<", Var("k"), Literal(2)), (Accum("total", "x", axes=("k",)),)),
+                ),
+                seed=False,
+            ),
+            Write("sum", (Literal(0, dtype="int"),), "total"),
+        )
+    )
+    actual = op.forward(np.array([1, 2, 100, 100], dtype=np.float32))
+    np.testing.assert_array_equal(actual, np.array([13], dtype=np.float32))
+
+
 # Fixtures — shared axes
 # ---------------------------------------------------------------------------
 
@@ -62,7 +114,7 @@ def _splice_loop_ops(producer: LoopOp, consumer: LoopOp, source: str) -> LoopOp 
 def _reduce_producer(*, source: str, output: str, rounds_to: DataType | None = None) -> LoopOp:
     """A bare sum reduce storing to ``output``, with its store rounding spelled when narrowing.
 
-    ``loop/lifting/090_spell_store_rounding`` is what spells it in the real pipeline; these tests
+    ``loop/lowering/090_spell_store_rounding`` is what spells it in the real pipeline; these tests
     splice hand-built kernels, so they state it directly — the splicer's contract is to PRESERVE a
     spelled conversion, never to re-derive one from the buffer.
     """
@@ -162,10 +214,9 @@ def test_pointwise_chain():
 
     merged = _splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
-    fns = _elementwise_fns(merged)
-    # exp from producer + copy alias for the Load + add from consumer.
-    assert "exp" in fns
-    assert "add" in fns
+    # exp from producer; the consumer's ``add(y, y)`` folds to one Affine ``2*y``.
+    assert "exp" in _elementwise_fns(merged)
+    assert _affine_shapes(merged) == [((2.0,), 0.0)]
     # Producer's Load (consumer had no other inputs) survives as source 0.
     loads = [s for s in merged.body.iter() if isinstance(s, Load)]
     assert len(loads) == 1
@@ -685,10 +736,9 @@ def test_chain_three_loops():
         splice_edges={("b", "A"): ("a", "A"), ("c", "B"): ("b", "B")},
     )
     assert merged is not None
-    fns = _elementwise_fns(merged)
-    assert "exp" in fns
-    assert "negative" in fns
-    assert "add" in fns
+    assert "exp" in _elementwise_fns(merged)
+    # ``-exp(x) + bias``: the negation and the add fold into one Affine.
+    assert _affine_shapes(merged) == [((-1.0, 1.0), 0.0)]
     # Two external Loads remain (X, BIAS); the splice edges collapsed into copy aliases.
     loads = [s for s in merged.body.iter() if isinstance(s, Load)]
     assert len(loads) == 2
@@ -929,8 +979,8 @@ def test_multi_output_root_preserves_all_writes():
     fns = _elementwise_fns(merged)
     # Producer chain materialized once (shared σ); both consumer ops present.
     assert fns.count("exp") == 1
-    assert "negative" in fns
     assert "abs" in fns
+    assert _affine_shapes(merged) == [((-1.0,), 0.0)]
 
 
 def test_multi_output_splice_target():
@@ -978,8 +1028,8 @@ def test_multi_output_splice_target():
     fns = _elementwise_fns(merged)
     # Both target ops appear in the merged body once each.
     assert fns.count("exp") == 1
-    assert fns.count("negative") == 1
-    assert "add" in fns
+    # The negation is read once (its write left with the splice edge), so ``exp(x) + (-x)`` is one Affine.
+    assert _affine_shapes(merged) == [((-1.0, 1.0), 0.0)]
     # Only one external Load (target's x); the splice edges replaced sink's Loads.
     loads = [s for s in merged.body.iter() if isinstance(s, Load)]
     assert len(loads) == 1
@@ -1039,8 +1089,9 @@ def test_shared_load_dedup_into_reduce():
     # Reduce + full silu chain + final multiply should all materialize once.
     assert _count_kind(merged, Accum) == 1
     fns = _elementwise_fns(merged)
-    for op in ("negative", "exp", "add", "reciprocal", "multiply"):
+    for op in ("exp", "reciprocal", "multiply"):
         assert op in fns, f"missing {op} in merged body: {fns}"
+    assert _affine_shapes(merged) == [((-1.0,), 0.0), ((2.0,), 0.0)]
 
 
 def test_literal_producer_write_index():
@@ -1074,7 +1125,7 @@ def test_literal_producer_write_index():
     merged = _splice_loop_ops(producer, consumer, source="src_0")
     assert merged is not None
     assert "exp" in _elementwise_fns(merged)
-    assert "negative" in _elementwise_fns(merged)
+    assert _affine_shapes(merged) == [((-1.0,), 0.0)]
 
 
 def test_large_sigma_target_free_vars_walks_do_not_scale_with_producer_chain(monkeypatch):
@@ -1082,6 +1133,12 @@ def test_large_sigma_target_free_vars_walks_do_not_scale_with_producer_chain(mon
 
     def splice(chain_length):
         from emmy.compiler.ir.expr import BinaryExpr
+        from emmy.compiler.ir.stmt.body import _normal_form
+        from emmy.compiler.ir.stmt.identity import _identity
+
+        # Both runs measure the computation, not a memo hit: the consumer is the same body both times.
+        _normal_form.cache_clear()
+        _identity.cache_clear()
 
         producer_axis = Axis("p", 4096)
         producer_stmts = [Load(name="x", input="X", index=(Var("p"),))]

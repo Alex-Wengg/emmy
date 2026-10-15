@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from emmy.compiler.context import Context
+from emmy.compiler.dtype import F16, F32
 from emmy.compiler.graph import Tensor
 from emmy.compiler.ir.axis import Axis, Window
 from emmy.compiler.ir.elementwise import ElementwiseImpl
@@ -28,7 +29,7 @@ from emmy.compiler.ir.tile import OutputSpec, Placement, TileOp
 from emmy.compiler.ir.tile.ops import carries_partition
 from emmy.compiler.pipeline.fork import iter_leaves
 from emmy.compiler.pipeline.passes.tile._fromloop import fold_from_loop
-from tests.compiler.helpers import enumerate_classic_reference
+from tests.compiler.helpers import enumerate_classic_reference, requires_cuda
 from tests.compiler.terms import contraction, projection, reduction, slab
 
 classic_forks = import_module("emmy.compiler.pipeline.passes.tile.schedule.040_schedule").classic_forks
@@ -160,6 +161,133 @@ def test_eight_output_lanes_are_offered_on_volta_and_lower_with_their_own_grid()
     for cap in ((8, 0), (12, 0)):
         assert not any(choice.coop_output_lanes == 8 for choice in classic._reduction_domain(tile, tile.op, Context.from_target(cap)))
     assert any(choice.coop_output_lanes == 8 for choice in classic._reduction_domain(tile, tile.op, target))
+
+
+def _deferred_softmax_merge(count: int) -> TileOp:
+    """Finished workspace states, including a ragged partition count, with one rounded output."""
+    from emmy.compiler.ir.expr import Literal
+    from emmy.compiler.ir.pure import Fold, Lambda
+    from emmy.compiler.ir.pure.twist import SOFTMAX, Twist
+
+    n = Axis("n", 8)
+    k = Axis("k", count, window=Window(parent=Axis("split", count), partition=True))
+    values = ("pm", "pd", "po")
+    fold = Fold(
+        operands=tuple(slab(value, "x", Literal(i, "int"), "k", "n") for i, value in enumerate(values)),
+        lift=Lambda(("k", *values), Body(), values),
+        init=(ElementwiseImpl("maximum").identity, 0.0, 0.0),
+        base=Lambda.componentwise(SOFTMAX.base, ("m", "d", "o")),
+        twist=Twist(SOFTMAX, ()),
+    )
+    root = projection((fold,), (Assign("out", "divide", ("o", "d")),), ("out",))
+    return TileOp(
+        op=root,
+        place=Placement(free=(n,)),
+        axes=(n, k),
+        inputs={"x": Tensor("x", (3, count, 8), F32)},
+        outputs={"y": Tensor("y", (8,), F16)},
+        output_specs=(OutputSpec(Write("y", (Var("n"),), "out")),),
+    )
+
+
+def _deferred_merge_graph(tile):
+    from emmy.compiler.graph import Graph
+    from emmy.compiler.ir.base import InputOp
+
+    graph = Graph()
+    graph.add_node(InputOp(), [], tile.inputs["x"], node_id="x")
+    graph.add_node(tile, ["x"], tile.outputs["y"], node_id="y")
+    graph.inputs, graph.outputs = ["x"], ["y"]
+    return graph
+
+
+def _partial_states():
+    import numpy as np
+
+    states = np.random.default_rng(4).normal(size=(3, 5, 8)).astype(np.float32)
+    states[1] = np.abs(states[1]) + 1
+    states[0, :, :2] = -np.inf
+    states[1:, :, :2] = 0
+    states[:, 0, 1] = (0, 1, 1.25)  # only one nonempty partition; several register chains stay empty
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pivot = np.maximum(states[0].max(axis=0), ElementwiseImpl("maximum").identity)
+        weights = np.exp(states[0] - pivot)
+        expected = (states[2] * weights).sum(axis=0) / (states[1] * weights).sum(axis=0)
+    return states, expected
+
+
+@pytest.mark.parametrize("count", [5, 16])
+@pytest.mark.parametrize(("reduce", "work"), [("", ""), ("r2", ""), ("r4", ""), ("coop-t", "t128")])
+def test_deferred_states_offer_and_lower_the_requested_reduction(count, reduce, work):
+    from emmy.compiler.ir.cuda import CudaOp
+    from emmy.compiler.ir.tile.ops import merges_partition
+    from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    tile = _deferred_softmax_merge(count)
+    assert merges_partition(tile)
+    graph = _deferred_merge_graph(tile)
+    row = {"WORK": work, "REDUCE": reduce, "RASTER": "", "PLACE": "fuse", "LOOPIFY": "0"}
+    with pinned_knobs(row):
+        compiled = Pipeline.build(CUDA_PASSES).run(graph, ctx=Context.from_target((8, 0)), db=None)
+    (kernel,) = [node.op for node in compiled.nodes.values() if isinstance(node.op, CudaOp)]
+    assert kernel.knobs["REDUCE"] == reduce and kernel.knobs["WORK"] == work
+    assert kernel.kernel_source.count("__float2half(") == 1
+    assert "const float*" in kernel.kernel_source
+
+
+@pytest.mark.parametrize("reduce", ["r2", "r4"])
+def test_deferred_register_partials_preserve_empty_states_and_the_uneven_tail(reduce):
+    import numpy as np
+
+    from emmy.compiler.ir.kernel import KernelOp
+    from emmy.compiler.ir.loop.runner import execute_loop_op_cpp
+    from emmy.compiler.ir.schedule.classic import materialize_classic
+    from emmy.compiler.pipeline.passes.lowering.kernel._factor import factorize
+
+    tile = _deferred_softmax_merge(5)
+    target = Context.from_target((8, 0))
+    row = {"WORK": "", "REDUCE": reduce}
+    problem = ClassicProblem(tile, target, row=row, validate_pins=True)
+    (choice,) = advance_schedule(ClassicScheduleContext(tile, target, problem))
+    realized = materialize_classic(tile, name="merge", knobs=row, target=target, schedule=choice)
+    bound = factorize(realized, root=None)
+    assert bound.axes == tile.place.free
+    # This serial Kernel IR uses only the shared scalar statements. Execute its actual strided
+    # body through the host renderer; the CUDA source assertion above checks the storage conversion.
+    kernel = KernelOp(body=Body((Loop(bound.axes[0], bound.body),)), inputs=tile.inputs, outputs=tile.outputs)
+    states, expected = _partial_states()
+    actual = execute_loop_op_cpp(kernel, {"x": states}, {"y": (8,)})
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6, equal_nan=True)
+
+
+@requires_cuda
+@pytest.mark.parametrize(("reduce", "work"), [("r2", ""), ("r4", ""), ("coop-t", "t128")])
+def test_deferred_reduction_cuda_preserves_empty_states_and_the_uneven_tail(reduce, work):
+    import numpy as np
+
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda import CudaOp
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    backend = CudaBackend()
+    row = {
+        "PLACE": "fuse",
+        "WORK": work,
+        "REDUCE": reduce,
+        "FAST_MATH": False,
+        "FAST_EXP": False,
+        "F16_MMA_F32_ACC": False,
+        "FP8_MMA": False,
+    }
+    with pinned_knobs(row):
+        compiled = backend.compile(_deferred_merge_graph(_deferred_softmax_merge(5)))
+    (kernel,) = [node.op for node in compiled.nodes.values() if isinstance(node.op, CudaOp)]
+    assert kernel.knobs["REDUCE"] == reduce and kernel.knobs["WORK"] == work
+    states, expected = _partial_states()
+    actual = backend.run(compiled, input_data={"x": states})[0].outputs["y"]
+    assert actual.dtype == np.float16
+    np.testing.assert_allclose(actual, expected.astype(np.float16), rtol=1e-3, atol=1e-3, equal_nan=True)
 
 
 def test_production_enumeration_is_the_compatible_independent_product() -> None:
@@ -330,6 +458,53 @@ def test_multi_channel_contraction_domain_is_per_cell_direct_and_warp_staged() -
     warp_transports = {choice.stage.transport for child in warp for choice in child.schedule.edges.values()}
     assert warp and not any(choice.stage.is_direct for child in warp for choice in child.schedule.edges.values())
     assert "smem" in warp_transports
+
+
+@pytest.mark.parametrize("n,work,fragment,legal", [(48, "w1x4", "f3x4", False), (48, "w1x2", "f3x1", True), (128, "w1x4", "f3x4", True)])
+def test_materialized_multi_channel_fill_requires_complete_copied_n_chunks(n, work, fragment, legal) -> None:
+    """A shared A and two copied B slabs obey the compute fill's vector-copy cover rule too."""
+    m_axis, n_axis, k_axis = Axis("m", 64), Axis("n", n), Axis("k", 64)
+    root = contraction(
+        k_axis,
+        slab("a_e", "a", "m", "k"),
+        (slab("b0_e", "b0", "k", "n"), "acc0"),
+        (slab("b1_e", "b1", "k", "n"), "acc1"),
+    )
+    tile = TileOp(
+        op=root,
+        place=Placement(free=(m_axis, n_axis)),
+        axes=(m_axis, n_axis, k_axis),
+        inputs={name: Tensor(name, shape, "bf16") for name, shape in (("a", (64, 64)), ("b0", (64, n)), ("b1", (64, n)))},
+        outputs={"out": Tensor("out", (64, n), "f32")},
+    )
+    row = {"WORK": work, "TILE": f"mma_m16n8k16_bf16_f32/{fragment}/k4", "STAGE": "d2/smem", "REDUCE": "", "RASTER": ""}
+    pins = {key: ((key, value),) for key, value in row.items()}
+    context = _context(tile, Context.from_target((12, 0)), pins=pins)
+    if legal:
+        assert tuple(_enumerate_context(context))
+    else:
+        with pytest.raises(ValueError, match="STAGE pin .* does not resolve"):
+            tuple(_enumerate_context(context))
+
+
+def test_materialized_multi_channel_fill_clamps_transposed_b_rows() -> None:
+    """K-contiguous B copies clamp whole N rows, even when N is narrower than a Volta tile."""
+    m, n, k = Axis("m", 16), Axis("n", 8), Axis("k", 64)
+    root = contraction(
+        k,
+        slab("a_e", "a", "m", "k"),
+        *((slab(f"b{i}_e", f"b{i}", "n", "k"), f"acc{i}") for i in range(3)),
+    )
+    tile = TileOp(
+        op=root,
+        place=Placement(free=(m, n)),
+        axes=(m, n, k),
+        inputs={"a": Tensor("a", (16, 64), "f16"), **{f"b{i}": Tensor(f"b{i}", (8, 64), "f16") for i in range(3)}},
+        outputs={f"out{i}": Tensor(f"out{i}", (16, 8), "f32") for i in range(3)},
+    )
+    row = {"WORK": "w1x1", "TILE": "mma_m8n8k4_f16_f32/f1x1/k8", "STAGE": "d2/smem", "REDUCE": "", "RASTER": ""}
+    context = _context(tile, Context.from_target((7, 0)), pins={key: ((key, value),) for key, value in row.items()})
+    assert tuple(_enumerate_context(context))
 
 
 def test_a_packed_gate_up_edge_offers_a_scalar_register_tile() -> None:

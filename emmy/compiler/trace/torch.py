@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from emmy.compiler.dtype import get as resolve_dtype
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import ConstantOp, InputOp
-from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.elementwise import ElementwiseImpl, is_elementwise
 from emmy.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, placeholder
 from emmy.compiler.ir.frontend.ir import (
     CatOp,
@@ -98,7 +98,23 @@ def trace_module_with_constants(
     ``Dim`` instances. Internal names torch assigns (``s0``, ``s1``,
     …) are renamed back to the user-supplied ``Dim`` names from
     ``dynamic_shapes`` so the resulting IR reads as ``Dim('seq_len')``.
+
+    A module that writes an input, parameter or buffer in place is refused: the graph cannot carry the
+    write back, so it would be dropped. :func:`trace_module_functional` traces one.
     """
+    graph, const_targets, _ = _trace(module, example_inputs, kwargs, dynamic_shapes=dynamic_shapes, functional=False)
+    return graph, const_targets
+
+
+def trace_module_functional(module: nn.Module, example_inputs: tuple[torch.Tensor, ...]) -> tuple[Graph, dict[str, str]]:
+    """Trace a module that may write its inputs in place: ``torch.export`` functionalizes each write into
+    the input's new value, which the graph returns after the module's own outputs. The second return
+    value maps each such output to the input the caller must write it into after every run."""
+    graph, _, writes = _trace(module, example_inputs, None, dynamic_shapes=None, functional=True)
+    return graph, writes
+
+
+def _trace(module, example_inputs, kwargs, *, dynamic_shapes, functional: bool) -> tuple[Graph, dict[str, str], dict[str, str]]:
     import time
 
     import torch
@@ -119,6 +135,16 @@ def trace_module_with_constants(
     # instead of tuple-valued ``wrap_with_set_grad_enabled`` higher-order nodes.
     with torch.no_grad():
         exported = torch.export.export(module, example_inputs, **export_kwargs)
+    # One export form for every module. Functionalization rewrites each in-place write and re-spells the view
+    # aliases (``chunk`` as ``split``, ``narrow`` as ``slice``, ``reshape`` and ``flatten`` as ``view``, ``expand_as``
+    # as ``expand``, ``to`` as ``_to_copy``) whether or not the module writes anything, so a module traces the same
+    # way with and without an in-place op. The empty table decomposes nothing else.
+    exported = exported.run_decompositions({})
+    # Functionalization reports each write that outlives the call, to an input, parameter or buffer, as an output.
+    output_kind = torch.export.graph_signature.OutputKind
+    written = [spec for spec in exported.graph_signature.output_specs if spec.kind != output_kind.USER_OUTPUT]
+    if written and not (functional and all(spec.kind == output_kind.USER_INPUT_MUTATION for spec in written)):
+        raise NotImplementedError(f"the module writes an input, parameter or buffer in place ({written[0].target!r})")
     gm = exported.graph_module
     t1 = time.monotonic()
     fx_nodes = list(gm.graph.nodes)
@@ -157,182 +183,26 @@ def trace_module_with_constants(
             logger.debug("Skipping FX node: %s (op=%s)", fx_node.name, fx_node.op)
     logger.info("FX→Graph IR walk done in %.1fs (%d IR nodes)", time.monotonic() - t1, len(g.nodes))
 
-    return g, const_targets
+    # The export returns each written value before the module's outputs; the graph returns it after them.
+    writes = {node_map[spec.arg.name]: spec.target for spec in written}
+    outputs = g.outputs[len(writes) :]
+    g.outputs = outputs + [ref for ref in writes if ref not in outputs]
+    return g, const_targets, writes
 
 
 def _output_live_fx_nodes(nodes: list[Any]) -> set[Any]:
-    """Return the FX nodes observable through the exported value outputs.
-
-    ``torch.export`` can retain a dead local mutation because FX's stock dead-code pass treats
-    every mutating ATen schema as impure. Reverse reachability removes that branch, but must also
-    retain a mutation through a view of a returned tensor. ATen schema aliases identify the
-    storage roots that a write can affect; unsupported observable writes therefore still fail in
-    the walker instead of being silently pruned.
-    """
+    """Return the FX nodes observable through the exported value outputs."""
     outputs = [node for node in nodes if node.op == "output"]
     if len(outputs) != 1:
         raise ValueError(f"torch export graph must contain exactly one output node, got {len(outputs)}")
-
-    alias_roots = _fx_alias_roots(nodes)
-
     live: set[Any] = set()
-
-    def add_ancestors(seeds) -> None:
-        stack = list(seeds)
-        while stack:
-            node = stack.pop()
-            if node in live:
-                continue
+    stack = list(outputs)
+    while stack:
+        node = stack.pop()
+        if node not in live:
             live.add(node)
             stack.extend(node.all_input_nodes)
-
-    add_ancestors(outputs)
-    while True:
-        live_roots = set().union(*(alias_roots[node] for node in live))
-        writes = [
-            node
-            for node in nodes
-            if node not in live and any(alias_roots.get(target, {target}) & live_roots for target in _written_fx_nodes(node))
-        ]
-        if not writes:
-            break
-        add_ancestors(writes)
     return live
-
-
-def _fx_alias_roots(nodes: list[Any]) -> dict[Any, set[Any]]:
-    """Return each FX value's storage roots from ATen schema alias labels."""
-    alias_roots: dict[Any, set[Any]] = {}
-    for node in nodes:
-        roots = {node}
-        schema = getattr(node.target, "_schema", None) if node.op == "call_function" else None
-        if schema is not None:
-            argument_roots: dict[str, set[Any]] = {}
-            for index, argument in enumerate(schema.arguments):
-                alias = argument.alias_info
-                if alias is None:
-                    continue
-                value = node.kwargs.get(argument.name, node.args[index] if index < len(node.args) else None)
-                for source in _fx_nodes_in_arg(value):
-                    for label in alias.before_set | alias.after_set:
-                        argument_roots.setdefault(label, set()).update(alias_roots.get(source, {source}))
-            returned_roots: set[Any] = set()
-            for result in schema.returns:
-                alias = result.alias_info
-                if alias is None:
-                    continue
-                for label in alias.before_set | alias.after_set:
-                    returned_roots.update(argument_roots.get(label, ()))
-            if returned_roots:
-                roots = returned_roots
-        alias_roots[node] = roots
-    return alias_roots
-
-
-def _observable_alias_read_after_write(node) -> tuple[Any, Any] | None:
-    """Find a live later read of written storage that bypasses ``node``'s returned value."""
-    nodes = list(node.graph.nodes)
-    aliases = _fx_alias_roots(nodes)
-    written = _written_fx_nodes(node)
-    if not written:
-        return None
-    written_roots = set().union(*(aliases.get(target, {target}) for target in written))
-
-    returned_descendants = {node}
-    stack = list(node.users)
-    while stack:
-        descendant = stack.pop()
-        if descendant in returned_descendants:
-            continue
-        returned_descendants.add(descendant)
-        stack.extend(descendant.users)
-
-    live = _output_live_fx_nodes(nodes)
-    position = nodes.index(node)
-    for later in nodes[position + 1 :]:
-        if later not in live:
-            continue
-        for source in later.all_input_nodes:
-            if source in returned_descendants:
-                continue
-            if aliases.get(source, {source}) & written_roots:
-                return later, source
-    return None
-
-
-def _static_affine_view_destination(
-    node,
-) -> tuple[Any, tuple[int, ...], tuple[int, ...], tuple[int | None, ...]] | None:
-    """Describe a static unit-step slice/select view in its root coordinates.
-
-    ``view_axes[root_axis]`` names the corresponding destination axis, or ``None``
-    when ``aten.select`` fixed that root coordinate. The descriptor is intentionally
-    rectangular; dynamic, strided, and other indexed views remain unsupported.
-    """
-    destination = node.args[0] if node.args else None
-    if destination is None or not hasattr(destination, "op"):
-        return None
-
-    chain = []
-    current = destination
-    while current.op == "call_function" and _op_name(current.target) in ("slice", "select"):
-        chain.append(current)
-        current = current.args[0] if current.args else None
-        if current is None or not hasattr(current, "op"):
-            return None
-
-    root_shape = _static_fx_shape(current)
-    if root_shape is None:
-        return None
-    offsets = [0] * len(root_shape)
-    extents = list(root_shape)
-    view_axes: list[int | None] = list(range(len(root_shape)))
-
-    for view in reversed(chain):
-        args = view.args
-        op_name = _op_name(view.target)
-        dim = args[1] if len(args) > 1 else 0
-        if not isinstance(dim, int) or isinstance(dim, bool):
-            return None
-        rank = sum(axis is not None for axis in view_axes)
-        norm_dim = dim if dim >= 0 else rank + dim
-        if not 0 <= norm_dim < rank:
-            return None
-        root_axis = next((axis for axis, view_axis in enumerate(view_axes) if view_axis == norm_dim), None)
-        if root_axis is None:
-            return None
-
-        if op_name == "slice":
-            start = args[2] if len(args) > 2 else None
-            end = args[3] if len(args) > 3 else None
-            step = args[4] if len(args) > 4 else 1
-            if any(value is not None and (not isinstance(value, int) or isinstance(value, bool)) for value in (start, end)):
-                return None
-            if step != 1:
-                return None
-            normalized_start, normalized_end, _ = slice(start, end, 1).indices(extents[root_axis])
-            offsets[root_axis] += normalized_start
-            extents[root_axis] = normalized_end - normalized_start
-        else:
-            index = args[2] if len(args) > 2 else 0
-            if not isinstance(index, int) or isinstance(index, bool):
-                return None
-            normalized_index = index if index >= 0 else extents[root_axis] + index
-            if not 0 <= normalized_index < extents[root_axis]:
-                return None
-            offsets[root_axis] += normalized_index
-            extents[root_axis] = 1
-            view_axes[root_axis] = None
-            view_axes = [axis - 1 if axis is not None and axis > norm_dim else axis for axis in view_axes]
-
-        expected_shape = [0] * sum(axis is not None for axis in view_axes)
-        for axis, view_axis in enumerate(view_axes):
-            if view_axis is not None:
-                expected_shape[view_axis] = extents[axis]
-        if _static_fx_shape(view) != tuple(expected_shape):
-            return None
-
-    return current, tuple(offsets), tuple(extents), tuple(view_axes)
 
 
 def _static_fx_shape(node) -> tuple[int, ...] | None:
@@ -341,95 +211,6 @@ def _static_fx_shape(node) -> tuple[int, ...] | None:
     if shape is None or any(not isinstance(extent, int) or isinstance(extent, bool) for extent in shape):
         return None
     return tuple(shape)
-
-
-def _reassemblable_local_affine_copy(
-    node,
-) -> tuple[Any, tuple[int, ...], tuple[int, ...], tuple[int | None, ...]] | None:
-    """Return a local affine-view update when every alias can be versioned safely."""
-    # A used ``copy_`` return is itself an alias. Supporting both it and an updated base would
-    # require versioning that returned view across later writes, outside this narrow local form.
-    if node.users:
-        return None
-    destination = _static_affine_view_destination(node)
-    if destination is None:
-        return None
-    root, _, _, _ = destination
-    if root.op != "call_function":
-        return None
-    if not _local_alias_version_is_rebindable(node, root):
-        return None
-    return destination
-
-
-def _local_alias_version_is_rebindable(node, root) -> bool:
-    """Whether a local root can be rebound without leaving a stale live alias."""
-    nodes = list(node.graph.nodes)
-    aliases = _fx_alias_roots(nodes)
-    if aliases.get(root, {root}) != {root}:
-        return False
-
-    written_roots = set().union(*(aliases.get(target, {target}) for target in _written_fx_nodes(node)))
-    live = _output_live_fx_nodes(nodes)
-    position = nodes.index(node)
-    positions = {candidate: index for index, candidate in enumerate(nodes)}
-
-    # The root name is rebound to the functional update during the walk, so later aliases
-    # constructed from it see the new version. An alias constructed before this write would
-    # still name the old Graph node and therefore cannot be updated safely here.
-    for later in nodes[position + 1 :]:
-        if later not in live:
-            continue
-        for source in later.all_input_nodes:
-            if not (aliases.get(source, {source}) & written_roots):
-                continue
-            if source is root or positions[source] > position:
-                continue
-            return False
-    return True
-
-
-def _reassemblable_local_affine_fill(
-    node,
-) -> tuple[Any, tuple[int, ...], tuple[int, ...], tuple[int | None, ...]] | None:
-    """Return a local affine-view update when every observable alias can be versioned."""
-    if node.users:
-        return None
-    destination = _static_affine_view_destination(node)
-    if destination is None:
-        return None
-    root, _, _, _ = destination
-    if root.op != "call_function":
-        return None
-    if not _local_alias_version_is_rebindable(node, root):
-        return None
-    return destination
-
-
-def _fx_nodes_in_arg(value) -> list[Any]:
-    if hasattr(value, "all_input_nodes") and hasattr(value, "op"):
-        return [value]
-    if isinstance(value, (tuple, list)):
-        return [node for item in value for node in _fx_nodes_in_arg(item)]
-    if isinstance(value, dict):
-        return [node for item in value.values() for node in _fx_nodes_in_arg(item)]
-    return []
-
-
-def _written_fx_nodes(node) -> list[Any]:
-    if node.op != "call_function":
-        return []
-    schema = getattr(node.target, "_schema", None)
-    if schema is None:
-        return []
-    written: list[Any] = []
-    for index, argument in enumerate(schema.arguments):
-        alias = argument.alias_info
-        if alias is None or not alias.is_write:
-            continue
-        value = node.kwargs.get(argument.name, node.args[index] if index < len(node.args) else None)
-        written.extend(_fx_nodes_in_arg(value))
-    return written
 
 
 def _expand_dynamic_shapes(module, example_inputs: tuple, kwargs: dict, user_dynamic: dict) -> dict:
@@ -663,6 +444,7 @@ _FILL_CONSTRUCTORS = {
     "new_full": None,
     "full": None,
     "full_like": None,
+    "fill": None,  # ``fill_`` once functionalized
 }
 
 
@@ -795,50 +577,37 @@ def _handle_getitem(fx_node: Any, node_map: dict[str, NodeRef]) -> None:
     node_map[fx_node.name] = ref[index]
 
 
-def _handle_chunk(
+def _handle_split(
     g: Graph,
     fx_node: Any,
     node_map: dict[str, NodeRef],
     *,
+    op_name: str = "split",
     sym_rename: dict[str, str] | None = None,
 ) -> None:
-    """Materialize a static ``aten.chunk`` tuple as cumulative ``SliceOp`` nodes."""
-    if len(fx_node.args) < 2:
-        raise ValueError("aten.chunk requires a chunk count")
-    source = fx_node.args[0]
-    source_ref = node_map.get(getattr(source, "name", None))
+    """Materialize a static ``aten.chunk`` / ``aten.split`` / ``aten.split_with_sizes`` tuple as cumulative
+    ``SliceOp`` nodes, one per output of the FX metadata, whose extents along ``dim`` are the sizes."""
+    source_ref = node_map.get(getattr(fx_node.args[0], "name", None)) if fx_node.args else None
     if not isinstance(source_ref, str):
-        raise ValueError("aten.chunk input did not resolve to a tensor")
-
-    raw_chunks = fx_node.args[1]
-    if not isinstance(raw_chunks, int) or isinstance(raw_chunks, bool):
-        raise NotImplementedError("aten.chunk requires a static integer chunk count")
-    if raw_chunks <= 0:
-        raise ValueError("aten.chunk chunk count must be greater than zero")
-
+        raise ValueError(f"aten.{op_name} input did not resolve to a tensor")
     raw_dim = fx_node.args[2] if len(fx_node.args) > 2 else 0
     if not isinstance(raw_dim, int) or isinstance(raw_dim, bool):
-        raise NotImplementedError("aten.chunk requires a constant integer dimension")
-
+        raise NotImplementedError(f"aten.{op_name} requires a constant integer dimension")
     source_node = g.nodes[source_ref]
     rank = len(source_node.output.shape)
     dim = raw_dim if raw_dim >= 0 else rank + raw_dim
     if not 0 <= dim < rank:
-        raise ValueError(f"aten.chunk dimension {raw_dim} is out of range for rank-{rank} input")
-
+        raise ValueError(f"aten.{op_name} dimension {raw_dim} is out of range for rank-{rank} input")
     values = fx_node.meta.get("val")
-    if not isinstance(values, (list, tuple)):
-        raise NotImplementedError("aten.chunk requires FX-provided static tuple output metadata")
+    if not isinstance(values, (list, tuple)) or not all(hasattr(value, "shape") for value in values):
+        raise NotImplementedError(f"aten.{op_name} requires FX-provided static tuple output metadata")
 
     output_ids: list[str] = []
     offset = 0
     for index, value in enumerate(values):
-        if not hasattr(value, "shape"):
-            raise NotImplementedError("aten.chunk output metadata must contain tensor shapes")
         raw_shape = tuple(value.shape)
-        chunk_extent = raw_shape[dim]
-        if not isinstance(chunk_extent, int):
-            raise NotImplementedError("aten.chunk does not support a dynamic chunked dimension")
+        if not isinstance(raw_shape[dim], int):
+            raise NotImplementedError(f"aten.{op_name} does not support a dynamic split dimension")
         shape = _wrap_shape(raw_shape, sym_rename)
         dtype = str(value.dtype).replace("torch.", "")
         output_name = f"{fx_node.name}_{index}"
@@ -849,70 +618,11 @@ def _handle_chunk(
             node_id=output_name,
         )
         output_ids.append(output_id)
-        offset += chunk_extent
-
-    if len(output_ids) > raw_chunks:
-        raise ValueError(f"aten.chunk produced {len(output_ids)} outputs for chunk count {raw_chunks}")
-    input_extent = source_node.output.shape[dim]
-    if getattr(input_extent, "is_static", False) and offset != input_extent.as_static():
-        raise ValueError(f"aten.chunk output extents cover {offset} elements but input dimension has {input_extent.as_static()}")
-    node_map[fx_node.name] = tuple(output_ids)
-
-
-def _handle_split_with_sizes(
-    g: Graph,
-    fx_node: Any,
-    node_map: dict[str, NodeRef],
-    *,
-    sym_rename: dict[str, str] | None = None,
-) -> None:
-    """Materialize a static ``aten.split_with_sizes`` tuple as slices."""
-    if len(fx_node.args) < 2:
-        raise ValueError("aten.split_with_sizes requires a size list")
-    source = fx_node.args[0]
-    source_ref = node_map.get(getattr(source, "name", None))
-    if not isinstance(source_ref, str):
-        raise ValueError("aten.split_with_sizes input did not resolve to a tensor")
-
-    raw_sizes = fx_node.args[1]
-    if not isinstance(raw_sizes, (list, tuple)) or any(
-        not isinstance(size, int) or isinstance(size, bool) or size < 0 for size in raw_sizes
-    ):
-        raise NotImplementedError("aten.split_with_sizes requires a static list of non-negative integer sizes")
-
-    raw_dim = fx_node.args[2] if len(fx_node.args) > 2 else 0
-    if not isinstance(raw_dim, int) or isinstance(raw_dim, bool):
-        raise NotImplementedError("aten.split_with_sizes requires a constant integer dimension")
-    source_node = g.nodes[source_ref]
-    rank = len(source_node.output.shape)
-    dim = raw_dim if raw_dim >= 0 else rank + raw_dim
-    if not 0 <= dim < rank:
-        raise ValueError(f"aten.split_with_sizes dimension {raw_dim} is out of range for rank-{rank} input")
-
-    values = fx_node.meta.get("val")
-    if not isinstance(values, (list, tuple)) or len(values) != len(raw_sizes):
-        raise NotImplementedError("aten.split_with_sizes requires matching FX tuple output metadata")
-
-    output_ids: list[str] = []
-    offset = 0
-    for index, (size, value) in enumerate(zip(raw_sizes, values, strict=True)):
-        if not hasattr(value, "shape") or value.shape[dim] != size:
-            raise ValueError(f"aten.split_with_sizes output {index} metadata does not match declared size {size}")
-        shape = _wrap_shape(tuple(value.shape), sym_rename)
-        dtype = str(value.dtype).replace("torch.", "")
-        output_name = f"{fx_node.name}_{index}"
-        output_id = g.add_node(
-            op=SliceOp(shape=_dim_tuple_to_op_shape(shape), dim=dim, start=offset),
-            inputs=[source_ref],
-            output=Tensor(output_name, shape, dtype),
-            node_id=output_name,
-        )
-        output_ids.append(output_id)
-        offset += size
+        offset += raw_shape[dim]
 
     input_extent = source_node.output.shape[dim]
     if getattr(input_extent, "is_static", False) and offset != input_extent.as_static():
-        raise ValueError(f"aten.split_with_sizes sizes cover {offset} elements but input dimension has {input_extent.as_static()}")
+        raise ValueError(f"aten.{op_name} outputs cover {offset} elements but input dimension has {input_extent.as_static()}")
     node_map[fx_node.name] = tuple(output_ids)
 
 
@@ -1240,11 +950,8 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, NodeRef], 
         return
 
     op_name = _op_name(fx_node.target)
-    if op_name == "chunk":
-        _handle_chunk(g, fx_node, node_map, sym_rename=sym_rename)
-        return
-    if op_name == "split_with_sizes":
-        _handle_split_with_sizes(g, fx_node, node_map, sym_rename=sym_rename)
+    if op_name in ("chunk", "split", "split_with_sizes"):
+        _handle_split(g, fx_node, node_map, op_name=op_name, sym_rename=sym_rename)
         return
     if op_name == "unbind":
         _handle_unbind(g, fx_node, node_map, sym_rename=sym_rename)
@@ -1528,158 +1235,65 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, NodeRef], 
         )
         return
 
-    # ``fill_`` returns destination-shaped scalar values. When a later live read observes
-    # the written storage, a static slice/select view of a local value can additionally
-    # version its base through a bounded two-source IndexMap. All other alias forms fail closed.
-    if op_name == "fill_":
+    # Functional ``copy(dest, src)``: the source broadcast and cast to the destination's shape and dtype.
+    if op_name == "copy":
         from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
         if len(input_ids) < 2:
-            raise ValueError("aten.fill_ requires resolved destination and fill tensors")
-        filled_id = broadcast_to(g, input_ids[1], shape).id
-        node_map[name] = filled_id
-
-        observable = _observable_alias_read_after_write(fx_node)
-        if observable is None:
-            return
-        reassembly = _reassemblable_local_affine_fill(fx_node)
-        if reassembly is None:
-            later, source = observable
-            raise NotImplementedError(
-                "aten.fill_ observable alias mutation is unsupported: "
-                f"later live node {later.name!r} reads original destination alias {source.name!r}; "
-                "functional fill_ is supported only through its returned value"
-            )
-
-        root, offsets, extents, view_axes = reassembly
-        previous_base = node_map.get(root.name)
-        if not isinstance(previous_base, str):
-            raise ValueError(f"aten.fill_ local destination root {root.name!r} did not resolve to a tensor")
-        base = g.nodes[previous_base].output
-        base_shape = tuple(base.shape)
-        view_shape = [0] * sum(axis is not None for axis in view_axes)
-        for root_axis, view_axis in enumerate(view_axes):
-            if view_axis is not None:
-                view_shape[view_axis] = extents[root_axis]
-        if len(base_shape) != len(offsets) or tuple(shape) != tuple(view_shape):
-            raise ValueError(
-                f"aten.fill_ local view shape mismatch: base={base_shape}, destination={tuple(view_shape)}, fill={tuple(shape)}"
-            )
-        if any(extent == 0 for extent in extents):
-            return
-
-        select = Literal(True, "bool")
-        for axis, (offset, extent) in enumerate(zip(offsets, extents, strict=True)):
-            coord = placeholder(axis)
-            in_axis = BinaryExpr(">=", coord, Literal(offset, "int"))
-            in_axis = BinaryExpr("&&", in_axis, coord.lt(Literal(offset + extent, "int")))
-            select = BinaryExpr("&&", select, in_axis)
-        source_coords: list[Any] = [Literal(0, "int")] * len(view_shape)
-        for root_axis, view_axis in enumerate(view_axes):
-            if view_axis is None:
-                continue
-            coord = placeholder(root_axis)
-            offset = offsets[root_axis]
-            source_coord = coord - Literal(offset, "int") if offset else coord
-            source_coords[view_axis] = TernaryExpr(select, source_coord, Literal(0, "int"))
-
-        identity = tuple(placeholder(axis) for axis in range(len(base_shape)))
-        update_name = f"{name}_base"
-        node_map[root.name] = g.add_node(
-            op=IndexMapOp(
-                out_shape=base_shape,
-                sources=(
-                    IndexSource(input_idx=0, coord_map=tuple(source_coords), select=select),
-                    IndexSource(input_idx=1, coord_map=identity),
-                ),
-            ),
-            inputs=[filled_id, previous_base],
-            output=Tensor(update_name, base_shape, base.dtype),
-            node_id=update_name,
-        )
-        return
-
-    # ``copy_(dest, src)`` returns destination-shaped source values. A static slice/select of a
-    # local value can also update its base functionally: one IndexMap source supplies the written
-    # region and the previous base supplies the rest. Broader alias mutation remains fail-closed.
-    if op_name == "copy_":
-        from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
-
-        observable = _observable_alias_read_after_write(fx_node)
-        reassembly = _reassemblable_local_affine_copy(fx_node) if observable is not None else None
-        if observable is not None and reassembly is None:
-            later, source = observable
-            raise NotImplementedError(
-                "aten.copy_ observable alias mutation is unsupported: "
-                f"later live node {later.name!r} reads original destination alias {source.name!r}; "
-                "functional copy_ is supported only through its returned value"
-            )
-        if len(input_ids) < 2:
-            raise ValueError("aten.copy_ requires resolved destination and source tensors")
+            raise ValueError("aten.copy requires resolved destination and source tensors")
         copied = broadcast_to(g, input_ids[1], shape)
         if copied.output.dtype == dtype:
-            copied_id = copied.id
+            node_map[name] = copied.id
         else:
             coord_map = tuple(placeholder(axis) for axis in range(len(shape)))
-            copied_id = g.add_node(
+            node_map[name] = g.add_node(
                 op=IndexMapOp(out_shape=shape, sources=(IndexSource(input_idx=0, coord_map=coord_map),)),
                 inputs=[copied],
                 output=Tensor(name, shape, dtype),
                 node_id=name,
             )
-        node_map[name] = copied_id
+        return
 
-        if reassembly is not None:
-            root, offsets, extents, view_axes = reassembly
-            previous_base = node_map.get(root.name)
-            if not isinstance(previous_base, str):
-                raise ValueError(f"aten.copy_ local destination root {root.name!r} did not resolve to a tensor")
-            if any(extent == 0 for extent in extents):
-                # An empty destination is a no-op on the base. Keep ``node_map[name]``
-                # above for the copy_ return, but do not emit an IndexMap whose eager
-                # source loads would index the zero-sized copied tensor.
-                return
-            base = g.nodes[previous_base].output
-            base_shape = tuple(base.shape)
-            view_shape = [0] * sum(axis is not None for axis in view_axes)
-            for root_axis, view_axis in enumerate(view_axes):
-                if view_axis is not None:
-                    view_shape[view_axis] = extents[root_axis]
-            if len(base_shape) != len(offsets) or tuple(shape) != tuple(view_shape):
-                raise ValueError(
-                    f"aten.copy_ local view shape mismatch: base={base_shape}, destination={tuple(view_shape)}, copy={tuple(shape)}"
-                )
-
-            select = Literal(True, "bool")
-            for axis, (offset, extent) in enumerate(zip(offsets, extents, strict=True)):
-                coord = placeholder(axis)
-                in_axis = BinaryExpr(">=", coord, Literal(offset, "int"))
-                in_axis = BinaryExpr("&&", in_axis, coord.lt(Literal(offset + extent, "int")))
-                select = BinaryExpr("&&", select, in_axis)
-            source_coords: list[Any] = [Literal(0, "int")] * len(view_shape)
-            for root_axis, view_axis in enumerate(view_axes):
-                if view_axis is None:
-                    continue
-                coord = placeholder(root_axis)
-                offset = offsets[root_axis]
-                source_coord = coord - Literal(offset, "int") if offset else coord
-                source_coords[view_axis] = TernaryExpr(select, source_coord, Literal(0, "int"))
-
-            identity = tuple(placeholder(axis) for axis in range(len(base_shape)))
-            update_name = f"{name}_base"
-            updated_base = g.add_node(
-                op=IndexMapOp(
-                    out_shape=base_shape,
-                    sources=(
-                        IndexSource(input_idx=0, coord_map=tuple(source_coords), select=select),
-                        IndexSource(input_idx=1, coord_map=identity),
-                    ),
+    # Functionalization spells a write through a static slice or select as the base with ``src`` over that
+    # region: one IndexMap source supplies the region, the base the rest.
+    if op_name in ("slice_scatter", "select_scatter"):
+        # slice_scatter(base, src, dim, start, end, step); select_scatter(base, src, dim, index) reads index as start
+        base, _, dim, start, end, step = (*fx_node.args, *(None, None, 0, None, None, 1)[len(fx_node.args) :])
+        base_shape = _static_fx_shape(base)
+        if base_shape is None or any(type(v) not in (int, type(None)) for v in (dim, start, end)) or step != 1:
+            raise NotImplementedError(f"aten.{op_name} requires a static base, dimension, bounds and step 1")
+        dim %= len(base_shape)
+        if op_name == "slice_scatter":
+            start, end, _ = slice(start, end).indices(base_shape[dim])
+        else:
+            start, end = start % base_shape[dim], start % base_shape[dim] + 1
+        if start >= end:  # an empty region leaves the base as it was
+            node_map[name] = input_ids[0]
+            return
+        # The region is a rectangle over every axis, its predicate seeded with a boolean literal; a source
+        # coordinate outside it clamps to 0, as backends may evaluate both sources.
+        select = Literal(True, "bool")
+        for axis, extent in enumerate(base_shape):
+            lo, hi = (start, end) if axis == dim else (0, extent)
+            coord = placeholder(axis)
+            select = BinaryExpr("&&", select, BinaryExpr("&&", BinaryExpr(">=", coord, Literal(lo, "int")), coord.lt(Literal(hi, "int"))))
+        src_coords = [
+            TernaryExpr(select, placeholder(a) - Literal(start, "int") if a == dim and start else placeholder(a), Literal(0, "int"))
+            for a in range(len(base_shape))
+            if not (a == dim and op_name == "select_scatter")
+        ]
+        node_map[name] = g.add_node(
+            op=IndexMapOp(
+                out_shape=shape,
+                sources=(
+                    IndexSource(input_idx=0, coord_map=tuple(src_coords), select=select),
+                    IndexSource(input_idx=1, coord_map=tuple(placeholder(a) for a in range(len(base_shape)))),
                 ),
-                inputs=[copied_id, previous_base],
-                output=Tensor(update_name, base_shape, base.dtype),
-                node_id=update_name,
-            )
-            node_map[root.name] = updated_base
+            ),
+            inputs=[input_ids[1], input_ids[0]],
+            output=Tensor(name, shape, dtype),
+            node_id=name,
+        )
         return
 
     # Data-dependent selection is a ternary elementwise op. ``masked_fill(self, mask, fill)``
@@ -1755,13 +1369,6 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, NodeRef], 
         "mul": "multiply",
         "div": "divide",
         "neg": "negative",
-        # In-place variants (``*=`` / ``+=`` / … — e.g. Gemma's
-        # ``hidden_states *= self.layer_scalar``). The trace is functional, so
-        # they lower to the same out-of-place numpy op.
-        "mul_": "multiply",
-        "add_": "add",
-        "sub_": "subtract",
-        "div_": "divide",
         # Comparisons and bool combines — the bool-output mask construction in
         # whole-model traces (the explicit attention-mask subgraph). aten spells
         # the operator combines as dunders (``mask | other`` → ``aten.__or__``).
@@ -2158,10 +1765,11 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, NodeRef], 
     # and the conversion falls out of the typed store. Keeping the statistic itself in f32
     # is deliberate and must not change: squaring gemma activations in f16 overflows above
     # |x| = 256 (measured: max|err| 60.7 at peak 300 vs HF), so only the OUTPUT narrows.
-    if op_name in ("to", "contiguous", "_assert_tensor_metadata", "clone", "detach", "alias", "type_as"):
+    # ``_to_copy`` is ``to`` once functionalized.
+    if op_name in ("to", "_to_copy", "contiguous", "_assert_tensor_metadata", "clone", "detach", "alias", "type_as"):
         if input_ids:
             src = g.nodes.get(input_ids[0])
-            if op_name in ("to", "type_as") and src is not None and dtype != src.output.dtype:
+            if op_name in ("to", "_to_copy", "type_as") and src is not None and dtype != src.output.dtype:
                 coord_map = tuple(placeholder(d) for d in range(len(shape)))
                 nid = g.add_node(
                     op=IndexMapOp(out_shape=tuple(shape), sources=(IndexSource(input_idx=0, coord_map=coord_map),)),
@@ -2279,13 +1887,9 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, NodeRef], 
         node_map[name] = nid
         return
 
-    if op_name == "dropout":
-        # Inference-time dropout is the identity. Drop the p / training args and
-        # lower it as a `copy` passthrough so it becomes a no-op in the graph.
-        input_ids = input_ids[:1]
-        op_name = "copy"
-
     # --- Fallback: unknown op becomes ElementwiseOp by torch-aten name ---
+    if not is_elementwise(op_name):
+        raise NotImplementedError(f"no tracer mapping for aten.{op_name}: it is not an elementwise function")
     logger.debug("Fallback elementwise for %s (%s)", op_name, fx_node.target)
     if input_ids:
         from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to

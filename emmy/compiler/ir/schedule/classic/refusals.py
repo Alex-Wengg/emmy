@@ -26,7 +26,7 @@ from emmy.compiler.ir.schedule.catalog import (
 from emmy.compiler.ir.schedule.choices import PlacedTile, Reduce, ResolvedStage, Stage, Tile, Work
 from emmy.compiler.ir.schedule.packing import block_scaled_atom
 from emmy.compiler.ir.schedule.views import ContractionFacts, NodeId
-from emmy.compiler.ir.stmt import Assign, Body, Load, Loop, Select, Write, mask_select_predicate
+from emmy.compiler.ir.stmt import Affine, Assign, Body, Load, Loop, Select, Stmt, Write, mask_select_predicate
 from emmy.compiler.ir.stmt.passes import has_contraction_tail
 
 from .schedule import NodeSchedule, binds_root, node_id_spelling, packed_works
@@ -66,7 +66,6 @@ def _reduction_domain(tile: TileOp, node, target) -> tuple[Reduce, ...]:
         chain_form,
         chain_members,
         kernel_roots,
-        merges_partition,
     )
 
     roots = kernel_roots(tile.op)
@@ -77,10 +76,6 @@ def _reduction_domain(tile: TileOp, node, target) -> tuple[Reduce, ...]:
     # A sweep the member's own ROOT is evaluated over wraps the whole chain, members included, and
     # only the serial fold spells that: the chain arm closes one grid cell.
     if {axis.name for spec in tile.output_specs for axis in spec.sweep} & (node.free_axes | owner.free_axes):
-        return (Reduce(),)
-    if is_root and merges_partition(tile):
-        # A split's deferred finalize: one partial per split per cell, the parallelism is the cells,
-        # and a band over the few partials pays a barrier per cell.
         return (Reduce(),)
     if node.observe is not None:
         # A prefix scan keeps every lane's inclusive state. Ordinary register partials, ``coop/v<n>`` runs,
@@ -237,8 +232,6 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
 
     Stated at the enumeration, not at the binder: a row nothing realizes costs the greedy a
     blocklist retry per rank, and there are more ranked rows than the retry budget."""
-    from emmy.compiler.ir.tile.ops import projection_tail  # noqa: PLC0415 — tile.ops reads this package; module level would cycle
-
     facts = tile.contractions.get(tile.node_id(node))
     score = facts.producer if facts is not None else None
     # The chunk's score is CONTRACTED into its fragments when a nested contraction supplies it, and
@@ -258,16 +251,12 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
     # contraction, and what scales its raw accumulator lives in the lift above it. Its leaves past
     # the producer are read once ahead of the chunk, so none of them may vary over the chunk.
     prefix = node.applied.cone(node.roles[0])
-    if any(not isinstance(stmt, (Assign, Load, Select)) for stmt in prefix.body):
+    if any(not isinstance(stmt, (Affine, Assign, Load, Select)) for stmt in prefix.body):
         return "the score's own prefix holds more than a straight-line program"
     coord_axes = {node.axis, *node.as_contraction().left_axes}
     uniform = {name for edge in node.operands if not edge.free_axes for name in edge.exposes}
     for stmt in (stmt for stmt in prefix.body if isinstance(stmt, Select)):
-        consumers = [
-            consumer
-            for consumer in prefix.body
-            if isinstance(consumer, Assign) and consumer.op.name == "add" and stmt.name in consumer.args
-        ]
+        consumers = [consumer for consumer in prefix.body if _adds(consumer, stmt.name)]
         if (
             mask_select_predicate(stmt) is None
             or len(consumers) != 1
@@ -282,7 +271,7 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
     # register. A projection may read those registers, and a cross-CTA split's partial stores each
     # of them WHOLE to its workspace (broadcast per row into a fragment); what the tier cannot write
     # is a per-row state computed into an output of its own beside the expectation.
-    tail = projection_tail(tile)
+    tail, _ = _fragment_projection(tile)
     body = Body(tail)
     states = set(node.base.results)
     cell = {axis.name for axis in tile.place.free}
@@ -663,6 +652,13 @@ def _wgmma_register_refusal(node: Fold, plan: Tile) -> str | None:
     )
 
 
+def _adds(consumer: Stmt, name: str) -> bool:
+    """Whether ``consumer`` adds the value ``name`` to something: a sum with it as a unit term."""
+    if isinstance(consumer, Affine):
+        return any(arg == name and coefficient == 1 for coefficient, arg in consumer.terms)
+    return isinstance(consumer, Assign) and consumer.op.name == "add" and name in consumer.args
+
+
 def _plan_node_refusal(tile_op, node: Fold, plan: Tile, placed: PlacedTile, facts: ContractionFacts) -> str | None:
     from emmy.compiler.ir.schedule import staging  # noqa: PLC0415
 
@@ -776,7 +772,7 @@ class _Relation:
     """What a prefix has decided that the compatibility of a later pick reads — the worker inventory it
     claimed, its physical-axis and fragment-seam agreements, and the decided nodes where a rule reads them:
     every one while no inventory is claimed (the canonical-form check runs over them), and all of them at a
-    site that is a shared root or a chain member. Two prefixes equal here admit the same picks at a site,
+    site that is a shared root, a chain member, or either end of a nested tile. Two prefixes equal here admit the same picks at a site,
     whatever else they decided, which is what lets a site keep one filtered answer per relation."""
 
     work: Work | None = None
@@ -789,12 +785,12 @@ class _Relation:
             object.__setattr__(self, name, frozendict(getattr(self, name)))
 
 
-def _relation_refusal(site: NodeId, pick, relation: _Relation, *, roots, pairs, allowed_works) -> str | None:
+def _relation_refusal(site: NodeId, pick, relation: _Relation, *, roots, pairs, nests, allowed_works) -> str | None:
     """Why ``pick`` cannot extend a prefix whose compatibility facts are ``relation``, or ``None``.
 
     ``pick`` is a site's tile choice or one of its supports; both carry ``node``, ``work``, ``axes`` and
-    ``fragments``, and the rules read nothing else. The shared-root and chain rules (``roots``, ``pairs``: the
-    kernel's) are the binder's dispatch applied at the offer; the inventory, canonical-form and physical-axis
+    ``fragments``, and the rules read nothing else. The shared-root, chain and nested-tile rules (``roots``,
+    ``pairs``, ``nests``: the kernel's) are the binder's dispatch applied at the offer; the inventory, canonical-form and physical-axis
     rules read the tile; the seam rule reads the claims, which only a support completes with its transport's K
     slab — so a choice passing here may still have no support that does."""
     node = pick.node
@@ -810,6 +806,12 @@ def _relation_refusal(site: NodeId, pick, relation: _Relation, *, roots, pairs, 
             return "a partitioned chain member under an output-tiled root, whose fill owns its cone"
         if picks[root].reduce.coop_transposed:
             return "a partitioned chain member under a transposed band, which binds its fold alone"
+    for root, nested in nests:
+        if site not in (root, nested):
+            continue
+        picks = {**relation.nodes, site: node}
+        if root in picks and nested in picks and picks[nested].tile.is_tiled and not picks[root].tile.is_tiled:
+            return "a contraction tile under a root that is not output-tiled, whose serial lowering would drop it"
     work = relation.work
     if work is not None and pick.work is not None and pick.work != work:
         return "pick requires a different worker inventory"

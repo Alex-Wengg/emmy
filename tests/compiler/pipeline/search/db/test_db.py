@@ -24,7 +24,7 @@ def _stats(us: float) -> PerfStats:
 
 
 def _ctx(gpu_name: str, flags: str = "") -> Context:
-    return replace(Context.from_target((12, 0), gpu_name=gpu_name), compile_flags=flags)
+    return Context.from_target((12, 0), gpu_name=gpu_name, compile_flags=flags)
 
 
 def _db(*kernels: str, **symbolic: tuple[str, ...]) -> SearchDB:
@@ -99,6 +99,34 @@ def test_cold_and_hot_measurements_never_replace_or_price_each_other() -> None:
     assert db.lookup_perf(hot, "k", bindings={}, knobs=_ROW, backend="cuda").stats.median == 10.0
 
 
+@pytest.mark.parametrize("name", ["FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA"])
+@pytest.mark.parametrize("umbrella", [False, True])
+def test_independent_precision_regimes_never_replace_or_price_each_other(name, umbrella) -> None:
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    contexts = []
+    for enabled in (umbrella, not umbrella):
+        with pinned_knobs({"FAST_MATH": umbrella, name: enabled}):
+            contexts.append(Context.from_target((12, 0), gpu_name=_5090))
+    ordinary, override = contexts
+    assert ordinary.compile_flags == override.compile_flags
+    assert ordinary.structural_key() != override.structural_key()
+    # Later ambient changes cannot change either captured regime.
+    with pinned_knobs({"FAST_MATH": not umbrella, name: umbrella}):
+        assert override.precision_pins()[name] is not umbrella
+    db = _db("k")
+    _record(db, ordinary, "k", 1.0)
+    assert db.best_per_op_time(override, "k", bindings={}) is None
+    _record(db, override, "k", 2.0)
+    for ctx, us in ((ordinary, 1.0), (override, 2.0)):
+        assert db.best_per_op_time(ctx, "k", bindings={}) == us
+        assert db.lookup_perf(ctx, "k", bindings={}, knobs=_ROW, backend="cuda").stats.median == us
+        assert [r.precision for r in db.iter_perf(ctx)] == [ctx.precision_pins()]
+        assert db.perf_sources(ctx) == {"measured": 1}
+    assert db.forget_perf(override, "measured") == 1
+    assert db.best_per_op_time(ordinary, "k", bindings={}) == 1.0
+
+
 def test_a_schedule_row_is_shared_and_a_read_row_holds_it_alone() -> None:
     """Two measurements taken with the same choices share one schedule row, whatever kernel they are
     of. A read row names its kernel by exact identity and holds the schedule row and nothing else: the
@@ -136,25 +164,23 @@ def test_a_kernel_row_is_written_once_and_read_back_under_its_key() -> None:
     assert (row.name, row.exact_identity) == ("k_first", "k"), "the stored key is the row's identity; nothing lifts the wire to learn it"
 
 
-#: The exact identities the tune DB keyed these corpus kernels by when ``db._VERSION`` was last cut: a formed
-#: kernel, a split's partial, a twisted softmax, a contraction and a piece formed from no loop op.
+#: Pins for the tune DB's identity computation: a formed kernel, a split's partial, a twisted softmax, attention,
+#: a contraction and a piece formed from no loop op. Re-pinning a changed corpus body does not change the DB version.
 _PINNED_IDENTITIES = {
-    ("reduce/cross-cta-sum-kernel.json", "k_sum_1_reduce"): "6422bb19e4161fade6e035e0054159ec2f722cdae3e4644d7742404eff475f0a",
-    ("reduce/cross-cta-sum-kernel.json", "k_sum_1_reduce__partial"): "09e2c8d5932c27e4b3ca620504d671be5c94f1523b72a3ed0e6c131370c397ec",
-    ("reduce/online-softmax-4x128.json", "k_softmax_77dd65"): "72febcaa20f274a012f2e81255248b0682cebcc21ddb9a0760ca5ee4cb3dc382",
-    ("matmul/bf16-mma-sm120.json", "k_matmul_7325d9"): "298021e7f8c617a1bf9500a83ae0c912c1efefc9ea98fe6b45c60d9304cc7742",
-    (
-        "fused/nvfp4-gate-up-requant-place-cut.json",
-        "k_linear_reduce_105826#2",
-    ): "42559896f330498a5643880fbe232f96c4ec723c996456b7490bfd25e17d28fb",
+    ("reduce/cross-cta-sum-kernel.json", "k_sum_1_reduce"): "90c5b32c4177ae9c0558a004",
+    ("reduce/cross-cta-sum-kernel.json", "k_sum_1_reduce__partial"): "07a20520422415e066fd52d3",
+    ("reduce/online-softmax-4x128.json", "k_softmax_77dd65"): "cc6135c3ed3123eeb4caa32c",
+    ("attention/sdpa-hd128-softmax-v-mma.json", "k_sdpa_441e96"): "693148e3d2bd24f77f956e35",
+    ("matmul/bf16-mma-sm120.json", "k_matmul_7325d9"): "7701ada1ac68e065d87f806c",
+    ("fused/nvfp4-gate-up-requant-place-cut.json", "k_linear_reduce_105826#2"): "94ab4afc4844e09c1488c6b5",
 }
 
 
 def test_the_identity_the_db_keys_kernels_by_is_the_one_its_version_was_cut_at() -> None:
     """A kernel row's key is computed from its Loop IR by live code, and a tune DB keeps the keys it was written
     with. So a change to that computation leaves every stored key naming nothing — silently, since the columns do
-    not change. Red here means exactly that: bump ``db._VERSION`` (a file under another version is re-created),
-    then re-pin these."""
+    not change. Changed computation requires a ``db._VERSION`` bump before re-pinning. When a corpus body changed,
+    first verify its prior wire still computes the old identity; then re-pin that input without a version bump."""
     from emmy.compiler.pipeline.search.golden import GoldenFile
     from tests.compiler.realization import helpers as corpus
 
@@ -162,14 +188,39 @@ def test_the_identity_the_db_keys_kernels_by_is_the_one_its_version_was_cut_at()
         assert GoldenFile.load(corpus.CASES_DIR / case).kernel(ref).exact_identity == identity, (case, ref)
 
 
+def test_context_keys_match_the_db_version_and_ignore_later_ambient_pins(monkeypatch) -> None:
+    from emmy.compiler.context import split_opt_level
+    from emmy.compiler.structural import digest
+
+    monkeypatch.setenv("EMMY_FAST_MATH", "1")
+    monkeypatch.setenv("EMMY_FAST_EXP", "1")
+    expected = {
+        None: "c05e1978f70ffeac79634331d54426ae1fc940289490421fbd29701e1e850cc1",
+        "FAST_EXP": "0f92e8f3044cfcd90c10d71bd452ef4cbbc0ce88d095ce9d2196bab6f88e34cd",
+        "F16_MMA_F32_ACC": "fa64cfbe993c3a6a9efc8f866de4f415239961a34621a31f9bfbfe17ccb92ba2",
+        "FP8_MMA": "d919089d897a7c27e9c1ddae5cec0cba98c13304fe792102368a470571b49d93",
+    }
+    for name, key in expected.items():
+        ctx = Context.from_target((12, 0), compile_flags="", precision={name: True} if name else None)
+        assert ctx.structural_key() == key, "context identity changes require a DB version bump"
+    for flags in ("", "-Xcicc -O3", "--use_fast_math"):
+        for cold in (False, True):
+            ctx = Context.from_target((12, 0), compile_flags=flags, cold_cache=cold)
+            old_key = digest("Context", (12, 0), *split_opt_level(flags), *(("cold-cache",) if cold else ()))
+            assert ctx.structural_key() == old_key, "unchanged regimes retain their existing pool keys"
+    assert Context.from_target((12, 0), compile_flags="", precision={"FAST_EXP": False}).structural_key() == expected[None]
+
+
 def test_a_file_written_under_another_version_is_re_created(tmp_path) -> None:
     """The columns of a file an older identity computation wrote are this DDL's, so only the version tells it
     apart: a writer re-creates it, a reader refuses it."""
+    from emmy.compiler.pipeline.search.db import _VERSION
+
     path = tmp_path / "autotune.db"
     db = SearchDB(path)
     db.record_kernel(kernel_row("k"))
     db.record_perf_row(perf_row("k", us=60.0))
-    db._conn.execute("PRAGMA user_version = 1")
+    db._conn.execute(f"PRAGMA user_version = {_VERSION - 1}")
     db.close()
 
     with pytest.raises(RuntimeError, match="written by another emmy"):
@@ -305,6 +356,7 @@ def test_a_file_another_emmy_wrote_is_re_created_whole_by_a_writer_and_refused_b
         "placement_knob",
         "routing",
         "taken",
+        "constant",
         "perf",
     }
     with pytest.raises(sqlite3.IntegrityError):
