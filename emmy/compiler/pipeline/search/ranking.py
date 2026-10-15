@@ -526,7 +526,37 @@ def placement_decisions(pools: Sequence[GoldenPool], like: GoldenPool) -> dict[s
     }
 
 
-def build_placement_groups(pools: Sequence[GoldenPool]) -> tuple[list[GoldenGroup], list[tuple[str, str, str]]]:
+def _walk_packed(task: tuple) -> tuple[list[GoldenGroup], list[tuple[str, str, str]], str | None]:
+    """One pool's share of :func:`build_placement_groups` — the work one worker process does: walk the pool under
+    its own card's context and pack each fork as a group. ``task`` is the pool and the recorded kernel-set
+    decisions in its card, regime and sizes. Returns the groups, the pool's skips as ``(gpu, name, reason)``, and
+    the line to log for a pool that did not lower — logged by the caller, so the lines keep the pools' order
+    whichever process did the work."""
+    pool, decisions = task
+    try:
+        forks, unmatched = walk_placement(pool, pool_context(pool), decisions)
+    except ValueError as exc:
+        # The same definition the schedule enumeration does not take back (``build_golden_groups``): the
+        # reduce piece of a cross-CTA split re-offers the split and mints the buffer it already holds.
+        return [], [(pool.gpu, pool.name, "did not lower")], f"did not lower — {exc}"
+    skipped = [(pool.gpu, pool.name, f"recorded cut not reached on {', '.join(unmatched)}")] if unmatched else []
+    if not forks:
+        return [], [*skipped, (pool.gpu, pool.name, "no kernel-set fork")], None
+    shape_key = ShapeKey.from_s_features(features.stamps(pool.kernel.op(pool.bindings)))
+    shape = _shape_group(shape_key)
+    groups = []
+    for n, fork in enumerate(forks, 1):
+        key = f"{pool.gpu}/{pool.name}" + (f"@{n}" if n > 1 else "")
+        tier = "dyn" if shape_key.is_dyn else fork.tier
+        groups.append(
+            GoldenGroup.over(
+                key, pool.name, tier, pool.gpu, shape, pack_features(fork.feats), fork.positives, len(fork.feats), pools=(pool,)
+            )
+        )
+    return groups, skipped, None
+
+
+def build_placement_groups(pools: Sequence[GoldenPool], *, jobs: int = 1) -> tuple[list[GoldenGroup], list[tuple[str, str, str]]]:
     """Enumerate each placement pool's kernel-set forks and pack them as :class:`GoldenGroup` records, one per
     fork, in its domain's tier (``pins.KERNEL_SET_DOMAINS``; ``dyn`` for a symbolic kernel): the arms the cut pass
     offers unpinned (keep fused, one seam each, the full-projection cut; unsplit and each split width; each
@@ -540,37 +570,25 @@ def build_placement_groups(pools: Sequence[GoldenPool]) -> tuple[list[GoldenGrou
     set is a group — the kernel's, then each remainder's, until the remainder is itself a piece of the set — with
     the arms carving pieces of it marked. A piece's own fork, where it stays whole, is a group too, as is a split
     or layout fork with the arm the decision names marked, and the first arm marked where nothing was recorded. A
-    kernel set no single-seam walk reaches is counted out by name: a deploy cannot take it either."""
+    kernel set no single-seam walk reaches is counted out by name: a deploy cannot take it either. ``jobs`` walks that
+    many pools side by side, one pool per worker process, as :func:`build_golden_groups` enumerates."""
     groups: list[GoldenGroup] = []
     skipped: list[tuple[str, str, str]] = []
-    ctxs: dict[tuple, Context] = {}
+    tasks = []
     for pool in pools:
         if not pool.kernel.formed:
             skipped.append((pool.gpu, pool.name, "kernel formed from no loop op"))
             continue
-        card = (pool.cap, pool.gpu, pool.regime)
-        ctx = ctxs.get(card)
-        if ctx is None:
-            ctx = ctxs[card] = pool_context(pool)
-        try:
-            forks, unmatched = walk_placement(pool, ctx, placement_decisions(pools, pool))
-        except ValueError as exc:
-            # The same definition the schedule enumeration does not take back (``build_golden_groups``): the
-            # reduce piece of a cross-CTA split re-offers the split and mints the buffer it already holds.
-            logger.warning("  !! %s: did not lower — %s", pool.name, exc)
-            skipped.append((pool.gpu, pool.name, "did not lower"))
-            continue
-        if unmatched:
-            skipped.append((pool.gpu, pool.name, f"recorded cut not reached on {', '.join(unmatched)}"))
-        if not forks:
-            skipped.append((pool.gpu, pool.name, "no kernel-set fork"))
-            continue
-        shape_key = ShapeKey.from_s_features(features.stamps(pool.kernel.op(pool.bindings)))
-        shape = _shape_group(shape_key)
-        for n, fork in enumerate(forks, 1):
-            key = f"{pool.gpu}/{pool.name}" + (f"@{n}" if n > 1 else "")
-            packed = pack_features(fork.feats)
-            tier = "dyn" if shape_key.is_dyn else fork.tier
-            groups.append(GoldenGroup.over(key, pool.name, tier, pool.gpu, shape, packed, fork.positives, len(fork.feats), pools=(pool,)))
+        tasks.append((pool, placement_decisions(pools, pool)))
+    if jobs == 1:
+        results = map(_walk_packed, tasks)
+    else:
+        with ProcessPoolExecutor(jobs, mp_context=get_context("spawn")) as workers:
+            results = list(workers.map(_walk_packed, tasks, chunksize=1))
+    for (pool, _), (found, missed, note) in zip(tasks, results, strict=True):
+        if note is not None:
+            logger.warning("  !! %s: %s", pool.name, note)
+        groups.extend(found)
+        skipped.extend(missed)
     logger.info("  %d kernel-set forks over %d pools (%d skipped)", len(groups), len(pools), len(skipped))
     return groups, skipped
