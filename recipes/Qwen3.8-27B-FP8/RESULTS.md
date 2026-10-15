@@ -15,8 +15,8 @@ It has not been run, with or without an image. The Volta lanes below are text-on
 
 ## Four V100 SXM2 16GB (TP4)
 
-Re-qualified 2026-10-12 (periodic verification) on a host with NVLink; previously re-qualified 2026-09-15, first
-qualified 2026-09-05 on a host without it.
+Re-qualified 2026-10-15 (periodic verification) on a host with NVLink; previously re-qualified 2026-10-12, 2026-09-15,
+first qualified 2026-09-05 on a host without it.
 
 ### Host requirement: NVLink
 
@@ -37,11 +37,24 @@ through NCCL, which can ring over linked pairs only.
 | Model | `Qwen/Qwen3.8-27B-FP8@017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` |
 | GPUs | 4 x NVIDIA Tesla V100 SXM2 16GB, compute capability 7.0, driver 580.178.04, NVLink as above |
 | Engine image | `cloudriftai/1cat-vllm-deepseek-v4-flash-0731:1.2.3-d76126608` (vLLM `1.2.3.dev87+gd76126608.d20260810`) |
-| Serving shape | TP4, context 262,144, `gpu_memory_utilization` 0.88 (KV cache pinned at 4.5 GiB per card, see Memory below), text-only, concurrency cap 4 — the cap this table was measured at; the recipe now ships 16, see Concurrency below |
+| Serving shape | TP4, context 262,144, `gpu_memory_utilization` 0.88, text-only, concurrency cap 4 — the cap this table was measured at; the recipe now ships 16, see Concurrency below |
 | Backends | FLASH_ATTN_V100 attention, Triton Gated DeltaNet prefill, TurboMind FP8 dequantization |
 | Workload | 16 prompts, 1,000 input / 1,000 output tokens, client concurrency 4, temperature 0, ignored EOS, 2 warm-ups, three repeats on one server with seeds 0, 1, 2 |
 
-| Metric | 2026-10-12 R1 | R2 | R3 |
+| Metric | 2026-10-15 R1 | R2 | R3 |
+| --- | ---: | ---: | ---: |
+| Successful / failed requests | 16 / 0 | 16 / 0 | 16 / 0 |
+| Benchmark duration | 385.11 s | 379.09 s | 388.25 s |
+| Output token throughput | 41.55 tok/s | 42.21 tok/s | 41.21 tok/s |
+| Total token throughput | 83.09 tok/s | 84.41 tok/s | 82.42 tok/s |
+| Median TTFT | 1,238.69 ms | 1,554.90 ms | 1,557.15 ms |
+| P99 TTFT | 2,971.90 ms | 1,579.54 ms | 1,579.12 ms |
+| Median TPOT | 93.38 ms | 93.88 ms | 96.25 ms |
+| P99 TPOT | 101.52 ms | 96.02 ms | 99.01 ms |
+
+Previous qualification (2026-10-12, driver 580.178.04):
+
+| Metric | Repeat 1 | Repeat 2 | Repeat 3 |
 | --- | ---: | ---: | ---: |
 | Successful / failed requests | 16 / 0 | 16 / 0 | 16 / 0 |
 | Benchmark duration | 385.29 s | 395.62 s | 379.31 s |
@@ -52,7 +65,7 @@ through NCCL, which can ring over linked pairs only.
 | Median TPOT | 93.85 ms | 98.40 ms | 93.39 ms |
 | P99 TPOT | 100.24 ms | 100.36 ms | 96.25 ms |
 
-Previous qualification (2026-09-15, driver 580.173.02):
+Earlier qualification (2026-09-15, driver 580.173.02):
 
 | Metric | Repeat 1 | Repeat 2 | Repeat 3 |
 | --- | ---: | ---: | ---: |
@@ -66,12 +79,12 @@ Previous qualification (2026-09-15, driver 580.173.02):
 | P99 TPOT | 97.92 ms | 95.23 ms | 104.48 ms |
 | Median inter-token latency | 95.10 ms | 94.39 ms | 103.25 ms |
 
-The 2026-10-12 repeats landed inside the prior run's spread: output token throughput 40.4–42.2 tok/s against
-41.4/41.9/38.3, and median TPOT 93–98 ms against 94–103, so the lane is unchanged on this driver. This run's first
-repeat carried a higher P99 time to first token (2,838 ms) than its siblings (1,338/1,586), the same one-repeat tail
-the previous qualification showed (its repeat 1 was 2,758 ms). This run's KV pool held 289,050 tokens, 1.10x
-concurrency at the full window. Model load to health took 348.8 s: 7.3 s of weights, 108.0 s of `torch.compile` and
-112.0 s of CUDA graph capture.
+The 2026-10-15 repeats landed inside the prior run's spread: output token throughput 41.2–42.2 tok/s against
+41.5/40.4/42.2, and median TPOT 93–96 ms against 93–98, so the lane is unchanged on this driver. This run's first
+repeat carried the higher P99 time to first token (2,972 ms) against its siblings (1,580/1,579) — the same
+one-repeat tail the 2026-10-12 (2,838 ms) and 2026-09-15 (2,758 ms) qualifications both showed on their first repeat.
+This run's KV pool held 287,512 tokens, 1.10x concurrency at the full window. Model load to health took 359.97 s:
+12.83 s of weights, 104.43 s of `torch.compile` and 108.0 s of CUDA graph capture.
 
 ### Time to first token
 
@@ -103,10 +116,10 @@ Run against this lane's deployed recipe on the NVLink host:
 
 | Gate | Result |
 | --- | --- |
-| Coherent answers | Pass — `144` for a multiplication with tools offered, a coherent answer from a returned tool result |
-| Reasoning separation | Pass — thinking on populates the `reasoning` field, separate from `content` (2026-10-12) |
-| Context fill | Pass — passphrase from a 247,534-token prompt in 214.6 s (2026-10-12); 249,581-token on 2026-09-15 |
-| Tool calling | Pass — `auto`, `required`, `none`, fed-back result probes (2026-10-12); 80-case matrix on 2026-09-15 |
+| Coherent answers | Pass — coherent arithmetic answer with tools offered, coherent answer from a fed-back tool result (2026-10-15) |
+| Reasoning separation | Pass — thinking on populates the `reasoning` field, separate from `content` (2026-10-15) |
+| Context fill | Pass — passphrase retrieved from an 80,048-token prompt in 42.7 s (2026-10-15); the 262,144 window boundary is confirmed (a 262,113-token prompt is refused at the limit), but full-window ~245K recall was not re-verified this run |
+| Tool calling | Pass — `auto` (`get_local_time` for Tokyo, structured `tool_calls`), `none` (plain answer, no markup), fed-back result (2026-10-15); full 80-case matrix on 2026-09-15 |
 
 Reasoning requires `chat_template_kwargs: {"enable_thinking": true}`; Qwen3.8 defaults thinking off and otherwise
 reasons inline in `content`.

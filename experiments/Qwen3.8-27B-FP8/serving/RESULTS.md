@@ -6,9 +6,9 @@ recipe in `recipes/Qwen3.8-27B-FP8/RESULTS.md`.
 
 ## NVIDIA Tesla V100 SXM2 16GB x4
 
-- Archive: `results_v100x4.tar.gz`, archived root `2026-10-12_11-26-36/`, byte-checked against the raw run.
-- Run timestamp `2026-10-12T11:26:36Z`, run ID `20261012T112636Z`; repository revision
-  `ce68e865a865bbdd7a6cb2f185615509c5712ffa` with uncommitted changes (this verification's report and archive edits).
+- Archive: `results_v100x4.tar.gz`, archived root `2026-10-15_10-52-51/`, byte-checked against the raw run.
+- Run timestamp `2026-10-15T10:52:51Z`, run ID `20261015T105251Z`; repository revision
+  `546f1fd3c59ad2fbe42f2451e03f650616a9c749` with uncommitted changes (this verification's report and archive edits).
 - Host: `riftvm`, Ubuntu 24.04.1, kernel 6.8.0-139-generic, Intel Xeon E5-2680 v4, 24 logical CPUs, 204 GiB RAM.
 - GPUs: four NVIDIA Tesla V100-SXM2-16GB, 16,384 MiB each, compute capability 7.0, driver 580.178.04. NVLink is up:
   pairs 0-1 and 2-3 share one link, pairs 0-2 and 1-3 two, and the diagonals 0-3 and 1-2 cross PCIe (PHB).
@@ -18,21 +18,22 @@ recipe in `recipes/Qwen3.8-27B-FP8/RESULTS.md`.
 - Controls: temperature 0, ignored EOS, 2 warm-ups, three repeats against one server with seeds 0, 1 and 2, text-only
   path, context 262,144, TP4, Triton GDN prefill backend, FLASH_ATTN_V100 attention, TurboMind FP8 dequant
   (`VLLM_SM70_FP8_TURBOMIND=1`, `VLLM_SM70_QUANT_BACKEND=turbomind`, `VLLM_SM70_GDN_DECODE_FLASHQLA=0`),
-  `--exclude-tools-when-tool-choice-none`, key/value cache pinned at 4.5 GiB per card. vLLM's custom all-reduce stays
-  off (not every GPU pair has NVLink), so tensor-parallel traffic goes through NCCL.
-- Measured KV pool: 289,050 tokens, 1.10x maximum concurrency at full context.
+  `--exclude-tools-when-tool-choice-none`, key/value cache sized from `gpu_memory_utilization` 0.88. vLLM's custom
+  all-reduce stays off (not every GPU pair has NVLink), so tensor-parallel traffic goes through NCCL.
+- Measured KV pool: 287,512 tokens, 1.10x maximum concurrency at full context.
 - Rows executed: 1 of 1 succeeded; 0 failed requests in each of the three repeats.
 
 | Row | Input / output | Concurrency | Prompts | Repeats |
 | --- | ---: | ---: | ---: | ---: |
 | `v100x4_r3` | 1,000 / 1,000 | 4 | 16 | 3 |
 
-Startup cost recorded for this row: deploy 348.8 s of model load and warm-up (7.3 s weights, 108.0 s `torch.compile`,
-112.0 s CUDA graph capture). The benchmark took 1,313.8 s across the three repeats and the serving workload was torn
-down afterwards.
+Startup cost recorded for this row: deploy 359.97 s of model load and warm-up (12.83 s weights, 104.43 s
+`torch.compile`, 108.0 s CUDA graph capture). The benchmark took 1,297.57 s across the three repeats and the serving
+workload was torn down afterwards.
 
-This archive replaces the 2026-09-15 run of the same row (archived root `2026-09-15_19-15-00/`), which ran on driver
-580.173.02; that run remains in the git history.
+This archive replaces the 2026-10-12 run of the same row (archived root `2026-10-12_11-26-36/`, driver 580.178.04),
+which in turn replaced the 2026-09-15 run (archived root `2026-09-15_19-15-00/`, driver 580.173.02); both remain in
+the git history.
 
 The archive contains the per-row system-only experiment record, the client benchmark log with one stanza per repeat,
 and the engine server log.
