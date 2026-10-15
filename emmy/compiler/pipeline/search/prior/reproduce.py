@@ -123,7 +123,9 @@ def reproduce_schedule(pools: Sequence[GoldenPool], *, kernel: str | None = None
 
 def reproduce_placement(pools: Sequence[GoldenPool], prior, *, kernel: str | None = None) -> list[Verdict]:
     """The placement verdicts of every pool with a kernel-set fork, one per fork of its own kernel — a placement
-    cut, then a split or a layout where the kernel stays whole — under the placement ``prior``."""
+    cut, then a split or a layout where the kernel stays whole — and, where the golden cut it, of each remainder
+    on the way to the recorded kernel set, under the placement ``prior``, which picks at every fork as a deploy
+    would and leaves the golden's path where its pick is no positive."""
     from emmy.compiler.pipeline.search.ranking import placement_decisions, pool_context, walk_placement  # noqa: PLC0415
 
     out: list[Verdict] = []
