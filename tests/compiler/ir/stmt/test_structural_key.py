@@ -17,13 +17,20 @@ from emmy.compiler.ir.stmt.body import Body
 from emmy.compiler.ir.stmt.identity import canonicalize_identity
 from emmy.compiler.ir.stmt.leaves import (
     Accum,
+    Affine,
     Assign,
     Init,
     Let,
     Load,
     Write,
 )
-from emmy.compiler.ir.stmt.normalize import _canonicalize_exprs, normalize_body, prepare_body, rename_ssa_sequential
+from emmy.compiler.ir.stmt.normalize import (
+    _canonicalize_exprs,
+    _normalize_body,
+    normalize_body,
+    prepare_body,
+    rename_ssa_sequential,
+)
 
 # ---------------------------------------------------------------------------
 # sort_commutative_args
@@ -58,7 +65,7 @@ def test_affine_index_equivalence_and_cse_have_one_exact_identity() -> None:
             )
             normalized = normalize_body(body)
             assert len(normalized.loads) == 1
-            assert len([s for s in normalized.iter() if isinstance(s, Assign)]) == 2
+            assert len([s for s in normalized.iter() if isinstance(s, (Assign, Affine))]) == 2
             assert normalize_body(Body(tuple(normalized))) == normalized
             keys.add(body.structural_key(structural=False))
     assert len(keys) == 1
@@ -281,7 +288,10 @@ def test_structural_key_equal_for_reordered_reduction_axis_metadata() -> None:
         )
 
     assert make(("row", "column")).structural_key(structural=False) == make(("column", "row")).structural_key(structural=False)
-    assert make(("row",)).structural_key(structural=False) != make(("column",)).structural_key(structural=False)
+    inner = Body((Load(name="x", input="X", index=(Var("row"), Var("column"))), Accum(name="total", value="x", axes=("column",))))
+    per_row_cell = (Loop(axis=Axis("column", 4), body=inner), Write(output="O", index=(Var("row"),), value="total"))
+    per_row = Body((Loop(axis=Axis("row", 4), body=per_row_cell),))
+    assert make(("row", "column")).structural_key(structural=False) != per_row.structural_key(structural=False)
 
 
 def test_structural_key_equal_for_ambiguous_free_axis_renaming() -> None:
@@ -1082,6 +1092,38 @@ def test_structural_key_idempotent() -> None:
     canonical = canonicalize_identity(body)
     assert canonicalize_identity(normalize_body(body)) == canonical
     assert set(canonical.arguments) == {"X", "Y", "O"}
+
+
+def test_normal_form_is_a_fixed_point_when_the_order_breaks_a_tie_by_spelling() -> None:
+    """Two loop-invariant values of one shape tie in the canonical order, which breaks the tie by their spelling: the
+    order runs again on its own output until it leaves it alone, so normalizing the normal form changes nothing."""
+    tile = (Literal(0, "int"), Var("a0"), Var("a2") / Literal(64, "int"), Var("a2") % Literal(64, "int"))
+    body = Body(
+        (
+            Loop(
+                Axis("a0", 48),
+                (
+                    Loop(
+                        Axis("a2", 512),
+                        (
+                            Assign("v36", "multiply", ("v35", "v3")),
+                            Assign("v37", "pad", ("v36",)),
+                            Write(output="reshape_9", index=tile, value="v37"),
+                            Loop(
+                                Axis("a7", 128),
+                                (
+                                    Assign("v146", "pad", ("v145",)),
+                                    Write(output="reshape_5", index=(*tile, Var("a7")), value="v146"),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    once = _normalize_body(body)
+    assert repr(_normalize_body(once)) == repr(once)
 
 
 def test_identity_coordinate_order_survives_axis_rename() -> None:

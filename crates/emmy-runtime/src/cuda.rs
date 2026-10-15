@@ -23,7 +23,7 @@ const MAX_BLOCK_DIMENSIONS: (u32, u32, u32) = (1024, 1024, 64);
 const MAX_GRID_DIMENSIONS: (u32, u32, u32) = (i32::MAX as u32, 65535, 65535);
 const DEFAULT_SHARED_MEMORY_BYTES: u32 = 48 * 1024;
 const MAX_RUN_ITERATIONS: u32 = 1_000_000;
-const MILLISECONDS_PER_SECOND: f64 = 1000.0;
+pub(crate) const MILLISECONDS_PER_SECOND: f64 = 1000.0;
 /// How long an event wait spins before it starts sleeping between driver queries.
 const SPIN_BEFORE_SLEEP_MS: f64 = 2.0;
 const SLEEP_BETWEEN_QUERIES: Duration = Duration::from_micros(200);
@@ -576,8 +576,8 @@ pub struct Executor {
     pages: BTreeMap<String, Vec<Region>>,
     bound: BTreeSet<String>,
     descriptors: BTreeMap<EnvKey, BTreeMap<(usize, String), Descriptor>>,
-    /// Whole-program graphs by symbol environment, most recently used last.
-    graphs: Vec<(EnvKey, CudaGraph)>,
+    /// Whole-program graphs by symbol environment and batch, most recently used last.
+    graphs: Vec<((EnvKey, u32), CudaGraph)>,
     /// One graph per launch position, each holding that launch's batch, at the current env.
     launch_graphs: Option<(Vec<u32>, Vec<CudaGraph>)>,
     /// Per-launch timing events, created once and reused across iterations.
@@ -610,6 +610,11 @@ impl Executor {
         env: Option<Env>,
         regions: Option<BTreeMap<String, (u64, usize)>>,
     ) -> Result<Self> {
+        ensure!(
+            artifact.program.backend == "cuda",
+            "a {} plan cannot run on the CUDA executor",
+            artifact.program.backend
+        );
         let context = device.context.clone();
         context.bind_to_thread()?;
         if let Some(arch) = &artifact.arch {
@@ -1375,8 +1380,13 @@ impl Executor {
     /// graph captured at an env replays only at that env (grids, runtime arguments and
     /// descriptors are baked), so one graph is kept per env, least recently used out.
     pub fn capture_program_graph(&mut self) -> Result<()> {
+        self.capture_program_batch(1)
+    }
+
+    pub fn capture_program_batch(&mut self, batch: u32) -> Result<()> {
+        ensure!(batch > 0, "batch must be positive");
         self.context.bind_to_thread()?;
-        let key = env_key(&self.env);
+        let key = (env_key(&self.env), batch);
         if let Some(position) = self.graphs.iter().position(|(k, _)| *k == key) {
             let entry = self.graphs.remove(position);
             self.graphs.push(entry);
@@ -1385,7 +1395,12 @@ impl Executor {
         // Encoding TMA descriptors uploads bytes and synchronizes the stream. Finish that
         // before capture begins, including the first capture at a new symbolic environment.
         self.ensure_descriptors()?;
-        let graph = self.capture(|executor| executor.submit())?;
+        let graph = self.capture(|executor| {
+            for _ in 0..batch {
+                executor.submit()?;
+            }
+            Ok(())
+        })?;
         self.graphs.push((key, graph));
         if self.graphs.len() > GRAPH_CACHE_MAX {
             self.graphs.remove(0);
@@ -1400,13 +1415,17 @@ impl Executor {
 
     /// Whether a graph exists for the current environment.
     pub fn has_program_graph(&self) -> bool {
-        let key = env_key(&self.env);
+        let key = (env_key(&self.env), 1);
         self.graphs.iter().any(|(k, _)| *k == key)
     }
 
     pub fn replay_program_graph(&mut self) -> Result<()> {
+        self.replay_program_batch(1)
+    }
+
+    fn replay_program_batch(&mut self, batch: u32) -> Result<()> {
         self.context.bind_to_thread()?;
-        let key = env_key(&self.env);
+        let key = (env_key(&self.env), batch);
         let graph = self
             .graphs
             .iter()
@@ -1419,10 +1438,10 @@ impl Executor {
         Ok(())
     }
 
-    /// Time `replays` back-to-back replays of the program graph, per replay in milliseconds.
+    /// Time one captured batch of `replays` whole-program forwards, per forward in milliseconds.
     pub fn time_program_window(&mut self, replays: u32, deadline_ms: f64) -> Result<f32> {
         ensure!(replays > 0, "replays must be positive");
-        self.capture_program_graph()?;
+        self.capture_program_batch(replays)?;
         if self.window.is_none() {
             self.window = Some((self.event()?, self.event()?));
         }
@@ -1431,9 +1450,7 @@ impl Executor {
         unsafe {
             result::event::record(start.cu_event(), stream)?;
         }
-        for _ in 0..replays {
-            self.replay_program_graph()?;
-        }
+        self.replay_program_batch(replays)?;
         let (start, stop) = self.window.as_ref().unwrap();
         unsafe {
             result::event::record(stop.cu_event(), stream)?;

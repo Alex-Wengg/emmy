@@ -391,7 +391,7 @@ def handle_eval_golden(args) -> None:
 
     from emmy.compiler.context import Context  # noqa: PLC0415
     from emmy.compiler.pipeline import CUDA_PASSES, Pipeline  # noqa: PLC0415
-    from emmy.compiler.pipeline.search.golden import GoldenFile, program_cold_cache, sole_evidence  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import GoldenFile, sole_evidence  # noqa: PLC0415
     from emmy.compiler.pipeline.search.pins import pinned_knobs  # noqa: PLC0415
     from emmy.serving.release import load_serving_config, model_matches  # noqa: PLC0415
     from emmy.serving.twins import capture_serving_twins, fork_less_weights, twin_realizations  # noqa: PLC0415
@@ -427,17 +427,17 @@ def handle_eval_golden(args) -> None:
 
     # A twin's rows are the ones it reaches: a static twin is compiled at its own width, a symbolic one for any
     # width. The twin is the row name's first field; a target's sizes are the kernel's provenance. A row's lane is
-    # its pins other than COLD_CACHE: the serving config has no cache-regime lanes; serving picks the cache regime per
-    # program at compile time.
+    # the regime its pins spell (``regime_pins``: a row may spell every precision gate or only the umbrella), the
+    # cache regime the config declares among them: a row recorded in another regime is a missing row.
     by_twin: dict[str, set[tuple]] = {}
     for kernel in document.targets():
         for row in document.rows:
             if row.kernel == kernel.ref:
                 twin = row.name.split(".", 1)[0]
-                by_twin.setdefault(twin, set()).add((tuple(sorted(kernel.bindings.items())), _lane_pins(row.pins)))
+                by_twin.setdefault(twin, set()).add((tuple(sorted(kernel.bindings.items())), _lane(row.pins)))
     missing = []
     for twin, actual in sorted(by_twin.items()):
-        expected = {(row.bindings, row.pins) for row in twin_realizations(serving, twin)}
+        expected = {(row.bindings, _lane(row.pins)) for row in twin_realizations(serving, twin)}
         for bindings, pins in sorted(expected - actual, key=lambda item: (item[1], item[0])):
             missing.append((twin, dict(bindings), pins))
     if missing:
@@ -459,20 +459,18 @@ def handle_eval_golden(args) -> None:
     # The serving-matrix half of the gate: each lane's twins compiled with that lane's rows as the only evidence,
     # strictly, on the live card the golden names — a fork no golden row decides is an EvidenceError naming the
     # kernel, never a prediction the prior makes. A twin is compiled in each lane one of its rows names (a shape's
-    # ``:fm`` suffix names its lane), in the cache regime serving selects for it from the lane's rows, in serving's
+    # ``:fm`` suffix names its lane), under the lane's pins and the context ``serve`` probes under them, in serving's
     # build order and under the weight layouts its narrower twins settled, as serving compiles it.
     failed = False
     for pins in sorted({row.pins for row in serving.realizations}, key=repr):
         lane = _format_pins(pins)
         reached = [name for name in graphs if any(row.pins == pins for row in twin_realizations(serving, name))]
-        in_lane = replace(document, rows=[row for row in document.rows if _lane_pins(row.pins) == tuple(sorted(pins))])
+        in_lane = replace(document, rows=[row for row in document.rows if _lane(row.pins) == _lane(pins)])
         with pinned_knobs(dict(pins)), sole_evidence([in_lane]):
+            lane_ctx = Context.probe()
 
-            def compile_twin(name, graph, lane=lane):
-                cold = program_cold_cache(graph, ctx)
-                logger.info("%s: %s: %s cache", lane, name, "cold" if cold else "hot")
-                with pinned_knobs({"COLD_CACHE": cold}):
-                    return Pipeline.build(CUDA_PASSES).run(graph, ctx=replace(ctx, cold_cache=cold))
+            def compile_twin(_name, graph, ctx=lane_ctx):
+                return Pipeline.build(CUDA_PASSES).run(graph, ctx=ctx)
 
             twins = {name: graphs[name] for name in reached}
             broken = audit_twins(twins, compile_twin, lane, lambda graph: fork_less_weights(graph, ctx))
@@ -481,6 +479,14 @@ def handle_eval_golden(args) -> None:
     if failed:
         logger.error("serving audit failed: every fork of every reachable kernel must be decided by a golden row")
         sys.exit(1)
+
+
+def _lane(pins) -> tuple:
+    """The regime ``pins`` spell, as a comparable key: a row that spells every precision gate and one that spells
+    only the ``FAST_MATH`` umbrella name the same lane."""
+    from emmy.compiler.pipeline.search.space import regime_pins  # noqa: PLC0415
+
+    return tuple(sorted(regime_pins(dict(pins)).items()))
 
 
 def audit_twins(graphs: dict, compile_twin, lane: str, fork_less) -> int:
@@ -502,11 +508,6 @@ def audit_twins(graphs: dict, compile_twin, lane: str, fork_less) -> int:
             broken += 1
             logger.error("%s: %s: %s", lane, name, " ".join(f"{type(exc).__name__}: {exc}".split()))
     return broken
-
-
-def _lane_pins(pins: dict) -> tuple:
-    """A golden row's serving lane: its pins without ``COLD_CACHE``, sorted like a realization's."""
-    return tuple(sorted((name, value) for name, value in pins.items() if name != "COLD_CACHE"))
 
 
 def _ratio_color(matched: int, total: int) -> str:

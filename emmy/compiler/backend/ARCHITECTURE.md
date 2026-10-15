@@ -1,6 +1,6 @@
 # Backend Architecture
 
-Three backends with a shared interpreter. Every backend exposes the
+Four backends with a shared interpreter. Every backend exposes the
 same two-step API (`backend/base.py`):
 
 ```python
@@ -17,6 +17,7 @@ What differs is `compile()` — how far the backend lowers the graph:
 |----------------|----------------------------------------------------|----------------------|
 | `NumpyBackend` | returns the graph as-is (no-op)                    | default `Backend.run`|
 | `LoopBackend`  | runs decomposition → optimization → fusion         | default `Backend.run`|
+| `CpuBackend`   | fusion + `tile/cut` + LLVM codegen per cut piece   | the Rust runtime     |
 | `CudaBackend`  | fusion + `lowering/kernel` + `lowering/cuda`       | the Rust runtime     |
 
 `numpy` and `loop` backends share the same runtime path — the only
@@ -69,8 +70,9 @@ references rather than against another Emmy realization.
 
 `Backend.run` provides a default implementation: walks the compiled
 graph in topological order and calls `node.op.forward(*args)` at each
-compute node. `InputOp` and `ConstantOp` boundaries are seeded from
-`input_data`; values are stored **per buffer** — a multi-output node's
+compute node. `InputOp` and externally bound `ConstantOp` boundaries are seeded from `input_data`. A declared
+`ConstantOp.value` is immutable: lowering may consume it, so changing that value requires recompilation.
+Values are stored **per buffer** — a multi-output node's
 `forward` returns a tuple matched positionally to `node.outputs`, and
 each result is reshaped to its own output tensor's shape when statically
 known.
@@ -113,6 +115,13 @@ this is the numpy backend with fusion in front.
 
 Used as the second axis of triangulation: **loop vs numpy disagreement
 implicates fusion; loop vs CUDA disagreement implicates codegen.**
+
+## CPU backend (`cpu/`)
+
+See `cpu/ARCHITECTURE.md`. Cuts the fused graph at every seam, compiles each piece's Loop IR to native code
+through LLVM (llvmlite, in process), and runs the pieces on a thread pool. A third triangulation axis that runs
+without a GPU: **cpu vs loop disagreement implicates the cut (which the loop backend never runs) or the CPU code
+generator, not fusion.**
 
 ## CUDA backend (`cuda/`)
 

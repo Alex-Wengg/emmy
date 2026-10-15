@@ -81,6 +81,7 @@ from emmy.compiler.ir.stmt import (
     Body,
     Cond,
     Init,
+    Let,
     Load,
     Loop,
     Select,
@@ -88,6 +89,7 @@ from emmy.compiler.ir.stmt import (
     Stmt,
     StridedLoop,
     Write,
+    binary,
     mask_select_predicate,
 )
 from emmy.compiler.ir.stmt.body import _exposed_defines, free_names
@@ -297,7 +299,7 @@ def _warp_epilogue(tail: list[Stmt], acc: str, m_name: str, n_name: str, sigma: 
     ``extra_accs`` are a multi-fold node's additional accumulator names, bound after ``acc`` so
     the chain combines the channels per element.
 
-    The projection is the post-reduce ``tail`` stmts: the leaf ``Load``s + pointwise ``Assign``s +
+    The projection is the post-reduce ``tail`` stmts: leaf ``Load``s, pure ``Let`` bindings, pointwise ``Assign``s and
     an optional causal ``Select``. They stay what they are; only the coordinates move. A leaf
     ``Load`` substitutes the cell base plus the reserved ``ELEM_ROW`` / ``ELEM_COL`` offset into its
     source coordinates before evaluating their arithmetic. A block-scale ``n/Q`` therefore reads
@@ -312,12 +314,14 @@ def _warp_epilogue(tail: list[Stmt], acc: str, m_name: str, n_name: str, sigma: 
     offset = {"m": Var(ELEM_ROW), "n": Var(ELEM_COL)}
     ph = dict(sigma.mapping)
     ph.update({name: BinaryExpr("+", sigma.apply(Var(name)), offset[role]) for role, name in (("m", m_name), ("n", n_name))})
-    for s in tail:
+    for s in binary(tail):
         if isinstance(s, Load):
             index = tuple(e.substitute(ph) for e in s.index)
             body.append(Load(names=s.names, input=s.input, index=index, dtype=s.dtype))
         elif isinstance(s, Assign):
             body.append(s)
+        elif isinstance(s, Let):
+            body.append(s.substitute(Sigma(ph)))
         elif isinstance(s, Select):
             body.append(Select(name=s.name, branches=tuple(SelectBranch(br.value, br.select.substitute(ph)) for br in s.branches)))
         elif isinstance(s, Write):
@@ -335,9 +339,9 @@ def _warp_epilogue(tail: list[Stmt], acc: str, m_name: str, n_name: str, sigma: 
     # into the ``LoweringError`` a truncated pipeline can still raise.
     from emmy.compiler.pipeline import RuleSkipped  # noqa: PLC0415 — avoid an import cycle
 
-    bound = {acc, *extra_accs}
+    bound = {acc, *extra_accs, *(name for value in ph.values() for name in value.free_vars())}
     for st in body:
-        reads = st.args if isinstance(st, Assign) else tuple(br.value for br in st.branches) if isinstance(st, Select) else ()
+        reads = st.deps() if isinstance(st, (Assign, Let)) else tuple(br.value for br in st.branches) if isinstance(st, Select) else ()
         if unbound := [a for a in reads if a not in bound]:
             raise RuleSkipped(
                 f"projection epilogue reads {unbound} this node does not compute (mis-sliced multi-channel tail)", reject=True
@@ -1504,7 +1508,7 @@ def _mask_key_bounds(stmts, held: str, key: Axis, row: str, offset, bk: int) -> 
     fragments = {held}  # the score and every value the prefix derives from it (its scaling, say)
     first: Expr | None = None
     end: Expr | None = None
-    for stmt in stmts:
+    for stmt in binary(stmts):  # a mask added inside a sum is one operation of its binary spelling
         if isinstance(stmt, Assign) and set(stmt.args) & fragments:
             fragments.add(stmt.name)
         masked = _mask_add(stmt, selects, fragments)
@@ -2700,6 +2704,7 @@ def _residence(
     frags, rows, memo = dict(frags), dict(rows), memo if memo is not None else {}
     frag_tag = tag if frag_tag is None else frag_tag
     selects: dict[str, Select] = {}
+    stmts = binary(stmts)  # a sum is evaluated one operation at a time here
     for stmt in stmts:
         if isinstance(stmt, Select) and select_sigma is not None:
             selects[stmt.name] = stmt

@@ -8,8 +8,8 @@ Emmy's kernels run inside the fork's runtime, which supplies the serving shell a
 the fork has to serve the model first: steps 1 to 3 set up the runtime and record the baseline to match, step 4 gets
 Emmy serving the model correctly, step 5 closes the speed gap, and step 6 releases.
 
-Written 2026-10-13, revised the same day after a review and after the owner fixed the goal. Nothing below has run on
-our hardware yet. Numbers marked "upstream" are 1Cat-vLLM's own reports.
+Written 2026-10-13, revised the same day after a review and after the owner fixed the goal. Steps 1 and 2 ran on
+2026-10-14 and 15; each result is written under its step. Numbers marked "upstream" are 1Cat-vLLM's own reports.
 
 ## What we know
 
@@ -23,8 +23,9 @@ our hardware yet. Numbers marked "upstream" are 1Cat-vLLM's own reports.
   when thinking; temperature 0.7, top-p 0.8, top-k 20, presence penalty 1.5 when not.
 - The Hugging Face architecture is `qwen4_exp`. Stock vLLM supports it since v0.29.0. Our Transformers pin (5.14.1)
   has no class for it.
-- License is `qwen-community-1.0`, not Apache. Nobody here has read it for paid serving or for redistributing weights
-  in an image.
+- License is `qwen-community-1.0`, not Apache. A Model-as-a-Service business needs a separate license from Qwen
+  before any commercial use. The owner continues the evaluation internally while that is open, so no model output is
+  published until it is settled.
 - The hosted "Qwen3.8-Flash" is a different, production build of this model. It is not a reference for the open
   weights.
 
@@ -53,8 +54,8 @@ cards at TP4 with direct NVLink, one request:
 - The release wheel does not contain the GGUF work. Upstream says it needs a development build.
 - The GGUF example serves 32K context. History can live in host memory, with a cache on the cards that is allocated
   after the engine has sized its key/value pool. The n-gram tables are read from disk and are not held on the cards.
-- Upstream's fast exchange between ranks is admitted only on a four-card ring of direct NVLink connections; its notes
-  say full-mesh groups keep the ordinary path. Our cards sit behind NVSwitches, so expect the ordinary path.
+- Upstream's notes admit its fast exchange between ranks only on a four-card ring of direct NVLink connections. On
+  our NVSwitch cards v1.5.1 admitted it anyway (step 1).
 - Upstream memory notes: a prefill chunk of 8,192 runs out of memory on 32 GB cards; packed weight copies add about
   1.25 GiB per rank at load; a manual key/value budget does not shrink to leave room for temporary peaks.
 - Open upstream: MTP decode deadlocks with two or more concurrent requests on NVFP4 (issue 865, open since
@@ -92,8 +93,8 @@ changes. It has no `qwen4_exp`. Every V100 recipe pins an image built from it.
 ### The node
 
 16× V100 SXM3 32GB (512 GiB, about 550 GB), 80 CPUs, 1,338 GB of RAM, CUDA 12.9, driver 580. By card count one node
-holds four TP4 replicas; whether four run well together is not known. The test node has NVLink switched off by a
-driver option; production nodes have it on.
+holds four TP4 replicas; whether four run well together is not known. The test node has NVLink on since its rebuild
+on 2026-10-14, like the production nodes.
 
 ## What DeepSeek taught, applied here
 
@@ -117,11 +118,12 @@ Each step ends at a gate. A failed gate stops the plan there, with the evidence 
 
 ### 0. Before any work
 
-- Read the license for paid serving and for baking weights into a published image. A no stops the plan.
-- The owner confirms the minimums in step 2, and turns NVLink on at the test node.
-- Create the experiment directory first, with the grid of step 2 as its matrix, so every run below lands in one place.
-- Decide the fork binary: the published wheel or our source build. Upstream warns that source builds can take slower
-  fallback paths. Steps 1 to 3 measure one binary, and step 3 builds the image from it.
+- Done: the license is read (see "The model"), NVLink is on at the test node, and the fork binary is the v1.5.1
+  release wheel. Upstream warns that source builds can take slower fallback paths; steps 1 to 3 measure this one
+  binary, and step 3 builds the image from it.
+- Open: the owner confirms the minimums in step 2.
+- Done differently: step 2 screened its grid by hand, one boot per cell, and its experiment directory records the
+  chosen shape's baseline. Step 1's raw results stayed outside the repository.
 
 ### 1. Does the model do our jobs?
 
@@ -130,25 +132,71 @@ and CUDA versions. NVFP4 runs from the v1.5.1 release wheel.
 
 Run the RadixArk NVFP4 checkpoint on four cards of the test node, MTP off and then on.
 
-- **Topology.** Confirm from the engine's start-up report which exchange path our cards get. Expect the ordinary one.
+- **Topology.** Confirm from the engine's start-up report which exchange path our cards get.
 - **Reference.** The BF16 checkpoint on stock vLLM at a pinned version, on rented H200s through the existing recipe
   shell. The same prompts, the same sampling, the same chat settings.
-- **Review set.** Ten merged pull requests, from 10,000 tokens up to the review tool's 128,000-token limit, three runs
-  each, for three models: the current reviewer (Qwen3.8-27B-FP8), the candidate, and the reference. A review counts as
-  usable when the tool accepts the answer, it is not cut off or empty, every file it names is in the change, every
-  line it cites is inside a changed hunk, and no finding is false when checked against the change. The review tool's
-  time limit is raised for these runs, and an answer that misses it is counted apart, so speed does not decide
-  quality here.
+- **Review set.** Nice to have, not part of the gate (the owner's decision of 2026-10-14). Ten merged pull requests,
+  from 10,000 tokens up to the review tool's 128,000-token limit, three runs each, for three models: the current
+  reviewer (Qwen3.8-27B-FP8), the candidate, and the reference. A review counts as usable when the tool accepts the
+  answer, it is not cut off or empty, every file it names is in the change, every line it cites is inside a changed
+  hunk, and no finding is false when checked against the change. The review tool's time limit is raised for these
+  runs, and an answer that misses it is counted apart, so speed does not decide quality here.
 - **Accuracy sets.** The 28 acceptance cases run against the DeepSeek offering, the long-document probes from the
   DeepSeek results at their recorded sizes, and 128 GSM8K questions. GSM8K runs at temperature 0 so the 3-point
   gate is not lost in sampling noise; the rest use the model card's sampling for each mode, three runs each.
 - Gate, all of:
-  - usable reviews: the candidate is at most 2 of 30 behind the current reviewer;
   - against the reference: GSM8K within 3 points, acceptance cases equal or better, long-document probes within 2
     correct answers per size;
   - no run ends by hitting the output limit.
 
   If NVFP4 fails where the reference passes, try FP8 on eight cards before stopping.
+
+**Result, 2026-10-14.** The NVFP4 checkpoint on the plain fork matches the full-precision reference on every quality
+check. One point is open to the owner: three fork runs ended at their output limit.
+
+- **Pins.** Fork release v1.5.1 (tag commit `589a5d1e1a9e`), wheel sha256 `757f2200ba6b…`, on
+  `nvidia/cuda:12.8.1-devel-ubuntu24.04` plus `python3.12-dev`: Triton compiles a helper against `Python.h` at
+  start-up, and without it the model class does not load. Torch 2.10.0+cu128, Triton 3.6.0, Transformers 5.19.0.
+  RadixArk NVFP4 at `7b719225242a`. Launcher `serve_flash_next_nvfp4_v100.sh` as shipped, on cards 0 to 3, plus the
+  served name and the `qwen3` reasoning and `qwen3_coder` tool parsers it does not set. MTP off is
+  `--speculative-config null`. Reference: stock vLLM v0.31.0, BF16 at `de4b8e4d43b9`, 4× H200 rented for 43 minutes,
+  context 163,840, thinking off by default like the fork, no MTP.
+- **Start-up.** The fast exchange between ranks is admitted on our NVSwitch cards (custom all-reduce, NCCL as the
+  fallback). Boot takes 8 min 47 s cold and 6 min warm. Weights take 22.9 GiB per card; the n-gram table stays in
+  pinned host memory, read through 47.7 GiB of file mappings. The KV pool is 173,353 tokens with MTP and 272,511
+  without, the same on cold and warm starts. A card holds 29.4 GB idle and 31.2 GB after a 32K prompt.
+- **Thinking.** The fork turns thinking off for every request that does not ask for it (its server default sets
+  `enable_thinking` to false); the model card says thinking is on by default. Every test set the switch explicitly.
+- **Speed, one request** (random prompts, 512 output tokens, greedy):
+
+  | Prompt | First token, MTP on | First token, MTP off | Per output token, MTP off |
+  | ---: | ---: | ---: | ---: |
+  | 1K | 0.30 s | 0.51 s | 13.6 ms |
+  | 8K | 1.57 s | 1.50 s | 13.0 ms |
+  | 32K | 6.26 s | 5.89 s | 13.5 ms |
+
+  On natural prompts the fork decodes 78 tok/s without MTP (upstream 80.7) and 114 tok/s with MTP4 (upstream 138 to
+  150; 2.9 tokens per step). Prefill runs at about 5,250 tok/s (upstream 7,056 at 8K); a 130K prompt takes 25.7 s.
+- **Quality against the reference:**
+
+  | Check | Fork, NVFP4 on 4× V100 | Reference, BF16 on 4× H200 |
+  | --- | --- | --- |
+  | GSM8K, 128 questions, temperature 0, thinking off | 125 (MTP off), 124 (MTP on) | 125 |
+  | Acceptance cases, three runs, thinking off / on | 27, 27, 27 / 27, 27, 28 | 27, 27, 27 / 26, 27, 27 |
+  | Long-document codes found, three runs, off / on | 387 of 387 / 383 of 384 | 387 of 387 / 383 of 384 |
+  | Usable reviews of 30 (not gating) | 7 | 6 |
+
+  The long-document probes plant one code in repository text at 6.9K to 130.7K tokens, eight documents at 15K and at
+  30K one at a time and at once, three codes at 1.5K to 120K tokens in prose and in a synthetic log, and one code per
+  question in nine of those documents. Unlike DeepSeek V4, the model finds the codes at every size. The one
+  acceptance case both miss is a three-step sum asked with thinking off.
+- **Output limit.** Three fork runs reached it, none on the reference. Two GSM8K answers reasoned at length without
+  thinking mode and reached the 2,048-token cap (MTP off), and one thinking answer used its whole 8,192-token budget
+  without an answer.
+- **Reviews.** Of 89 findings from the three models, checked against the code, 2 were true. A review is usable
+  almost only when it finds nothing on a small change; the current reviewer had 7 usable of the 19 runs Relay
+  completed. The tool's 128,000 is its own token count: its largest prompts are 129K to 145K tokens for this model,
+  so a 131,072 context refuses them, and 163,840 (a 178,339-token KV pool with MTP) fits them.
 
 ### 2. Pick the serving shape and record the baseline
 
@@ -161,7 +209,7 @@ Proposed minimums, for the owner to confirm in step 0:
 
 | Measure | Minimum | Why this number |
 | --- | --- | --- |
-| Context | 131,072 tokens | the review tool sends up to 128,000 and needs room for the answer |
+| Context | 131,072 tokens | the launcher's default; serving the review tool would need about 160,000 (step 1), wanted but not required |
 | Decode, one request | 40 tok/s | five times what the node serves today, half of upstream's report |
 | First token, 8K prompt | 10 s | upstream reports 4.5 s |
 | First token, 128K prompt | 120 s | leaves time for the answer within 280 s, the review tool's limit raised to just under Relay's 290 s |
@@ -193,6 +241,61 @@ of the layer, host time, and time in exchanges between ranks.
 
 Gate: one shape meets every confirmed minimum and the step 1 accuracy gate with all its replicas running together,
 and its baseline and profile are in the results.
+
+**Result, 2026-10-15.** The shape is the RadixArk NVFP4 checkpoint at TP4 with MTP off, four replicas per node, a
+131,072 context, the KV pool pinned at 2.5 GiB per card (194,016 tokens), a 4,096-token prefill step, up to eight
+sequences, prefix caching, the n-gram table in pinned host memory and history on the cards. It meets every proposed
+minimum with all four replicas running and passes the step 1 accuracy sets. The baseline is the experiment
+`experiments/Qwen3.8-Flash-Next/fork_baseline_v100_sxm3`. The minimums still wait for the owner's confirmation.
+
+- **The grid, one boot per cell by hand.** `emmy bench` deploys every row cold, about 9.5 minutes each, so the full
+  grid would have cost about 56 boots; the screen took one boot per cell and the experiment records only the chosen
+  shape.
+
+  | Cell | Result |
+  | --- | --- |
+  | RadixArk TP4, MTP off / on | boots; 272,511 / 173,353 KV tokens at a 0.90 share; 78 / 114 tok/s on natural prompts |
+  | nvidia NVFP4 TP4, MTP off / on | boots; same speed and memory as RadixArk (MTP on 209,292 KV tokens: its draft experts are FP8) |
+  | RadixArk PP2 × TP4, MTP off | boots only with `--block-size 816` (the n-gram table placement sizes the cache before the attention block is enlarged); 70 tok/s, 3.7 s to the first token at 32K against 5.9 s at TP4 |
+  | RadixArk PP2 × TP4, MTP on | boots, then dies on the first request with a device-side assert |
+  | Qwen FP8 PP2 × TP4 | fails at load: the fork's SM70 FP8 preparation rejects the checkpoint's scale layout; at TP4 the weights do not fit |
+
+  The nvidia PP2 cells were not run: that checkpoint matches RadixArk at TP4, and RadixArk is the one step 1
+  qualified against the reference.
+- **Issue 865 does not reproduce.** MTP4 at eight concurrent requests ran 900 requests over 29 minutes with no stall
+  (264 tok/s in total), so the rule allows MTP on.
+- **The 3 GiB margin, tested directly.** A process holds 3 GiB on every card, the server starts beside it, and the
+  worst-case loads run: one 130K prompt, four 32K prompts at once, a 64K prompt with 4,096 output tokens, and a 128K
+  prefill arriving among three decoding requests. TP4 with MTP off passes with about 0.6 GiB to spare; PP2 × TP4
+  with MTP off and the n-gram table moved to host memory (`VLLM_QWEN4EXP_PLE_HOST_GIB=12`) passes with about 8.7 GiB
+  to spare; TP4 with MTP on runs out of memory at four 32K prompts even with its pool cut to 131,072 tokens. The
+  launcher's own 8,192-token step at a 0.95 share leaves the fork about 0.3 GiB before any margin. So MTP is off: at
+  TP4 it cannot keep the margin, and under PP it crashes.
+- **TP4 over PP2 × TP4.** Four TP4 replicas give a node about 790 tok/s at eight requests each (measured, through the
+  load balancer), two PP2 replicas about 460 (from one replica's 228). TP4 decodes faster per request (13 ms against
+  14 ms); PP2 reaches the first token sooner on long prompts and keeps far more memory free. PP2 × TP4 stays the
+  fallback if Emmy needs more than the 3 GiB.
+- **All four replicas together.** They boot in about 7 minutes side by side and do not slow each other: each ran the
+  four-request case for 30 minutes (three decoding streams, 128K prompts arriving back to back) with no stall or
+  failure, the streams averaging 25 tok/s (about 6 tok/s while a 128K prompt is being prefilled), and each 128K
+  prompt reaching its first token in 49-50 s. Host RAM in use: 327 GB, mostly the pinned n-gram tables.
+- **Two boots give the same text.** Six greedy prompts came back identical from the four replicas.
+- **Accuracy on this shape.** GSM8K 124 of 128, none at the cap; acceptance cases 27 of 28 in each mode (the known
+  arithmetic miss); every long-document code found, 129 of 129 without thinking and 128 of 128 with it.
+- **Baseline, one replica, repeats 2-4 of 4:**
+
+  | Load | First token | Per output token | Total output |
+  | --- | ---: | ---: | ---: |
+  | 1 request, 1K / 8K / 32K / 130K prompt | 0.49-0.54 / 1.57 / 6.12-6.22 / 25.9-26.2 s | 13.0-13.5 / 13.0-13.1 / 13.3-13.4 / 14.1-14.2 ms | |
+  | 4 requests, 4K / 1K | 2.5 s mean | 20.6 ms | 173-174 tok/s |
+  | 8 requests, 4K / 1K | 3.5 s mean | 25.2-25.3 ms | 278-280 tok/s |
+  | 4 replicas, 32 requests, 4K / 1K | 7.9-11.9 s mean, 2.8-4.0 s median | 26.3 ms | 775-811 tok/s |
+
+- **Profile, one request, rank 0.** About 11 ms of GPU work per decode step against a 13 ms token, so about 2 ms is
+  host time. Per decode step: dense FP16 projections about 3.7 ms, exchanges between ranks (the fast all-reduce and
+  the fused hyper-connection gathers) 2.7 ms, MoE 1.9 ms, hyper-connection local work 0.9 ms, sparse attention
+  0.8 ms, Gated DeltaNet 0.5 ms. A 3,920-token prefill chunk takes about 0.6 s, led by dense GEMMs and the NVFP4
+  expert GEMMs; prefill exchanges go over the NCCL ring, not the fast path.
 
 ### 3. Bring our fork up to date
 
@@ -306,17 +409,17 @@ Native serving. It would first need MoE, quantized weights, more than one GPU an
 
 - **The bar is higher than it was for DeepSeek.** In August the fork left whole phases in generic code, and Emmy won
   about 20%. Upstream has since tuned this model's path hard, and the two comparisons we have on this family are both
-  against Emmy by a wide margin. For scale: the fork's whole token here is about 12 ms without MTP (80.7 tok/s on four
-  cards), while Emmy's DeepSeek image spends 79 to 149 ms per token on sixteen. Parity may take many rounds, or may
-  stop at a part only the fork can run fast.
+  against Emmy by a wide margin. For scale: the fork's whole token here is 12.8 ms without MTP on our node (78 tok/s
+  on four cards, step 1), while Emmy's DeepSeek image spends 79 to 149 ms per token on sixteen. Parity may take many
+  rounds, or may stop at a part only the fork can run fast.
 - **A moving target.** Upstream lands changes daily. The baseline is the pinned build of step 1. Re-pinning during
   step 5 resets the A/B.
 - **Compile time.** On a four-core V100 host one layer program spent 15 to 75 minutes pricing its kernel sets, and on
   2026-09-18 one greedy resolve of a Gated DeltaNet chunk took 48 minutes; both need re-measuring on main. Twins are
   shared per layer class, so this is three classes at every width, not 48 layers.
-- **Memory.** Emmy's prefill needed about 2 GiB per card beyond the fork's on DeepSeek, and upstream already runs
-  this model on four cards at a 0.90 to 0.95 share. If step 2's 3 GiB margin does not fit at TP4, the shape is
-  PP2 × TP4, where the plugin cannot serve with MTP.
+- **Memory.** Emmy's prefill needed about 2 GiB per card beyond the fork's on DeepSeek. Step 2's TP4 shape keeps the
+  3 GiB margin with only about 0.6 GiB more to spare. If Emmy needs more than that, the shape is PP2 × TP4, where the
+  fork keeps about 8.7 GiB free beyond the margin but decodes about 10% slower and halves the replicas per node.
 
 ## Side finding: the same update may speed up what we already serve
 
@@ -328,22 +431,21 @@ test node after step 3, at our checkpoint and envelope, and its own plan if it h
 
 ## Not established
 
-- The quality of NVFP4 and FP8 against full precision on our tasks.
-- Whether MTP is safe under concurrency, and whether issue 865 is fixed in any build we would pin.
-- The longest context each layout holds on 32 GB cards, and whether PP2 × TP4 works for this model on Volta.
-- How much the ordinary exchange path between ranks costs on our NVSwitch topology, and speed without NVLink.
-- Whether four replicas run well together on one node.
+- The quality of FP8 against full precision on our tasks. NVFP4 matches it (step 1).
+- Whether MTP stays safe under concurrency with real prompts and sampling; issue 865 did not reproduce in step 2's
+  30 minutes of random prompts at eight requests.
+- The longest context PP2 × TP4 holds with the margin; TP4 holds 131,072 (step 2).
 - How fast vision input runs on Volta.
-- What the license allows.
+- Whether Qwen grants the separate license commercial serving needs.
 
 ## Effort
 
-No total yet. Steps 1 and 2 are measurement and depend on three things outside our hands: the license answer, NVLink
-on the test node, and rented cards for the reference. Step 4 has more new parts than DeepSeek had. DeepSeek took about
-six weeks from its first boot to parity; expect step 4 and step 5 together to take longer, and estimate step 5 only
-after the first strict boot and its profile.
+No total yet. Step 1 took one day, with 43 minutes of rented H200s for the reference; step 2 is measurement on the
+test node. Step 4 has more new parts than DeepSeek had. DeepSeek took about six weeks from its first boot to parity;
+expect step 4 and step 5 together to take longer, and estimate step 5 only after the first strict boot and its
+profile.
 
 ## Operations
 
 The test node is shared. Check that every card is free before a launch, never stop a process that is not ours, and
-delete nothing when done. Its address stays out of the repository. Turning NVLink on there is the owner's change.
+delete nothing when done. Its address stays out of the repository.

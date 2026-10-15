@@ -327,7 +327,7 @@ def _bind_plan_constants(plan, sources, cache):
     weight footprint). ``cache`` must be scoped to one wrapper — param paths are
     wrapper-relative, so a cross-wrapper cache would collide. A weight the plan cannot rebuild
     from ``sources`` raises: the program would otherwise read its buffer as zeros."""
-    from emmy.compiler.backend.cuda.program import _numpy_storage
+    from emmy.compiler.backend.binding import numpy_storage
     from emmy.compiler.backend.plan import apply_weight_loads
     from emmy.compiler.loader.binder import assemble_source
 
@@ -340,7 +340,7 @@ def _bind_plan_constants(plan, sources, cache):
             raise RuntimeError(f"plan constant {nid!r} cannot bind: {reason}")
         dtype = buffer_dtypes[nid]
         if cache is None:
-            out[nid] = _numpy_storage(apply_weight_loads(src, w.load_ops), dtype)
+            out[nid] = numpy_storage(apply_weight_loads(src, w.load_ops), dtype)
             continue
         import numpy as np
         import torch
@@ -348,7 +348,7 @@ def _bind_plan_constants(plan, sources, cache):
         key = (w.source_path, w.source_parts, w.generated, w.load_ops, dtype.name)
         arr = cache.get(key)
         if arr is None:
-            arr = torch.from_numpy(np.ascontiguousarray(_numpy_storage(apply_weight_loads(src, w.load_ops), dtype))).cuda()
+            arr = torch.from_numpy(np.ascontiguousarray(numpy_storage(apply_weight_loads(src, w.load_ops), dtype))).cuda()
             cache[key] = arr
         out[nid] = arr
     return out
@@ -620,15 +620,10 @@ def _compile_split(
         settled = tuple(dev_consts.settled().items()) if dev_consts is not None else ()
 
         def compile_plan(g):
-            from emmy.compiler.context import Context
             from emmy.compiler.pipeline.passes.tile._layout import settled_layouts
-            from emmy.compiler.pipeline.search.golden import program_cold_cache
-            from emmy.compiler.pipeline.search.pins import pinned_knobs
 
-            ctx = Context.probe()
-            cold = program_cold_cache(g, ctx)
-            with pinned_knobs({"COLD_CACHE": cold}), settled_layouts(dict(settled)):
-                return plan_from_graph(CudaBackend(tune_db="auto").compile(g, ctx=replace(ctx, cold_cache=cold)))
+            with settled_layouts(dict(settled)):
+                return plan_from_graph(CudaBackend(tune_db="auto").compile(g))
 
         plan = plan_cache.resolve(graph, compile_plan, settled) if plan_cache is not None else compile_plan(graph)
     if dev_consts is not None:
