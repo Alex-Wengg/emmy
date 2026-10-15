@@ -118,7 +118,9 @@ so promote them with the rows; a refresh that leaves them in the working file le
 file. If the run warns that it has no `torch.compile` timing, say so in the report. One run per precision lane, each
 spelled explicitly: `EMMY_FAST_MATH=1` for the fast-math row and `EMMY_FAST_MATH=0` for the standard row. Fast math is
 the default, so a standard row recorded with the variable unset measures the fast-math kernel under the standard row's
-name. Then promote: copy the measured rows — and any kernel or routing row the pick added — from the working file into
+name. A record run's clean rows also land in the card's tune DB; before the card goes away, merge that DB into the
+repository freeze (README, "Keep what a tune measured"). Then promote: copy the measured
+rows — and any kernel or routing row the pick added — from the working file into
 the canonical one (`GoldenFile.edit(path)` with `add_kernel`, `add_routing`, `upsert_row`), so the diff is only those
 entries — the seed row's `latency` block included, on a row spelling `knobs: {}`, the form a repository golden stores
 a whole-row timing in. A row and a routing row name a kernel by its `ref` in the file, and the same kernel can be

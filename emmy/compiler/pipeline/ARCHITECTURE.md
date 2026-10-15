@@ -898,7 +898,9 @@ tables hold compilable kernels, the decisions that minted them, and measurements
   identity ignores the hint, so without them one kernel at two sizes would be one row), then the stats, `status`,
   `captured`, a `bench_fail` row's `error` and `source` (`measured`; `golden:<digest>` or `freeze:<digest>` for an
   imported row — the digest of the golden scope or the freeze it came from, which is how a re-recorded golden's rows
-  are told from the current file's and let go).
+  are told from the current file's and let go). A row measured here is never replaced by an import, and a golden
+  file's row never by a freeze's: the golden readers read `golden:` rows alone, so a freeze repeating a golden's
+  schedule a hair faster would otherwise take the pool out of the fit.
   Failed rows ARE recorded — the next compile disqualifies that arm instead of failing the same way again — and an
   `ok` row is never downgraded by
   a later failure; a config whose **compile** ran past its budget is not recorded at all, since a stored row would
@@ -960,9 +962,14 @@ behind.
   rows; a stale file is a restamp, not an import option. A golden file's rows become, through
   `emmy db export`, the golden pools `emmy fit` and `eval prior` read (Part 8); a compile never reads this instance,
   and the tune DB imports the goldens on its own.
-- No freeze is checked in at the moment. The RTX 5090 freeze predates the `kernel` table and was dropped rather than
-  converted; the card is re-collected through the `perf` writer, after which `emmy db freeze` writes the next
-  one into `search/freezes/`.
+- **The freeze kept with the repository** is the directory `search/freezes/` (`freeze.REPOSITORY_FREEZE`): one
+  file per card, exactly what `emmy db freeze` writes, payload in git LFS and left out of the wheel. `emmy db import
+  --repository` reads it beside the repository goldens, and nothing else does — not a compile, not the reproduction
+  gate, not the placement export, which iterate the golden paths. It grows by merge (README, "Keep what a tune
+  measured"): the directory and a tune DB go into one dataset DB, which is frozen back into the directory, so a
+  schedule measured twice keeps its best median and merging the same tune DB again rewrites the same bytes. A row
+  whose kernel no longer lowers drops out at the next import, with a warning per kernel and no count: the measured
+  pools the nightly refresh reports, rows and regret per card, are where a large drop shows.
 
 **Recording benches** is Part 5's subject: a `run --bench` that benched rows with hand-forced knob values (golden or
 `--ab` rows) records each clean measurement — plus the greedy pick, through its comparable `greedy (isolated)`

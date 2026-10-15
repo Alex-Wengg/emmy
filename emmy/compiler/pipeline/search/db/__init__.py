@@ -609,7 +609,9 @@ class SearchDB:
         numbers aren't comparable, and captured is the better truth — while an uncaptured measurement
         never overwrites a captured one. A row measured here (``source`` ``measured``) is never replaced
         by an imported one: the import is a cache fill, and the local row is the one copy of what this
-        machine measured. The kernel must be a ``kernel`` row already."""
+        machine measured. A golden file's row is never replaced by a freeze's: the golden readers read
+        ``golden:`` rows alone, so a freeze repeating a golden's schedule a hair faster would otherwise
+        take the pool out of the fit. The kernel must be a ``kernel`` row already."""
         context = self._context_id(
             row.backend, row.gpu, _arch(row.cc), row.opt, row.flags, row.cold_cache, knobs_json(row.precision), create=True
         )
@@ -624,6 +626,8 @@ class SearchDB:
             prev_status, prev_captured, prev_median, prev_source = existing
             if prev_source == "measured" and row.source != "measured":
                 return  # an import never replaces a measurement taken here
+            if prev_source.startswith("golden:") and row.source.startswith("freeze:"):
+                return  # a golden file's row is the file's; a freeze repeating its schedule never displaces it
             if prev_status == "ok":
                 if row.status != "ok":
                     return  # a failure never replaces a good measurement

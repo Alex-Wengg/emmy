@@ -17,8 +17,9 @@ not frozen again.
 Freezing the same rows twice yields the same bytes: rows sort by content and the golden dump is
 deterministic. A file's identity is its bytes — ``emmy db import`` sources its rows as
 ``freeze:<sha256[:12]>`` of the file (``golden.evidence.file_source``), so a report over a dataset DB names the
-exact snapshot it was computed over. A freeze checked into the repository lives under ``search/freezes/`` (payload
-in git LFS) and is named on the import command line like any other source.
+exact snapshot it was computed over. The freeze kept with the repository is the directory ``search/freezes/``
+(:data:`REPOSITORY_FREEZE`, payload in git LFS): ``emmy db import --repository`` reads it beside the repository
+goldens, and it grows by merging a tune DB into it — import both, freeze back out (README, "Fit the priors").
 
 Produced by ``emmy db freeze``.
 """
@@ -42,6 +43,10 @@ from emmy.compiler.pipeline.search.features import DEPLOYABLE_OPT, stamps
 logger = logging.getLogger(__name__)
 
 _LFS_POINTER = "version https://git-lfs.github.com/spec/v1"
+#: The measurement freeze kept with the repository: one golden file per card, exactly what :func:`write_freeze`
+#: writes. ``emmy db import --repository`` reads it beside the repository goldens; nothing else does — not a compile,
+#: not the reproduction gate, which iterate the golden paths. Left out of the wheel, so a plain path.
+REPOSITORY_FREEZE = Path(__file__).parent.parent / "freezes"
 
 
 def kernel_ops(db: SearchDB) -> Callable[[PerfRow], object]:

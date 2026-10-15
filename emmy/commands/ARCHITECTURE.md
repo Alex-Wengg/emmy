@@ -881,7 +881,9 @@ default, so nothing here can touch the tune DB (`_data/dataset.db` in the exampl
 `import [SOURCES…] --db PATH [--fresh] [--repository]` fills it, and nothing else does: a source is a measurement
 freeze directory, a golden file, or a tune DB file, which is frozen first; `--repository` adds every repository golden
 — the hardware goldens and each maintained recipe's, the set the priors are fit on under `--fresh` (README, "Fit the
-priors"); a tune DB is the source to add when the fit needs more. A golden file is the DB's shape, so the import goes
+priors") — and the measurement freeze kept with the repository (`search/freezes/`) when it holds files; a tune DB
+is the source to add when the fit needs more, and merging it into that freeze is how it stays. A golden file is the
+DB's shape, so the import goes
 row for row (`golden.evidence.import_file`), each row under the context of its own regime and the exact identity
 computed from its stored kernel (one whose body no longer lowers is skipped with a warning), and its rows are sourced
 by the file's kind and digest — `freeze:` for a freeze directory's files, `golden:` for a golden file; a source the
