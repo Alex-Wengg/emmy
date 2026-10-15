@@ -1,8 +1,8 @@
-"""The online-prior featurizers — every knob-dict → feature-vector encoding, in one file.
+"""The prior featurizers — every knob-dict → feature-vector encoding, in one file.
 
 :func:`knob_features` is the single featurizer over a whole knob dict (the ``D_*`` engineered
 geometry / occupancy family, the ``MMA_*`` atom expansion, the ``S_*`` / ``H_*`` pass-throughs);
-:func:`tile_signature` is the schema-agnostic structural identity used to join golden YAML rows
+:func:`tile_signature` is the schema-agnostic structural identity used to join golden file rows
 against enumerated candidates; :data:`ROUTING_FEATURES` and :func:`is_dynamic_row` are the routing stamp's
 spelling and its one reader. Lives in the same package as :mod:`.space` so the whole search space
 (dimensions × values × encoding) is analyzable in one place; the ``Knob`` descriptor / registry /
@@ -12,21 +12,28 @@ env plumbing stays in :mod:`~emmy.compiler.pipeline.knob`.
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from sys import float_info
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
-from emmy.compiler.pipeline.knob import (
-    _SITE_FAMILIES,
-    CTX_PREFIX,
-    STRUCT_PREFIX,
-    KnobType,
-    axis_of,
-    family_of,
-    family_value,
-    get,
-)
+from emmy.compiler.ir.stmt import Body
+from emmy.compiler.ir.stmt.blocks import Cond, Loop
+from emmy.compiler.ir.stmt.leaves import Assign, binary
+from emmy.compiler.pipeline.knob import _SITE_FAMILIES, KnobType, axis_of, family_of, family_value, get
+from emmy.compiler.wire import kernel_tile
+
+if TYPE_CHECKING:
+    from emmy.compiler.graph import Graph
+    from emmy.compiler.ir.base import Op
+
+#: The feature families a knob row never holds: ``S_*`` describes the kernel's body (:func:`stamps`), ``H_*`` the
+#: card and regime (``Context.features``). Both are computed where a row is featurized.
+STRUCT_PREFIX = "S_"
+CTX_PREFIX = "H_"
 
 # Version of the knob vocabulary + feature encoding this module reads. Rows recorded under a
 # different version featurize to garbage (the 2026-07 tile-IR rebuild replaced ``BM/BN/FM/FN/…``
@@ -44,16 +51,31 @@ from emmy.compiler.pipeline.knob import (
 #
 # Version 4 is the exact-site classic schedule vocabulary. It retires the tree-path keys and the
 # old ``STAGE`` tokens, so mutable v3 rows must age out rather than silently featurize under a new
-# meaning. The shipped linear artifacts were schema-migrated with the bump: their retired
-# ``D_stage_ring`` coefficient moved to ``D_stage_prefetch``, the identical ``depth >= 2`` signal,
-# so the scoring function did not change and no synthetic refit was needed.
-FEATURIZER_VERSION = 4
+# meaning.
+#
+# Version 5 computes the ``S_*`` stamps from the kernel's own derived body (:func:`stamps`) where version 4
+# read the ones stamped off the loop body the kernel was formed from, and computes warp eligibility for
+# every schedule row of a tile kernel.
+#
+# Version 6 adds ``D_wave_fill``, how full the last wave of CTAs is.
+#
+# Version 7 adds ``S_n_load_reduce_inner``, how many loads stream along a reduction axis in memory order.
+#
+# Version 8 preserves bound coordinate maps in reduction value numbers and canonicalizes free-axis role expressions
+# independently of the current nest. The same stored Loop IR can now retain distinct accumulators and derive another
+# loop structure, so its structural stamps change while the feature names stay the same; earlier datasets and weights
+# must be rebuilt.
+# Version 9 reads declared Let dtypes on operand edges. Existing stored kernels with typed literal bindings can
+# thereby gain a tensor-core schedule and change S_warp_eligible without changing their exact kernel identity.
+# Version 10 admits either physical matvec orientation. A missing right axis can now gain a unit matrix
+# coordinate, changing schedule eligibility without changing the stored computation or exact identity.
+# Version 11 is the Affine normal form: every sum, difference, negation and product with a literal in a stored body
+# is one ``Affine`` statement, counted here as its binary spelling. Earlier datasets and weights must be rebuilt.
+FEATURIZER_VERSION = 11
 
-# The features that SELECT a weight set rather than describe a candidate — the ``S_ext_n_symbolic_axis`` stamp
-# a masked-tile (symbolic-axis) kernel carries. The stamp VOCABULARY belongs here with the rest of the feature
-# spelling, so a dataset can read it without importing a model; what to DO with it stays with the model classes
-# (``prior/linear_model.py``: the two weight sets, and ``descent_cols``, which keeps the stamp out of the linear
-# descent because a pool-constant term cancels out of a within-pool ranking).
+# The features that name a candidate's regime rather than describe it — the ``S_ext_n_symbolic_axis`` stamp a
+# masked-tile (symbolic-axis) kernel carries. The stamp VOCABULARY belongs here with the rest of the feature
+# spelling, so a dataset can read it without importing a model; the model splits on it like any column.
 #: The ``H_opt`` value of the DEPLOYABLE regime — the nvcc opt level ``compile`` / ``run`` / ``tune``
 #: all compile at, and therefore the only one a measurement is worth anything under. Rows carrying
 #: any other value came from a deliberately pinned sweep or from the era when tuning ranked at
@@ -67,9 +89,8 @@ ROUTING_FEATURES = ("S_ext_n_symbolic_axis",)
 def is_dynamic_row(feats: dict) -> bool:
     """Whether a featurized row carries the symbolic-axis (masked-tile) routing stamp — the ONE reading of it.
 
-    What the stamp SELECTS is the reader's business: the linear model routes to a second weight vector
-    (``LinearModel.weight_set``), a tree splits on the column, and ``ShapeKey.is_dyn`` records it as part of a
-    shape's identity. All three ask this one question, because a second spelling of "is the stamp set" would be
+    What the stamp SELECTS is the reader's business: the model splits on the column, and ``ShapeKey.is_dyn``
+    records it as part of a shape's identity. Both ask this one question, because a second spelling of "is the stamp set" would be
     a second chance to disagree about which regime a pool belongs to."""
     return any(feats.get(name, 0.0) > 0 for name in ROUTING_FEATURES)
 
@@ -157,20 +178,10 @@ def _stage_features(knobs: dict) -> dict[str, float]:
     st = _parsed_stage(str(spec))
     if st is None:
         return {}
+    if st.transport == "reg":
+        return {"D_stage_reg": 1.0}  # register storage has no shared-memory pipeline
     return {
         "D_stage_depth": float(st.depth),
-        # Does the gmem→smem pipeline prefetch at all — depth 1 is a single buffer, ≥ 2 is a ring.
-        # A STEP, deliberately, on a feature the linear model otherwise only holds linearly: a weight
-        # on ``D_stage_depth`` is monotone in depth and cannot express "prefetching is on", so without
-        # this the whole single-buffer-vs-ring distinction is inexpressible to the offline prior. The
-        # retired ``D_stage_ring`` flag was carrying exactly this step (measured: identical to
-        # ``depth >= 2`` over 2 033 344 candidate rows, zero disagreements) and its removal cost the
-        # RTX 5090 matmul fit its top-1 entirely — 54 of 242 goldens ranked first, then 4. Restoring
-        # the step recovers it; restoring the retired FLAG would not, since the flag named a rotation
-        # discipline the staged K-loop no longer has (it compiled byte-identically either way).
-        # Additive: an artifact fit before this key simply has no weight for it and scores it 0.0, so
-        # no ``FEATURIZER_VERSION`` bump is owed for the addition itself.
-        "D_stage_prefetch": 1.0 if st.depth >= 2 else 0.0,
         "D_stage_async": 1.0 if st.is_async else 0.0,
         "D_stage_tma": 1.0 if st.transport == "smem-tma" else 0.0,
         "D_stage_reg_depth": float(st.reg_depth),  # smem→register double-buffer (p<n>)
@@ -327,29 +338,11 @@ def _schedule_node_features(node_knobs: dict) -> dict[str, float]:
     # the row: the packed dtype (``S_dtype_f4e2m1x2``) is a whole-kernel fact that the compute-fill
     # sibling rows share, and ``D_stage_async`` is a transport flag every 16-bit matmul sets too.
     # Only their conjunction is the packed byte slab, and the packed arm of ``resolve_warp_stage``
-    # is its only producer. Emitted ONLY there, the way the ``D_tma_*`` terms are emitted only on a
-    # TMA-staged row, so every other row is untouched. Additive: a fit made before this key has no
+    # is its only producer. Emitted ONLY there, so every other row is untouched. Additive: a fit made before this key has no
     # weight for it and scores it 0.0, so no ``FEATURIZER_VERSION`` bump is owed, and both fitted
     # views name their ``MMA_*`` keys explicitly, so neither picks it up until asked to.
     if feats.get("D_stage_async") and float(node_knobs.get("S_dtype_f4e2m1x2", 0.0) or 0.0) > 0 and "MMA_a_bits" in feats:
         feats["MMA_b_store_bits"] = float(PACKED_PAIR_STORE_BITS)
-    # TMA-conditioned tile pricing: TMA staging only enumerates where the hardware offers it
-    # (Hopper/Blackwell), so a geometry term gated on ``D_stage_tma`` is where one weight set
-    # prices those cards' tiles separately — no per-arch split needed. The 2026-07-09 5090
-    # sweep showed the golden TMA tiles want narrower/squarer warp grids and wider splits than
-    # the shared weights choose (TILE match 0/17); these give the fit that axis. Emitted only
-    # on a TMA-staged row (skip-if-missing 0.0 elsewhere).
-    if feats.get("D_stage_tma"):
-        for src, dst in (
-            ("D_aspect", "D_tma_aspect"),
-            ("D_log2_area", "D_tma_log2_area"),
-            ("D_w_grid_m", "D_tma_grid_m"),
-            ("D_w_grid_n", "D_tma_grid_n"),
-        ):
-            if src in feats:
-                feats[dst] = feats[src]
-        if "D_splitk" in feats:
-            feats["D_tma_l2_splitk"] = math.log2(max(feats["D_splitk"], 1.0))
     return feats
 
 
@@ -435,12 +428,107 @@ def knob_features(knobs: dict) -> dict[str, float]:
     return feats
 
 
+class Featurizer:
+    """The one featurizer every prior reads: a candidate's row is the card's ``H_*`` features, the decided kernel's
+    stamps (:func:`stamps`), whether its schedule space holds a warp plan, and the candidate's knobs
+    (:func:`knob_features`), joined with the kernels the candidate leaves summed and maxed (:func:`piece_features`).
+    A schedule row leaves its kernel whole; a placement arm leaves the cut's pieces. Training and deploy featurize
+    through :meth:`features`, so both priors read one feature set, and nothing a row is built from is stored: every
+    ``S_*`` feature is computed here from the kernel."""
+
+    def __init__(self, base: Mapping[str, float], ctx=None) -> None:
+        self.base = dict(base)
+        self.ctx = ctx
+        self._warp_eligible: dict[int, tuple[Op, bool]] = {}
+
+    @classmethod
+    def of(cls, ctx) -> Featurizer:
+        """The featurizer of the card and regime ``ctx`` compiles for."""
+        return cls(ctx.features(), ctx)
+
+    def features(self, kernel: Op, knobs: Mapping = MappingProxyType({}), *, pieces: Graph | Op | None = None) -> dict[str, float]:
+        """One candidate's feature row. ``kernel`` is the kernel the fork decides; ``knobs`` the candidate's own row;
+        ``pieces`` the kernels it leaves (a cut's fragment ``Graph`` or the fused op; ``None``: the kernel itself)."""
+        base = {**self.base, **stamps(kernel)}
+        if pieces is None and self.warp_eligible(kernel):
+            base["S_warp_eligible"] = 1.0
+        left = [(kernel, None)] if pieces is None else kernel_pieces(pieces)
+        return {**knob_features({**base, **knobs}), **piece_features(left)}
+
+    def warp_eligible(self, kernel: Op) -> bool:
+        """Whether the classic schedule space of ``kernel`` holds a warp plan on this card — the scheduling
+        problem's own answer, under the live precision pins. A schedule row reads it: a scalar tile on such a
+        kernel competes against tensor cores. ``False`` for a kernel no tile stands behind and for a featurizer
+        given no context. Computed once per kernel."""
+        from emmy.compiler.ir.schedule.classic import ClassicProblem  # noqa: PLC0415
+        from emmy.compiler.pipeline.passes.tile._fromloop import serial_form  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.space import F16_MMA_F32_ACC, FP8_MMA, precision_pin  # noqa: PLC0415
+
+        tile = kernel_tile(kernel)
+        if tile is None or tile.op is None or self.ctx is None:
+            return False
+        if (known := self._warp_eligible.get(id(tile))) is not None:
+            return known[1]
+        problem = ClassicProblem(
+            serial_form(tile, tile.name) if tile.carries else tile,
+            self.ctx,
+            allow_f16_accumulate=precision_pin(F16_MMA_F32_ACC) is True,
+            allow_fp8=precision_pin(FP8_MMA) is True,
+        )
+        self._warp_eligible[id(tile)] = (tile, problem.warp_eligible)  # the tile is held, so its id is not reused
+        return problem.warp_eligible
+
+
+def stamps(op: Op) -> dict[str, float]:
+    """The ``S_*`` row of the kernel ``op`` realizes: :func:`structure_features` of the body its identity digests —
+    its tile's derived body (``wire.kernel_tile``), or a loop op's own body where no tile stands behind it — with
+    the operand dtypes read off the kernel's own io. A function of the kernel alone, so it is computed wherever it
+    is read and never stored; memoized on the kernel, which is immutable. Empty for an op that is no kernel."""
+    from emmy.compiler.ir.loop import LoopOp  # noqa: PLC0415
+
+    kernel = kernel_tile(op) or op
+    cached = kernel.__dict__.get("_stamps")
+    if cached is None:
+        body = kernel.body if isinstance(kernel, LoopOp) else getattr(kernel, "loop_body", None)
+        cached = structure_features(body, {**kernel.outputs, **kernel.inputs}) if body is not None else {}
+        kernel.__dict__["_stamps"] = cached
+    return cached
+
+
+def kernel_pieces(option: Graph | Op) -> list[tuple[Op, bool]]:
+    """Each kernel ``option`` leaves — a cut's pieces, bound to the fragment's buffers, or the fused kernel itself —
+    with whether it folds a whole contraction."""
+    from emmy.compiler.graph import Graph  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+
+    if isinstance(option, Graph):
+        ops = [node.op.with_io(option, node) for node in option.nodes.values() if isinstance(node.op, TileOp)]
+    else:
+        ops = [option]
+    return [(op, op.op is not None and op.op.tiles_whole()) for op in ops]
+
+
+def piece_features(left: list[tuple[Op, bool | None]]) -> dict[str, float]:
+    """The ``P_*`` block: how many kernels a candidate leaves, each ``S_*`` stamp summed and maxed over them, and —
+    where known — how many fold a whole contraction, which tells apart cuts whose Loop histograms agree but whose
+    contraction has a surrounding projection."""
+    rows = [stamps(op) for op, _ in left]
+    feats = {"P_n_pieces": float(len(left))}
+    for key in sorted({k for row in rows for k in row}):
+        values = [row.get(key, 0.0) for row in rows]
+        feats[f"P_sum_{key[2:]}"] = sum(values)
+        feats[f"P_max_{key[2:]}"] = max(values)
+    if all(whole is not None for _, whole in left):
+        feats["P_n_whole_contraction_roots"] = float(sum(whole for _, whole in left))
+    return feats
+
+
 def _serial_cell_trips(knobs: dict) -> float:
-    """The trips a thread actually serializes: the stamped worst per-cell reduce-nest product
-    (``S_ext_serial_cell_work``, ``passes/identity.py``) after the row's reduce-partition
+    """The trips a thread actually serializes: the kernel's worst per-cell reduce-nest product
+    (``S_ext_serial_cell_work``, :func:`stamps`) after the row's reduce-partition
     coverage. cta (``g<n>``) and coop lanes divide; the register/ILP fold (``r<n>``) does not —
     the same thread walks every trip, just on independent accumulator chains. ``0.0`` when the
-    row carries no stamp."""
+    row carries no such feature."""
     work = float(knobs.get("S_ext_serial_cell_work") or 0.0)
     if not work:
         return 0.0
@@ -487,8 +575,11 @@ class _Decomp:
     finalize: str = "atomic"
     # The ``coop-t`` transposed cooperative band (k-major matvec lane mapping) — a different
     # kernel from the interleaved ``coop`` at the same width, so it must reach both the features
-    # and the ``tile_signature`` identity (``coop-t`` goldens are recorded in the per-GPU YAMLs).
+    # and the ``tile_signature`` identity (``coop-t`` goldens are recorded in the per-GPU golden files).
     coop_transposed: bool = False
+    # The lane's contiguous run (``/v<n>``): identity only, no feature reads it, so a ``coop/v8``
+    # golden row matches its own candidate rather than the first band of the same width.
+    columns: int = 1
 
 
 def _reduce_decomp(knobs: dict) -> _Decomp:
@@ -513,7 +604,9 @@ def _reduce_decomp(knobs: dict) -> _Decomp:
     # a default "atomic" in place, so ``D_finalize_kernel`` goes dead (0.0) on the affected rows
     # and the offline prior's atomic-free split interaction never fires (found scalar-side by the
     # 2026-07-07 reduce-featurization tests; the warp tier repeated the same drop until 2026-07-28).
-    return _Decomp(fold=plan.reg, cta=plan.cta, coop=plan.coop, finalize=plan.finalize, coop_transposed=plan.coop_transposed)
+    return _Decomp(
+        fold=plan.reg, cta=plan.cta, coop=plan.coop, finalize=plan.finalize, coop_transposed=plan.coop_transposed, columns=plan.coop_columns
+    )
 
 
 def tile_signature(knobs: dict) -> tuple:
@@ -521,8 +614,8 @@ def tile_signature(knobs: dict) -> tuple:
     K-chunk, the primary reduce decomposition, and the atom kind — read from the native codec
     knobs (``TILE`` / ``REDUCE`` / ``STAGE``, either exact-site or bare analytical values). Two configs
     with equal signatures are the same kernel variant whichever key form spelled them, so this
-    is the bridge for matching a recorded golden YAML row against the native enumeration's
-    candidate rows (``emmy fit``'s golden group builder / ``search/golden_eval.evaluate_record``).
+    is the bridge for matching a recorded golden file row against the native enumeration's
+    candidate rows (``emmy fit``'s golden group builder / ``search/ranking.evaluate_record``).
     The K-chunk (``Tile.bk``) is part of the identity — without it every ``k<n>`` sibling in
     a warp pool joined ambiguously (a golden recorded at ``k4`` matched the ``k1`` candidate).
     Operand staging (the ``STAGE`` codec) is part of the identity — a staged and a gmem-direct
@@ -569,27 +662,19 @@ def _geom_feats(
     finalize: str = "atomic",
 ) -> dict[str, float]:
     """The engineered ``D_*`` tile-geometry / occupancy feature family — the
-    single featurization the priors rank on. It folds in everything the old
-    hand-coded matmul heuristic scored (occupancy waves, tile-area / thread /
-    aspect targets, the geometry "bands", K-chunk depth), so a fixed linear model
-    over these features (:class:`~emmy.compiler.pipeline.search.prior.OfflinePrior`)
-    reproduces that heuristic and the ``OnlinePrior`` sees the same
-    derived signal a tree can't cheaply reconstruct from raw knobs + the *coarse*
-    ``S_ext_*`` extents.
+    single featurization the priors rank on: the derived signal a tree can't
+    cheaply reconstruct from raw knobs + the *coarse* ``S_ext_*`` extents. A
+    monotone transform of a kept column, or a threshold on one, is left out: a
+    tree forms it with a split.
 
-    Tier-aware: the "ideal" tile / thread targets differ between the scalar thread
-    tile (256 threads, 8192-elem area) and the warp tile (128 threads = 4 warps,
-    64×64 = 4096 area), selected by ``warp``. ``free_prod`` is the output free-dim
+    ``warp`` selects the tier. ``free_prod`` is the output free-dim
     product (``S_ext_free_prod``); when present the occupancy terms are added —
     ``#CTAs ≈ M·N / tile_area · SPLITK`` (ceil-free, needs only the product the
-    ``S_*`` features carry, not the per-axis split). The ``BN``/``BM`` band
-    features are the OFF sentinel ``0`` on a warp row (so they don't fire there);
-    the K-chunk ``bk`` is a live knob on the warp tier only today (the ``TILE``
-    codec's ``k<n>``, atom_k multiples — the scalar codec spells no K token, so
-    the scalar ``D_*_bk`` bands stay 0), riding tier-split features (``D_*_bk``
-    scalar vs ``D_w_*_bk`` warp) because the tiers pull opposite ways. The rest
-    of the warp tier's signal rides the geometry / occupancy terms via the
-    tier-aware targets."""
+    ``S_*`` features carry, not the per-axis split). ``BN``/``BM`` are the OFF
+    sentinel ``0`` on a warp row; the K-chunk ``bk`` is a live knob on the warp
+    tier only today (the ``TILE`` codec's ``k<n>``, atom_k multiples — the scalar
+    codec spells no K token, so the scalar ``D_l2_bk`` stays 0), riding
+    tier-split features (``D_l2_bk`` scalar vs ``D_w_l2_bk`` warp)."""
 
     def l2(x: float) -> float:
         return math.log2(max(float(x), 1.0))
@@ -597,8 +682,6 @@ def _geom_feats(
     area = max(tile_m * tile_n, 1)
     reuse = area / (tile_m + tile_n) if (tile_m + tile_n) else 0.0
     aspect = l2(tile_m) - l2(tile_n)
-    thr_target = 7.0 if warp else 8.0  # log2 threads: 128 (4-warp) vs 256
-    area_target = 12.0 if warp else 13.0  # log2 area: 64×64=4096 vs 8192
     masked_m = float(knobs.get("S_masked_m", 0.0) or 0.0)
     masked_n = float(knobs.get("S_masked_n", 0.0) or 0.0)
     masked_k = float(knobs.get("S_masked_k", 0.0) or 0.0)
@@ -613,16 +696,8 @@ def _geom_feats(
         "D_log2_area": l2(area),
         "D_reuse": reuse,
         "D_aspect": aspect,
-        # offline (ex-heuristic) terms — tier-aware targets
-        "D_l2_threads": l2(threads),
-        "D_near_threads": -abs(l2(threads) - thr_target),
+        # a periodic predicate no split on ``D_threads`` can express
         "D_pow2_threads": 1.0 if threads > 0 and (threads & (threads - 1)) == 0 else 0.0,
-        "D_cells_cap": min(float(cells), 128.0),
-        "D_near_cells": -abs(float(cells) - 16.0),
-        "D_near_area": -abs(l2(area) - area_target),
-        "D_square": -abs(aspect),
-        "D_l2_reuse": l2(reuse),
-        "D_near_intensity": -abs(l2(reuse) - 5.0),
         "D_near_kchunks": -abs(l2(kchunks) - 5.0),
         # Per-role masked-tile penalties: split M / N / K so the prior can weight K-masking
         # distinctly. Negative = penalty.
@@ -633,25 +708,18 @@ def _geom_feats(
         "D_l2_bn": l2(bn),
         "D_l2_bm": l2(bm),
         "D_bn_ge_bm": 1.0 if bn > 0 and bn >= bm else 0.0,
-        "D_bn_band": 1.0 if 16 <= bn <= 64 else 0.0,
-        "D_bm_band": 1.0 if 8 <= bm <= 16 else 0.0,
         # BK bands are tier-specific: the scalar tile wants deep K-chunks (BK≥32)
         # while the warp / TMA tile wants a shallow pipelined BK≈2 — opposite
         # directions, so they ride separate features (one weight can't serve both).
         "D_l2_bk": 0.0 if warp else l2(bk),
-        "D_bk_ge32": 0.0 if warp else (1.0 if bk >= 32 else 0.0),
         "D_w_l2_bk": l2(bk) if warp else 0.0,
-        "D_w_near_bk": (-abs(l2(bk) - 1.0)) if warp else 0.0,
         "D_splitk": float(splitk),
-        "D_splitk_le2": 1.0 if splitk <= 2 else 0.0,
         # Cross-CTA finalize fold (the REDUCE codec ``c`` field's letter): 1.0 = deferred
         # KERNEL combine (``c<cta>k``), 0.0 = in-place ATOMIC (``c<cta>a`` / bare). The
         # offline prior's split-K gate reads it.
         "D_finalize_kernel": 1.0 if (splitk > 1 and finalize == "kernel") else 0.0,
-        "D_tilen_clean": 1.0 if tile_n in (32, 64, 128) else 0.0,
-        "D_near_tilen": -abs(l2(tile_n) - 6.0),
-        # A scalar tile on a warp-ELIGIBLE contraction (16-bit operands, atoms offered — the
-        # scheduler's ``S_warp_eligible`` kernel stamp) competes against tensor cores: the
+        # A scalar tile on a warp-ELIGIBLE contraction (16-bit operands, atoms offered —
+        # ``Featurizer.warp_eligible``) competes against tensor cores: the
         # roofline bar none of the flat geometry terms can see. 0 on warp rows and on kernels
         # with no warp offer, so fp32 / non-contraction ranking is untouched.
         "D_scalar_on_warp_eligible": 1.0 if (not warp and float(knobs.get("S_warp_eligible", 0.0) or 0.0) > 0) else 0.0,
@@ -661,17 +729,17 @@ def _geom_feats(
         waves = math.log2(max(ctas / sm, 1e-3))
         out["D_log2_ctas"] = l2(ctas)
         out["D_log2_waves"] = waves  # CTAs relative to SM count
-        out["D_near_waves"] = -abs(waves - 1.0)  # target ~2 waves
-        out["D_ctas_ge_sm"] = 1.0 if ctas >= sm else 0.0
+        # How full the last wave is: 112 CTAs on 108 SMs leave the second wave 4% full and nearly double the time
+        # of one full wave. A periodic function of the CTA count, which no split on ``D_log2_waves`` can express.
+        full = math.ceil(ctas) / sm
+        out["D_wave_fill"] = full / math.ceil(full)
         # Split-K beyond what occupancy needs is pure atomic/combine waste. The free
         # axes alone give ``free_ctas = free_prod/area`` CTAs; split-K is justified
-        # only to lift that toward the ~2·SM ``D_near_waves`` target. The terms above
+        # only to lift that toward ~2 waves. The terms above
         # fold ``splitk`` straight into ``ctas``, so they CANNOT tell "≈2 waves via a
         # small tile" (golden, free) from "≈2 waves via heavy split-K on a big tile"
-        # (atomic-bound) — both score the same waves / ctas≥sm. This credits split-K
-        # up to the need and penalizes the excess, the engineered signal the online
-        # prior needs to separate the SPLITK=1/2 goldens from the SPLITK=8/16 tiles
-        # the -O1 sweep over-ranks (the offline prior already gets it via D_splitk_le2).
+        # (atomic-bound) — both score the same waves. This credits split-K up to the
+        # need and penalizes the excess.
         free_ctas = float(free_prod) / area
         # Split-K is justified to (a) lift occupancy toward ~2 waves AND (b) hide the K-streaming
         # latency of a K-HEAVY GEMM — a long reduction per output tile parallelizes across the split
@@ -688,19 +756,12 @@ def _geom_feats(
         # The deficit side: UNDER-splitting a shape that justifies a wide split (``splitk < needed``)
         # is the K-heavy miss — the penalty that lifts the ``g<w>k`` golden over the ``g1`` tile the
         # occupancy terms alone rank as safe. Zero once ``splitk ≥ needed`` (and for every shape with
-        # ``needed == 1``, so the well-tuned non-split geometries are untouched). Was absent: split-K
-        # had only penalties (``D_splitk_le2`` / ``D_splitk_excess``), never a reward when justified.
+        # ``needed == 1``, so the well-tuned non-split geometries are untouched).
         out["D_splitk_deficit"] = math.log2(max(needed / max(float(splitk), 1.0), 1.0))
         # The deferred split-K finalize (``g<w>k``) writes + re-reads a full free-size partial
         # workspace and launches the combine kernel — a round-trip volume the in-place atomic
         # ``g<w>a`` finalize does not pay.
         out["D_splitk_roundtrip"] = l2(free_prod) if out["D_finalize_kernel"] else 0.0
-        # Register-tile intensity × occupancy interaction: a wide per-thread
-        # register tile (big FM·FN) is a win only while the grid still covers
-        # the SMs — the flat D_cells* terms can't express that, so the big-FM
-        # goldens (square.2048's FM=26) rank deep under any sign the fit gives
-        # them (2026-06-12 golden-sweep finding 2).
-        out["D_l2_cells_occ"] = l2(cells) if ctas >= sm else 0.0
     return out
 
 
@@ -710,11 +771,8 @@ def _geom_feats(
 # (``area=1`` makes ``#CTAs = free_prod·splitk`` — exactly the per-output-cell reduce grid).
 _REDUCE_FEATURE_KEYS = (
     "D_threads",
-    "D_l2_threads",
     "D_pow2_threads",
-    "D_near_threads",
     "D_splitk",
-    "D_splitk_le2",
     "D_splitk_excess",
     "D_finalize_kernel",
     "D_splitk_roundtrip",
@@ -725,8 +783,7 @@ _REDUCE_FEATURE_KEYS = (
     "D_scalar_on_warp_eligible",
     "D_log2_ctas",
     "D_log2_waves",
-    "D_near_waves",
-    "D_ctas_ge_sm",
+    "D_wave_fill",
 )
 
 
@@ -741,7 +798,7 @@ def _reduce_features(knobs: dict) -> dict[str, float]:
     keeps the :data:`_REDUCE_FEATURE_KEYS` slice; the ILP register fold (``r<n>``) rides its own
     ``D_reduce_ilp`` — serial and ``r4`` differ in neither threads nor split-K. Empty when the row
     carries no ``REDUCE`` family key, so pointwise rows stay feature-free as before. Additive
-    encoding: raw knob dicts re-featurize at read time, so existing node rows / reservoirs gain
+    encoding: raw knob dicts re-featurize at read time, so existing perf rows / reservoirs gain
     these keys on the next fit — no ``FEATURIZER_VERSION`` bump."""
     if not any(family_of(k) == "REDUCE" for k in knobs):
         return {}
@@ -790,7 +847,7 @@ def _tile_features(knobs: dict) -> dict[str, float]:
     d = _reduce_decomp(knobs)
     # The scalar ``TILE`` codec spells no K-chunk (the smem slab's K granularity is derived
     # fit-to-smem at stage resolution, never a knob), so ``bk`` is structurally 1 here and the
-    # scalar ``D_l2_bk`` / ``D_bk_ge32`` bands stay 0 until the codec grows a K token.
+    # scalar ``D_l2_bk`` stays 0 until the codec grows a K token.
     bn, bm, fm, fn, br, bk, splitk = par_n, par_m, reg_m, reg_n, d.coop, 1, d.cta
     return _geom_feats(
         knobs,
@@ -837,7 +894,7 @@ def _warp_tile_features(knobs: dict) -> dict[str, float]:
         bn=0,  # OFF sentinels: the BN/BM bands don't fire on a warp row
         bm=0,
         # The slab K-chunk is the TILE codec's ``k<n>`` token (``Tile.bk``, atom_k multiples —
-        # the codec's native unit, matching the shallow ``D_w_near_bk`` ≈2 target). It used to read
+        # the codec's native unit). It used to read
         # the never-set ``_Decomp.serial`` (always 1), so every ``D_w_*_bk`` was constant and
         # k-chunk siblings featurized byte-identically.
         bk=plan.bk,
@@ -891,3 +948,130 @@ def _coerce_float(v: object) -> float | None:
         return float(v)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# The ``S_*`` stamps — a kernel body's structural features
+# ---------------------------------------------------------------------------
+
+
+def structure_features(body: Body, buffers: Mapping | None = None) -> dict[str, float]:
+    """Flat ``S_``-prefixed structural feature dict for a Loop IR ``body``:
+    the extent-free skeleton merged with the ``S_ext_*`` loop extents.
+
+    ``buffers`` (a kernel's io: buffer name to ``Tensor``) supplies operand dtypes for the ``S_dtype_*``
+    multiset; omit it (an ad-hoc caller with a bare body) to skip dtype features.
+    Values are floats so the dict drops straight into the numeric feature row."""
+    return {**_skeleton(body, buffers), **_extents(body)}
+
+
+def _skeleton(body: Body, buffers: Mapping | None) -> dict[str, float]:
+    """Extent-free histogram: stmt-type counts + pointwise/reduce op multisets
+    + loop-nest roles/depth + operand dtype multiset."""
+    feats: Counter[str] = Counter()
+    loads = body.loads
+    feats["S_n_load"] = len(loads)
+    feats["S_n_distinct_input"] = len({ld.input for ld in loads})
+    feats["S_n_write"] = len(body.writes)
+    feats["S_n_accum"] = len(body.accums)
+    feats["S_n_cond"] = len(body.iter_of_type(Cond))
+    # A sum is one ``Affine`` statement in the stored body; the work it stands for is its binary spelling.
+    assigns = [s for s in binary(body.iter()) if isinstance(s, Assign)]
+    feats["S_n_assign"] = len(assigns)
+    for s in assigns:
+        feats[f"S_pw_{s.op.name}"] += 1
+    for s in body.accums:
+        feats[f"S_reduce_{s.op.name}"] += 1
+    loops = body.loops
+    # A buffer is row-major, so a load whose last index follows a reduction axis reads that axis contiguously:
+    # the same contraction over a weight stored the other way round is a different kernel to split or tile.
+    reduce_axes = {loop.axis.name for loop in loops if loop.is_reduce}
+    feats["S_n_load_reduce_inner"] = sum(1 for ld in loads if ld.index and ld.index[-1].free_vars() & reduce_axes)
+    feats["S_n_loop"] = len(loops)
+    feats["S_n_reduce_loop"] = sum(1 for loop in loops if loop.is_reduce)
+    feats["S_n_free_loop"] = sum(1 for loop in loops if not loop.is_reduce)
+    feats["S_loop_depth"] = _loop_depth(body)
+    if buffers is not None:
+        for ld in loads:
+            t = buffers.get(ld.input)
+            dt = str(t.dtype) if t is not None else "?"
+            feats[f"S_dtype_{dt}"] += 1
+    return {k: float(v) for k, v in feats.items()}
+
+
+def _loop_depth(body: Body) -> int:
+    """Max ``Loop`` nesting depth along any path (non-Loop wrappers like
+    ``Cond`` recurse without incrementing)."""
+    best = 0
+    for s in body:
+        if isinstance(s, Loop):
+            best = max(best, 1 + _loop_depth(s.body))
+        else:
+            for nested in s.nested():
+                best = max(best, _loop_depth(nested))
+    return best
+
+
+def _bounded_mul(value: float, extent: float) -> float:
+    """One saturating multiply step of an extent product — never an unbounded Python integer."""
+    if extent and value > float_info.max / extent:
+        return float_info.max
+    return value * extent
+
+
+def _serial_cell_work(body: Body) -> float:
+    """Worst per-cell serial trip count: the max over loop-nest paths of the product of the
+    static reduce-loop extents along the path. Nest-aware where ``S_ext_reduce_prod`` is flat —
+    sibling reduces take the max, nested reduces multiply — so a subtree re-evaluated under an
+    enclosing reduce is priced by the trips a thread actually serializes (DeepSeek-V4
+    ``post4096``'s elected consumer piece recomputed a 16384-step statistics contraction inside a
+    4096-step reduce: flat product 2^36-blind, nest product the honest 2^30). Free and sweep
+    loops are excluded (grid-distributed / conservative), a symbolic extent contributes no
+    factor, and so does a ``StridedLoop`` (like everywhere else in this feature block — a
+    strided respelling can therefore evade the count, in the conservative direction), so the
+    value is a lower bound; saturates at the largest finite float."""
+    best = 1.0
+    for s in body:
+        if isinstance(s, Loop):
+            inner = _serial_cell_work(s.body)
+            ext = s.axis.extent
+            if s.is_reduce and ext.is_static:
+                inner = _bounded_mul(inner, float(ext.as_static()))
+            best = max(best, inner)
+        else:
+            for nested in s.nested():
+                best = max(best, _serial_cell_work(nested))
+    return best
+
+
+def _extents(body: Body) -> dict[str, float]:
+    """Continuous ``S_ext_*`` loop extents, split by free vs reduce axis
+    (``Loop.is_reduce``). Symbolic axes (non-static extent) are excluded from
+    the products and counted in ``S_ext_n_symbolic_axis``."""
+    free: list[int] = []
+    reduce_: list[int] = []
+    n_symbolic = 0
+    for loop in body.loops:
+        ext = loop.axis.extent
+        if not ext.is_static:
+            n_symbolic += 1
+            continue
+        (reduce_ if loop.is_reduce else free).append(ext.as_static())
+
+    def bounded_product(values: list[int]) -> float:
+        """Multiply extent features without constructing an unbounded Python integer."""
+        value = 1.0
+        for extent in values:
+            value = _bounded_mul(value, extent)
+        return value
+
+    return {
+        "S_ext_n_free_axis": float(len(free)),
+        "S_ext_free_prod": bounded_product(free),
+        "S_ext_free_max": float(max(free)) if free else 0.0,
+        "S_ext_n_reduce_axis": float(len(reduce_)),
+        "S_ext_reduce_prod": bounded_product(reduce_),
+        "S_ext_reduce_max": float(max(reduce_)) if reduce_ else 0.0,
+        "S_ext_n_symbolic_axis": float(n_symbolic),
+        "S_ext_serial_cell_work": _serial_cell_work(body),
+    }

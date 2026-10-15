@@ -27,9 +27,10 @@ from emmy.compiler.dim import Dim
 from emmy.compiler.graph import Node
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.kernel import KernelOp
-from emmy.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW
+from emmy.compiler.ir.kernel.ir import ELEM_COL, ELEM_ROW, FRAG_COL, FRAG_ROW
+from emmy.compiler.ir.schedule.register import RegisterMaterialization
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Assign, Body, Load, Write
+from emmy.compiler.ir.stmt import Affine, Assign, Body, Let, Load, Write
 from emmy.compiler.ir.stmt.body import free_names
 from emmy.compiler.ir.tile import TileOp
 from emmy.compiler.ir.tile.ops import UnbindableProjection, reduce_plan, sched_of
@@ -45,14 +46,28 @@ def rewrite(match: Match, root: Node, ctx=None) -> KernelOp | None:
     # structural ``tile/030_cut`` fork's, decided BEFORE scheduling (the walk's catalog
     # offers no ``g`` row, and its pin path strips the consumed ``g`` half). A surviving split
     # request is a bug — the materializer only lowers single-launch kernels.
-    rplan = reduce_plan(tile) if tile.op is not None else None
+    resident = isinstance(tile.materialization, RegisterMaterialization)
+    if tile.carries and not resident:
+        from emmy.compiler.pipeline.passes.tile._fromloop import serial_form  # noqa: PLC0415
+
+        tile = serial_form(tile, root.id)
+    rplan = reduce_plan(tile) if tile.op is not None and not resident else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage reached the kernel pass past 030_cut"
     try:
-        materialized = _pointwise_strip(tile, factorize(tile, root, sm_count=getattr(ctx, "sm_count", 0)))
-        body = _drop_repeated_declarations(Body((materialized,)))
+        materialized = factorize(tile, root, sm_count=getattr(ctx, "sm_count", 0))
+        if not resident:
+            materialized = _pointwise_strip(tile, materialized)
+        # Kernel IR evaluates one operation at a time: a sum is its binary spelling from here on.
+        body = _drop_repeated_declarations(Body((materialized,)).map(lambda s: s.as_assigns() if isinstance(s, Affine) else s))
         unbound = _unbound_names(tile, root, body)
         assert not unbound, f"materialize: kernel {tile.name!r} reads names it never binds: {sorted(unbound)}"
-        return KernelOp(body=body, name=tile.name)
+        kernel = KernelOp(body=body, name=tile.name, serial=() if resident else tuple(tile.place.serial))
+        if resident:
+            # The state's port — the buffer the lift added for the classic realization, which no
+            # store of the term writes. Register storage has no global state allocation, so the
+            # port goes: a graph splice; snapshots with external readers remain ordinary outputs.
+            return _drop_private_ports(match, root, replace(kernel, source=tile, knobs=tile.knobs), "register")
+        return kernel
     except UnbindableProjection as exc:
         # The offered row has no multi-root binding (e.g. it tiles two contraction operands of a
         # projection whose outputs do not partition by root). The row stays OFFERED — the
@@ -61,11 +76,35 @@ def rewrite(match: Match, root: Node, ctx=None) -> KernelOp | None:
         raise RuleSkipped(f"kernel binder refuses this row's projection ownership: {exc}", reject=True) from exc
 
 
+def _drop_private_ports(match: Match, root: Node, kernel: KernelOp, suffix: str):
+    """Remove unused global state allocations after a resident materialization."""
+    written = {name for stmt in kernel.body.iter() for name in stmt.external_writes()}
+    ports = {t.name for t in root.outputs if t.name not in written and t.name not in match.graph.outputs}
+    ports = {name for name in ports if not match.graph.buffer_users(name)}
+    if not ports:
+        return kernel
+    from emmy.compiler.pipeline.passes.tile._cut import _input_fragment  # noqa: PLC0415
+
+    outputs = tuple(t for t in root.outputs if t.name not in ports)
+    names = {t.name: t.name + "__" + suffix for t in outputs}
+    fragment = _input_fragment(match, root)
+    fragment.add_node(
+        replace(kernel, body=kernel.body.rename_buffers(names), outputs={}),
+        list(root.inputs),
+        outputs=(outputs[0], *(replace(t, name=names[t.name]) for t in outputs[1:])),
+        node_id=names[outputs[0].name],
+    )
+    fragment.outputs = list(names.values())
+    match.output = names
+    return fragment
+
+
 #: Names the RENDERER supplies, so a statement may read them with no binding anywhere in the IR:
 #: the CTA helper coordinates it declares in the prologue of any body that uses them
-#: (``ir.stmt.blocks``), and the reserved coordinates a :class:`~emmy.compiler.ir.kernel.ir.FragmentMask`
-#: predicate is written over, which the render substitutes per element (tile origin + layout offset).
-_RENDERED_HELPERS = frozenset({"lane", "warp", FRAG_ROW, FRAG_COL})
+#: (``ir.stmt.blocks``), and the reserved coordinates a :class:`~emmy.compiler.ir.kernel.ir.FragmentApply`
+#: COORD / GMEM template is written over, which the render substitutes per element (tile origin + layout offset),
+#: and the in-fragment offsets a :class:`~emmy.compiler.ir.kernel.ir.RegStore` epilogue reads.
+_RENDERED_HELPERS = frozenset({"lane", "warp", FRAG_ROW, FRAG_COL, ELEM_ROW, ELEM_COL})
 
 
 def _unbound_names(tile: TileOp, root: Node, body: Body) -> set[str]:
@@ -81,7 +120,7 @@ def _unbound_names(tile: TileOp, root: Node, body: Body) -> set[str]:
     undefined*, a hundred errors deep in a generated source and attributed to whichever candidate the
     tuner happened to be benching. Asking it here names the kernel and the value instead, in the pass
     that built them."""
-    bound = {*root.inputs, *root.buffer_names(), *_RENDERED_HELPERS}
+    bound = {*root.inputs, *root.buffer_names(), *_RENDERED_HELPERS, *(axis.name for axis in tile.place.serial)}
     for axis in (*tile.axes, *tile.place.free):
         bound |= set(axis.extent_expr().free_vars())
     return set().union(*(free_names(stmt) for stmt in body)) - bound
@@ -128,13 +167,23 @@ def _pointwise_strip(tile: TileOp, materialized):
 
 def _binding(stmt) -> tuple | None:
     """What ``stmt`` binds its name TO, or ``None`` when it binds something this guard cannot
-    compare. A scalar ``Load`` binds an ADDRESS; an ``Assign`` binds an EXPRESSION over names the
-    scope has already bound. Both are repeatable: a second, identical one computes the same value."""
+    compare. A scalar ``Load`` binds an ADDRESS; ``Assign`` and ``Let`` bind EXPRESSIONS over names the
+    scope has already bound. A second, identical binding computes the same value."""
     if isinstance(stmt, Load) and stmt.is_scalar:
         return (stmt.input, tuple(e.pretty() for e in stmt.index))
     if isinstance(stmt, Assign):
         return (stmt.op.name, stmt.args, stmt.dtype)
+    if isinstance(stmt, Let):
+        return (Let, stmt.value.pretty(), stmt.dtype)  # spelled, so a negative zero stays distinct from zero
     return None
+
+
+def _copied(stmt, bound: dict[str, tuple], dtypes: dict[str, object]) -> tuple | None:
+    """What a same-dtype ``copy`` of one bound value binds: that value's own binding."""
+    if not isinstance(stmt, Assign) or stmt.op.name != "copy" or len(stmt.args) != 1:
+        return None
+    (source,) = stmt.args
+    return bound.get(source) if dtypes.get(source) in (None, stmt.dtype) or stmt.dtype is None else None
 
 
 def _drop_repeated_declarations(body: Body) -> Body:
@@ -144,19 +193,25 @@ def _drop_repeated_declarations(body: Body) -> Body:
     Operand cones splice INDEPENDENTLY (``Fold.spliced_step``), so two sibling cones over one
     shared value each carry their own copy of the statements that bind it, under the same SSA
     names. Flattened into one loop body those are two C declarations of one name, which nvcc
-    rejects (*already declared in the current scope*). Both repeatable kinds occur: the ``Load``
+    rejects (*already declared in the current scope*). Repeated bindings include the ``Load``
     of a broadcast constant — eleven of them on DeepSeek-V4's MXFP4 expert kernel, whose decode
     applies eleven shared constants to both halves of the fused ``gate_up`` weight — and the
     ``Assign`` that DERIVES a value from one, which the same model's post block reaches whenever a
-    placement cut lands two cones of one reciprocal at the kernel's own scope.
+    placement cut lands two cones of one reciprocal at the kernel's own scope. Static scalar ``Let``
+    bindings repeat in the same way when both cones carry their own denominator or epsilon.
 
     The repeat binds nothing new, so it is dropped with NO rewrite: every downstream use already
     names the survivor. That is what keeps the guard narrow, and narrow is what makes it safe over
-    a WHOLE kernel body. The renaming forms (``_atom._dedup_loads``, ``stmt.dedup_loads``) collapse
+    a WHOLE kernel body. The renaming forms (``_atom._dedup_loads``, ``stmt.normalize.place_values``) collapse
     two DIFFERENT names at one address, which needs the memory-effect reasoning neither does: a
     ``Write`` or an async fill between two identical loads of a staged buffer makes the second a
     different value. A same-name repeat cannot hide such a reload — a rebind in one C scope is
     already illegal — so this guard needs no such analysis.
+
+    A same-dtype ``copy`` of a value bound to what its name already holds is the same repeat in
+    another spelling: a placement cut drops the identity cast of a workspace read in a one-operand
+    projection and keeps it where the projection has more operands, so one cone binds ``v0`` to the
+    read and its sibling binds ``v0 = copy(read)`` (softmax's maximum, cut on a V100).
 
     A name re-bound to a DIFFERENT value is left alone: that is an SSA fault, and it must surface
     as one rather than be collapsed onto a stale value. Per scope, so an inner body may legally
@@ -164,13 +219,16 @@ def _drop_repeated_declarations(body: Body) -> Body:
 
     def scope(stmts) -> tuple:
         bound: dict[str, tuple] = {}
+        dtypes: dict[str, object] = {}
         kept = []
         for stmt in stmts:
             binding = _binding(stmt)
             if binding is not None:
-                if bound.get(stmt.name) == binding:
+                held = bound.get(stmt.name)
+                if held is not None and held in (binding, _copied(stmt, bound, dtypes)):
                     continue
                 bound[stmt.name] = binding
+                dtypes[stmt.name] = stmt.dtype
             nested = stmt.nested()
             if nested:
                 stmt = stmt.with_bodies(tuple(Body(scope(inner)) for inner in nested))

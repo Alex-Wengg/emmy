@@ -141,6 +141,68 @@ def test_load_recipe_rejects_completion_smoke_test_for_embedding(tmp_path):
         load_recipe(str(recipe_dir))
 
 
+def _modalities_config(modalities, *, task="generate", extra_args=""):
+    model = {"huggingface": "org/vl-model", "task": task}
+    if modalities is not None:
+        model["input_modalities"] = modalities
+    return {"model": model, "engine": {"llm": {"vllm": {"extra_args": extra_args}}}}
+
+
+def _load(tmp_path, config):
+    recipe_dir = tmp_path / "r"
+    recipe_dir.mkdir()
+    (recipe_dir / "recipe.yaml").write_text(yaml.dump(config))
+    return load_recipe(str(recipe_dir))
+
+
+def test_load_recipe_defaults_input_modalities_to_text(tmp_path):
+    assert _load(tmp_path, _modalities_config(None)).model.input_modalities == ("text",)
+
+
+def test_load_recipe_accepts_image_input_modality(tmp_path):
+    config = _modalities_config(["text", "image"], extra_args="--limit-mm-per-prompt '{\"image\": 4}'")
+    assert _load(tmp_path, config).model.input_modalities == ("text", "image")
+
+
+@pytest.mark.parametrize("modalities", [[], "text", ["audio"], ["image"], ["text", "text"], ["text", "video"]])
+def test_load_recipe_rejects_malformed_input_modalities(tmp_path, modalities):
+    with pytest.raises(ValueError, match="model.input_modalities"):
+        _load(tmp_path, _modalities_config(modalities))
+
+
+def test_load_recipe_accepts_audio_input_modality(tmp_path):
+    config = _modalities_config(["text", "audio"], extra_args="--limit-mm-per-prompt '{\"audio\": 1}'")
+    assert _load(tmp_path, config).model.input_modalities == ("text", "audio")
+
+
+def test_load_recipe_rejects_audio_input_disabled_by_extra_args(tmp_path):
+    with pytest.raises(ValueError, match="disable audio input"):
+        _load(tmp_path, _modalities_config(["text", "audio"], extra_args="--limit-mm-per-prompt audio=0"))
+
+
+def test_load_recipe_rejects_image_input_for_embedding(tmp_path):
+    with pytest.raises(ValueError, match="model.task: generate"):
+        _load(tmp_path, _modalities_config(["text", "image"], task="embed"))
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        "--language-model-only",
+        '--limit-mm-per-prompt \'{"image": 0, "audio": 0}\'',
+        "--kv-cache-dtype fp8 --limit-mm-per-prompt image=0 --enable-auto-tool-choice",
+    ],
+)
+def test_load_recipe_rejects_image_input_disabled_by_extra_args(tmp_path, extra_args):
+    with pytest.raises(ValueError, match="disable image input"):
+        _load(tmp_path, _modalities_config(["text", "image"], extra_args=extra_args))
+
+
+def test_load_recipe_allows_text_only_flags_without_image(tmp_path):
+    recipe = _load(tmp_path, _modalities_config(None, extra_args="--language-model-only"))
+    assert recipe.model.input_modalities == ("text",)
+
+
 def test_load_recipe_no_deploy_gpu(tmp_recipe_dir):
     """Base recipe has no deploy.gpu (it comes from matrices)."""
     recipe = load_recipe(tmp_recipe_dir)
@@ -333,6 +395,50 @@ def test_resolve_for_hardware_skips_sweeps(tmp_path):
     recipe = resolve_for_hardware(str(tmp_path), "NVIDIA GeForce RTX 5090")
     assert recipe.deploy.gpu == "NVIDIA GeForce RTX 5090"
     assert recipe.deploy.gpu_count == 1
+
+
+def _write_shared_gpu_recipe(tmp_path):
+    """Two H200 x1 entries, the reduced-fraction one declared first, plus an H100 x4 entry."""
+    recipe_data = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {"llm": {"tensor_parallel_size": 1, "vllm": {"image": "vllm/vllm-openai:v0.17.0"}}},
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA H200 141GB",
+                "deploy.gpu_count": 1,
+                "engine.llm.gpu_memory_utilization": 0.55,
+                "engine.llm.context_length": 131072,
+            },
+            {"deploy.gpu": "NVIDIA H200 141GB", "deploy.gpu_count": 1, "engine.llm.context_length": 262144},
+            {"deploy.gpu": "NVIDIA H100 80GB", "deploy.gpu_count": 4, "engine.llm.tensor_parallel_size": 4},
+        ],
+    }
+    (tmp_path / "recipe.yaml").write_text(yaml.safe_dump(recipe_data))
+    return str(tmp_path)
+
+
+def test_resolve_for_hardware_prefers_the_highest_fraction_without_a_selector(tmp_path):
+    """The whole-GPU qualification wins however the author ordered the entries."""
+    recipe = resolve_for_hardware(_write_shared_gpu_recipe(tmp_path), "NVIDIA H200 141GB", 1)
+    assert recipe.engine.llm.gpu_memory_utilization == 0.9
+    assert recipe.engine.llm.context_length == 262144
+
+
+def test_resolve_for_hardware_exact_fraction_selects_the_shared_entry(tmp_path):
+    recipe = resolve_for_hardware(_write_shared_gpu_recipe(tmp_path), "NVIDIA H200 141GB", 1, 0.55)
+    assert recipe.engine.llm.gpu_memory_utilization == 0.55
+    assert recipe.engine.llm.context_length == 131072
+
+
+def test_resolve_for_hardware_unknown_fraction_names_the_available_ones(tmp_path):
+    with pytest.raises(ValueError, match=r"Available fractions: \[0.55, 0.9\]"):
+        resolve_for_hardware(_write_shared_gpu_recipe(tmp_path), "NVIDIA H200 141GB", 1, 0.7)
+
+
+def test_resolve_for_hardware_fraction_has_no_divisible_fallback(tmp_path):
+    """A plan names the qualified entry; eight H100s do not resolve onto the x4 entry."""
+    with pytest.raises(ValueError, match="Available fractions"):
+        resolve_for_hardware(_write_shared_gpu_recipe(tmp_path), "NVIDIA H100 80GB", 8, 0.9)
 
 
 # ── validate_extra_args ────────────────────────────────────────────

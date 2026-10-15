@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from emmy import config, gpu
+from emmy import gpu
 
 if TYPE_CHECKING:
     from emmy.compiler.pipeline.search.pool import PoolSample
@@ -47,10 +47,12 @@ DEFAULT_SM_COUNT = gpu.DEFAULT_GPU.sm_count
 
 
 def _env_compile_flags() -> str:
-    """Extra nvcc flags for this compile (``EMMY_NVCC_FLAGS``). Set by the
-    CLI commands (via :func:`emmy.config.set_nvcc_flags`); folded into
-    :meth:`Context.structural_key` so the perf cache is partitioned by opt level."""
-    return config.nvcc_flags()
+    """Effective nvcc flags, including the FAST_MATH policy and custom overrides.
+
+    Folded into Context.structural_key so timing evidence cannot cross arithmetic regimes."""
+    from emmy.compiler.backend.cuda.nvcc import effective_flags  # noqa: PLC0415
+
+    return " ".join(effective_flags())
 
 
 # The cicc optimization level as it is spelled on the nvcc command line, with the ``-Xcicc``
@@ -59,8 +61,13 @@ def _env_compile_flags() -> str:
 _OPT_TOKEN = re.compile(r"(?:-Xcicc\s+)?-O(\d)")
 
 
+#: The flag fast math adds — the one extra compiler flag that is a regime of its own, since it changes the
+#: code a kernel runs as (``backend.cuda.nvcc.effective_flags``).
+FAST_MATH_FLAG = "--use_fast_math"
+
+
 def split_opt_level(compile_flags: str) -> tuple[int, str]:
-    """Split extra nvcc flags into ``(cicc opt level, everything else)``.
+    """Split effective nvcc flags into ``(cicc opt level, everything else)``.
 
     ONE parse, shared by the two places the opt level matters: the ``H_opt`` feature
     (:meth:`Context.features`) and the identity a measurement is stored under
@@ -149,31 +156,34 @@ class Context:
     # PCIe product name of the card this context is for (e.g. "NVIDIA H200 141GB"),
     # set by ``from_target(gpu_name=…)`` or probed live (``gpu.live_name``). The one
     # identity that separates same-die SKUs (H100 vs H200: identical cc + SM features,
-    # different VRAM) — used by the node-store key + ``gpu`` column so cross-hardware
-    # tuning data never collides. NOT in ``structural_key`` (the perf cache stays
-    # SKU-coarse on purpose; only the node *dataset* keys on it). ``None`` ⇒ unknown.
+    # different VRAM) — the ``perf`` table's ``gpu`` key column, so cross-hardware
+    # measurements never collide. NOT in ``structural_key``, which spells the regime (compute
+    # capability + compiler flags) and nothing about the card. ``None`` ⇒ unknown.
     gpu_name: str | None = None
     # Identifies which backend's perf rows this compile reads/writes — the
-    # tune DB keys ``perf`` by ``(context_key, op_key, backend)``. Defaults to
+    # tune DB keys ``perf`` by the card, the regime, the kernel and ``backend``. Defaults to
     # ``"cuda"`` — the canonical autotune target. ``run_autotune`` replaces
     # this when a live :class:`Backend` is supplied.
     backend_name: str = "cuda"
-    # Extra nvcc flags this compile uses (from ``EMMY_NVCC_FLAGS`` — e.g.
-    # normally empty — tune, compile and run all measure in the deployable regime).
-    # Folded into ``structural_key`` (split, see :func:`split_opt_level`) so the autotune
-    # ``perf`` cache is partitioned by opt level: a measurement taken under a deliberately
-    # non-deployable ``--nvcc-flags`` never answers for a deploy. Populated from the env by :meth:`probe` /
-    # :meth:`from_target`.
+    # Effective nvcc flags, from FAST_MATH plus EMMY_NVCC_FLAGS. Folded into structural_key
+    # so timings under different arithmetic or optimization flags cannot rank one another.
+    # Populated from the environment by probe / from_target.
     compile_flags: str = ""
-    # Whether the strict knob-pin validator (``lowering/tile/_validate``)
+    # Bound precision decisions — the one carrier of the fast-math decision: ``compile_flags`` names it only
+    # at construction (``from_target``), and every reader takes :meth:`precision_pins`. Empty on a directly
+    # constructed context means the standard regime, never the current environment; factories capture the
+    # live policy or an explicitly recorded one.
+    precision: tuple[tuple[str, bool], ...] = ()
+    # Measurement regime: kernels timed after L2 eviction cannot rank hot-cache measurements.
+    cold_cache: bool = False
+    # Whether the strict knob-pin validator (``tile/_validate``)
     # is active. ``True`` on the deterministic greedy compile (``compile`` / ``run``),
     # where a force-pinned env knob foreign to the kernel's resolved tier is a user
-    # error that should fail loudly instead of silently mis-compiling. ``False`` under
-    # the tune SEARCH (``Run.drive`` flips it): the search legitimately explores
-    # tier-foreign forks and steers heterogeneous multi-op graphs with a UNION pin
-    # vector (warp ``WM``/``WN`` + scalar ``BM``/``BN`` together — each op takes its
-    # tier's subset), so a per-op contradiction is a pruned branch, not an error. NOT
-    # in ``structural_key`` (it changes no codegen, only whether a contradiction raises).
+    # error that should fail loudly instead of silently mis-compiling. ``False`` for a
+    # caller that steers heterogeneous multi-op graphs with a UNION pin vector (warp
+    # ``WM``/``WN`` + scalar ``BM``/``BN`` together — each op takes its tier's subset),
+    # so a per-op contradiction is a pruned branch, not an error. NOT in
+    # ``structural_key`` (it changes no codegen, only whether a contradiction raises).
     validate_pins: bool = True
     # The candidate-pool sample this compile enumerates under, or ``None`` for a LIVE compile,
     # which always sees the whole pool. Set by the offline dataset builders (``emmy fit``), never
@@ -190,12 +200,26 @@ class Context:
     kernel_cache: object | None = field(default=None, compare=False, repr=False)
 
     @classmethod
-    def from_target(cls, cap: tuple[int, int], *, gpu_name: str | None = None) -> Context:
+    def from_target(
+        cls,
+        cap: tuple[int, int],
+        *,
+        gpu_name: str | None = None,
+        compile_flags: str | None = None,
+        cold_cache: bool | None = None,
+        precision: dict[str, bool] | None = None,
+    ) -> Context:
         """A target-derived context. ``gpu_name`` (a PCIe product name) pins the
         device-physical features to that card's **memorized** specs from the
         :mod:`emmy.gpu` registry — used to reconstruct a *golden* config's
         context so it featurizes with its own card's SM count / smem (not the live
         device's). Default ``None`` → the live device (the live-compile path).
+        ``compile_flags`` names the regime the context stands for — the flags a
+        recorded row was measured under — instead of the live environment's.
+        Explicit flags without ``precision`` use their umbrella regime, the one place the decision is read
+        off the flag string; a recorded row's input pins are supplied in ``precision`` — its independent
+        precision overrides, and its cache mode unless ``cold_cache`` says — and spell the flags when none
+        are given. Without either, both capture the live policy.
 
         A ``gpu_name`` the registry does not know is a hard error, never a fallback: the caller
         named a specific card, so substituting the live device's properties would featurize that
@@ -203,6 +227,8 @@ class Context:
         construction — :data:`DEFAULT_SM_COUNT` is the most common card in the corpus, so a
         misresolved name produces H_* features identical to a correct one on a GPU-less host.
         Recording goldens on a card before adding it to the registry is exactly when this fires."""
+        from emmy.compiler.pipeline.search.space import COLD_CACHE, FAST_MATH, precision_pins, regime_pins  # noqa: PLC0415
+
         spec = gpu.by_name(gpu_name) if gpu_name else None
         if gpu_name and spec is None:
             raise ValueError(
@@ -211,14 +237,29 @@ class Context:
             )
         props = spec.device_features() if spec else {}
         sm = int(props.get("sm_count") or _live_sm_count())
+        # The regime the context stands for: the one the recorded ``precision`` pins spell, or the live one.
+        regime = regime_pins(precision)
+        if precision is None and compile_flags is not None:
+            # The one place the decision is read off the flag string: a caller naming only flags names the umbrella.
+            precision = {FAST_MATH.name: FAST_MATH_FLAG in compile_flags.split()}
+        elif compile_flags is None and precision is not None:
+            compile_flags = FAST_MATH_FLAG if regime[FAST_MATH.name] else ""
         return cls(
             compute_capability=cap,
             max_dynamic_smem=_max_dynamic_smem_for(cap),
             sm_count=sm,
             device_props=props,
             gpu_name=spec.name if spec else gpu_name,
-            compile_flags=_env_compile_flags(),
+            compile_flags=_env_compile_flags() if compile_flags is None else compile_flags,
+            cold_cache=regime[COLD_CACHE.name] if cold_cache is None else cold_cache,
+            precision=tuple(precision_pins(precision).items()),
         )
+
+    def precision_pins(self) -> dict[str, bool]:
+        """The bound arithmetic policy, including every independent override, without consulting live pins."""
+        from emmy.compiler.pipeline.search.space import precision_pins  # noqa: PLC0415
+
+        return precision_pins(dict(self.precision))
 
     @property
     def has_volta_mma(self) -> bool:
@@ -278,7 +319,7 @@ class Context:
     def structural_key(self) -> str:
         """Implements :class:`emmy.compiler.structural.Structural`.
 
-        Folds in only codegen-affecting fields. ``compute_capability``
+        Folds in codegen fields and the cache regime used to select measurement evidence. ``compute_capability``
         gates hardware-feature passes (TMA, cp.async, dynamic smem cap);
         anything derived from it (``max_dynamic_smem``) is implied.
         ``compile_flags`` is folded in because the nvcc opt level genuinely
@@ -290,16 +331,21 @@ class Context:
         The flags enter **split** (:func:`split_opt_level`), never raw, so that one regime has one
         key however it is spelled.
         """
+        from emmy.compiler.pipeline.search.space import FAST_MATH  # noqa: PLC0415
         from emmy.compiler.structural import digest  # noqa: PLC0415
 
-        return digest("Context", self.compute_capability, *split_opt_level(self.compile_flags))
+        regime = ("cold-cache",) if self.cold_cache else ()
+        pins = self.precision_pins()
+        overrides = tuple((name, value) for name, value in pins.items() if value != pins[FAST_MATH.name])
+        precision = ("precision", overrides) if overrides else ()
+        return digest("Context", self.compute_capability, *split_opt_level(self.compile_flags), *precision, *regime)
 
     def hardware_id(self) -> str:
-        """A stable per-card identity for the node-store key + ``gpu`` column: the PCIe
+        """A stable per-card identity for the ``perf`` table's ``gpu`` key column: the PCIe
         product name when known, else a digest of the device-physical regime (``H_*``
         features + capability). Separates same-die SKUs (H100 vs H200) that
         ``structural_key`` (cc + opt only) and the SM-only ``H_*`` features can't, so a
-        cross-hardware node dataset never collides."""
+        cross-hardware dataset never collides."""
         if self.gpu_name:
             return self.gpu_name
         from emmy.compiler.structural import digest  # noqa: PLC0415
@@ -310,9 +356,9 @@ class Context:
     def features(self) -> dict[str, float]:
         """Host/hardware regime as ``H_*`` features for the online prior, so a
         SINGLE global prior spans every GPU and nvcc opt level (these are
-        constant across a compile's sibling candidates → they never change the
-        argmax; they only let the model fit per-regime offsets instead of
-        averaging across regimes). Combines capability-derived facts with the
+        constant across a compile's sibling candidates, but trees can combine
+        them with candidate features to rank differently per regime).
+        Combines capability-derived facts with the
         live device's physical SKU properties:
 
         - ``H_cc`` — compute capability ``major*10 + minor``
@@ -320,12 +366,15 @@ class Context:
         - ``H_smem_optin`` — per-block dynamic-smem opt-in cap (bytes)
         - ``H_opt`` — nvcc cicc opt level from ``compile_flags`` (tune's
           an explicit ``-Xcicc -O1`` pin → 1; the default → 3)
+        - ``H_fast_math`` — 1 under the bound ``FAST_MATH`` decision (:meth:`precision_pins`), the regime a
+          golden can decide a kernel set differently in
         - ``H_sm_count`` / ``H_smem_per_sm`` / ``H_smem_per_block`` /
           ``H_regs_per_block`` / ``H_warp_size`` / ``H_total_mem`` — live device props
           (:func:`target.live_device_features`; absent on GPU-less hosts). ``H_total_mem``
           (VRAM bytes) is the one feature that distinguishes same-die SKUs the SM-only
           features can't — H100 80GB vs H200 141GB share cc + SM count.
         """
+        from emmy.compiler.pipeline.search.space import FAST_MATH  # noqa: PLC0415
         from emmy.compiler.target import live_device_features  # noqa: PLC0415
 
         major, minor = self.compute_capability
@@ -334,6 +383,7 @@ class Context:
             "H_tc_gen": float(_TENSOR_CORE_GEN.get((major, minor), major)),
             "H_smem_optin": float(self.max_dynamic_smem),
             "H_opt": float(split_opt_level(self.compile_flags)[0]),
+            "H_fast_math": float(self.precision_pins()[FAST_MATH.name]),
         }
         # The memorized props of this context's card (golden reconstruction) when
         # set, else the live device's — so a golden featurizes with its own card.
@@ -344,7 +394,7 @@ class Context:
     @classmethod
     def probe(cls) -> Context:
         """Build by probing the live CUDA device. Falls back to (0, 0) if
-        cupy is unavailable — callers treat that as "no hardware feature
+        no CUDA device is visible — callers treat that as "no hardware feature
         support" (rules gating on capability self-skip via ``RuleSkipped``).
 
         ``max_dynamic_smem`` is the *live device's* opt-in cap, not the
@@ -355,6 +405,7 @@ class Context:
         the launch. Without this distinction, ``--target sm_90`` on an
         sm_86 box would request 227 KB on a 99 KB device.
         """
+        from emmy.compiler.pipeline.search.space import cold_cache, precision_pins  # noqa: PLC0415
         from emmy.compiler.target import compute_capability, live_compute_capability  # noqa: PLC0415
 
         cap = compute_capability()
@@ -371,4 +422,6 @@ class Context:
             sm_count=_live_sm_count(),
             gpu_name=gpu.live_name(),
             compile_flags=_env_compile_flags(),
+            cold_cache=cold_cache(),
+            precision=tuple(precision_pins().items()),
         )

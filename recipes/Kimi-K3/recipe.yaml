@@ -3,9 +3,9 @@ tags:
   - untested
 model:
   huggingface: moonshotai/Kimi-K3
-  rationale: "Strong HF likes provide solid attention despite less Reddit proof."
-  heat: 72
+  rationale: "Family arena signal strong (kimi-k3-max #1 open, 1488); specific K3 repo open-status unverified."
+  heat: 65
   task: generate
 matrices:
 - deploy.gpu: NVIDIA B200
-  deploy.gpu_count: 8
+  deploy.gpu_count: 16

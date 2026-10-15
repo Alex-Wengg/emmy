@@ -1,0 +1,11 @@
+tags:
+- onboarding
+- untested
+model:
+  huggingface: apple/LensVLM-9B
+  rationale: "First-party lab VLM with early momentum; 262K-context compression novelty, though no fresh stats or current mentions."
+  heat: 60
+  task: generate
+matrices:
+- deploy.gpu: NVIDIA H200 141GB
+  deploy.gpu_count: 1

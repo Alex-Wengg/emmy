@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from emmy.compiler.ir.axis import Axis
-from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.kernel.ir import Smem, TreeHalve, WarpShuffle
 from emmy.compiler.ir.pure import Fold
 from emmy.compiler.ir.schedule import Placement, Raster, Reduce, Stage, Tile, Work, derive_inventory
@@ -20,7 +20,7 @@ from emmy.compiler.ir.schedule.classic import (
     ProjectionSchedule,
     ReductionSchedule,
 )
-from emmy.compiler.ir.stmt import Assign, Cond, Load, Loop, StridedLoop, Write
+from emmy.compiler.ir.stmt import Assign, Cond, Init, Let, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from emmy.compiler.ir.tile import TileOp
 from emmy.compiler.pipeline.passes.lowering.kernel._factor import factorize
 from tests.compiler.terms import contraction, projection, reduction, slab
@@ -121,12 +121,73 @@ def test_a_transposed_band_on_a_chain_member_binds_serial() -> None:
     """The ``coop-t`` band's σ-substitution and guarded close assume the fold is the kernel ROOT,
     so the chain arm cannot realize one. It must fall to the degenerate serial arm — realizing it
     as a PLAIN coop band would mint one kernel from two knob spellings."""
-    bound = factorize(_chain_tile(Reduce.of(coop=32, coop_transposed=True)), root=None)
+    bound = factorize(_two_member_tile(Reduce.of(coop=32, coop_transposed=True), Reduce()), root=None)
     flat = _flat(bound.body)
     assert not any(isinstance(s, StridedLoop) for s in flat), "a transposed band is not offered the chain arm"
     assert any(isinstance(s, Loop) for s in flat), "the member still folds serially per cell"
     assert not any(a.name.endswith("_co") for a in bound.axes)
     assert bound.block_threads is None
+
+
+def test_a_transposed_root_emits_its_computed_provider_at_the_lane_owned_cell() -> None:
+    red = _reduce(_K, "acc", _provider(), "x")
+    bound = factorize(_stamped(red, {red: Reduce.of(coop=128, coop_transposed=True, output_lanes=8)}), root=None)
+    stmts = list(bound.body)
+    loop = next(i for i, stmt in enumerate(stmts) if isinstance(stmt, StridedLoop))
+    provider = next(i for i, stmt in enumerate(stmts) if isinstance(stmt, Load) and stmt.input == "cutbuf")
+    assert provider < loop
+    assert "m" not in stmts[provider].index[0].free_vars()
+    assert {"m_blk", "m_ln"} <= stmts[provider].index[0].free_vars()
+    assert any(isinstance(stmt, TreeHalve) and stmt.inner == ("m_ln", 8) for stmt in _flat(stmts))
+    assert bound.block_threads == 128
+
+
+def test_transposed_columns_keep_the_serial_provider_loop_coordinate() -> None:
+    stat = reduction(_J, (slab("z_e", "z", "m", "j"),), (Assign(name="stat__v", op="multiply", args=("z_e", "z_e")),), ("stat",))
+    provider = projection((stat,), (Assign(name="scale", op="rsqrt", args=("stat",)),))
+    red = _reduce(_K, "acc", provider, "x")
+    bound = factorize(_stamped(red, {red: Reduce.of(coop=128, coop_transposed=True, output_lanes=8, columns=2)}, axes=(_K, _J)), root=None)
+    flat = _flat(bound.body)
+    assert any(isinstance(stmt, Loop) and stmt.axis.name == "j" for stmt in flat)
+    assert "j__v1" not in _names_read(flat)
+    assert "stat__v1" in _names_read(flat)
+
+
+def _transposed_masked(predicate):
+    n = Axis("n", 8)
+    red = reduction(_K, (slab("x_e", "x", "m", "n", "k"),), (Assign(name="acc__v", op="copy", args=("x_e",)),), ("acc",))
+    root = projection(
+        (red,),
+        (
+            Let(name="zero", value=Literal(0.0, "f32")),
+            Select(name="chosen", branches=(SelectBranch("acc", predicate), SelectBranch("zero", Literal(1, "int")))),
+        ),
+    )
+    tile = _stamped(root, {red: Reduce.of(coop=128, coop_transposed=True, output_lanes=8)})
+    tile = replace(tile, place=Placement(free=(_M, n)), axes=(_M, n, _K))
+    return factorize(tile, root=None)
+
+
+def test_block_uniform_demand_guards_the_collective_but_keeps_its_seeds_visible() -> None:
+    bound = _transposed_masked(BinaryExpr("&&", Var("m").lt(3), Var("n").lt(2)))
+    (guard,) = [stmt for stmt in bound.body if isinstance(stmt, Cond) and any(isinstance(s, TreeHalve) for s in _flat(stmt.body))]
+    assert guard.cond == Var("m").lt(3)
+    assert any(isinstance(stmt, Init) and stmt.name == "acc" for stmt in bound.body)
+    assert not next(stmt for stmt in guard.body if isinstance(stmt, StridedLoop)).seed
+
+
+def test_lane_varying_demand_does_not_guard_a_collective() -> None:
+    for predicate in (Var("n").lt(2), BinaryExpr("||", Var("m").lt(3), Var("n").lt(2))):
+        bound = _transposed_masked(predicate)
+        assert not any(isinstance(stmt, Cond) and any(isinstance(s, TreeHalve) for s in _flat(stmt.body)) for stmt in bound.body)
+        assert any(isinstance(stmt, TreeHalve) for stmt in bound.body)
+
+
+def test_disabling_coordinate_guards_keeps_the_collective_unconditional(monkeypatch) -> None:
+    monkeypatch.setenv("EMMY_GUARD_REDUCTIONS", "0")
+    bound = _transposed_masked(Var("m").lt(3))
+    assert any(isinstance(stmt, TreeHalve) for stmt in bound.body)
+    assert next(stmt for stmt in bound.body if isinstance(stmt, StridedLoop)).seed
 
 
 def _two_member_root() -> tuple[Fold, Fold, Fold]:
@@ -188,6 +249,29 @@ def test_a_contraction_chain_member_binds_through_the_chain_arm() -> None:
     assert any(isinstance(s, (WarpShuffle, TreeHalve, Smem)) for s in flat), "the cross-thread combine must close the fold"
 
 
+def test_a_partitioned_second_projection_root_is_the_bound_root() -> None:
+    """A reduce plan on a projection's second contraction root must select that root for binding.
+
+    The output-tile selector already did this for ``TILE`` rows, but a ``REDUCE``-only row still
+    bound the first root and lowered the selected root serially in the projection tail. The row was
+    offered and stamped while producing byte-identical Kernel IR to the all-off row.
+    """
+
+    def matvec(axis: Axis, source: str, weight: str, acc: str) -> Fold:
+        a = Load(name=f"{source}_e", input=source, index=(Var("m"), Var(axis.name)))
+        b = Load(name=f"{weight}_e", input=weight, index=(Var(axis.name),))
+        return contraction(axis, a, (b, acc))
+
+    first = matvec(_K, "x", "w", "acc")
+    second = matvec(_J, "y", "v", "acc2")
+    root = projection((first, second), (Assign(name="out", op="add", args=("acc", "acc2")),), results=("out",))
+    bound = factorize(_stamped(root, {second: Reduce.of(coop=64)}, axes=(_K, _J)), root=None)
+
+    strided = [stmt for stmt in _flat(bound.body) if isinstance(stmt, StridedLoop)]
+    assert [(stmt.axis.name, stmt.start, stmt.step.value) for stmt in strided] == [("j", Var("j_co"), 64)]
+    assert bound.block_threads == 64
+
+
 def test_the_walk_offers_and_the_binder_realizes_two_partitioned_members(monkeypatch) -> None:
     """End-to-end through the ACTUAL enumeration, no direct stamping: a chain kernel with two
     reduce members enumerates rows where both members carry the coop band — a row holds ONE worker
@@ -199,7 +283,7 @@ def test_the_walk_offers_and_the_binder_realizes_two_partitioned_members(monkeyp
     from emmy.compiler.context import Context  # noqa: PLC0415
     from emmy.compiler.pipeline.fork import iter_leaves  # noqa: PLC0415
 
-    classic_forks = importlib.import_module("emmy.compiler.pipeline.passes.lowering.tile.040_schedule").classic_forks
+    classic_forks = importlib.import_module("emmy.compiler.pipeline.passes.tile.schedule.040_schedule").classic_forks
     for var in ("EMMY_KNOBS", "EMMY_PLACE", "EMMY_TILE", "EMMY_WORK", "EMMY_STAGE", "EMMY_REDUCE", "EMMY_RASTER"):
         monkeypatch.delenv(var, raising=False)
     _, _, root = _two_member_root()

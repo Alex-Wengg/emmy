@@ -10,9 +10,11 @@ slow kernel, and no numerics assert downstream would attribute the wrong answer 
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import pytest
 
+from emmy import config
 from emmy.commands.trace import graph_from_code
 from emmy.compiler.context import Context
 from emmy.compiler.dim import Dim
@@ -23,12 +25,12 @@ from emmy.compiler.ir.expr import Var
 from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.ir.pure import Fold, Lambda
 from emmy.compiler.ir.pure.twist import SOFTMAX, WELFORD
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Const, Load, Loop, Write
+from emmy.compiler.ir.stmt import Accum, Affine, Assign, Body, Let, Load, Loop, Write
 from emmy.compiler.ir.tile import TileOp
 from emmy.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pipeline
-from emmy.compiler.pipeline.passes.lowering.tile._fromloop import lift_loop_op
-from emmy.compiler.pipeline.passes.lowering.tile._twist import _hoist_invariant, rewrite_twisted
-from tests.compiler.terms import projection, slab
+from emmy.compiler.pipeline.passes.tile._fromloop import lift_loop_op
+from emmy.compiler.pipeline.passes.tile._twist import _hoist_invariant, _replace, rewrite_twisted
+from tests.compiler.terms import contraction, projection, reduction, slab
 
 
 def _carrier(weight_of: str) -> Fold:
@@ -67,6 +69,21 @@ def test_a_weight_derived_from_the_streamed_value_is_no_contraction() -> None:
     assert _carrier("v").as_contraction() is None
 
 
+@pytest.mark.parametrize(("coordinate", "contracts"), [("i", True), ("j", True), ("n", False)])
+def test_a_weight_may_read_only_its_own_operand_coordinates(coordinate, contracts) -> None:
+    carrier = _carrier("r")
+    body = Body(
+        (
+            Let("offset", Var(coordinate)),
+            Assign("shifted", "add", ("r", "offset")),
+            replace(carrier.lift.body[0], args=("shifted",)),
+            carrier.lift.body[1],
+        )
+    )
+    carrier = replace(carrier, lift=Lambda.closing(carrier.lift.params, body, carrier.lift.results))
+    assert (carrier.as_contraction() is not None) == contracts
+
+
 def _folds(root: Fold):
     """Every term of the tree, each object once."""
     seen: set[int] = set()
@@ -87,7 +104,7 @@ def _twisted_folds(root: Fold) -> list[Fold]:
 def _tile(code: str) -> TileOp:
     graph, _, _ = graph_from_code(code)
     graph = Pipeline.build(LOOP_PASSES).run(graph)
-    graph = Pipeline.build(["lowering/tile"], select=["lift", "twisted"]).run(graph)
+    graph = Pipeline.build(["tile/lift"], select=["lift", "twisted"]).run(graph)
     # By the TREE, not the node id: the carrier is what these tests are about, and a softmax fused
     # into a matmul names its node after neither.
     return next(node.op for node in graph.nodes.values() if isinstance(node.op, TileOp) and _twisted_folds(node.op.op))
@@ -107,17 +124,17 @@ def test_softmax_rewrites_to_twisted_pair() -> None:
     assert fold.twist.recipe is SOFTMAX and fold.combine == SOFTMAX.program(fold.as_reduction().states)
     assert len(fold.init) == 2 and fold.init[1] == 0.0
     assert [edge.as_slab() is not None for edge in fold.operands] == [True], "the score slab is its one operand"
-    assert [stmt.value for stmt in fold.lift.body if isinstance(stmt, Const)] == [1.0], "the stable singleton is (score, 1)"
+    assert [stmt.value.value for stmt in fold.lift.body if isinstance(stmt, Let)] == [1.0], "the stable singleton is (score, 1)"
     assert not [stmt for stmt in fold.lift.body if isinstance(stmt, Assign) and stmt.op.name == "exp"], "no exp in the term"
     assert [stmt.op.name for stmt in fold.based().body if isinstance(stmt, Assign)] == ["exp", "multiply"], "psi_inv restores it"
-    assert any(isinstance(stmt, Const) and stmt.value == 1.0 for stmt in fold.injected.body), "psi injects 1"
+    assert any(isinstance(stmt, Let) and stmt.value.value == 1.0 for stmt in fold.injected.body), "psi injects 1"
 
 
 def test_sdpa_rewrites_to_twisted_expectation() -> None:
     """Attention's value channel joins the same carrier, stored in STABLE coordinates: the score
     contraction leads, the value slab is the streamed operand, and the expectation channel injects
     that value unchanged. The bilinear reading comes back through ψ⁻¹ (:meth:`Fold.based`), so no
-    cone is minted to hold ``exp(s)``. The ``1/l`` factor hoists into the epilogue above."""
+    cone is minted to hold ``exp(s)``. The epilogue divides by the denominator once."""
     tile = _tile(
         "F.scaled_dot_product_attention("
         "torch.randn(1, 1, 4, 2, dtype=torch.float16), "
@@ -132,7 +149,7 @@ def test_sdpa_rewrites_to_twisted_expectation() -> None:
     assert streamed.as_slab() is not None and streamed.free_axes, "the value slab is B"
     assert fold.as_contraction() is not None
     assert not [s for s in fold.lift.body if isinstance(s, Assign) and s.op.name == "exp"], "the weight is not in the term"
-    assert tile.op.axis is None and any(stmt.op.name == "multiply" for stmt in tile.op.lift.body), "the epilogue applies 1/l once"
+    assert tile.op.axis is None and any(stmt.op.name == "divide" for stmt in tile.op.lift.body), "the epilogue divides by l once"
 
 
 def test_causal_sdpa_uses_the_same_twisted_rewrite() -> None:
@@ -144,12 +161,14 @@ def test_causal_sdpa_uses_the_same_twisted_rewrite() -> None:
     )
 
     assert len(fold.init) == 3
+    assert fold.as_contraction() is not None
+    assert fold.chunked(), "predicate coordinates must preserve the tensor-core attention channel"
 
 
 def test_a_cat_in_the_query_cone_still_twists() -> None:
     """``rotate_half`` is a ``torch.cat``, so every rotary attention hands the score a query whose
     cone carries a coord-predicated ``Select`` — a multi-source ``IndexMapOp`` lowers to one, and
-    its predicate reads the enclosing contraction's axis without declaring it a lift param.
+    its predicate reads the enclosing contraction's axis as a free coordinate.
 
     That capture is what the match has to see past: ``canonical`` abstracts a term's bound axis in
     its own lift and leaves it FREE where an operand captures it, so two alpha-equal score cones
@@ -167,6 +186,36 @@ def test_a_cat_in_the_query_cone_still_twists() -> None:
     )
 
     assert len(fold.init) == 3
+    assert fold.chunked(), "the rotary predicate must preserve the tensor-core attention channel"
+
+
+@pytest.mark.parametrize("different", [None, "buffer", "coordinate"])
+def test_twist_compares_operand_values_independently_of_coordinate_parameter_order(different) -> None:
+    def score(suffix: str) -> Fold:
+        weights = slab(f"w{suffix}", "other" if suffix and different == "buffer" else "w", "d", "k")
+        # The same load can close its captured coordinates in either order. Neither order is
+        # an index permutation; changing the actual coordinates must still reject the recipe.
+        if suffix:
+            weights = replace(weights, lift=replace(weights.lift, params=tuple(reversed(weights.lift.params))))
+        values = slab(f"x{suffix}", "x", "k" if suffix and different == "coordinate" else "row", "d")
+        return contraction("d", values, (weights, f"score{suffix}"))
+
+    first, second = score(""), score("2")
+    maximum = Fold(
+        operands=(first,),
+        lift=Lambda(("k", "score"), Body(()), ("score",)),
+        init=(float("-inf"),),
+        base=Lambda.componentwise(("maximum",), ("maximum",)),
+    )
+    denominator = reduction(
+        "k",
+        (maximum, second),
+        (Affine("shift", ("score2", "maximum"), (1.0, -1.0)), Assign("total__v", "exp", ("shift",))),
+        ("total",),
+    )
+    axes = {axis.name: axis for axis in (Axis("row", 4), Axis("d", 3), Axis("k", 5))}
+
+    assert (denominator.fuse(SOFTMAX, axes) is not None) == (different is None)
 
 
 def test_a_score_on_its_own_slab_still_injects_the_streamed_value() -> None:
@@ -190,10 +239,17 @@ def test_a_score_on_its_own_slab_still_injects_the_streamed_value() -> None:
     )
 
 
-def test_sdpa_score_contraction_reaches_the_mma_tier() -> None:
+def test_sdpa_score_contraction_reaches_the_mma_tier(monkeypatch) -> None:
     """The fused carrier keeps the score contraction as an operand site, which the tensor-core
     tier tiles — and the carrier itself is a site the chunk tier folds, so the value channel
-    reaches the tensor cores in the same kernel."""
+    reaches the tensor cores in the same kernel.
+
+    The fused placement, unsplit reduction and carrier tier are pinned on this kernel alone: whether
+    the tensor cores are OFFERED is the compiler's contract; the unmeasured greedy schedule is the
+    prior's choice, and it moves with the program and with the live card's SM count."""
+    monkeypatch.setenv(config.knob_var("PLACE@map.1/twist"), "fuse")
+    monkeypatch.setenv(config.knob_var("REDUCE@node_scaled_dot_product_attention"), "")  # no cross-CTA split
+    monkeypatch.setenv(config.knob_var("TILE@map.1/twist"), "mma_m16n8k16_f16_f32/f1x2")
     graph, _, _ = graph_from_code(
         "F.scaled_dot_product_attention("
         "torch.randn(1, 1, 32, 16, dtype=torch.float16), "
@@ -202,13 +258,11 @@ def test_sdpa_score_contraction_reaches_the_mma_tier() -> None:
     )
     lowered = Pipeline.build(CUDA_PASSES).run(graph, ctx=Context.from_target((8, 0)))
     sources = [node.op.kernel_source for node in lowered.nodes.values() if isinstance(node.op, CudaOp)]
-    assert sources
-    assert any("emmy_mma_m16n8k16" in source for source in sources), "the score contraction reaches the tensor-core tier"
-    # The kernel that writes the f16 output converts at the boundary — through the explicit packer,
-    # or through the per-element assign a fragment store converts implicitly. Asked of the
-    # FINALIZE, not of the set: a cross-CTA split's partial keeps the carrier in an f32 workspace
-    # and converts nothing.
-    assert "__float2half" in sources[-1] or "half2_rn" in sources[-1] or "acc" in sources[-1]
+    assert len(sources) == 1, "the pinned carrier is one kernel"
+    assert "emmy_mma_m16n8k16" in sources[0], "the score contraction reaches the tensor-core tier"
+    # The kernel writes the f16 output and converts at the boundary — through the explicit packer,
+    # or through the per-element assign a fragment store converts implicitly.
+    assert "__float2half" in sources[0] or "half2_rn" in sources[0] or "acc" in sources[0]
 
 
 # ===================================================================
@@ -270,12 +324,12 @@ def test_welford_variance_pair_fuses_into_one_carrier() -> None:
     assert fold.combine.alpha_eq(WELFORD.program(view.states))
     assert fold.init == (0.0, 0.0, 0.0, 0.0)
     score, one, mean, square = fold.lift.results
-    consts = {stmt.name: stmt.value for stmt in fold.lift.body if isinstance(stmt, Const)}
+    consts = {stmt.name: stmt.value.value for stmt in fold.lift.body if isinstance(stmt, Let)}
     products = {stmt.name: stmt.args for stmt in fold.lift.body if isinstance(stmt, Assign) and stmt.op.name == "multiply"}
     assert mean == score and consts[one] == 1.0, "the stable singleton is (x, 1, x, 0)"
     assert consts[square] == 0.0, "one element deviates from its own mean by nothing"
     assert products == {}, "no product in the term at all, so no channel reads bilinear"
-    injected = {stmt.name: stmt.value for stmt in fold.injected.body if isinstance(stmt, Const)}
+    injected = {stmt.name: stmt.value.value for stmt in fold.injected.body if isinstance(stmt, Let)}
     assert injected[fold.injected.results[3]] == 0.0, "psi takes it to 0 — a lone element deviates from its own mean by nothing"
     lowered = fold.lower(axes=axes)
     (loop,) = [stmt for stmt in lowered if isinstance(stmt, Loop)]  # ``1/N`` is hoisted ahead of it
@@ -368,9 +422,20 @@ def test_a_refusing_sibling_cluster_says_why(caplog) -> None:
     """A ``maximum`` fold whose same-axis sibling no recipe fuses onto it is the shape this pass
     exists for, refusing — and the demotion is otherwise invisible."""
     graph, _, _ = graph_from_code(
-        "torch.randn(64,128,dtype=torch.float16).amax(-1, keepdim=True) + torch.randn(64,128,dtype=torch.float16).sum(-1, keepdim=True)"
+        "(torch.randn(64,128,dtype=torch.float16) - torch.randn(64,128,dtype=torch.float16).amax(-1, keepdim=True)).sum(-1, keepdim=True)"
     )
-    with caplog.at_level(logging.DEBUG, logger="emmy.compiler.pipeline.passes.lowering.tile._twist"):
-        Pipeline.build(LOOP_PASSES + ["lowering/tile"]).run(graph, ctx=Context.from_target((12, 0)))
+    with caplog.at_level(logging.DEBUG, logger="emmy.compiler.pipeline.passes.tile._twist"):
+        Pipeline.build(LOOP_PASSES + ["tile/lift", "tile/cut", "tile/schedule"]).run(graph, ctx=Context.from_target((12, 0)))
     declines = [r.message for r in caplog.records if "declined" in r.message]
     assert declines, "a refusing max/sum sibling pair must name the predicate that refused"
+
+
+def test_replacing_shared_components_rebinds_every_reader() -> None:
+    """Two old edges may land on the same fused component under different reader names."""
+    first, second = slab("first", "x", "j"), slab("second", "x", "j")
+    reader = projection((first, second), (Assign("sum", "add", ("first", "second")),))
+    rewritten = _replace(reader, {id(second): (first, {0: 0})})
+    assert rewritten.operands == (first,)
+    assert rewritten.lift.params == ("first",)
+    assert rewritten.lift.body == Body((Assign("sum", "add", ("first", "first")),))
+    assert rewritten.free_axes == reader.free_axes

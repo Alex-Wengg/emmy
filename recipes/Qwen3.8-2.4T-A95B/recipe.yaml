@@ -3,8 +3,8 @@ tags:
   - untested
 model:
   huggingface: Qwen/Qwen3.8-2.4T-A95B
-  rationale: "Dominant 2.4T MoE breakout across all independent discovery sources."
-  heat: 95
+  rationale: "Strong family momentum but lacking independent fleet, download, or arena evidence this cycle."
+  heat: 55
   task: generate
 matrices:
 - deploy.gpu: NVIDIA B200

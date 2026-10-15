@@ -1,7 +1,7 @@
 """GreedyStrategy — the greedy compile as a search shape (``Pipeline.run``'s orchestration).
 
-The decide callback it resolves with — :func:`~..policy.greedy.greedy_decide` — and the pricing
-machinery live in ``policy/greedy.py``: that is the POLICY (what to pick at one fork); this
+The decide callback it resolves with — :func:`~..policy.greedy.greedy_decide` — lives in
+``policy/greedy.py``: that is the POLICY (what to pick at one fork); this
 module is the SHAPE (how many resolves, the blocklist retries, the loud failure).
 """
 
@@ -15,11 +15,19 @@ from typing import TYPE_CHECKING
 from emmy.compiler.context import Context
 from emmy.compiler.ir.loop.ir import LoopOp
 from emmy.compiler.ir.tile.ir import TileOp
-from emmy.compiler.pipeline.knob import family_of
+from emmy.compiler.pipeline.knob import axis_of, family_of, family_pins
 from emmy.compiler.pipeline.pipeline import Decision, LoweringError, Run
 from emmy.compiler.pipeline.search.db import SearchDB
-from emmy.compiler.pipeline.search.pins import composed_routes
-from emmy.compiler.pipeline.search.policy.greedy import _db_measured_index, _strip_fork_stamps, greedy_decide, logger, tile_identity
+from emmy.compiler.pipeline.search.golden.evidence import evidence_db
+from emmy.compiler.pipeline.search.pins import (
+    PLACEMENT_APPLIED_PINS_HINT,
+    PLACEMENT_DECISIONS_HINT,
+    composed_routes,
+    place_keys_tracked,
+    tracking_place_keys,
+    unmatched_place_pins,
+)
+from emmy.compiler.pipeline.search.policy.greedy import greedy_decide, logger, tile_identity
 from emmy.compiler.pipeline.search.strategy.base import SearchStrategy
 
 if TYPE_CHECKING:
@@ -45,11 +53,13 @@ class GreedyStrategy(SearchStrategy):
     * **Structural retirement** — a refused row blocklists at the piece's own schedule fork (its
       node id is stable across re-resolves), so the composed route replays while the piece
       re-ranks; once no row of the piece binds, the cut that minted it is retired at its own
-      fork — that one splice withdrawn, every other kernel-set decision still priced by the
+      fork — that one splice withdrawn, every other kernel-set decision still taken from the
       evidence — and the pieces' blocklists go with it.
-    * **Prior-off re-resolve** — when the blocklist budget exhausts, one final resolve without
-      the prior (emission-order pick) drops the extrapolation that overflowed; the measured
-      arms still decide the kernel-set forks they spell, and ``blocked`` rides along.
+    * **Prior-off re-resolve** — when the retry budget runs out or the retries have nothing left to
+      block, one final resolve drops the schedule prior at the nodes still un-lowered, and with it the
+      extrapolation that overflowed: those nodes take the first leaf the enumeration produces that
+      ``blocked`` does not list. Every other schedule fork keeps the prior, and kernel-set forks
+      still use measured arms and the placement prior.
     * **Loud failure** — a node the settled terminal left un-lowered raises
       :class:`~emmy.compiler.pipeline.pipeline.LoweringError` instead of a downstream
       ``CudaBackend`` mystery. What counts as un-lowered is the whole terminal when the
@@ -72,52 +82,76 @@ class GreedyStrategy(SearchStrategy):
         backend_name = getattr(backend, "name", "cuda")
         if ctx.backend_name != backend_name:
             ctx = replace(ctx, backend_name=backend_name)
-        db = self.db if self.db is not None else SearchDB()
         t_start = time.monotonic()
 
         # Only a pipeline that runs to the final lowering pass promises a Graph[CudaOp]; a
         # truncated build terminates in an earlier dialect, where a surviving tile is the answer.
         complete = pipeline.lowers_to_cuda
         blocked: dict[str, set[frozenset]] = {}
-        # A measured route row that marks several seams of one kernel is the composed decision a
-        # pinned compile consumed them as; the cut pass offers that arm beside its single seams so
-        # the row can spell it (``spelled_arm``), the way the pinned compile that measured it did.
-        # Only a pipeline that reaches the cut pass consults it: the loop-level lowerings a golden
-        # record's derivations run (hundreds per file) never do, and must not pay the evidence import.
-        with composed_routes(_measured_composed_routes(db, ctx) if complete else []):
+        # The evidence is the DB: the tune DB's rows, and the golden rows in scope imported among them
+        # (``evidence.evidence_db``). Only a pipeline that reaches the cut pass consults it: the
+        # loop-level lowerings a golden record's derivations run (hundreds per file) never do, and
+        # must not pay the import. A stored decision that marks several seams of one kernel is the
+        # composed decision a pinned compile consumed them as; the cut pass offers that arm beside
+        # its single seams so a row can spell it (``spelled_arm``), the way the compile that
+        # measured it did.
+        names = {pass_.name for pass_ in pipeline.passes}
+        reaches_placement = "tile/cut" in names
+        db = evidence_db(self.db, ctx) if reaches_placement else (self.db if self.db is not None else SearchDB())
+        # A caller already collecting resolved keys (the golden route check) reports them itself.
+        report_pins = reaches_placement and not place_keys_tracked()
+        with composed_routes(_measured_composed_routes(db) if reaches_placement else []), tracking_place_keys() as resolved:
             for _attempt in range(_MAX_GREEDY_RETRIES):
+                resolved.clear()
                 rejections: list[tuple[str, str, str]] = []
                 run = Run(pipeline=pipeline, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
                 terminal, trace = run.resolve(graph.copy(), greedy_decide(blocked=blocked, db=db))
                 stuck = _stuck(terminal, rejections, lowers_to_cuda=complete)
                 if not stuck or not _retire(blocked, trace, stuck):
                     break
-            # The prior-ranked tiles all overflowed ``validate(ctx)`` within the retry budget — an
-            # *online* prior can extrapolate a large tile onto a small shape, and the blocklist
-            # retry exhausts before reaching an in-budget leaf. Re-resolve WITHOUT the prior (the
-            # emission-order pick): the point is dropping the extrapolation that overflowed, not
-            # the quality of what emission order lands on. When that leaf overflows too the
-            # re-resolve stays un-lowered and ``_raise_on_unlowered`` fires below, exactly as
-            # before.
-            if _stuck(terminal, rejections, lowers_to_cuda=complete):
+            # The retries ran out, or had nothing left to block, with a node still un-lowered — an
+            # *online* prior can extrapolate a large tile onto a small shape, and the retry budget
+            # runs out before reaching an in-budget leaf. Re-resolve WITHOUT the schedule prior
+            # at the nodes still un-lowered (the emission-order pick): the point is dropping the
+            # extrapolation that overflowed, not the quality of what emission order lands on. Every
+            # other kernel keeps its prior-ranked pick. When that leaf overflows too the re-resolve
+            # stays un-lowered and ``_raise_on_unlowered`` fires below.
+            if stuck := _stuck(terminal, rejections, lowers_to_cuda=complete):
+                resolved.clear()
                 rejections = []
                 run = Run(pipeline=pipeline, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
-                terminal, _ = run.resolve(graph.copy(), greedy_decide(blocked=blocked, prior=None, db=db))
+                terminal, trace = run.resolve(graph.copy(), greedy_decide(blocked=blocked, db=db, unranked=frozenset(stuck)))
         _raise_on_unlowered(terminal, rejections, lowers_to_cuda=complete)
+        if report_pins:
+            for key in unmatched_place_pins(resolved):
+                logger.warning("PLACE pin %s names no seam of any kernel in this compile — it decided nothing", key)
+        terminal.hints.set(
+            PLACEMENT_DECISIONS_HINT,
+            [
+                {str(key): str(value) for key, value in decision.knob_delta.items() if family_of(str(key)) in {"PLACE", "LAYOUT"}}
+                for decision in trace
+                if any(family_of(str(key)) in {"PLACE", "LAYOUT"} for key in decision.knob_delta)
+            ],
+        )
+        terminal.hints.set(
+            PLACEMENT_APPLIED_PINS_HINT,
+            {key: value for key, value in family_pins("PLACE", kernels=True) if key in resolved and axis_of(key) is not None},
+        )
         logger.info("compile: total %.2fs (deterministic resolve)", time.monotonic() - t_start)
         return terminal
 
 
-def _measured_composed_routes(db, ctx) -> list[tuple[frozenset, tuple[str, ...]]]:
-    """Every measured route row in this compile's evidence that marks several seams ``cut`` — a
-    composed decision, keyed by the signature of the kernel it was recorded on (less the stamps a
-    schedule fork mints, as the evidence pick matches route rows) — for the cut pass to offer."""
-    out: list[tuple[frozenset, tuple[str, ...]]] = []
-    for signature, rows in _db_measured_index(db, ctx).routes.items():
-        for tun, _us in rows:
-            keys = tuple(sorted(key for key, value in tun.items() if family_of(key) == "PLACE" and value == "cut"))
-            if len(keys) > 1 and (entry := (_strip_fork_stamps(signature), keys)) not in out:
-                out.append(entry)
+def _measured_composed_routes(db) -> list[tuple[str, tuple[str, ...]]]:
+    """Measured placement cuts by exact parent identity.
+
+    Multi-seam routes add a composed arm; any route can keep its fresh child open
+    when that child has a later measured cut.
+    """
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for parent, arm in db.decisions():
+        keys = tuple(sorted(key for key, value in arm.items() if family_of(key) == "PLACE" and value == "cut"))
+        if keys and (entry := (parent, keys)) not in out:
+            out.append(entry)
     return out
 
 

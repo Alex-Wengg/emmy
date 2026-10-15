@@ -1,0 +1,331 @@
+"""Enumerate every kernel-set cut before any schedule is composed.
+
+Stored-Fold-edge placement is first, transposed-constant layout second, and cross-CTA reduction splitting third.
+The rule runs to a fixpoint, so each successful choice and every fresh piece re-enters these ordered
+domains before scheduling.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.schedule import Schedule, ScheduleContext, ScheduleRefused, schedule
+from emmy.compiler.ir.tile import TileOp
+from emmy.compiler.ir.tile.path import MissingSiteError, parse_key, resolve, sites
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.fork import DeferredFork
+from emmy.compiler.pipeline.knob import axis_of, family_of, family_pins
+from emmy.compiler.pipeline.passes.tile._cut import cuttable_seams, full_projection_seams, output_map, place_token, realize
+from emmy.compiler.pipeline.passes.tile._layout import layout_forks
+from emmy.compiler.pipeline.passes.tile._split import split_forks
+from emmy.compiler.pipeline.passes.tile.cut import takes_kernel_set_decision
+from emmy.compiler.pipeline.search.pins import composed_cuts_for, note_place_key
+
+PATTERN = [Pattern("root", TileOp)]
+FIXPOINT = True
+
+
+@dataclass(frozen=True)
+class _CutContext(ScheduleContext[DeferredFork, object, object]):
+    """One immutable frontier over the cut pass's already-restricted structural choices."""
+
+    choices: tuple[DeferredFork, ...]
+    _schedule: Schedule = field(default_factory=lambda: Schedule(None, {}, {}), repr=False)
+
+    @property
+    def schedule(self) -> Schedule:
+        return self._schedule
+
+    def extensions(self):
+        if self.schedule.kernel is None:
+            for choice in self.choices:
+                yield Schedule(choice, {}, {})
+
+    def extend(self, pick: Schedule) -> _CutContext:
+        if self.schedule.kernel is not None or pick.nodes or pick.edges or pick.kernel not in self.choices:
+            raise ScheduleRefused("pick is outside the cut frontier")
+        return replace(self, _schedule=pick)
+
+
+def _cut_arm(root: Node, materialize, seams) -> DeferredFork:
+    """The arm that cuts ``seams`` of ``root``'s kernel: it spells every occurrence of each clustered
+    value, names the seam each of those spellings stands for, and carries the redirect of the kernel's
+    buffers onto its pieces' outputs."""
+    knobs = {spelling: "cut" for seam in seams for spelling in (seam.spelling, *seam.aliases)}
+    aliases = {alias: seam.spelling for seam in seams for alias in seam.aliases}
+    return DeferredFork(materialize, knobs, structural=True, aliases=aliases, output=output_map(root))
+
+
+def _seam_index(seams) -> dict[int, object]:
+    """Map every seam node and clustered sibling to its shared decision."""
+    by_node = {}
+    for seam in seams:
+        by_node[id(seam.node)] = seam
+        by_node.update((id(sibling), seam) for sibling, *_ in seam.siblings)
+        by_node.update((id(sibling), seam) for sibling, _ in seam.indexed_siblings)
+    return by_node
+
+
+def _rootmost(seams, all_sites, refuse: frozenset[str] = frozenset()):
+    """Return the root-most seam not excluded by a scoped fuse pin."""
+    kept = [seam for seam in seams if seam.spelling not in refuse]
+    if not kept:
+        return None
+    depth = {id(site.node): site.depth for site in all_sites}
+    return min(kept, key=lambda candidate: depth[id(candidate.node)])
+
+
+def _child_pins() -> tuple[tuple[str, str, str], ...]:
+    """``(original, local key, value)`` for PLACE pins addressed to a cut piece.
+
+    The ``place_<token>/`` prefix identifies the piece; the remainder uses the ordinary
+    site spelling relative to that piece, or no suffix for its root-most cut.
+    """
+    return tuple(
+        (name, "PLACE" + ("@" + scope.partition("/")[2] if "/" in scope else ""), value)
+        for name, value in family_pins("PLACE", kernels=True)
+        if (scope := axis_of(name)) is not None and scope.startswith("place_")
+    )
+
+
+def _step_pin(key: str) -> tuple[int, str] | None:
+    """A root-site pin addressed to one same-name remainder after successive cuts."""
+    scope = axis_of(key) or ""
+    stage, slash, site = scope.partition("/")
+    if not stage.startswith("step.") or not stage[5:].isdigit() or (slash and not site):
+        return None
+    return int(stage[5:]), f"PLACE@{site}" if slash else "PLACE"
+
+
+def _site_exists(op, key: str) -> bool:
+    """Whether a scoped key addresses this fold tree."""
+    try:
+        return resolve(op, key) is not None
+    except MissingSiteError:
+        return False
+
+
+def _placement_candidates(tile: TileOp) -> tuple[tuple[tuple[str, str, str], ...], bool]:
+    """The original and local spellings of pins addressed to this kernel."""
+    targeted = _child_pins()
+    if targeted and (token := place_token(tile.name)) is not None:
+        # A nested cut keeps its ancestor's token in its name. Address only the most recent
+        # piece, so an ancestor's output-cut pin cannot cut the grandchild again.
+        matched = tuple(
+            (original, local, value)
+            for original, local, value in targeted
+            if original.split("@", 1)[1].split("/", 1)[0] == f"place_{token}"
+        )
+        return matched, True
+    return tuple((key, key, value) for key, value in family_pins("PLACE")), False
+
+
+def _placement_pins(tile: TileOp) -> tuple[tuple[tuple[str, str], ...], dict[str, str]]:
+    """Resolve child-site scope and the current cut stage before parsing site paths."""
+    candidates, child = _placement_candidates(tile)
+    selected: list[tuple[str, str]] = []
+    sources: dict[str, str] = {}
+    for original, local, value in candidates:
+        if original in tile.placement_consumed:
+            continue
+        staged = _step_pin(local)
+        if staged is not None and staged[0] != tile.placement_step:
+            continue
+        local = staged[1] if staged is not None else local
+        previous = next((sources.get(name, name) for name, _ in selected if name == local), None)
+        if previous is not None:
+            raise ValueError(f"PLACE pins {previous!r} and {original!r} address the same site at step {tile.placement_step}")
+        selected.append((local, value))
+        if staged is not None or child:
+            sources[local] = original
+    return (tuple(selected), sources) if selected or not child else ((("PLACE", "fuse"),), {})
+
+
+def _placement_restriction(tile: TileOp, seams) -> tuple[tuple, str, frozenset[str]] | None:
+    """The authoritative placement spelled by live PLACE pins, or ``None``.
+
+    This restriction is consumed entirely by the cut pass before classic schedule enumeration.
+    Every scoped ``PLACE@site=cut`` pin that resolves on this kernel joins ONE composed decision —
+    the seams all live on this kernel's tree, so one realization cuts them together. A numbered
+    ``PLACE@step.N/site=cut`` pin applies only after N same-name cuts. A bare ``PLACE=cut``
+    consumes its root-most cut the same way. A scoped pin whose
+    site path does not exist on this kernel addresses another kernel of the graph; a kernel none of
+    the pins address decides FUSE, so the unpinned fork never returns under a pin-driven compile.
+    A pin that resolves to a site no cut realizes is an addressing error and raises. A scoped
+    ``PLACE@site=fuse`` excludes that seam from the composed cut (alone, it decides fuse under
+    that spelling). A bare cut supplies the primary root-most seam and composes with scoped cuts;
+    a bare fuse applies only when no scoped pin addressed this kernel."""
+    scoped_pins, source_keys = _placement_pins(tile)
+    pins = [(name, value) for name, value in scoped_pins if family_of(name) == "PLACE"]
+    if not pins:
+        # A numbered future cut cannot choose an unpinned prerequisite at this stage.
+        if any((step := _step_pin(key)) is not None and step[0] > tile.placement_step for key, _ in family_pins("PLACE")):
+            return ("PLACE",), "fuse", frozenset()
+        return None
+    for _, value in pins:
+        if value not in {"fuse", "cut"}:
+            raise ValueError(f"bad PLACE value {value!r}; expected 'fuse' or 'cut'")
+    all_sites = sites(tile.op)
+    by_node = _seam_index(seams)
+    cut: list = []
+    fused: list[str] = []
+    addressed: list[tuple[str, str, object]] = []
+    missing = False
+    for name, value in pins:
+        if name == "PLACE":
+            continue
+        try:
+            site = resolve(tile.op, name, all_sites=all_sites)
+        except MissingSiteError:
+            missing = True  # the key addresses a seam of another kernel in the graph
+            continue
+        if id(site.node) not in by_node:
+            raise ValueError(f"PLACE pin {name!r} does not address a cuttable Fold edge in this kernel")
+        seam = by_node[id(site.node)]
+        addressed.append((source_keys.get(name, name), value, seam))
+        if value == "fuse":
+            fused.append(seam.spelling)
+        elif not any(chosen is seam for chosen in cut):
+            cut.append(seam)
+    refused = frozenset(fused)
+    cut = [seam for seam in cut if seam.spelling not in refused]
+    bare = next(((name, value) for name, value in pins if name == "PLACE"), None)
+    if bare is not None and bare[1] == "cut":
+        seam = _rootmost(seams, all_sites, refused)
+        if seam is not None and not any(chosen is seam for chosen in cut):
+            cut.append(seam)
+    if cut:
+        for original, value, seam in addressed:
+            if (value == "cut" and any(chosen is seam for chosen in cut)) or (value == "fuse" and seam.spelling in refused):
+                note_place_key(original)
+        used = frozenset(original for original, _, _ in addressed)
+        if bare is not None and bare[1] == "cut":
+            original = source_keys.get("PLACE", "PLACE")
+            note_place_key(original)
+            used |= {original}
+        return tuple(cut), "cut", used
+    if fused:
+        for original, value, seam in addressed:
+            if value == "fuse" and seam.spelling in refused:
+                note_place_key(original)
+        return (fused[0],), "fuse", frozenset()
+    if bare is not None:
+        if bare[1] == "fuse":
+            note_place_key(source_keys.get("PLACE", "PLACE"))
+        return ("PLACE",), "fuse", frozenset()
+    if missing:
+        return ("PLACE",), "fuse", frozenset()
+    return None
+
+
+def _composed_forks(match: Match, root: Node, tile: TileOp, seams, ctx) -> list[DeferredFork]:
+    """One composed arm per measured route of this kernel that names several of its seams
+    (:func:`composed_cuts_for`) — the decision a pinned compile consumed those seams as, offered
+    again so the row that measured it can spell it. A route is registered for every kernel of the
+    compile, so most of its keys address another one: a scoped key whose path is not on this tree is
+    skipped, and a BARE key is skipped whatever tree it meets. The codec spells bare for a family
+    with ONE site, so the kernel that spelled it has one seam and composes with nothing — the key is
+    always another kernel's, and resolving it here only asks this tree a question about somebody
+    else, which on a tree with several sites is ambiguous and ended the compile. A route that
+    resolves to fewer than two seams adds nothing the single arms lack."""
+    if ctx is None:
+        return []
+    routes = composed_cuts_for(tile.identity_key(structural=False, with_io=True))
+    if not routes:
+        return []
+    all_sites = sites(tile.op)
+    by_node = _seam_index(seams)
+    out: list[DeferredFork] = []
+    for keys in routes:
+        chosen: list = []
+        for name in keys:
+            if parse_key(name).bare:
+                continue
+            try:
+                site = resolve(tile.op, name, all_sites=all_sites)
+            except MissingSiteError:
+                continue
+            note_place_key(name)
+            seam = by_node.get(id(site.node)) if site is not None else None
+            if seam is not None and not any(picked is seam for picked in chosen):
+                chosen.append(seam)
+        if len(chosen) > 1:
+            composed = tuple(chosen)
+            out.append(_cut_arm(root, lambda composed=composed: realize(match, root, composed), composed))
+    return out
+
+
+def _placement_forks(match: Match, root: Node, tile: TileOp, ctx=None):
+    """Return the next stored-edge cut fork, or ``None`` when that domain is consumed."""
+    seams = cuttable_seams(tile)
+    if not seams:
+        return None
+
+    pinned = _placement_restriction(tile, seams)
+    if pinned is not None:
+        chosen, value, used = pinned
+        if value == "fuse":
+            (spelling,) = chosen
+            return DeferredFork(lambda: replace(tile, placement_decided=True), {spelling: "fuse"})
+
+        consumed = tile.placement_consumed | used
+        pending = tuple(
+            (original, local) for original, local, _ in _placement_candidates(tile)[0] if original != "PLACE" and original not in consumed
+        )
+
+        def cut():
+            fragment = realize(match, root, chosen, placement_decided=not _child_pins())
+            for node in fragment.nodes.values():
+                if isinstance(node.op, TileOp) and node.op.name == tile.name:
+                    # A numbered pin may name a site exposed by a later cut; until its step,
+                    # the future-step guard in _placement_restriction chooses fuse. An ordinary
+                    # pin keeps this remainder open only when its site exists here.
+                    next_step = node.op.placement_step
+                    later = False
+                    for _, local in pending:
+                        staged = _step_pin(local)
+                        if staged is not None:
+                            later = staged[0] >= next_step
+                        else:
+                            later = _site_exists(node.op.op, local)
+                        if later:
+                            break
+                    node.op = replace(node.op, placement_decided=not later, placement_consumed=consumed)
+            return fragment
+
+        return _cut_arm(root, cut, chosen)
+
+    options = [DeferredFork(lambda: replace(tile, placement_decided=True), {"PLACE": "fuse"})]
+    options.extend(_cut_arm(root, lambda seam=seam: realize(match, root, (seam,)), (seam,)) for seam in seams)
+    whole = full_projection_seams(tile, seams)
+    if whole:
+        options.append(_cut_arm(root, lambda: realize(match, root, whole), whole))
+    options.extend(_composed_forks(match, root, tile, seams, ctx))
+    return options
+
+
+def rewrite(match: Match, root: Node, ctx=None):
+    tile: TileOp = root.op
+    if not takes_kernel_set_decision(tile):
+        raise RuleSkipped("TileOp already scheduled")
+    if tile.carries:
+        # The runner launches one kernel's steps to completion before the next kernel's first, so
+        # the pieces of a cut could not interleave step by step: piece two's step c would read what
+        # piece one stored at EVERY step. A kernel that carries a state takes no cut; its one
+        # kernel-set decision is the split across the sequence (``_split.realize_carry_split``).
+        choices = split_forks(match, root)
+        if choices is None:
+            raise RuleSkipped("a kernel that carries a state is one kernel")
+        options = [cut.kernel for cut in schedule(_CutContext(tuple(choices)))]
+        return options if len(options) > 1 else options[0]
+    choices = None if tile.placement_decided else _placement_forks(match, root, tile, ctx)
+    if choices is None:
+        choices = layout_forks(match, root)
+    if choices is None:
+        choices = split_forks(match, root)
+    if choices is None:
+        raise RuleSkipped("no pending kernel-set cut")
+    choices = choices if isinstance(choices, list) else [choices]
+    options = [cut.kernel for cut in schedule(_CutContext(tuple(choices)))]
+    return options if len(options) > 1 else options[0]

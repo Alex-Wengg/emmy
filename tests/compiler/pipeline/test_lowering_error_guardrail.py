@@ -23,15 +23,13 @@ past it.
 ``GreedyStrategy`` reads the settled terminal itself, so both reach the
 same fallbacks — blocklist the row and re-resolve, then re-resolve once
 with the prior dropped — and, if nothing lowers the node, the same loud
-:class:`LoweringError` naming it. The tuning path
-(``Pipeline.tune_async`` / ``TuningSearch``) never raises: a dropped
-branch is a graceful dead end there, sibling branches carry other tile
-shapes, and an un-lowered terminal is priced a ``bench_fail``.
+:class:`LoweringError` naming it.
 """
 
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 
 import pytest
 
@@ -42,9 +40,8 @@ from emmy.compiler.ir.kernel.ir import KernelOp, Smem
 from emmy.compiler.ir.tile.ir import TileOp
 from emmy.compiler.pipeline import FINAL_LOWERING_PASS, LoweringError
 from emmy.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule, RuleSkipped
-from emmy.compiler.pipeline.search.policy.terminal_bench import point_stats
-from emmy.compiler.pipeline.search.strategy.greedy import _raise_on_unlowered
-from tests.compiler.helpers import drain_tune
+from emmy.compiler.pipeline.search.strategy import greedy as greedy_strategy
+from emmy.compiler.pipeline.search.strategy.greedy import GreedyStrategy, _raise_on_unlowered
 
 
 def _small_smem_ctx() -> Context:
@@ -53,12 +50,16 @@ def _small_smem_ctx() -> Context:
     return Context(compute_capability=(9, 0), max_dynamic_smem=2048)
 
 
+_STAMP = {"S_test": 1.0}
+
+
 def _graph_with_tile() -> Graph:
     """``x -> y`` where ``y`` holds a (placeholder) ``TileOp``. The rule's
-    rewrite ignores the body, so an empty one is fine."""
+    rewrite ignores the body, so an empty one is fine; the stamp stands in
+    for the body the featurizer would read."""
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4,), "f32"), node_id="x")
-    g.add_node(op=TileOp(name="k_test"), inputs=["x"], output=Tensor("y", (4,), "f32"), node_id="y")
+    g.add_node(op=TileOp(name="k_test", knobs=_STAMP), inputs=["x"], output=Tensor("y", (4,), "f32"), node_id="y")
     g.inputs = ["x"]
     g.outputs = ["y"]
     return g
@@ -149,67 +150,26 @@ def test_greedy_run_raises_lowering_error():
     assert "smem 16384 > max_dynamic_smem 2048" in msg
 
 
-def test_tuning_does_not_raise_and_prunes_branch():
-    from emmy.compiler.pipeline import TuningSearch
-    from emmy.compiler.pipeline.search.db import SearchDB
+def test_truncated_kernel_pipeline_registers_measured_composed_routes(monkeypatch):
+    """``compile --ir kernel`` still runs the placement pass, so its measured multi-cut route
+    must be registered even though the truncated pipeline does not lower through CUDA."""
+    routes = [(frozenset({("S_shape", "128")}), ("PLACE@map", "PLACE@map.1/map"))]
+    registered = []
 
-    pipeline = _build_pipeline()
-    terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
-    # Tuning yields the (dead) terminal without raising; the node stays a
-    # TileOp because its only lowering option was validate-filtered.
-    assert terminals, "tuning should still yield the dead terminal"
-    assert isinstance(terminals[0].graph.nodes["y"].op, TileOp)
+    monkeypatch.setattr(greedy_strategy, "_measured_composed_routes", lambda _db: routes)
 
+    @contextmanager
+    def capture_composed_routes(value):
+        registered.append(value)
+        yield
 
-# ---------------------------------------------------------------------------
-# Tune-side bench guard: a terminal still carrying an un-lowered node is a
-# bench_fail decided in ``_TerminalBench.prelude`` — never an ``ok``. Without
-# the guard the un-lowered node is invisible to the bench (it sums CudaOps
-# only): a no-CudaOp terminal reported ok @ 0 µs, and a cached residual kernel
-# (a split's finalize) reported its own µs as the terminal's — the issue-#327
-# "impossibly fast" ok rows that poisoned the tune DB.
-# ---------------------------------------------------------------------------
+    monkeypatch.setattr(greedy_strategy, "composed_routes", capture_composed_routes)
+    monkeypatch.setattr(greedy_strategy.Run, "resolve", lambda _run, graph, _decide: (graph, []))
+    pipeline = Pipeline(passes=[Pass(name="tile/cut", rules=[], index=0), Pass(name="lowering/kernel", rules=[], index=1)])
 
+    GreedyStrategy(pipeline, db=object()).run(Graph(), ctx=_small_smem_ctx())
 
-def _terminal_bench(graph, *, backend, db):
-    from types import SimpleNamespace
-
-    from emmy.compiler.pipeline.search.policy.terminal_bench import TerminalBench as _TerminalBench
-
-    return _TerminalBench(SimpleNamespace(graph=graph, ctx=_small_smem_ctx()), backend=backend, db=db)
-
-
-def test_unlowered_terminal_is_bench_fail_without_cuda_nodes():
-    from emmy.compiler.pipeline.search.db import SearchDB
-
-    b = _terminal_bench(_graph_with_tile(), backend=None, db=SearchDB())
-    assert b.unlowered == ["y"]
-    kind, (_stats, status) = b.prelude()
-    assert kind == "done"
-    assert status == "bench_fail"
-
-
-def test_unlowered_terminal_is_bench_fail_despite_cached_residual_kernel():
-    from emmy.compiler.ir.cuda.ir import CudaOp
-    from emmy.compiler.pipeline.search.db import SearchDB
-
-    class _StubBackend:
-        name = "cuda"
-        bench_run_timeout_s = 1.0
-
-    # ``x -> y (TileOp) -> z (CudaOp)`` — the split shape: an un-lowered partial
-    # feeding a lowered finalize whose perf row is already cached.
-    g = _graph_with_tile()
-    cuda = CudaOp(kernel_source="__global__ void k_fin() {}", kernel_name="k_fin")
-    g.add_node(op=cuda, inputs=["y"], output=Tensor("z", (4,), "f32"), node_id="z")
-    g.outputs = ["z"]
-    db = SearchDB()
-    b = _terminal_bench(g, backend=_StubBackend(), db=db)
-    db.record_perf(b.context_key, cuda.identity_key(with_io=True, with_knobs=True), backend="cuda", status="ok", stats=point_stats(104.0))
-    kind, (stats, status) = b.prelude()
-    assert kind == "done"
-    assert status == "bench_fail"
-    assert stats.median > 104.0  # the pinned fail latency, not the residual kernel's cached µs
+    assert registered == [routes]
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +179,7 @@ def test_unlowered_terminal_is_bench_fail_despite_cached_residual_kernel():
 # the prior dropped recovers the in-budget tile (these fixture rules emit it
 # first — a property of the fixture, not a promise the enumeration makes; the
 # fallback is a VALIDITY mechanism and claims nothing about speed). This is the
-# tune-time golden-sweep crash: a prior trained on big square matmuls picked a
+# golden-sweep crash: a prior trained on big square matmuls picked a
 # >smem-cap tile for the tiny ``qwen3_06b.q_proj`` projection and the assemble
 # raised instead of falling back.
 # ---------------------------------------------------------------------------
@@ -228,18 +188,19 @@ def test_unlowered_terminal_is_bench_fail_despite_cached_residual_kernel():
 class _BiggestBNFirstPrior:
     """Stub global prior that ranks leaves by ``BN`` descending — i.e. always
     prefers the largest (over-budget) tile, the way a prior trained on big
-    square matmuls extrapolates onto a tiny shape. ``pick`` returns the
-    argmax-BN row, so greedy keeps choosing over-budget tiles until the
-    blocklist retry budget is exhausted."""
+    square matmuls extrapolates onto a tiny shape. The argmax-BN row scores
+    lowest, so greedy keeps choosing over-budget tiles until the blocklist
+    retry budget is exhausted."""
 
     fitted = True
 
-    def pick(self, rows: list[dict]) -> tuple[int, float]:
-        best_i = max(range(len(rows)), key=lambda i: rows[i].get("BN", 0))
-        return best_i, 0.0
+    def mean_scores_features(self, rows: list[dict]) -> list[float]:
+        return [-float(row.get("BN", 0)) for row in rows]
 
 
-def _two_pass_tile_pipeline(n_over_budget: int, *, decline: bool = False) -> Pipeline:
+def _two_pass_tile_pipeline(
+    n_over_budget: int, *, decline: bool = False, overflowing: str | None = None, widest_first: bool = False
+) -> Pipeline:
     """Mirror the real lowering shape: pass 0 (partition → tile ``Fork``) emits
     an in-budget option-0 (``BN=8``, emitted first) followed by
     ``n_over_budget`` over-budget tile leaves (``BN=16, 24, …``); pass 1
@@ -254,8 +215,10 @@ def _two_pass_tile_pipeline(n_over_budget: int, *, decline: bool = False) -> Pip
 
     With ``decline`` those same leaves are declined by an ordinary ``RuleSkipped``
     instead — the row is refused with nothing recorded, the second way a node ends up
-    stranded."""
-    from emmy.compiler.pipeline.fork import OptionFork
+    stranded. With ``overflowing`` only that node's wide tiles overflow; every tile of
+    every other node fits. With ``widest_first`` the widest over-budget leaf is emitted
+    before the in-budget one, so emission order alone would pick a leaf that overflows."""
+    from emmy.compiler.pipeline.fork import DeferredFork
 
     def _tile_leaf(bn: int) -> TileOp:
         return TileOp(name="k_test", knobs={"BN": bn})
@@ -263,9 +226,9 @@ def _two_pass_tile_pipeline(n_over_budget: int, *, decline: bool = False) -> Pip
     def emit_tiles(root):
         if "BN" in root.op.knobs:  # already tiled (our own output) → don't re-fork
             raise RuleSkipped("already tiled")
-        leaves = [OptionFork(option=_tile_leaf(8), knobs={"BN": 8})]
-        leaves += [OptionFork(option=_tile_leaf(16 + 8 * i), knobs={"BN": 16 + 8 * i}) for i in range(n_over_budget)]
-        return leaves
+        wide = [16 + 8 * i for i in range(n_over_budget)]
+        order = [wide[-1], 8, *wide[:-1]] if widest_first else [8, *wide]
+        return [DeferredFork(lambda bn=bn: _tile_leaf(bn), {"BN": bn}) for bn in order]
 
     def materialize(root):
         bn = root.op.knobs.get("BN", 0)
@@ -273,7 +236,8 @@ def _two_pass_tile_pipeline(n_over_budget: int, *, decline: bool = False) -> Pip
             # The SILENT decline: an ordinary ``RuleSkipped`` (``reject=False``) records
             # nothing in the rejection sink, so only the surviving TileOp says the row failed.
             raise RuleSkipped(f"nothing lowers BN={bn}")
-        extents = (64,) if bn <= 8 else (4096,)  # 256 B fits the 2 KiB cap; 16 KiB overflows
+        fits = bn <= 8 or overflowing not in (None, root.id)
+        extents = (64,) if fits else (4096,)  # 256 B fits the 2 KiB cap; 16 KiB overflows
         return KernelOp(body=[Smem(name="buf", extents=extents, dtype="float")], name="k_test", knobs={"BN": bn})
 
     emit_rule = Rule(
@@ -307,6 +271,34 @@ def test_greedy_run_falls_back_to_option0_when_prior_overflows(monkeypatch):
     op = terminal.nodes["y"].op
     assert isinstance(op, KernelOp), "the in-budget first-emitted tile must lower (no LoweringError)"
     assert op.knobs.get("BN") == 8, "the recovered tile is the budget-safe emission-order leaf"
+
+
+def test_emission_order_fallback_keeps_the_prior_at_every_other_node(monkeypatch):
+    # One node whose prior-ranked tiles all overflow exhausts the retry budget. The fallback
+    # drops the prior at that node alone: its neighbour, whose every tile fits, keeps the
+    # prior's pick instead of falling to emission order with it.
+    import emmy.compiler.pipeline.search.policy.greedy as greedy_mod
+
+    monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
+    graph = _graph_with_tile()
+    graph.add_node(op=TileOp(name="k_test", knobs=_STAMP), inputs=["x"], output=Tensor("z", (4,), "f32"), node_id="z")
+    graph.outputs = ["y", "z"]
+    terminal = _two_pass_tile_pipeline(n_over_budget=12, overflowing="y").run(graph, ctx=_small_smem_ctx())
+    assert terminal.nodes["y"].op.knobs.get("BN") == 8, "the stuck node takes the emission-order leaf"
+    assert terminal.nodes["z"].op.knobs.get("BN") == 16 + 8 * 11, "its neighbour keeps the prior's widest tile"
+
+
+def test_emission_order_fallback_skips_the_blocked_leaves(monkeypatch):
+    # The widest tile is emitted first and overflows, and the first retry blocks it. Emission
+    # order alone would pick it again in the fallback; the fallback takes the first leaf the
+    # retries did not block, which here is the in-budget one.
+    import emmy.compiler.pipeline.search.policy.greedy as greedy_mod
+
+    monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
+    terminal = _two_pass_tile_pipeline(n_over_budget=12, widest_first=True).run(_graph_with_tile(), ctx=_small_smem_ctx())
+    op = terminal.nodes["y"].op
+    assert isinstance(op, KernelOp), "the fallback must not re-pick the blocked widest tile"
+    assert op.knobs.get("BN") == 8
 
 
 def test_greedy_run_still_raises_when_no_in_budget_option(monkeypatch):
@@ -365,7 +357,7 @@ def test_greedy_run_raises_when_the_only_lowering_declines_silently():
 def test_greedy_run_keeps_the_tile_terminal_of_a_truncated_pipeline():
     # ``emmy compile --ir tile`` and the loop backend stop before the final lowering pass,
     # where a surviving TileOp is the requested answer — the check must not fire there.
-    terminal = _silently_declining_pipeline("lowering/tile").run(_graph_with_tile(), ctx=_small_smem_ctx())
+    terminal = _silently_declining_pipeline("tile/schedule").run(_graph_with_tile(), ctx=_small_smem_ctx())
     assert isinstance(terminal.nodes["y"].op, TileOp)
 
 
@@ -382,24 +374,9 @@ def test_greedy_run_retries_past_a_silently_declined_row(monkeypatch):
     assert op.knobs.get("BN") == 8
 
 
-def test_tuning_prunes_a_silently_declined_row_without_raising():
-    # Under tune the same decline stays a graceful dead end: the terminal is yielded with
-    # the node still a TileOp and ``TerminalBench`` prices it a bench_fail — never a raise
-    # that would abort the whole session over one row.
-    from emmy.compiler.pipeline import TuningSearch
-    from emmy.compiler.pipeline.search.db import SearchDB
-
-    pipeline = _silently_declining_pipeline(FINAL_LOWERING_PASS)
-    terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
-    assert terminals, "tuning should still yield the dead terminal"
-    assert isinstance(terminals[0].graph.nodes["y"].op, TileOp)
-
-
 def test_run_leaves_no_state_on_pipeline():
     # The rejection sink is Run-scoped (``Run.rejections``), never stashed on
-    # the shared frozen Pipeline — a subsequent tune on the same Pipeline sees
-    # no sink (silent fork-pruning preserved), and concurrent runs can't
-    # clobber each other.
+    # the shared frozen Pipeline, so concurrent runs can't clobber each other.
     pipeline = _build_pipeline()
     with pytest.raises(LoweringError):
         pipeline.run(_graph_with_tile(), ctx=_small_smem_ctx())
@@ -407,12 +384,7 @@ def test_run_leaves_no_state_on_pipeline():
 
 
 # ---------------------------------------------------------------------------
-# Per-variant containment: a lowering pass that *raises* (not a validate
-# filter) aborts a greedy compile loudly, but under tune is a dropped dead
-# end so one un-lowerable search fork can't abort the whole tune. This is the
-# stacked defect the static tune-findings report flagged: an un-handled
-# fused-cell slab shape (compute_phase_info LoweringError) / an orphan AtomTile
-# at render would crash mid-tune with no per-variant containment.
+# A lowering pass that *raises* (not a validate filter) aborts a greedy compile loudly.
 # ---------------------------------------------------------------------------
 
 
@@ -441,63 +413,6 @@ def test_greedy_run_propagates_lowering_exception():
     pipeline = _build_raising_pipeline()
     with pytest.raises(LoweringError, match="synthetic un-lowerable shape"):
         pipeline.run(_graph_with_tile(), ctx=_small_smem_ctx())
-
-
-def test_tuning_contains_raising_lowering_pass(caplog):
-    # Under tune, ``Run.drive`` catches the lowering exception, drops the
-    # candidate's subtree, logs a warning, and finishes without raising —
-    # so a single un-lowerable fork can't abort the whole tune.
-    import logging
-
-    from emmy.compiler.pipeline import TuningSearch
-    from emmy.compiler.pipeline.search.db import SearchDB
-
-    pipeline = _build_raising_pipeline()
-    with caplog.at_level(logging.WARNING, logger="emmy.compiler.pipeline"):
-        terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
-    # The only lowering option raised, so no terminal is benchable — the search
-    # ends cleanly with zero terminals instead of crashing.
-    assert terminals == []
-    assert any("dropped un-lowerable candidate" in r.message for r in caplog.records)
-
-
-def test_tuning_contains_raising_fork_thunk(caplog):
-    # Same containment, one step earlier in the loop: a rule can defer the
-    # un-lowerable shape behind a ``DeferredFork`` thunk, so the raise lands in
-    # ``LazyCandidate.resolve`` -> ``Fork.expand`` -> the rule's materializer
-    # rather than in the next ``_step``. Observed in the wild on a DeepSeek-V4
-    # tune (a realize-time cut guardrail firing under ``030_cut``'s realize
-    # lambda), where it killed the whole session. The sibling option must still
-    # reach a terminal.
-    import logging
-
-    from emmy.compiler.pipeline import TuningSearch
-    from emmy.compiler.pipeline.fork import DeferredFork
-    from emmy.compiler.pipeline.search.db import SearchDB
-
-    def raise_at_expand():
-        raise LoweringError("synthetic un-lowerable shape")
-
-    def rewrite(root):  # noqa: ARG001 — both options are fixed
-        return [
-            DeferredFork(materialize=raise_at_expand, knobs={"BN": 8}),
-            KernelOp(body=[Smem(name="buf", extents=(64,), dtype="float")], name="k_test", knobs={"BN": 16}),
-        ]
-
-    rule = Rule(
-        name="__deferred_raising_lower__",
-        pattern=[Pattern(name="root", op_type=TileOp)],
-        rewrite=rewrite,
-        param_names=tuple(inspect.signature(rewrite).parameters.keys()),
-    )
-    pass_ = Pass(name="__test_deferred_raise__", rules=[rule], index=0)
-    rule.pass_ = pass_
-    pipeline = Pipeline(passes=[pass_])
-
-    with caplog.at_level(logging.WARNING, logger="emmy.compiler.pipeline"):
-        terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
-    assert [t.graph.nodes["y"].op.knobs.get("BN") for t in terminals] == [16], "the surviving sibling must still terminate"
-    assert any("dropped un-lowerable candidate" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +479,7 @@ def test_greedy_run_raises_when_the_projection_tail_is_mis_sliced():
 # A refused row on ONE piece of a composed route re-ranks that piece inside the
 # same structural route, across as many retries as the piece has rows; once no
 # row of the piece binds, the one structural pick retired is the cut that minted
-# the piece, so every other kernel-set decision stays priced by evidence.
+# the piece, so every other kernel-set decision stays as the evidence took it.
 # Observed on the DeepSeek-V4 ``post4096`` twin: the greedy elected the composed
 # placement route, a consumer piece's top-ranked row was refused by the kernel
 # binder, and the retry could never re-rank it — the blocklist was keyed on the
@@ -582,40 +497,40 @@ def _composed_fragment(input_id: str, suffix: str) -> Graph:
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor(input_id, (4,), "f32"), node_id=input_id)
     ws, cut = f"y_ws{suffix}", f"y__cut{suffix}"
-    g.add_node(op=TileOp(name=f"k_ws{suffix}"), inputs=[input_id], output=Tensor(ws, (4,), "f32"), node_id=ws)
-    g.add_node(op=TileOp(name=f"k_residual{suffix}"), inputs=[ws], output=Tensor(cut, (4,), "f32"), node_id=cut)
+    g.add_node(op=TileOp(name=f"k_ws{suffix}", knobs=_STAMP), inputs=[input_id], output=Tensor(ws, (4,), "f32"), node_id=ws)
+    g.add_node(op=TileOp(name=f"k_residual{suffix}", knobs=_STAMP), inputs=[ws], output=Tensor(cut, (4,), "f32"), node_id=cut)
     g.outputs = [cut]
     return g
 
 
 def _composed_route_pipeline(refused: dict[str, set[int]], *, rows: tuple[int, ...] = (8, 16), cut_residual: bool = False) -> Pipeline:
     """Pass 0 is the kernel-set fork at ``k_test`` (and, with ``cut_residual``, again at the residual
-    ``k_residual`` — the piece's own cut): the fused ``rows`` beside the composed route. Pass 1
-    schedules each piece over ``rows``. Pass 2 materializes every row except the ``refused`` ones
+    ``k_residual`` — the piece's own cut): keep it fused beside the composed route. Pass 1
+    schedules each kernel over ``rows``. Pass 2 materializes every row except the ``refused`` ones
     per kernel name, which it declines with a rejecting skip — the kernel binder's
     projection-ownership refusal. Pass 3 is the kernel-stage policy stamp: a decided knob lands on
     every node still un-lowered, exactly as ``LOOPIFY`` does on the production terminal."""
     from dataclasses import replace
 
-    from emmy.compiler.pipeline.fork import OptionFork
+    from emmy.compiler.pipeline.fork import DeferredFork
     from emmy.compiler.pipeline.pipeline import RuleSkipped
 
     def cut(root):
-        if "BN" in root.op.knobs:
-            raise RuleSkipped("already scheduled")
+        if "BN" in root.op.knobs or "PLACE" in root.op.knobs:
+            raise RuleSkipped("already decided")
         if root.op.name == "k_test":
             fragment, seam = _composed_fragment("x", ""), "PLACE@seam"
         elif root.op.name == "k_residual" and cut_residual:
             fragment, seam = _composed_fragment("y_ws", "2"), "PLACE@seam.1"
         else:
             raise RuleSkipped("not a kernel-set fork")
-        fused = [OptionFork(option=TileOp(name=root.op.name, knobs={"BN": bn}), knobs={"BN": bn}) for bn in rows]
-        return [*fused, OptionFork(option=fragment, knobs={seam: "cut"})]
+        fused = DeferredFork(lambda: TileOp(name=root.op.name, knobs={"PLACE": "fuse"}), {"PLACE": "fuse"})
+        return [fused, DeferredFork(lambda: fragment, {seam: "cut"}, structural=True)]
 
     def schedule(root):
         if "BN" in root.op.knobs:
             raise RuleSkipped("already scheduled")
-        return [OptionFork(option=replace(root.op, knobs={"BN": bn}), knobs={"BN": bn}) for bn in rows]
+        return [DeferredFork(lambda bn=bn: TileOp(name=root.op.name, knobs={"BN": bn}), {"BN": bn}) for bn in rows]
 
     def materialize(root):
         bn = root.op.knobs["BN"]
@@ -637,13 +552,12 @@ def _composed_route_pipeline(refused: dict[str, set[int]], *, rows: tuple[int, .
 
 
 def _elect_composed_route(monkeypatch) -> None:
-    """The prior ranks the widest ``BN`` first; every composed route prices below its fused side,
-    and the fused root is disqualified (``inf`` — every measured variant of it failed)."""
+    """The prior ranks the widest ``BN`` first, and every kernel-set fork takes its composed route while one is
+    on the ballot — the placement prior's pick on the DeepSeek-V4 twin."""
     import emmy.compiler.pipeline.search.policy.greedy as greedy_mod
 
     monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
-    monkeypatch.setattr(greedy_mod, "_price_graph", lambda *_: 1.0)
-    monkeypatch.setattr(greedy_mod, "_price_op_leaf", lambda fp, *_: float("inf") if fp.root_op.name == "k_test" else 10.0)
+    monkeypatch.setattr(greedy_mod, "_kernel_set_pick", lambda fp, *_: next((o for o in fp.flat() if o.structural), fp.flat()[0]))
 
 
 def _kernels(terminal: Graph) -> dict[str, tuple[str, int]]:
@@ -659,9 +573,19 @@ def test_refused_piece_rows_rerank_within_the_composed_route(monkeypatch):
     assert _kernels(terminal) == {"y_ws": ("k_ws", 24), "y": ("k_residual", 8)}, "the refused piece re-ranks onto its third row"
 
 
+def test_greedy_compile_retains_final_placement_receipt(monkeypatch):
+    """The A/B pin gate can verify a consumed graph splice after CUDA emission."""
+    from emmy.compiler.pipeline.search.pins import PLACEMENT_DECISIONS_HINT
+
+    _elect_composed_route(monkeypatch)
+    terminal = _composed_route_pipeline({}).run(_graph_with_tile(), ctx=_small_smem_ctx())
+
+    assert {"PLACE@seam": "cut"} in terminal.hints.get(PLACEMENT_DECISIONS_HINT)
+
+
 def test_exhausted_piece_retires_only_its_own_cut(monkeypatch, caplog):
     # Every row of the residual's own residual piece is refused: the cut that minted it is retired
-    # at its fork and re-priced, while the root's cut — an evidence decision — stays. Retirement
+    # at its fork and decided again, while the root's cut — an evidence decision — stays. Retirement
     # is logged loudly with the rejection reason.
     import logging
 
@@ -675,7 +599,7 @@ def test_exhausted_piece_retires_only_its_own_cut(monkeypatch, caplog):
 
 def test_structural_pick_is_revisited_only_when_no_piece_row_binds(monkeypatch):
     # With no row of the residual binding and no cut of its own, the cut that minted it is the
-    # root's — the fused root is the one resolution left, disqualified or not.
+    # root's — the fused root is the one resolution left.
     _elect_composed_route(monkeypatch)
     terminal = _composed_route_pipeline({"k_residual": {8, 16}}).run(_graph_with_tile(), ctx=_small_smem_ctx())
     assert _kernels(terminal) == {"y": ("k_test", 16)}, "every row refused → the fused route is the fallback"

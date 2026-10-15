@@ -1,0 +1,1684 @@
+"""Materialize a stored Fold edge as a kernel boundary.
+
+The cut is structural: the child Fold keeps its algebra and becomes its own kernel, the parent
+reads what it produced through ordinary ``Load`` edges. Both pieces are fresh unmapped ``TileOp``
+objects. Pinned cuts consume placement on both pieces before the cut pass continues with cross-CTA
+reduction splitting; unpinned cuts may expose smaller seams.
+
+A seam has three realizations, and the seam itself decides which — one site stays ONE decision,
+because at each seam one of them dominates the others outright and there is no trade for the
+evidence to weigh:
+
+- the WORKSPACE cut, the general case: the piece writes every state component to a fresh buffer.
+- the STORAGE-FRONTIER cut (contraction-operand seams whose cone passes through a decode, see
+  :func:`storage_frontier`): the buffer holds the raw storage bits, exact and narrower than the
+  re-rounded result, and the consumer keeps the decode-plus-factors residue.
+- the OUTPUT-OWNING cut (:func:`_output_owners`): where the seam's cone solely produces some of the
+  kernel's OWN outputs, the piece writes those outputs and the sibling piece keeps the rest. The
+  workspace would have held the output's exact bytes at the output's exact dtype, leaving the
+  sibling nothing to do for them but copy, so this deletes a buffer and a copy. It also leaves both
+  pieces single-output, which is what lets the shared-sweep promotion
+  (:func:`~emmy.compiler.ir.tile.ir.promoted_sweep`) bind a sweep the fused kernel had to serialize.
+
+Several seams can also be ONE decision. :func:`realize` takes a group, and :func:`full_projection_seams` names one
+such group off the tree: on a projection that owns more outputs than the binder can bind, every contraction
+occurrence beside every output-owning branch. That group has to be one decision — each of its seams alone leaves the
+rest of the shape standing — which is also what makes the route recordable, since a measured row names a decision
+rather than a sequence of them.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, fields, replace
+from math import gcd
+
+from emmy.compiler.dtype import F32
+from emmy.compiler.dtype import get as get_dtype
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.axis import Axis, Dim
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.ir.pure.fold import (
+    Fold,
+)
+from emmy.compiler.ir.pure.lam import Lambda
+from emmy.compiler.ir.schedule.packing import match_packed_pair_node
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Affine, Assign, Body, Let, Load, Write
+from emmy.compiler.ir.stmt.passes import rewrite as rewrite_stmt
+from emmy.compiler.ir.tile import OutputSpec, Placement, TileOp
+from emmy.compiler.ir.tile.ops import (
+    UnbindableProjection,
+    carries_partition,
+    edge_dtypes,
+    output_regions,
+    owns_outputs_it_cannot_bind,
+)
+from emmy.compiler.ir.tile.path import family_sites, sites, spell
+from emmy.compiler.pipeline import Match
+from emmy.compiler.pipeline.knob import consume_kernel_row
+from emmy.compiler.pipeline.passes.loop.fusion._region import build_merged_region, live_outputs_of, wrap_multi_output_fragment
+from emmy.compiler.pipeline.passes.tile._row import io_shapes, lift_kernel, reformed
+from emmy.compiler.pipeline.passes.tile._split import add_output_piece, output_root
+from emmy.compiler.structural import digest
+from emmy.compiler.tensor import Tensor
+
+
+@dataclass(frozen=True)
+class CutSite:
+    """All stored occurrences of one canonically shared child Fold. ``dtypes`` is the workspace's
+    per-component materialization, decided at offer time so the realization stores exactly what
+    was offered. ``frontier`` (contraction-operand seams only) moves the cut to the cone's storage
+    waypoint — see :class:`Frontier`."""
+
+    node: Fold
+    spelling: str
+    axes: tuple
+    dtypes: tuple
+    frontier: Frontier | None = None
+    #: Duplicate cones this seam ALSO stands for — alpha-equivalent up to their captured axis
+    #: names: each sibling is ``(node, ((rep axis name, sibling axis name), …), channels)`` — the
+    #: positional capture correspondence the clustering proved, and for each component the sibling
+    #: exposes the position of the representative's component that is the same value (a lone
+    #: contraction beside the twin that folds it with another). One placement decision
+    #: materializes the value once; the realization replaces every sibling with workspace loads
+    #: spelled through its own axes. Object sharing is the degenerate case (identity, with the
+    #: identity correspondence).
+    siblings: tuple = ()
+    #: Copies with a different output-axis layout. Each channel names its representative
+    #: component and the complete correspondence from that component's workspace axes.
+    #: ``(node, ((component, ((axis, address), ...)), ...))``.
+    indexed_siblings: tuple = ()
+    #: The siblings' own spellings: a row or a pin that names any occurrence of the value names
+    #: this one decision, and the arm that cuts it spells every one of them.
+    aliases: tuple[str, ...] = ()
+    #: ``(tail, stores)`` when this seam's cone solely produces some of the kernel's OWN output
+    #: specifications — those stores and the projection statements only they read — else ``None``.
+    #: A seam with ``owned`` realizes as the output-owning cut (module docstring) and writes no
+    #: workspace, so its ``dtypes`` are empty.
+    owned: tuple | None = None
+
+
+@dataclass(frozen=True)
+class Frontier:
+    """A contraction-operand cone's STORAGE waypoint: a decode (the ``ElementwiseImpl.decodes``
+    trait) of a value the cone itself computes. The seam materializes there instead of at the
+    cone's result — the workspace holds the raw storage bits (exact, the element the graph's own
+    quantize produced), the producer piece computes ``producer`` (the encode prefix), and the
+    consumer keeps ``residue`` (the decode plus the factor chain), which the normalize-time
+    decode hoist then absorbs into a raw storage-dtype load with the factors on the accumulator
+    epilogue — the same ``sum_k a*(s*w) = s*sum_k a*w`` reassociation as the materialized case."""
+
+    name: str  # the encoded value the workspace holds
+    producer: Fold  # the encode prefix, retaining the operand edges it reads
+    residue: tuple  # the decode + factor stmts the consumer keeps
+    dtype: object  # the storage DataType the decode op names
+
+
+def storage_frontier(node: Fold) -> Frontier | None:
+    """``node``'s storage frontier, or ``None`` when it has none the cut can separate.
+
+    The shape is semantic, not an op list: exactly one decode of a value DEFINED by the cone's own
+    body (a decode of a materialized load was already absorbed by normalization). The residue
+    reads the stored bits and recomputes any pure values shared with the encode, such as its scale.
+    Each side keeps its operand edges, so a computed scale can contain a reduction and can be cut
+    separately in the same placement decision."""
+    if not isinstance(node, Fold) or node.axis is not None or len(node.lift.results) != 1:
+        return None
+    lift = node.applied
+    body = lift.body
+    if any(not isinstance(stmt, (Load, Affine, Assign, Let)) for stmt in body):
+        return None
+    computed = {name for stmt in body if isinstance(stmt, (Affine, Assign)) for name in stmt.defines()}
+    decodes = [
+        stmt
+        for stmt in body
+        if isinstance(stmt, Assign) and stmt.op.decodes is not None and len(stmt.args) == 1 and stmt.args[0] in computed
+    ]
+    if len(decodes) != 1:
+        return None
+    decode = decodes[0]
+    frontier = decode.args[0]
+    prefix = tuple(body.backward_cone((frontier,)).members)
+    remaining = Body(stmt for stmt in body if frontier not in stmt.defines())
+    residue = tuple(remaining.backward_cone(lift.results).members)
+    if decode not in residue:
+        return None
+    result = get_dtype(decode.op.decodes)
+
+    operands = tuple(edge for edge in node.operands if set(edge.exposes) & Body(prefix).ssa_uses)
+    params = tuple(name for edge in operands for name in edge.exposes)
+    producer = Fold(operands=operands, lift=Lambda.closing(params, Body(prefix), (frontier,)))
+    return Frontier(name=frontier, producer=producer, residue=residue, dtype=result)
+
+
+def _external_reads(node: Fold) -> frozenset[str]:
+    """Everything ``node`` needs supplied from outside — read off its DECLARATION.
+
+    Was: lower the term and walk the result for free names. That asked a term to re-derive what it
+    already states, re-lowered on every call, and returned a superset (names the term binds
+    internally, which every caller here discards). :attr:`Fold.free_axes` is the declaration —
+    the term's own axes unioned with its operands', asked of the term rather than derived here. A
+    term is closed: its values arrive through its operand edges, so its coordinates are all it
+    takes from outside."""
+    return node.free_axes
+
+
+def _closed_at(node: Fold, axes: tuple) -> bool:
+    """Whether ``node`` has no capture other than the axes (by name) in scope at its incoming edge."""
+    return _external_reads(node) <= set(axes)
+
+
+def _workspace_dtypes(node: Fold, table: dict[int, tuple], readers: dict[str, object] | None = None) -> tuple | None:
+    """The cut workspace's per-component dtypes, or ``None`` when they cannot be determined.
+    Reduction carrier precision is a Kernel IR policy — every Fold state is f32 until lowering
+    stamps the concrete Accum/Init pair; a zero-axis value has no carrier and is inferred from its
+    typed pure program instead, including a contraction operand. A later output conversion cannot
+    change the precision of that earlier value. A reducing component every reader only converts to one
+    narrower dtype (``readers``, :func:`_narrowed_reads`) stores that dtype: the conversion happens
+    once in the piece instead of in every reader, the value is the same, and a 16-bit workspace is
+    one a warp atom's copy transports can stage. A seam whose dtypes stay undetermined is not offered: the
+    offer and the realization must agree, and a raise past the offer would kill the compile."""
+    names = node.exposes
+    dtypes = tuple((readers or {}).get(name, F32) for name in names) if node.axis is not None else table.get(id(node), ())
+    if len(dtypes) != len(names) or any(dtype is None for dtype in dtypes):
+        return None
+    return dtypes
+
+
+def _narrowed_reads(tile: TileOp) -> dict[str, object]:
+    """Each stored value whose every read is a conversion to one narrower dtype, mapped to that dtype.
+    A reduce's result is an f32 accumulator; the rounding its source program performed reads it back
+    through such a conversion (``loop/lowering/090_spell_store_rounding``)."""
+    casts: dict[str, set] = {}
+    for site in sites(tile.op):
+        for stmt in site.node.lift.body.iter():
+            narrowing = isinstance(stmt, Assign) and stmt.op == ElementwiseImpl("copy") and stmt.dtype is not None and len(stmt.args) == 1
+            for name in Body((stmt,)).ssa_uses:
+                casts.setdefault(name, set()).add(stmt.dtype if narrowing and stmt.dtype.nbytes < 4 else None)
+    for store in tile.output_specs:
+        for name in store.write.values:
+            casts.setdefault(name, set()).add(None)
+    return {name: dtype for name, found in casts.items() if len(found) == 1 and (dtype := next(iter(found))) is not None}
+
+
+def _dtype_table(tile: TileOp) -> dict[int, tuple]:
+    """Each stored edge's inferred result dtypes, keyed by edge identity.
+
+    One edge, one answer: a term is CLOSED, so its values arrive through its own operand edges and
+    it types the same wherever it occurs. The occurrence-agreement filter this used to apply — one
+    shared cone under two scopes having two answers — cannot arise once no term captures."""
+    cache: dict[int, tuple] = {}
+    edge_dtypes(tile.op, tile.inputs, cache)
+    return dict(cache)
+
+
+def _output_owners(tile: TileOp) -> dict[int, tuple]:
+    """Root operands that independently own outputs, keyed by operand identity.
+
+    Every output must read exactly one operand, and the operands' body cones must be disjoint and
+    cover the projection. This is the reversible cut for a fused multi-output producer, including
+    when its two pieces would use the same grid.
+    """
+    op = tile.op
+    if len(tile.output_specs) < 2 or not isinstance(op, Fold) or op.axis is not None or len(op.operands) < 2:
+        return {}
+    try:
+        regions = output_regions(op, tile.output_specs)
+    except UnbindableProjection:
+        return {}
+    return {id(region): (tail, stores) for region, tail, stores in regions if stores}
+
+
+def seam_token(parent: TileOp, spelling: str) -> str:
+    """The token a piece cut from ``parent`` at the seam ``spelling`` carries in its kernel name,
+    ``…__place_<token>``, and in the workspace buffers it writes: the parent's structural identity and
+    the seam's canonical ``PLACE`` key, digested — the keys of a seam set joined by ``+`` for the
+    producers one decision fuses. Two pieces of one shape cut at different seams, or at one seam of
+    two parents, are two kernels, and a ``place_<token>`` pin reaches exactly one."""
+    return digest(parent.identity_key(structural=False) or "", spelling)[:10]
+
+
+def place_token(name: str) -> str | None:
+    """The token the kernel ``name`` carries — what follows its last ``__place_``, up to what a split
+    or a nested cut appends after ``__`` — or ``None`` for a kernel that is no cut piece. A
+    ``place_<token>`` pin and a recorded route address the piece by it."""
+    return name.rsplit("__place_", 1)[1].split("__", 1)[0] if "__place_" in name else None
+
+
+def cuttable_seams(tile: TileOp) -> tuple[CutSite, ...]:
+    """Every semantically closed stored Fold edge a cut can hand its own kernel, grouped only by
+    object sharing. A contraction's operand edges are seams too — cutting one materializes the cone
+    feeding the operand into its own kernel and the contraction reads it back as an ordinary load —
+    except on a block-scaled packed pair, whose operand cones are not seams at all. A seam is offered only where
+    the cone is closed at the axes of every occurrence; a term is closed by construction, so that
+    check names a malformed tree rather than a capture to resolve.
+
+    Workspace dtypes must be determined for the seam to be offered — the offer and the realization
+    must agree, and a raise past the offer would kill the compile. An OUTPUT-OWNING seam
+    (:func:`_output_owners`) writes no workspace, so it carries none and that condition does not
+    apply to it."""
+    all_sites = sites(tile.op)
+    owners = _output_owners(tile)
+    # Storage frontiers belong to pointwise contraction operands, not reducing carriers.
+    consumers = {
+        id(edge): site.node
+        for site in all_sites
+        if site.node.as_contraction() is not None
+        for edge in site.node.operands
+        if isinstance(edge, Fold) and edge.as_slab() is None and edge.axis is None
+    }
+    outer = tuple(axis.name for axis in (*tile.place.free, *(axis for store in tile.output_specs for axis in store.sweep)))
+    occurrence_axes: dict[int, list[tuple]] = {}
+    for site in all_sites[1:]:
+        occurrence_axes.setdefault(id(site.node), []).append((*outer, *site.scope))
+    dtype_table: dict[int, tuple] = {}
+    if isinstance(tile.op, Fold):
+        dtype_table = _dtype_table(tile)
+    narrowed = _narrowed_reads(tile)
+    taken = _kept_components(tile)
+    stored = _stored_values(tile)
+    out: list[CutSite] = []
+    seen: set[int] = set()
+    for site in family_sites("PLACE", all_sites):
+        node = site.node
+        scopes = occurrence_axes.get(id(node), ())
+        if not isinstance(node, Fold) or id(node) in seen or not scopes:
+            continue
+        if not all(_closed_at(node, scope) for scope in scopes):
+            continue
+        if node.observe is not None or node.carries:
+            # An observed fold's per-step results exist only inside its stream — a cut would
+            # separate the scan from its streamed boundary store, which no piece can then spell.
+            # A carried state is the same: its steps run in order inside one loop.
+            continue
+        if not taken.get(id(node), node.exposes):
+            # No reader takes any component: lowering drops the edge outright, so a workspace
+            # here would be written and never read.
+            continue
+        if node.scalar() or (not node.operands and node.base is None and all(isinstance(stmt, Load) for stmt in node.lift.body)):
+            # Storing scalars or copying gmem reads into another workspace removes no per-cell computation.
+            continue
+        consumer = consumers.get(id(node))
+        if consumer is not None and match_packed_pair_node(consumer, tile.inputs) is not None:
+            # An operand cone of a BLOCK-SCALED packed pair reaches gmem already: its codes and
+            # its block scale are loads, and the cone only decodes them. Materializing it stores
+            # the decoded values instead, so the consumer holds neither the codes nor the
+            # per-block scale the cell multiplies — the reading is gone for every occurrence the
+            # seam covers, and no piece can put it back. Nothing is hoisted either way, so this
+            # is not a placement trade. The contraction's OWN seam stays offered, and that is the
+            # cut that gives the piece the output-axis pair a fragment needs.
+            continue
+        # A frontier REPLACES the decoded-value realization at this seam rather than joining the
+        # offer: the raw bits dominate the decoded-value workspace on both precision (exact vs
+        # re-rounded) and footprint (storage width vs store width), so there is no trade for the
+        # evidence to decide — one site stays one decision.
+        owned = owners.get(id(node))
+        if owned is None and _strands_a_store(tile.op, node, stored):
+            # The piece takes the cone's interior with it, and the consumer reads back only what
+            # the cone exposes: a boundary store of a value only that interior defines would name
+            # a value the consumer no longer defines.
+            continue
+        frontier = storage_frontier(node) if consumer is not None and owned is None else None
+        if owned is not None:
+            dtypes = ()  # the piece writes the kernel's own outputs; there is no workspace to type
+        else:
+            dtypes = (frontier.dtype,) if frontier is not None else _workspace_dtypes(node, dtype_table, narrowed)
+            if dtypes is None:
+                continue
+        seen.add(id(node))
+        # Keep the term's read coordinates and unit axes that supply its matrix geometry.
+        axes = tuple(
+            axis
+            for name in dict.fromkeys(name for scope in scopes for name in scope)
+            for axis in (tile.axis_of(name),)
+            if name in node.free_axes or axis.extent == 1
+        )
+        out.append(
+            CutSite(
+                node=node,
+                spelling=spell(tile.op, "PLACE", node, all_sites=all_sites),
+                axes=axes,
+                dtypes=dtypes,
+                frontier=frontier,
+                owned=owned,
+            )
+        )
+    return _cluster_reindexed_contractions(_cluster_value_seams(out, tile.axes), tile.axes)
+
+
+def _hoisted_reduces(tile: TileOp) -> set[int]:
+    """The reduce nodes evaluated ONCE ahead of the output sweep of the branch that holds them,
+    keyed by identity — a branch's ROW STATISTIC, as opposed to a fold each cell of the sweep
+    performs for itself.
+
+    This is :func:`~emmy.compiler.ir.tile.ir.promoted_sweep`'s refusal read from the other side.
+    That rule will not bind a sweep past a reduce invariant in it, because each cell would then
+    recompute the whole statistic; so a piece holding one stays at a single grid axis however much
+    else is cut away from it. Naming them here is what lets the cut hand them their own kernels
+    instead, after which the piece reads one stored value and its sweep binds.
+    """
+    hoisted: set[int] = set()
+    for region, _tail, stores in output_regions(tile.op, tile.output_specs):
+        sweep = set.intersection(*({axis.name for axis in store.sweep} for store in stores)) if stores else set()
+        if not sweep:
+            continue
+        hoisted.update(
+            id(site.node)
+            for site in sites(region)
+            if isinstance(site.node, Fold) and site.node.axis is not None and not sweep <= site.node.free_axes
+        )
+    return hoisted
+
+
+def full_projection_seams(tile: TileOp, seams) -> tuple[CutSite, ...]:
+    """The seams of the FULL-PROJECTION cut — every contraction occurrence of this kernel, every
+    reduce hoisted ahead of an output sweep, and every output-owning branch — or ``()`` where the
+    kernel has no such cut to offer.
+
+    Offered on a projection that owns more outputs than it can bind
+    (:func:`~emmy.compiler.ir.tile.ops.owns_outputs_it_cannot_bind`). Such a kernel builds around
+    one reduce and lowers every other serially inside the projection, so all but one of its
+    contractions reach no tensor-core tier where they are — and its stores ride different axes, so
+    the fused grid promotes none of them and even that one root has no ``(m, n)`` pair to tile.
+    The cut answers both at once: each contraction becomes the sole root of its own kernel, and each
+    owned output becomes a pointwise-or-small-reduce kernel over the sweep its store rides.
+
+    It is ONE decision, not a sequence. Each seam alone leaves the rest of the shape standing, the
+    pieces a partial cut mints respell what is left, and the evidence a route is recorded as names a
+    decision rather than a sequence of them.
+
+    The seams are the ones :func:`cuttable_seams` already offers; nothing new becomes cuttable. A
+    contraction it does not offer stays where it is — the piece around it is no worse than the fused
+    kernel was — so this takes what is on the ballot rather than declining the whole cut. A reduce
+    each cell of a sweep performs for itself stays too: a block maximum over sixteen stored values is
+    the small-reduce half of the target shape, and cutting it would buy a launch and a workspace for
+    nothing.
+    """
+    if not owns_outputs_it_cannot_bind(tile.op, tile.output_specs):
+        return ()
+    hoisted = _hoisted_reduces(tile)
+    chosen = tuple(seam for seam in seams if seam.owned is not None or seam.node.as_contraction() is not None or id(seam.node) in hoisted)
+    return chosen if len(chosen) > 1 else ()
+
+
+def _pruned(body: Body, roots: frozenset[str]) -> Body:
+    """``body`` cut to what ``roots`` need — the statements a root reads through, in order, a
+    loop kept with what its own body keeps."""
+    from emmy.compiler.ir.stmt.body import free_names  # noqa: PLC0415
+
+    needed = set(roots)
+    while True:
+        before = needed.copy()
+        kept: list = []
+        for stmt in reversed(tuple(body)):
+            if stmt.nested():
+                inner = tuple(_pruned(child, frozenset(needed)) for child in stmt.nested())
+                if not any(inner):
+                    continue
+                stmt = stmt.with_bodies(inner)
+            elif not (needed.intersection(stmt.defines()) or stmt.external_writes()):
+                continue
+            kept.append(stmt)
+            needed |= free_names(stmt)
+        # A carried state may be read before its update. Keep its update too, even when the
+        # backward walk discovered that read after it had already visited the update.
+        if needed == before:
+            return Body(tuple(reversed(kept)))
+
+
+def _children(expr) -> tuple:
+    values = (getattr(expr, f.name) for f in fields(expr))
+    return tuple(child for v in values for child in (v if isinstance(v, (tuple, list)) else (v,)) if isinstance(child, Expr))
+
+
+def _coordinate_reads(body: Body, names: tuple[str, ...]) -> dict[str, Expr]:
+    """For each coordinate the cone reads through ONE expression of that coordinate alone, other
+    than the coordinate itself, that expression — the index a rotate-half read computes its column
+    by. A coordinate read two ways, or plainly, reads no expression."""
+
+    found: dict[str, set] = {name: set() for name in names}
+
+    def visit(expr) -> None:
+        own = expr.free_vars()
+        if len(own) == 1 and (name := next(iter(own))) in found:
+            found[name].add(expr)
+            return
+        for child in _children(expr):
+            visit(child)
+
+    for stmt in body.iter():
+        for expr in stmt.exprs():
+            visit(expr)
+    return {name: next(iter(exprs)) for name, exprs in found.items() if len(exprs) == 1 and exprs != {Var(name)}}
+
+
+class _AbstractingSigma(Sigma):
+    """Replaces each coordinate's read expression by the bare coordinate — the cone as a function of
+    the value its index computes. The mapping names the coordinates so a binder still shadows them."""
+
+    def apply(self, expr):
+        return expr.rebuild(lambda term: next((Var(name) for name, read in self._reads.items() if term == read), term))
+
+
+def _value_forms(seam: CutSite, axes: tuple) -> tuple[tuple, dict[str, Expr]]:
+    """What each component of a seam's cone computes, spelled so two copies of one value key
+    alike: the cone lowered over its captured axes renamed by position, cut to the component,
+    under the exact statement identity (SSA names, commutative order and buffer declaration order
+    do not reach it) beside the buffers that fill its roles. A copy under another scope binds the
+    same coordinates by other names — the o_proj result feeds a norm's statistic inside a reduce
+    and the residual add at the kernel's own free axis — and its lambda params may sit in another
+    order, which :meth:`Fold.canonical` reads positionally; neither is a different value. Per
+    component, because a value folded beside another in one twin (the k and v projections over
+    one input) is the same value as the lone contraction that feeds its norm's statistic.
+
+    A coordinate the cone reads only through one expression of it is abstracted to the bare
+    coordinate, and the expression returned in the seam's own names: RoPE's rotate-half reads the q
+    projection at three columns of one head dim, which are one value read at three addresses."""
+    from emmy.compiler.ir.stmt.identity import canonicalize_identity  # noqa: PLC0415 — identity imports the tile IR
+
+    scoped = tuple(axis.name for axis in seam.axes if axis.name in seam.node.free_axes)
+    names = {name: f"_s{position}" for position, name in enumerate(scoped)}
+    # Substituted, not renamed: a loop inside the cone may bind a captured name again (the o_proj
+    # copy under the post-attention statistic reuses its reduce axis inside the V projection's
+    # norm), and that loop keeps its own variable.
+    captured = Sigma({name: Var(spelled) for name, spelled in names.items()})
+    body = Body(tuple(rewrite_stmt(stmt, lambda name: name, captured) for stmt in seam.node.lower(bound=frozenset(scoped), axes=axes)))
+    reads = _coordinate_reads(body, tuple(names.values()))
+    if reads:
+        sigma = _AbstractingSigma({name: Var(name) for name in reads})
+        object.__setattr__(sigma, "_reads", reads)
+        body = Body(tuple(rewrite_stmt(stmt, lambda name: name, sigma) for stmt in body))
+    forms = []
+    for exposed in seam.node.exposes:
+        identity = canonicalize_identity(_pruned(body, frozenset((exposed,))))
+        forms.append((identity.key, identity.arguments))
+    own = {spelled: Var(name) for name, spelled in names.items()}
+    return tuple(forms), {name: reads[spelled].substitute(own) for name, spelled in names.items() if spelled in reads}
+
+
+def _cluster_value_seams(seams: list[CutSite], axes: tuple) -> tuple[CutSite, ...]:
+    """Fold duplicate cones — alpha-equivalent up to captured axis names — into ONE seam per value.
+
+    Object sharing groups occurrences of one stored node; a traced graph can also hold several
+    ALPHA-EQUIVALENT copies of the same computation captured under different axis names —
+    attention's normalized K cone appears once per score contraction, and a fused decoder half
+    reads its o_proj result under the post-attention statistic's reduce, under the pre-FFN
+    statistic's and at the residual add. Those copies are one VALUE: the cluster's first seam
+    becomes the decision for all of them, carrying each duplicate as a sibling with its
+    positional capture correspondence (:class:`CutSite`), so one cut materializes the value once
+    and every occurrence reads the workspace. Membership is :func:`_value_forms` inclusion; a member
+    joins only when its paired axes agree on extent and window, its workspace dtypes match, and
+    every workspace axis is a mapped capture — otherwise it stays its own seam. An output-owning
+    seam writes the kernel's outputs and a frontier seam its raw storage bits; neither is a
+    workspace another occurrence could read, so they cluster with nothing."""
+    eligible = [index for index, seam in enumerate(seams) if seam.frontier is None and seam.owned is None]
+    if len(eligible) < 2:
+        return tuple(seams)
+    captured = {index: tuple(axis.name for axis in seams[index].axes) for index in eligible}
+    scoped = {index: tuple(axis for axis in captured[index] if axis in seams[index].node.free_axes) for index in eligible}
+    forms, reads = {}, {}
+    for index in eligible:
+        forms[index], reads[index] = _value_forms(seams[index], axes)
+    descendants = {index: {id(site.node) for site in sites(seams[index].node)[1:]} for index in eligible}
+    drop: set[int] = set()
+    merged: dict[int, CutSite] = {}
+    # The representative exposes the most: a twin stands for the lone contractions that equal its
+    # channels, never the other way round. Among equals it reads its coordinates plainly, so a copy
+    # read through an index expression reads its workspace at that expression.
+    for rep_index in sorted(eligible, key=lambda index: (-len(forms[index]), len(reads[index]))):
+        if rep_index in drop:
+            continue
+        rep = seams[rep_index]
+        rep_params = scoped[rep_index]
+        rep_axes = {axis.name: axis for axis in rep.axes}
+        if {axis.name for axis in _workspace_axes(rep, rep.node) if not _unit(axis)} - set(rep_params):
+            continue  # a workspace axis with no capture to map has no sibling spelling; a unit axis reads at 0
+        siblings = []
+        aliases = []
+        for member_index in eligible:
+            if member_index == rep_index or member_index in drop or member_index in merged:
+                continue
+            member = seams[member_index]
+            # A multi-result cone may expose a value it also consumes below another result.
+            # Replacing that descendant by the cone's workspace would make the producer cyclic.
+            if id(member.node) in descendants[rep_index] or id(rep.node) in descendants[member_index]:
+                continue
+            if not all(form in forms[rep_index] for form in forms[member_index]):
+                continue
+            channels = tuple(forms[rep_index].index(form) for form in forms[member_index])
+            member_params = scoped[member_index]
+            member_axes = {axis.name: axis for axis in member.axes}
+            aligned = (
+                len(member_params) == len(rep_params)
+                and tuple(member.dtypes) == tuple(rep.dtypes[channel] for channel in channels)
+                and all(
+                    (a := rep_axes[rn]).extent == (b := member_axes[mn]).extent and a.window == b.window
+                    for rn, mn in zip(rep_params, member_params, strict=True)
+                )
+            )
+            if not aligned:
+                continue
+            pairs = tuple(
+                (rn, _read_at(rn, mn, rep, member, reads[rep_index], reads[member_index]))
+                for rn, mn in zip(rep_params, member_params, strict=True)
+            )
+            if any(read is None for _, read in pairs):
+                continue
+            siblings.append((member.node, pairs, channels))
+            aliases.append(member.spelling)
+            drop.add(member_index)
+        if siblings:
+            merged[rep_index] = replace(rep, siblings=tuple(siblings), aliases=tuple(aliases))
+    return tuple(merged.get(index, seam) for index, seam in enumerate(seams) if index not in drop)
+
+
+class _AbstractingRow(Sigma):
+    """Read one logical output coordinate through a captured expression."""
+
+    def apply(self, expr):
+        return expr.rebuild(lambda term: Var("_row") if term == self._row else term)
+
+
+def _row_form(seam: CutSite, name: str, row: Expr, common: tuple[str, ...], axes: tuple) -> tuple | None:
+    """Exact identity of a contraction channel as a function of one output address."""
+    from emmy.compiler.ir.stmt.identity import canonicalize_identity  # noqa: PLC0415 — tile IR import
+
+    node = _channels(seam.node, (name,)) if len(seam.node.exposes) > 1 else seam.node
+    scoped = tuple(axis.name for axis in seam.axes if axis.name in node.free_axes)
+    captured = Sigma({axis: Var(f"_s{i}") for i, axis in enumerate(common)})
+    body = Body(tuple(rewrite_stmt(stmt, lambda value: value, captured) for stmt in node.lower(bound=frozenset(scoped), axes=axes)))
+    sigma = _AbstractingRow()
+    object.__setattr__(sigma, "_row", row)
+    body = Body(tuple(rewrite_stmt(stmt, lambda value: value, sigma) for stmt in body))
+    if any(row.free_vars() & expr.free_vars() for stmt in body.iter() for expr in stmt.exprs()):
+        return None
+    identity = canonicalize_identity(_pruned(body, frozenset((name,))))
+    return identity.key, identity.arguments
+
+
+def _row_candidates(seam: CutSite, name: str, axes: tuple) -> tuple[Expr, ...]:
+    """Captured output addresses actually read by a contraction channel."""
+    node = _channels(seam.node, (name,)) if len(seam.node.exposes) > 1 else seam.node
+    scoped = frozenset(axis.name for axis in seam.axes if axis.name in node.free_axes)
+    body = Body(tuple(node.lower(bound=scoped, axes=axes)))
+    return tuple(
+        dict.fromkeys(
+            expr for stmt in body.iter() if isinstance(stmt, Load) for expr in stmt.index if expr.free_vars() and expr.free_vars() <= scoped
+        )
+    )
+
+
+def _row_layout(seam: CutSite, name: str, axes: tuple) -> tuple[tuple[Expr, tuple, int], ...]:
+    """Bijective flat row coordinates offered by a representative's workspace.
+
+    A plain axis or a row-major pair covers each row exactly once. A row that
+    repeats (for example ``(block / 8) * 16 + lane``) cannot be the producer:
+    its workspace would do the same contraction eight times.
+    """
+    found = []
+    for row in _row_candidates(seam, name, axes):
+        if isinstance(row, Var):
+            match = next((axis for axis in seam.axes if axis.name == row.name and axis.extent.is_static), None)
+            if match is not None and match.extent.as_static() > 1:
+                found.append((row, (match,), match.extent.as_static()))
+            continue
+        if not isinstance(row, BinaryExpr) or row.op != "+":
+            continue
+        for high, low in ((row.left, row.right), (row.right, row.left)):
+            if not isinstance(low, Var) or not isinstance(high, BinaryExpr) or high.op != "*":
+                continue
+            for factor, upper in ((high.left, high.right), (high.right, high.left)):
+                if not isinstance(factor, Literal) or factor.dtype != "int" or not isinstance(upper, Var):
+                    continue
+                hi = next((axis for axis in seam.axes if axis.name == upper.name and axis.extent.is_static), None)
+                lo = next((axis for axis in seam.axes if axis.name == low.name and axis.extent.is_static), None)
+                if hi is not None and lo is not None and hi != lo and lo.extent.as_static() == factor.value:
+                    found.append((row, (hi, lo), hi.extent.as_static() * lo.extent.as_static()))
+    return tuple(found)
+
+
+def _cluster_reindexed_contractions(seams: tuple[CutSite, ...], axes: tuple) -> tuple[CutSite, ...]:
+    """Share a flat contraction across block and packed-pair views of its output coordinate.
+
+    Each channel has the same statement identity after abstracting its output address. Interval
+    analysis proves that every address reads inside the representative's workspace. A packed
+    pair supplies two channels at distinct addresses of that one workspace.
+    """
+    eligible = [
+        i for i, seam in enumerate(seams) if seam.frontier is None and seam.owned is None and seam.node.as_contraction() is not None
+    ]
+    if len(eligible) < 2:
+        return seams
+    descendants = {i: {id(site.node) for site in sites(seams[i].node)[1:]} for i in eligible}
+    dropped: set[int] = set()
+    updated: dict[int, CutSite] = {}
+    for rep_index in eligible:
+        rep = updated.get(rep_index, seams[rep_index])
+        if rep_index in dropped or rep.indexed_siblings:
+            continue
+        for rep_row, row_axes, row_extent in _row_layout(rep, rep.node.exposes[0], axes):
+            other = tuple(axis for axis in rep.axes if axis not in row_axes)
+            rep_forms = {}
+            for channel, name in enumerate(rep.node.exposes):
+                if rep_row in _row_candidates(rep, name, axes):
+                    form = _row_form(rep, name, rep_row, tuple(axis.name for axis in other), axes)
+                    if form is not None:
+                        rep_forms.setdefault((form, rep.dtypes[channel]), channel)
+            if not rep_forms:
+                continue
+            additions = []
+            aliases = []
+            for member_index in eligible:
+                if member_index == rep_index or member_index in dropped:
+                    continue
+                member = seams[member_index]
+                if (
+                    member.siblings
+                    or member.indexed_siblings
+                    or id(member.node) in descendants[rep_index]
+                    or id(rep.node) in descendants[member_index]
+                ):
+                    continue
+                channels = []
+                for position, name in enumerate(member.node.exposes):
+                    found = None
+                    for row in _row_candidates(member, name, axes):
+                        # A plain coordinate is an ordinary captured-axis copy. The value
+                        # clustering above handles matching captures; reordering captures is
+                        # outside this pass's computed-address correspondence.
+                        if isinstance(row, Var):
+                            continue
+                        row_names = row.free_vars()
+                        common = tuple(axis for axis in member.axes if axis.name not in row_names)
+                        if (
+                            not row_names
+                            or len(common) != len(other)
+                            or any(a.extent != b.extent or a.window != b.window for a, b in zip(other, common, strict=True))
+                            or not all(axis.extent.is_static for axis in member.axes if axis.name in row_names)
+                        ):
+                            continue
+                        ctx = SimplifyCtx(
+                            ranges={axis.name: Interval(0, axis.extent.as_static() - 1) for axis in member.axes if axis.name in row_names}
+                        )
+                        bounds = row.range(ctx)
+                        if bounds is None or bounds.lo < 0 or bounds.hi >= row_extent:
+                            continue
+                        form = _row_form(member, name, row, tuple(axis.name for axis in common), axes)
+                        channel = rep_forms.get((form, member.dtypes[position]))
+                        if channel is not None:
+                            mapping = tuple((axis.name, Var(copy.name)) for axis, copy in zip(other, common, strict=True))
+                            if len(row_axes) == 1:
+                                mapping += ((row_axes[0].name, row),)
+                            else:
+                                high, low = row_axes
+                                stride = Literal(low.extent.as_static(), "int")
+                                mapping += (
+                                    (high.name, BinaryExpr("/", row, stride)),
+                                    (low.name, BinaryExpr("%", row, stride)),
+                                )
+                            found = (channel, mapping)
+                            break
+                    if found is None:
+                        break
+                    channels.append(found)
+                if len(channels) == len(member.node.exposes):
+                    additions.append((member.node, tuple(channels)))
+                    aliases.append(member.spelling)
+                    dropped.add(member_index)
+            if additions:
+                rep = replace(rep, indexed_siblings=(*rep.indexed_siblings, *additions), aliases=(*rep.aliases, *aliases))
+                updated[rep_index] = rep
+                break
+    return tuple(updated.get(i, seam) for i, seam in enumerate(seams) if i not in dropped)
+
+
+def _read_at(rn: str, mn: str, rep: CutSite, member: CutSite, rep_reads: dict, member_reads: dict) -> Expr | None:
+    """The address a clustered copy reads the representative's workspace at along ``rn``, or ``None``.
+
+    Both read the coordinate plainly, or through one expression: the copy's own coordinate. The
+    representative reads it plainly and the copy through an expression whose values lie on the
+    representative's axis: that expression. Anything else is not the same value at one address."""
+    if rn in rep_reads:
+        return Var(mn) if member_reads.get(mn) == rep_reads[rn].substitute({rn: Var(mn)}) else None
+    read = member_reads.get(mn)
+    if read is None:
+        return Var(mn)
+    extent = next(axis.extent for axis in rep.axes if axis.name == rn)
+    own = next(axis.extent for axis in member.axes if axis.name == mn)
+    if not (extent.is_static and own.is_static):
+        return None
+    values = {read.eval({mn: value}) for value in range(own.as_static())}
+    return read if min(values) >= 0 and max(values) < extent.as_static() else None
+
+
+def _channel_copies(seam: CutSite, axes: tuple) -> dict[int, tuple[int, dict[str, Expr]]]:
+    """The components of ONE seam that are another component read at other coordinates, as
+    ``{position: (position read, {axis: address})}``. Lifting folds every contraction over one input
+    into one twin, so RoPE's rotate-half copies of a projection become channels beside the plain one,
+    and each channel reads the weight again. Compared one component at a time, a copy is the plain
+    channel's value at the address its index expression computes (:func:`_read_at`), so the workspace
+    stores the plain channel and the copy reads it there."""
+    node = seam.node
+    if (
+        len(node.exposes) < 2
+        or node.twist is not None
+        or node.observe is not None
+        or node.carries
+        or seam.frontier is not None
+        or seam.owned is not None
+    ):
+        return {}  # a twisted or observed state is one whole: its components depend on each other
+    scoped = tuple(axis.name for axis in seam.axes if axis.name in seam.node.free_axes)
+    forms = [_value_forms(replace(seam, node=seam.node.exposing((name,))), axes) for name in seam.node.exposes]
+    # Within one value the channel reading the fewest coordinates through an expression holds it.
+    reps = {}
+    for position, ((form,), _reads) in sorted(enumerate(forms), key=lambda item: len(item[1][1])):
+        reps.setdefault(form, position)
+    copies: dict[int, tuple[int, dict[str, Expr]]] = {}
+    for position, ((form,), reads) in enumerate(forms):
+        rep = reps[form]
+        if rep == position or seam.dtypes[rep] != seam.dtypes[position]:
+            continue
+        mapping = {name: _read_at(name, name, seam, seam, forms[rep][1], reads) for name in scoped}
+        if all(read is not None for read in mapping.values()):
+            copies[position] = (rep, mapping)
+    return copies
+
+
+def _channels(node: Fold, names: tuple[str, ...]) -> Fold:
+    """``node`` computing only the components ``names``, every operand it no longer reads dropped."""
+    from emmy.compiler.ir.tile.normalize import _prune_unread  # noqa: PLC0415
+
+    return _prune_unread(node.exposing(names), frozenset(names))
+
+
+def _unchanged(pieces: tuple, members) -> bool:
+    return len(pieces) == len(members) and all(piece is member for piece, member in zip(pieces, members, strict=True))
+
+
+def _replace_member(member, targets: dict[int, tuple], renamed: dict[str, str]):
+    if id(member) in targets:
+        # A storage-frontier residue retains operand edges. Apply nested cuts there too, just
+        # as in the encode producer, so both sides reuse a separately materialized scale.
+        return tuple(_replace_fold(piece, targets, renamed) if isinstance(piece, Fold) else piece for piece in targets[id(member)])
+    if isinstance(member, Fold):
+        return (_replace_fold(member, targets, renamed),)
+    nested = member.nested()
+    if not nested:
+        return (member,)
+    bodies = []
+    changed = False
+    for body in nested:
+        replaced = tuple(piece for child in body for piece in _replace_member(child, targets, renamed))
+        changed = changed or not _unchanged(replaced, body)
+        bodies.append(Body(replaced))
+    return (member.with_bodies(tuple(bodies)) if changed else member,)
+
+
+def _follow_reads(before: Fold, after: Fold, renamed: dict[str, str]) -> Fold:
+    """``after`` with every value its statements DERIVE from a re-spelled read re-spelled the same way.
+
+    :func:`_read_name` tags a workspace read because the value can still be computed in place
+    beside it. The same holds one step on: a statement over that read is a different statement from
+    the one still computed in place — ``v = in0__ws… + b`` beside ``v = in0 + b`` — and a lowered
+    scope binds a name once, so under one name the pair is the same SSA fault (nvcc: *already
+    declared*). Each such definition takes the tags of the reads it depends on; a statement that
+    reads no workspace keeps its name and still shares with its in-place copy. The term's readers
+    follow through :attr:`~emmy.compiler.ir.pure.fold.Fold.applied`, which is what walks the rename
+    up the tree, one rebuilt term at a time. It stops at a reduce: a carried state keeps its name,
+    because a twisted carrier's tile offer reads it. ``renamed`` collects what was minted, for the
+    boundary stores.
+    """
+    was = {param: edge.exposes[slot] for param, edge, slot in before.bindings}
+    tags = {param: now.removeprefix(was[param]) for param, edge, slot in after.bindings if (now := edge.exposes[slot]) != was[param]}
+    for stmt in after.lift.body:
+        read = sorted({tags[name] for name in Body((stmt,)).ssa_uses if name in tags})
+        tags.update((name, "".join(read)) for name in stmt.defines() if read)
+    names = {name: f"{name}{tag}" for name, tag in tags.items() if name not in was}
+    renamed.update(names)
+    return replace(after, lift=after.lift.rename(names)) if names else after
+
+
+def _replace_fold(node: Fold, targets: dict[int, tuple], renamed: dict[str, str]) -> Fold:
+    """Replace every stored occurrence of the target Folds in ONE walk — ``targets`` maps
+    ``id(node)`` to its replacement stmts. One walk, because the rebuild copies every node on the
+    way down: a second walk's target objects no longer exist in the first walk's output, so
+    sequential replacement silently loses every decision after the first. IDENTITY-PRESERVING off
+    the replacement spine: a subtree holding no target returns the SAME object, so untouched
+    Lambdas are not reconstructed (construction normalization over a large fused body is where a
+    copying walk turns quadratic) and shared-node grouping keeps its identities.
+
+    An operand's replacement is POSITIONAL — one entry per component the edge exposed — and
+    ``None`` there means the reader takes that component no more (:func:`_kept_components`). The
+    param it bound goes with it: params past the iteration var bind the operands' components in
+    order, so a dropped entry that left its param behind would turn a value into a free coordinate
+    the kernel can hand no extent."""
+    operands: list = []
+    bound: list[bool] = []
+    for edge in node.operands:
+        pieces = _replace_member(edge, targets, renamed)
+        components = len(edge.exposes) if isinstance(edge, Fold) else 0
+        if any(piece is None for piece in pieces):
+            bound.extend(piece is not None for piece in pieces)
+            pieces = tuple(piece for piece in pieces if piece is not None)
+        else:
+            bound.extend([True] * components)
+        operands.extend(pieces)
+    operands = tuple(operands)
+    body = tuple(piece for stmt in node.lift.body for piece in _replace_member(stmt, targets, renamed))
+    if _unchanged(operands, node.operands) and _unchanged(body, node.lift.body):
+        return node
+    lift = replace(node.lift, body=Body(body))
+    if not all(bound):
+        lead = 1 if node.base is not None else 0
+        params = node.lift.params
+        head, slots, tail = params[:lead], params[lead : lead + len(bound)], params[lead + len(bound) :]
+        lift = replace(lift, params=(*head, *(name for name, keep in zip(slots, bound, strict=True) if keep), *tail))
+    return _follow_reads(node, replace(node, operands=operands, lift=lift), renamed)
+
+
+def _without_identity_casts(node: Fold, dtypes: dict[str, object]) -> Fold:
+    """``node`` with each projection that only converts one workspace read to the dtype that workspace
+    already stores replaced by the read itself, under the projection's name. A reader's rounding
+    becomes such a copy once the workspace stores the rounded dtype (:func:`_narrowed_reads`), and
+    left in place it keeps the edge a computed cone: the chunk tier streams V only from a slab."""
+    targets: dict[int, tuple] = {}
+    for site in sites(node)[1:]:
+        proj = site.node
+        if not isinstance(proj, Fold) or proj.axis is not None or len(proj.operands) != 1 or len(proj.lift.body) != 1:
+            continue
+        (stmt,) = proj.lift.body
+        slab = proj.operands[0].as_slab() if isinstance(proj.operands[0], Fold) else None
+        if slab is None or not isinstance(stmt, Assign) or stmt.op != ElementwiseImpl("copy") or stmt.args != proj.lift.params[:1]:
+            continue
+        if dtypes.get(slab.load.input) == stmt.dtype:
+            targets[id(proj)] = (Fold.slab(replace(slab.load, names=(stmt.name,))),)
+    return _replace_fold(node, targets, {}) if targets else node
+
+
+def _defined_values(root: Fold, skip: int | None = None) -> set[str]:
+    """Every value a term of ``root``'s tree exposes or defines, leaving out the subtree at ``skip``."""
+    out: set[str] = set()
+    pending, seen = [root], set()
+    while pending:
+        node = pending.pop()
+        if id(node) in seen or id(node) == skip:
+            continue
+        seen.add(id(node))
+        out |= set(node.exposes) | node.step().ssa_defs
+        pending.extend(node.operands)
+    return out
+
+
+def _strands_a_store(root: Fold, node: Fold, stored: set[str]) -> bool:
+    """Whether a boundary store writes a value that only ``node``'s interior defines."""
+    inside = stored & (_defined_values(node) - set(node.exposes))
+    return bool(inside - _defined_values(root, skip=id(node))) if inside else False
+
+
+def _stored_values(tile: TileOp) -> set[str]:
+    """The values the kernel's boundary stores write, spelled the way the tree's terms name them:
+    ``Fold.lower`` re-spells a store naming a bound param as the operand result it binds."""
+    if not isinstance(tile.op, Fold):
+        return set()
+    spelled = dict(zip(tile.op.lift.params, tile.op.applied.params, strict=True))
+    return {spelled.get(name, name) for store in tile.output_specs for name in store.write.values}
+
+
+def _kept_components(tile: TileOp) -> dict[int, tuple[str, ...]]:
+    """Per stored edge, the result components its READERS take — what :meth:`Fold.lower` places.
+
+    A term may carry more components than any one reader wants: six channels folded into one
+    reduce, each occurrence read for a single accumulator. A cut that materialized all six would
+    write five workspaces nothing loads back, and the backend's liveness plan refuses a scratch
+    buffer with no consuming launch. A boundary store keeps the component it writes; an interior
+    store keeps its defining subtree without making every enclosing result a workspace output.
+    """
+    if not isinstance(tile.op, Fold):
+        return {}
+    # Compare in the stores' applied spelling, or a store of an operand's own result reads as a
+    # name no edge exposes.
+    return tile.op.read_components(frozenset(_stored_values(tile)))
+
+
+def _unit(axis) -> bool:
+    return axis.extent.is_static and axis.extent.as_static() == 1
+
+
+def _workspace_axes(seam: CutSite, produced: Fold) -> tuple:
+    """The seam axes the PRODUCED piece actually sweeps — its workspace dimensions. ``produced``
+    is the seam node, or the frontier prefix when the seam materializes at a storage waypoint.
+
+    Static unit axes consume no additional storage, but retain the producer's schedule geometry.
+    Dropping one lets a later split axis take its place as a contraction fragment axis even though
+    operand indices still read it as the outer partition coordinate."""
+    read = _external_reads(produced)
+    return tuple(axis for axis in seam.axes if axis.name in read or _unit(axis))
+
+
+def _workspace_strides(produced: Fold, axes: tuple) -> dict[str, tuple[int, int]]:
+    """``{coordinate: (d, c)}`` for each coordinate the stored terms read only as ``i // d`` and ``i % c``.
+
+    Such a value holds one stored cell per ``(i // d, i % c)``: ``c`` of every ``d`` cells, at
+    ``(i // d) * c + i % c``. With no remainder (``c = 1``) that is one cell per group of ``d``
+    (GQA's k read at the head ``h // 2``); with one it is a fused (head, head-dim) channel whose
+    head is divided again (GQA's v read at ``(i // 128 // 2) * 128 + i % 128``), stored once per
+    kv head instead of once per q head. Different divisors share their greatest common divisor,
+    which the remainder must divide; a direct read, or a coordinate a statement computes with,
+    keeps the full extent. Read the stored terms, including coordinate predicates."""
+    out: dict[str, tuple[int, int]] = {}
+    for axis in axes:
+        name = axis.name
+        reads: set[tuple[str, int]] = set()
+        plain = False
+        pending = [produced]
+        while pending:
+            term = pending.pop()
+            pending.extend(term.operands)
+            if name not in term.free_axes:
+                continue
+            plain = plain or term.observe is not None or name in term.lift.results
+            for stmt in term.lift.body.iter():
+                plain = plain or (not isinstance(stmt, Load) and name in stmt.deps())
+                for expr in stmt.exprs():
+                    reads.update(_divmod_reads(expr, name))
+        divisors = [value for op, value in reads if op == "/"]
+        remainders = {value for op, value in reads if op == "%"}
+        if plain or ("", 1) in reads or not divisors or len(remainders) > 1:
+            continue
+        d, c = gcd(*divisors), next(iter(remainders), 1)
+        if d <= c or d % c or (c > 1 and not (axis.extent.is_static and axis.extent.as_static() % d == 0)):
+            continue
+        out[name] = (d, c)
+    return out
+
+
+def _compressed(axis, stride: tuple[int, int]):
+    """``axis`` with the extent its workspace keeps under :func:`_workspace_strides`' ``(d, c)``."""
+    d, c = stride
+    return replace(axis, extent=axis.extent.ceil_div(d) if c == 1 else Dim(axis.extent.as_static() // d * c))
+
+
+def _compressed_index(name: str, stride: tuple[int, int]) -> Expr:
+    """Where the workspace stores coordinate ``name``'s value: ``(i // d) * c + i % c``."""
+    d, c = stride
+    return Var(name) / d if c == 1 else (Var(name) / d) * c + BinaryExpr("%", Var(name), Literal(c, "int"))
+
+
+def _divisor(expr, name: str) -> int | None:
+    """What ``expr`` divides the bare coordinate ``name`` by through positive integer divisions, or ``None``."""
+    if expr == Var(name):
+        return 1
+    if not (isinstance(expr, BinaryExpr) and expr.op in ("/", "//") and isinstance(expr.right, Literal)):
+        return None
+    if expr.right.dtype != "int" or expr.right.value <= 0 or (inner := _divisor(expr.left, name)) is None:
+        return None
+    return inner * int(expr.right.value)
+
+
+class _FoldingSigma(Sigma):
+    """A substitution that FOLDS as it lands, under a fixed range context.
+
+    ``Sigma.apply`` substitutes and stops, which is right everywhere else: a σ that rewrote its
+    result would hide what it did. Here the fold is the point — the whole gain is that
+    ``i / c`` and ``i % c`` collapse to the bare split coordinates, and an index left as
+    ``((hi * c) + lo) / c`` reaches the scheduler as an expression of the fused name again."""
+
+    def apply(self, expr):
+        return expr.substitute(self.mapping).simplify(self._ctx)
+
+
+def _substitute_and_fold(produced: Fold, name: str, sigma: Sigma, ctx: SimplifyCtx) -> Fold:
+    """``produced`` with the coordinate ``name`` substituted and every index folded against ``ctx``.
+
+    Applied per STATEMENT, not to the term: a free coordinate is a lift PARAM, so a σ handed the
+    term is dropped as shadowed exactly where it has work to do. Each lift is re-closed instead —
+    the substituted name leaves the param list and :meth:`Lambda.closing` appends the two the body
+    now reads, as TRAILING params, which is where a coordinate already sat and is what keeps the
+    operand correspondence in the prefix untouched."""
+    folding = _FoldingSigma(dict(sigma.mapping))
+    object.__setattr__(folding, "_ctx", ctx)
+    operands = tuple(_substitute_and_fold(edge, name, sigma, ctx) for edge in produced.operands)
+    body = Body(rewrite_stmt(stmt, lambda n: n, folding) for stmt in produced.lift.body)
+    lift = Lambda.closing(tuple(p for p in produced.lift.params if p != name), body, produced.lift.results)
+    return replace(produced, operands=operands, lift=lift)
+
+
+def _divmod_in_edge(edge: Fold, name: str, factor: int) -> tuple[bool, bool]:
+    """``(the edge reads name / factor, the edge reads name's low part)`` anywhere under it.
+
+    A division by a multiple of ``factor`` reads the high part too: ``i // (factor * g)`` is the
+    high part divided again, as GQA's k reads the head. The low part is ``name % factor`` or
+    ``name`` itself: a plain read depends on both halves, as a workspace indexed by the fused
+    name does when a cut materialized one operand at it."""
+    div = low = False
+    pending = [edge]
+    while pending:
+        term = pending.pop()
+        pending.extend(term.operands)
+        for stmt in term.lift.body.iter():
+            for expr in stmt.exprs():
+                for op, value in _divmod_reads(expr, name):
+                    high = op == "/" and value % factor == 0
+                    div = div or high
+                    low = low or not high
+    return div, low
+
+
+def _divmod_reads(expr, name: str) -> list[tuple[str, int]]:
+    """How ``expr`` reads the coordinate ``name``: ``("/", d)`` per outermost chain of integer
+    divisions (``(i // a) // b`` reads ``i // (a * b)``), ``("%", m)`` per remainder, ``("", 1)``
+    per bare use."""
+    parts = tuple(expr.subterms())
+    chains = {
+        id(part): divisor
+        for part in parts
+        if isinstance(part, BinaryExpr) and (divisor := _divisor(part, name)) is not None and divisor > 1
+    }
+    inner = {id(part.left) for part in parts if id(part) in chains}
+    reads = [("/", divisor) for key, divisor in chains.items() if key not in inner]
+    reads += [
+        ("%", int(part.right.value))
+        for part in parts
+        if isinstance(part, BinaryExpr)
+        and part.op == "%"
+        and part.left == Var(name)
+        and isinstance(part.right, Literal)
+        and part.right.dtype == "int"
+        and isinstance(part.right.value, int)
+        and part.right.value > 1
+    ]
+    uses = sum(isinstance(part, Var) and part.name == name for part in parts)
+    return reads + [("", 1)] * (uses - len(reads))
+
+
+def _straddles_a_contraction(produced: Fold, name: str, factor: int) -> bool:
+    """Whether the pair straddles ONE contraction's operands — the div feeding a DIFFERENT edge
+    from the mod.
+
+    That straddle IS the pathology, and nothing weaker is. It says the contraction's A operand is
+    indexed by ``name / factor`` while its B operand contracts into ``name % factor``, so A depends
+    on the axis B reduces over and the term is not a matmul the warp tier can tile. A coordinate
+    that merely happens to carry a divmod somewhere — a flat index a reduce walks, a strided read —
+    is an ordinary coordinate, and splitting it only re-spells a kernel that was already scheduled.
+    """
+    pending = [produced]
+    while pending:
+        term = pending.pop()
+        pending.extend(term.operands)
+        if term.axis is None or len(term.free_axes) < 2:
+            # TWO free axes or nothing: the pathology presupposes the contraction already HAS an m
+            # and an n and that the fused pair is one of them, so splitting only un-entangles what
+            # the tier could otherwise tile. A contraction with ONE free axis is a different shape
+            # — splitting INVENTS its second dimension — and the DeepSeek V4 post block measured
+            # what that costs: its piece stopped completing a single iteration in 90 s.
+            continue
+        divs = {position for position, edge in enumerate(term.operands) if _divmod_in_edge(edge, name, factor)[0]}
+        mods = {position for position, edge in enumerate(term.operands) if _divmod_in_edge(edge, name, factor)[1]}
+        if divs and mods and (divs - mods or mods - divs):
+            return True
+    return False
+
+
+def _fused_pair_factor(produced: Fold, axes: tuple) -> tuple[str, int] | None:
+    """A grid coordinate read as ``i / c`` beside ``i % c`` or ``i`` itself is TWO coordinates
+    wearing one name — ``(the axis, c)``, or ``None``. The plain read is a workspace a cut stored
+    at the fused index: the other operand of the same contraction still reads ``i / c``.
+
+    Attention's (head, head-dim) pair arrives fused: the projection downstream reshapes the
+    attention output to one flat width, and a cut inherits that spelling. While the pair stays
+    fused the contraction's A operand is indexed by ``i / c`` — it DEPENDS on the axis the B
+    operand contracts into — which is not a matmul, so the warp tier never offers a tile and the
+    piece falls to a per-cell reduce that walks the whole reduction once per ``c``. Splitting the
+    name restores the batched matmul the tier already schedules elsewhere.
+
+    Distinct from :func:`_workspace_strides`, which claims a coordinate used only as ``i // d``
+    and rightly declines this one: a remainder beside the division is not a narrower workspace,
+    it is a second axis."""
+    for axis in axes:
+        name = axis.name
+        if not axis.extent.is_static:
+            continue
+        extent = axis.extent.as_static()
+        reads: set[tuple[str, int]] = set()
+        pending = [produced]
+        while pending:
+            term = pending.pop()
+            pending.extend(term.operands)
+            if name not in term.free_axes:
+                continue
+            for stmt in term.lift.body.iter():
+                for expr in stmt.exprs():
+                    reads.update(_divmod_reads(expr, name))
+        divisors = {value for op, value in reads if op == "/"}
+        remainders = {value for op, value in reads if op == "%"}
+        # The pair's factor is the finest division; a coarser one that it divides reads the high
+        # part again (GQA's k at ``head // group``), which the split folds to ``hi // group``.
+        factor = min(divisors, default=0)
+        if divisors and all(value % factor == 0 for value in divisors) and remainders <= {factor} and (remainders or ("", 1) in reads):
+            if 1 < factor < extent and extent % factor == 0 and _straddles_a_contraction(produced, name, factor):
+                return name, factor
+    return None
+
+
+def _split_fused_pair(produced: Fold, axes: tuple, index: tuple) -> tuple[Fold, tuple, tuple, tuple]:
+    """``(tree, grid axes, write index, minted axes)`` with one fused pair split back into two.
+
+    The substitution ``i -> hi * c + lo`` is an exact change of iteration variables, so the tree
+    keeps its meaning whatever the detector decided; what changes is that the operands' ``i / c``
+    and ``i % c`` fold to the bare coordinates the contraction wants. The WRITE keeps the fused
+    index and the workspace its shape, so the sibling that reads it back needs no adjustment —
+    only the grid is two-dimensional where it was one."""
+    found = _fused_pair_factor(produced, axes)
+    if found is None:
+        return produced, axes, index, ()
+    name, factor = found
+    axis = next(a for a in axes if a.name == name)
+    extent = axis.extent.as_static()
+    taken = {a.name for a in axes} | set(produced.free_axes)
+    hi, lo = (f"{name}_{suffix}" for suffix in ("hi", "lo"))
+    while hi in taken or lo in taken:
+        hi, lo = f"{hi}_", f"{lo}_"
+    fused = BinaryExpr("+", BinaryExpr("*", Var(hi), Literal(factor, "int")), Var(lo))
+    ranges = {hi: Interval(0, extent // factor - 1), lo: Interval(0, factor - 1)}
+    produced = _substitute_and_fold(produced, name, Sigma({name: fused}), SimplifyCtx(ranges=ranges))
+    minted = (Axis(name=hi, extent=Dim(extent // factor)), Axis(name=lo, extent=Dim(factor)))
+    grid = tuple(part for a in axes for part in (minted if a.name == name else (a,)))
+    return produced, grid, tuple(expr.substitute({name: fused}) for expr in index), minted
+
+
+def _buffer_reads(node: Fold) -> set[str]:
+    """The gmem buffers ``node``'s STORED tree reads — every lift body's loads, through the operand
+    edges (a slab's body is its one load). Read off the tree, never by lowering it."""
+    out = {load.input for load in node.lift.body.loads}
+    for edge in node.operands:
+        out |= _buffer_reads(edge)
+    return out
+
+
+def _piece_inputs(root: Node, fold: Fold, first: tuple[str, ...] = ()) -> list[str]:
+    """A piece's graph inputs: its workspaces, then every buffer of ``root``'s the piece reads.
+
+    The read set is the STORED tree's (:func:`_buffer_reads`), walked through the operand edges a
+    body cannot reach. A walk that stopped at the stored body named fewer inputs than the kernel
+    went on to read; the workspace producers then had no consumer edge, were pruned as orphans,
+    and the launch asked for a buffer nothing had allocated."""
+    reads = _buffer_reads(fold)
+    return [*first, *(name for name in root.inputs if name in reads)]
+
+
+def _input_fragment(match: Match, root: Node) -> Graph:
+    fragment = Graph()
+    for name in root.inputs:
+        fragment.add_node(op=InputOp(), inputs=[], output=match.graph.buffer(name), node_id=name)
+    return fragment
+
+
+#: The temporary every piece of a placement cut travels under while the fragment is spliced in.
+#: One suffix per rewrite (``_split`` mints ``__split``), so a fragment's names say which decision
+#: minted them.
+_PLACED = "__placed"
+
+
+def output_map(root: Node) -> dict[str, str]:
+    """Stable temporary output names used by every cut sibling of ``root``."""
+    return {name: f"{name}{_PLACED}" for name in root.buffer_names()}
+
+
+def _in_source_order(stores: tuple, order: list[str]) -> tuple:
+    """``stores`` in the kernel's own output-specification order. The ownership partition groups by
+    region; ``apply_output_specs`` reads consecutive same-path stores as one sweep nest, so the
+    pieces must keep the order the kernel spelled rather than the order the partition returned."""
+    return tuple(sorted(stores, key=lambda store: order.index(store.write.output)))
+
+
+def _region_term(regions: tuple, body, results: tuple) -> Fold:
+    """A zero-axis term over ``regions`` and the projection statements they own, exposing
+    ``results`` — the values the stores that stay with it are written from. The results are named
+    rather than derived from the body's last definition: a piece may own several stores, and one
+    that owns a store read straight off a region has no body at all."""
+    bound = tuple(name for region in regions for name in region.exposes)
+    return Fold(operands=regions, lift=Lambda.closing(bound, Body.coerce(body), results))
+
+
+def _region_piece(
+    tile: TileOp, regions: tuple, tail, stores: tuple, placement_decided: bool, split_consumed: bool, spelling: str, shapes: dict
+):
+    """One output-owning piece: the regions' term, the outputs they produce, and the PARENT's free
+    axes. The placement is deliberately the parent's and not the seam's own axes — the piece is a
+    kernel writing the kernel's own outputs, so its grid is settled by the same shared-sweep
+    promotion that settles any single-output kernel's, applied now that the sibling's stores are no
+    longer in the intersection."""
+    piece = TileOp(
+        op=_region_term(regions, tail, tuple(dict.fromkeys(value for store in stores for value in store.write.values))),
+        # The seam token keeps recursive pieces' kernel names distinct, as it does for a workspace
+        # producer — two same-named pieces from different cut levels would launch one kernel twice.
+        name=f"{tile.name}__place_{seam_token(tile, spelling)}",
+        place=Placement(free=tuple(tile.place.free)),
+        axes=tile.axes,
+        output_specs=stores,
+        placement_decided=placement_decided,
+        split_consumed=split_consumed,
+    )
+    return replace(reformed(piece, shapes), knobs=consume_kernel_row(piece.knobs))
+
+
+def _read_name(name: str, token: str, ordinal: int | None = None) -> str:
+    """The SSA name a workspace read binds: the cone's own result name, tagged with the seam whose
+    workspace it now comes from (and, for a clustered duplicate, its ordinal in the cluster).
+
+    A lowered body reads PRODUCER names throughout — a consumer's params are spelled as the result
+    names of the edge they bind (:attr:`~emmy.compiler.ir.pure.fold.Fold.applied`) — so an edge's
+    result name is what the emitted kernel declares, and the cone's own name is NOT unique among
+    what one kernel binds. The value a cut materializes can still be computed in place beside the
+    read: a structurally equal cone the replacement did not reach (replacement follows object
+    sharing), or a second seam exposing that same value. Under one name those are two declarations
+    at two different addresses, which is an SSA fault and which nvcc rejects (*already declared in
+    the current scope*). Reads of ONE workspace at one address keep one name, so the emitted body
+    still binds each value once. What a reader derives from the read carries the tag on
+    (:func:`_follow_reads`).
+    """
+    return f"{name}__ws{token}" if ordinal is None else f"{name}__ws{token}s{ordinal}"
+
+
+def _indexed_read(seam: CutSite, own: str, channel: int, correspondence: tuple, held: dict, indexes: dict, token: str, ordinal: int):
+    """One indexed sibling's read, or no edge when its component has no reader."""
+    if channel not in held:
+        return None
+    mapping = dict(correspondence)
+    mapping.update({axis.name: Literal(0, "int") for axis in seam.axes if _unit(axis) and axis.name not in mapping})
+    return Fold.slab(
+        Load(
+            name=_read_name(own, token, ordinal),
+            input=held[channel],
+            index=tuple(expr.substitute(mapping) for expr in indexes[channel]),
+        )
+    )
+
+
+def _producer_order(pieces) -> list:
+    """Topologically order cut producers by the workspaces their stored Fold reads.
+
+    Containment can make one produced piece read another even when the corresponding seams have
+    no provider requirement. Dependency COUNT is not an order: two pieces may each read one
+    workspace while one of those workspaces is produced by the other piece.
+    """
+    workspaces = {buffer for *_, buffers in pieces for buffer in buffers}
+    remaining = list(pieces)
+    ordered = []
+    available: set[str] = set()
+    while remaining:
+        ready = [piece for piece in remaining if _buffer_reads(piece[1]) & workspaces <= available]
+        assert ready, "strict Fold containment makes the cut-workspace dependency graph acyclic"
+        ordered.extend(ready)
+        available.update(buffer for *_, buffers in ready for buffer in buffers)
+        remaining = [piece for piece in remaining if not any(piece is chosen for chosen in ready)]
+    return ordered
+
+
+def _fuse_sibling_producers(fragment: Graph, spelled: dict[str, str], parent: TileOp) -> None:
+    """Fuse independent workspace producers through the ordinary Loop IR splicer.
+
+    The consumer is outside each region: its workspace reads are the cuts this decision took.
+    Producers with different workspace dependencies stay apart for the same reason. The fused
+    producer returns to Tile IR without a schedule, so an output-owning cut can separate it.
+    ``spelled`` is each workspace buffer's seam; the fused producer is the piece of the seam set its
+    members produced, and carries that set's token.
+    """
+    workspace = set(spelled)
+    by_dependencies: dict[frozenset[str], set[str]] = {}
+    for buffer in spelled:
+        node = fragment.producer(buffer)
+        assert node is not None
+        if any(tensor.dtype.logical_elems > 1 for tensor in node.outputs):
+            continue  # the Loop splicer cannot remove a packed tensor's storage relation
+        by_dependencies.setdefault(frozenset(set(node.inputs) & workspace), set()).add(node.id)
+    for members in by_dependencies.values():
+        # A previous splice can prune unused producers from later groups as orphans.
+        members = members & fragment.nodes.keys()
+        if len(members) < 2:
+            continue
+        loop_graph = fragment.copy()
+        for nid in members:
+            tile = loop_graph.nodes[nid].op
+            loop_graph.nodes[nid].op = LoopOp(body=tile.loop_body, name=tile.name)
+        live = live_outputs_of(loop_graph, members)
+        merged = build_merged_region(loop_graph, members, live)
+        if merged is None:
+            raise ValueError(f"fusion cannot splice cut producers: {sorted(members)}")
+        # Re-cut pieces retain the parent's input ABI, independent of sibling traversal order.
+        inputs = (*spelled, *parent.inputs)
+        merged = replace(merged, inputs={name: merged.inputs[name] for name in inputs if name in merged.inputs})
+        replacement, output_map = wrap_multi_output_fragment(fragment, merged, live)
+        merged_node = next(node for node in replacement.nodes.values() if isinstance(node.op, LoopOp))
+        seams = "+".join(sorted({spelled[nid] for nid in members}))
+        fused = lift_kernel(merged_node.op, name=f"{parent.name}__place_{seam_token(parent, seams)}")
+        merged_node.op = replace(fused, split_consumed=any(fragment.nodes[nid].op.split_consumed for nid in members))
+        fragment.splice(replacement, consumed=members, output=output_map)
+
+
+def realize(
+    match: Match,
+    root: Node,
+    seams,
+    *,
+    placement_decided: bool = False,
+) -> Graph:
+    """Build the cut fragment for ``seams`` — one piece per seam plus the ONE sibling piece that
+    reads what they produced. A single seam is the two-kernel cut; several seams are one COMPOSED
+    placement decision (a pinned compile consumes every scoped PLACE pin that resolves on this
+    kernel at once, and the knob row records every spelling).
+
+    A frontier seam cuts at the cone's storage waypoint: the piece computes the encode prefix, the
+    workspace holds the raw bits, and the sibling keeps the decode + factor residue as its operand
+    cone (which normalization then binds as a raw storage-dtype load with the factors hoisted onto
+    the accumulator epilogue). An OUTPUT-OWNING seam writes the kernel's own outputs instead of a
+    workspace, and the sibling keeps the rest; the two kinds compose, because a workspace cut nested
+    under an output-owning region is applied to that region's term like any other consumer's.
+
+    ``placement_decided`` consumes an authoritative pinned PLACE restriction on each emitted piece.
+    Unpinned pieces and newly fused producers can expose and decide smaller seams. A placement
+    cut never erases an earlier cross-CTA decision: every piece inherits the parent's explicit or
+    sliced-axis split receipt."""
+    tile: TileOp = root.op
+    split_consumed = tile.split_consumed or carries_partition(tile)
+    owning = tuple(seam for seam in seams if seam.owned is not None)
+    seams = tuple(seam for seam in seams if seam.owned is None)
+    pieces = []
+    # What each replaced cone's result is called once the consumer reads it back, and what every
+    # value derived from such a read is called after it (:func:`_follow_reads`) — the renames this
+    # pass mints, collected as they are minted. A term's readers follow them for free (a
+    # consumer's params are spelled as the result names of the edge they bind), but the kernel's
+    # boundary stores are NOT part of the term: ``TileOp.output_specs`` names the stored value as
+    # a plain string, so a store of a renamed value has to be re-spelled here or it names a value
+    # the consumer no longer defines.
+    read_names: dict[str, str] = {}
+    taken = _kept_components(tile)
+    for seam in seams:
+        child = seam.node
+        front = seam.frontier
+        # A workspace holds the components the consumer READS. The piece still folds every
+        # channel — a reduce carries its accumulators together — but a component no reader takes
+        # is not stored, so no launch is left loading a buffer nothing wrote for it.
+        # One workspace serves the representative AND every clustered sibling, so a component any
+        # occurrence reads is kept for all of them.
+        shared = set(taken.get(id(child), set(child.exposes)))
+        for sibling, _, channels in seam.siblings:
+            read = taken.get(id(sibling), set(sibling.exposes))
+            shared.update(child.exposes[channel] for position, channel in enumerate(channels) if sibling.exposes[position] in read)
+        for sibling, addresses in seam.indexed_siblings:
+            read = taken.get(id(sibling), set(sibling.exposes))
+            shared.update(child.exposes[channel] for own, (channel, _) in zip(sibling.exposes, addresses, strict=True) if own in read)
+        # A channel that is another channel read elsewhere stores nothing of its own: it reads that one.
+        copies = _channel_copies(seam, tile.axes) if front is None else {}
+        shared = {child.exposes[copies.get(position, (position,))[0]] for position, name in enumerate(child.exposes) if name in shared}
+        # ONE workspace per DISTINCT component, not one per position. A carrier seats a component
+        # once per reader, so a value two readers share is exposed at SEVERAL positions naming the
+        # one accumulator (flash's numerator, read straight and again through its normalizing
+        # wrapper). Fused lowering collapses those onto that one SSA value; a workspace keyed by
+        # position instead declares the accumulator's storage once per position and emits a
+        # redeclaration no compiler accepts. The first position owns the buffer and the rest read it.
+        owner = {name: position for position, name in reversed(list(enumerate(child.exposes))) if name in shared}
+        slots = tuple(owner.get(name) == position for position, name in enumerate(child.exposes))
+        wanted = tuple(name for position, name in enumerate(child.exposes) if slots[position])
+        token = seam_token(tile, seam.spelling)
+        # One piece per stride: a channel that reads a coordinate only as ``i // d`` where another reads
+        # it plainly (GQA's k beside q) is computed and stored once per group of ``d`` cells by its own
+        # piece, instead of ``d`` times beside the other channel. Channels over different axes stay
+        # one piece: they share the reads a twin folds them over. The ordinal names the component a
+        # workspace holds, so a narrowed seam keeps the spelling of the components it did keep.
+        if front is not None:
+            groups = [((front.name,), front.producer, seam.dtypes, (0,))]
+        else:
+            kept = tuple(position for position in range(len(child.exposes)) if slots[position])
+            by_shape: dict[tuple, list[int]] = {}
+            for position in kept:
+                alone = _channels(child, (child.exposes[position],)) if len(kept) > 1 else child
+                axes = _workspace_axes(seam, alone)
+                by_shape.setdefault((axes, frozenset(_workspace_strides(alone, axes).items())), []).append(position)
+            if len({axes for axes, _ in by_shape}) > 1:
+                by_shape = {None: list(kept)}
+            groups = []
+            for positions in by_shape.values():
+                names = tuple(child.exposes[position] for position in positions)
+                produced = child if len(by_shape) == 1 else _channels(child, names)
+                groups.append((names, produced, tuple(seam.dtypes[position] for position in positions), tuple(positions)))
+        held: dict[int, str] = {}
+        indexes: dict[int, tuple] = {}
+        for number, (names, produced, dtypes, ordinals) in enumerate(groups):
+            axes = _workspace_axes(seam, produced)
+            strides = _workspace_strides(produced, axes)
+            index = tuple(_compressed_index(axis.name, strides[axis.name]) if axis.name in strides else Var(axis.name) for axis in axes)
+            axes = tuple(_compressed(axis, strides[axis.name]) if axis.name in strides else axis for axis in axes)
+            buffers = tuple(f"{root.id}__place_{token}_{i}" for i in ordinals)
+            for name, buffer in zip(names, buffers, strict=True) if front is None else ():
+                held.update({position: buffer for position, own in enumerate(child.exposes) if own == name})
+                indexes.update({position: index for position, own in enumerate(child.exposes) if own == name})
+            pieces.append(
+                (replace(seam, dtypes=dtypes), produced, axes, strides, token if number == 0 else f"{token}_{number}", names, buffers)
+            )
+
+        # SLABS, not bare Loads: these replace an operand edge, and an operand is a term. The
+        # workspace read declares the seam axes it indexes, exactly as any other gmem read does.
+        # Positional over what the edge exposed, ``None`` where the reader took nothing. A
+        # frontier's workspace is the one raw waypoint, which the block below spells instead.
+        # A channel that copies another is read from that channel's buffer at the address it computes.
+        for position, (rep, mapping) in copies.items():
+            if rep in held:
+                held[position] = held[rep]
+                indexes[position] = tuple(expr.substitute(mapping) for expr in indexes[rep])
+        loads: tuple = tuple(
+            Fold.slab(Load(name=_read_name(name, token), input=held[position], index=indexes[position])) if position in held else None
+            for position, name in enumerate(child.exposes)
+        )
+        if front is not None:
+            # The raw storage read at the frontier's dtype stays INLINE under its decode residue —
+            # the storage-decode cone the operand readers recognize (a raw ``b8`` fill), not a
+            # projection over a slab. The residue is a lambda over that read, so tagging what it
+            # EXPOSES renames its defining statements in lockstep and leaves the read's own
+            # internal spelling alone.
+            raw = Load(name=names[0], input=buffers[0], index=index, dtype=front.dtype)
+            operands = tuple(edge for edge in child.operands if set(edge.exposes) & Body(front.residue).ssa_uses)
+            params = tuple(name for edge in operands for name in edge.exposes)
+            residue = Lambda.closing(params, Body((raw, *front.residue)), child.applied.results)
+            loads = (Fold(operands=operands, lift=residue.rename({name: _read_name(name, token) for name in residue.results})),)
+        # The names the consumer reads this workspace back under. A frontier seam's workspace holds
+        # the raw storage waypoint, so its piece is named after the FRONTIER while the consumer
+        # still exposes the cone's decoded results — the rename is over those.
+        read_names.update({name: _read_name(name, token) for name in (wanted if front is None else child.lift.results)})
+        read_names.update({child.exposes[position]: _read_name(child.exposes[position], token) for position in copies})
+        replacements = {id(child): loads}
+        for ordinal, (sibling, pairs, channels) in enumerate(seam.siblings):
+            # A clustered duplicate reads the SAME workspace, spelled through its own captured
+            # axes via the correspondence the clustering proved — and under its own read names,
+            # since it reads that workspace at a DIFFERENT address than the representative. It
+            # reads the component that is its value: a lone contraction reads one channel of the
+            # twin it equals.
+            mapping = dict(pairs)
+            mapping.update({axis.name: Literal(0, "int") for axis in seam.axes if _unit(axis) and axis.name not in mapping})
+            replacements[id(sibling)] = tuple(
+                Fold.slab(
+                    Load(
+                        name=_read_name(own, token, ordinal),
+                        input=held[channel],
+                        index=tuple(expr.substitute(mapping) for expr in indexes[channel]),
+                    )
+                )
+                if channel in held
+                else None
+                for own, channel in zip(sibling.exposes, channels, strict=True)
+            )
+            # The representative wins a shared name: a boundary store of a value both occurrences
+            # expose reads the term's own, and only the representative sits on the term's path.
+            for name, channel in zip(sibling.exposes, channels, strict=True):
+                if channel in held:
+                    read_names.setdefault(name, _read_name(name, token, ordinal))
+        for ordinal, (sibling, addresses) in enumerate(seam.indexed_siblings, start=len(seam.siblings)):
+            # Each channel reads its matching component at its own proven row address.
+            loads = []
+            for own, (channel, correspondence) in zip(sibling.exposes, addresses, strict=True):
+                load = _indexed_read(seam, own, channel, correspondence, held, indexes, token, ordinal)
+                loads.append(load)
+                if load is not None:
+                    read_names.setdefault(own, _read_name(own, token, ordinal))
+            replacements[id(sibling)] = tuple(loads)
+        pieces[len(pieces) - len(groups) :] = [(*piece, replacements) for piece in pieces[len(pieces) - len(groups) :]]
+
+    # Every replacement applies to the consumer AND to every OTHER seam's produced piece: a
+    # composed decision may cut a cone nested inside another seam's value (attention's statistics
+    # cone contains the score dots whose operand cones are cut beside it), and that producer must
+    # read the workspace like any other consumer. Containment is strict, so order is free.
+    everything = {target: loads for *_, replacements in pieces for target, loads in replacements.items()}
+    parent_fold = _replace_fold(tile.op, everything, read_names)
+    stored = {buffer: dtype for seam, *_, buffers, _ in pieces for buffer, dtype in zip(buffers, seam.dtypes, strict=False)}
+    parent_fold = _without_identity_casts(parent_fold, stored)
+    specs = tuple(
+        replace(store, write=replace(store.write, values=tuple(read_names.get(value, value) for value in store.write.values)))
+        for store in tile.output_specs
+    )
+    produced_pieces = []
+    for seam, produced, axes, strides, token, names, buffers, replacements in pieces:
+        others = {target: loads for target, loads in everything.items() if target not in replacements}
+        # A piece that reads another seam's workspace re-spells what it derives from it too, and
+        # its own stores name those values.
+        derived: dict[str, str] = {}
+        produced = _without_identity_casts(_replace_fold(produced, others, derived) if others else produced, stored)
+        # The piece sweeps the stored cells: coordinate ``j`` is the original ``(j // c) * d + j % c``,
+        # folded under ``j``'s range so ``i // d`` and ``i % c`` read back as ``j // c`` and ``j % c``.
+        for axis in axes:
+            if (stride := strides.get(axis.name)) is None:
+                continue
+            d, c = stride
+            if c == 1:
+                produced = rewrite_stmt(produced, lambda name: name, Sigma({axis.name: Var(axis.name) * d}))
+                continue
+            folding = _FoldingSigma({axis.name: (Var(axis.name) / c) * d + BinaryExpr("%", Var(axis.name), Literal(c, "int"))})
+            object.__setattr__(folding, "_ctx", SimplifyCtx(ranges={axis.name: Interval(0, axis.extent.as_static() - 1)}))
+            produced = rewrite_stmt(produced, lambda name: name, folding)
+        index = tuple(Var(axis.name) for axis in axes)
+        produced_pieces.append((seam, produced, axes, index, token, tuple(derived.get(name, name) for name in names), buffers))
+
+    fragment = _input_fragment(match, root)
+    spelled = {buffer: seam.spelling for seam, *_, buffers in produced_pieces for buffer in buffers}  # each workspace's seam
+    all_buffers = list(spelled)
+    # Every buffer a piece reads or writes: the kernel's own, and each workspace at the shape its reader reads it at.
+    shapes = io_shapes(tile)
+    shapes.update((buffer, tuple(axis.extent for axis in axes)) for _, _, axes, *_, buffers in produced_pieces for buffer in buffers)
+    # A producer reading another seam's workspace must follow the node that writes it. Strict
+    # containment makes this dependency graph acyclic, including chains whose members have the
+    # same number of direct workspace reads.
+    for seam, produced, axes, index, token, names, buffers in _producer_order(produced_pieces):
+        # The workspace keeps the shape the sibling already reads it back at, so the split below
+        # moves the GRID and nothing else.
+        shape = tuple(axis.extent for axis in axes)
+        produced, grid, index, minted = _split_fused_pair(produced, axes, index)
+        producer = TileOp(
+            op=produced,
+            # The seam token keeps recursive pieces' kernel names distinct — the one-name-one-source
+            # launch rule stated beside ``nvcc.load_cubin_function``: two same-named producers from
+            # different cut levels would launch one kernel twice.
+            name=f"{tile.name}__place_{token}",
+            # The workspace axes are the store's SWEEP, and the one rank rule
+            # (``promoted_sweep``, applied by ``TileOp.__post_init__``) binds the ones binding
+            # replicates nothing over. A free axis per workspace dimension instead bound the sweep a
+            # row statistic is invariant in, so the piece re-folded it once per output CELL: a
+            # materialized q/k RoPE cone launched one cooperative block per element.
+            place=Placement(free=()),
+            axes=(
+                *(next((axis for axis in grid if axis.name == original.name), original) for original in tile.axes),
+                *minted,
+            ),
+            output_specs=tuple(
+                OutputSpec(Write(output=buffer, index=index, value=name), sweep=grid) for name, buffer in zip(names, buffers, strict=True)
+            ),
+            placement_decided=placement_decided,
+            split_consumed=split_consumed,
+        )
+        producer = replace(reformed(producer, shapes), knobs=consume_kernel_row(producer.knobs))
+        workspace_tensors = tuple(Tensor(name=buffer, shape=shape, dtype=dtype) for buffer, dtype in zip(buffers, seam.dtypes, strict=True))
+        reads = _buffer_reads(produced)
+        fragment.add_node(
+            op=producer,
+            inputs=_piece_inputs(root, produced, tuple(buffer for buffer in all_buffers if buffer in reads)),
+            outputs=workspace_tensors,
+            node_id=buffers[0],
+        )
+
+    # A bare reduction carries NO output specification — its grid-cell store is materializer glue —
+    # so the sibling's ports are read off the graph node, not off the stores.
+    consumer_fold, consumer_stores = parent_fold, specs
+    consumer_outputs = set(root.buffer_names())
+    if owning:
+        chosen = {index: seam for index, edge in enumerate(tile.op.operands) for seam in owning if seam.node is edge}
+        # The ownership partition, re-derived over the REPLACED root: a workspace cut composed with
+        # these swapped a cone for a slab under one of the regions, and the piece has to carry that
+        # swap. With no such seam the replacement is the identity and this is the same call the
+        # offer made, so the two agree by construction; a composed one replaces operand edges and
+        # leaves the root body alone, which is what the partition reads. Either way it is positional
+        # over the operands, so the regions line up with the seams that chose them.
+        regions = output_regions(parent_fold, specs)
+        order = [store.write.output for store in specs]
+        for index, seam in chosen.items():
+            region, tail, stores = regions[index]
+            stores = _in_source_order(stores, order)
+            piece = _region_piece(tile, (region,), tail, stores, placement_decided, split_consumed, seam.spelling, shapes)
+            reads = _buffer_reads(piece.op)
+            add_output_piece(
+                fragment,
+                output_root(root, {store.write.output for store in stores}),
+                piece,
+                _piece_inputs(root, piece.op, tuple(buffer for buffer in all_buffers if buffer in reads)),
+                suffix=_PLACED,
+            )
+        kept = [regions[index] for index in range(len(regions)) if index not in chosen]
+        consumer_stores = _in_source_order(tuple(store for _, _, stores in kept for store in stores), order)
+        # A composed decision may hand every output away; then there is no sibling piece to emit.
+        if not consumer_stores:
+            _fuse_sibling_producers(fragment, spelled, tile)
+            return fragment
+        consumer_outputs = {store.write.output for store in consumer_stores}
+        consumer_fold = _region_term(
+            tuple(region for region, _, _ in kept),
+            Body(tuple(stmt for _, tail, _ in kept for stmt in tail)),
+            tuple(dict.fromkeys(value for store in consumer_stores for value in store.write.values)),
+        )
+
+    consumer = TileOp(
+        op=consumer_fold,
+        name=tile.name,
+        place=tile.place,
+        axes=tile.axes,
+        # ``specs`` already reads each stored value under the name the cut left it;
+        # ``add_output_piece`` re-spells the BUFFER each write targets.
+        output_specs=consumer_stores,
+        placement_decided=placement_decided,
+        placement_consumed=tile.placement_consumed,
+        placement_step=tile.placement_step + 1,
+        split_consumed=split_consumed,
+    )
+    consumer = replace(reformed(consumer, shapes), knobs=consume_kernel_row(consumer.knobs))
+    add_output_piece(
+        fragment,
+        output_root(root, consumer_outputs),
+        consumer,
+        _piece_inputs(root, consumer_fold, tuple(all_buffers)),
+        suffix=_PLACED,
+    )
+    _fuse_sibling_producers(fragment, spelled, tile)
+    return fragment
+
+
+__all__ = [
+    "CutSite",
+    "Frontier",
+    "cuttable_seams",
+    "full_projection_seams",
+    "output_map",
+    "place_token",
+    "realize",
+    "seam_token",
+    "storage_frontier",
+]

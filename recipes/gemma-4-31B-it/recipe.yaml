@@ -1,10 +1,10 @@
 tags:
-  - maintained
+  - best-effort
 
 model:
   huggingface: "google/gemma-4-31B-it"
-  rationale: "Strong OR presence and 31B dense VLM signal."
-  heat: 58
+  rationale: "Established arena presence (1453, open #14) but family cooling; no fresh momentum."
+  heat: 45
 engine:
   llm:
     tensor_parallel_size: 1

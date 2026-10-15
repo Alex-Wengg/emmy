@@ -3,11 +3,9 @@ tags:
   - untested
 model:
   huggingface: Qwen/Qwen3.8-35B-A3B
-  rationale: "Overshadowed by the 27B variant despite underlying momentum."
-  heat: 25
+  rationale: "No public Qwen3.8-35B-A3B repo exists; overshadowed by dominant 27B line."
+  heat: 15
   task: generate
 matrices:
-- deploy.gpu: NVIDIA RTX PRO 6000 Blackwell Server Edition
-  deploy.gpu_count: 1
 - deploy.gpu: NVIDIA H200 141GB
   deploy.gpu_count: 1

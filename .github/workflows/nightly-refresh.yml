@@ -1,0 +1,604 @@
+name: Nightly refresh
+
+on:
+  schedule:
+    - cron: "13 8 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-refresh
+  cancel-in-progress: false
+
+jobs:
+  durations:
+    runs-on:
+      group: ubuntu-runners
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      updated: ${{ steps.commit.outcome == 'success' }}
+    env:
+      # The prior and discovery jobs may land their files on main while this job measures; any other move stops the push.
+      TOLERATED_PATHS: >-
+        emmy/compiler/pipeline/search/prior/weights/schedule.json
+        emmy/compiler/pipeline/search/prior/weights/placement.json
+        emmy/compiler/pipeline/search/golden/records/*.json
+        recipes/*/recipe.yaml
+        recipes/*/DISCOVERY.md
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the measurement freeze from LFS
+        run: git lfs pull --include="emmy/compiler/pipeline/search/freezes/*"
+
+      - uses: ./.github/actions/setup-emmy
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-v1
+
+      - name: Measure CPU test durations
+        timeout-minutes: 170
+        run: make test-durations
+
+      - name: Check for updated durations
+        id: changes
+        run: |
+          if git diff --quiet -- tests/durations_cpu.json; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A dispatch from a branch measures that branch to test the workflow; only a run on main commits.
+      - name: Commit updated durations to main
+        if: steps.changes.outputs.updated == 'true' && github.ref == 'refs/heads/main'
+        id: commit
+        uses: ./.github/actions/push-to-main
+        with:
+          app-id: ${{ secrets.EXPERIMENT_APP_ID }}
+          private-key: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
+          message: "tests: refresh CPU durations"
+          paths: tests/durations_cpu.json
+
+  prior:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        space: [schedule, placement]
+    runs-on:
+      group: ubuntu-runners
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    # Each leg fills the output named after its space; the other stays empty and does not overwrite it.
+    outputs:
+      schedule: ${{ steps.summary.outputs.schedule }}
+      placement: ${{ steps.summary.outputs.placement }}
+    env:
+      SPACE: ${{ matrix.space }}
+      WEIGHTS: emmy/compiler/pipeline/search/prior/weights/${{ matrix.space }}.json
+      # The duration and discovery jobs may land their files on main while this job fits; any other move stops the push.
+      TOLERATED_PATHS: >-
+        tests/durations_cpu.json
+        emmy/compiler/pipeline/search/golden/records/*.json
+        recipes/*/recipe.yaml
+        recipes/*/DISCOVERY.md
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-emmy
+
+      - name: Export repository goldens
+        run: |
+          ./venv/bin/emmy db import --db _data/ci-prior.db --fresh --repository
+          ./venv/bin/emmy db export --db _data/ci-prior.db _data/ci-prior --space "$SPACE" --repository
+
+      - name: Fit candidate prior
+        run: ./venv/bin/emmy fit _data/ci-prior _data/candidate.json --folds 0 --out _data/fit
+
+      - name: Compare prior ranks
+        id: compare
+        run: |
+          ./venv/bin/emmy eval prior _data/ci-prior --offline-file "$WEIGHTS" \
+            --compare-to _data/candidate.json --min-rank-improvement 0.05 --json _data/decision.json
+          echo "updated=$(jq -r .comparison.qualified _data/decision.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify improved prior
+        if: steps.compare.outputs.updated == 'true'
+        run: |
+          cp _data/candidate.json "$WEIGHTS"
+          EMMY_GOLDEN_FILE= ./venv/bin/pytest tests/compiler/pipeline/search/prior/test_reproduction.py \
+            -k "$SPACE" -q -p no:randomly -n auto --dist=loadgroup
+
+      # The weights this leg leaves on main: each pool re-decided with no measurement in scope, the pick's regret
+      # read off the golden row that is the pick.
+      - name: Evaluate the prior's picks
+        timeout-minutes: 120
+        run: ./venv/bin/emmy eval prior _data/ci-prior --offline-file "$WEIGHTS" --json _data/eval.json
+
+      - name: Commit improved prior to main
+        if: steps.compare.outputs.updated == 'true' && github.ref == 'refs/heads/main'
+        id: commit
+        uses: ./.github/actions/push-to-main
+        with:
+          app-id: ${{ secrets.EXPERIMENT_APP_ID }}
+          private-key: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
+          message: "compiler: refresh ${{ matrix.space }} prior"
+          paths: ${{ env.WEIGHTS }}
+
+      # Runs after a failed or timed-out step too, so the message carries what the leg finished.
+      - name: Summarize the comparison
+        id: summary
+        if: always()
+        env:
+          COMMITTED: ${{ steps.commit.outcome }}
+        run: |
+          summary="No comparison finished"
+          if [ -f _data/decision.json ]; then
+            summary=$(jq -r .comparison.message _data/decision.json)
+          fi
+          if [ "$COMMITTED" = success ]; then
+            summary="Updated the weights on main; $summary"
+          fi
+          if [ -f _data/eval.json ]; then
+            summary="$summary. $(jq -r -f .github/workflows/scripts/prior_picks.jq _data/eval.json)"
+          fi
+          echo "$SPACE=$summary" >> "$GITHUB_OUTPUT"
+
+  gaps:
+    runs-on:
+      group: ubuntu-runners
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      summary: ${{ steps.summary.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-emmy
+
+      # Every measured row beside torch.compile — the repository goldens and the realization corpus — and the
+      # corpus cases recorded as known gaps.
+      - name: List compiler gaps
+        id: summary
+        run: |
+          mkdir -p _data
+          ./venv/bin/emmy golden list --json _data/goldens.json
+          ./venv/bin/emmy golden list tests/compiler/realization/cases --json _data/corpus.json
+          find tests/compiler/realization/cases -name '*_xfail_*.json' | sort \
+            | jq -R -s 'split("\n") | map(select(length > 0))' > _data/xfail.json
+          summary=$(jq -r -n -f .github/workflows/scripts/compiler_gaps.jq \
+            --slurpfile goldens _data/goldens.json --slurpfile corpus _data/corpus.json --slurpfile xfail _data/xfail.json)
+          echo "$summary"
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+
+  # Fill one hardware golden's missing measurements on its own card: the file with the most rows `emmy golden list
+  # --missing` names among the cards CloudRift can rent now. Skipped when every row is measured or no card is free.
+  fill:
+    runs-on:
+      group: ubuntu-runners
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      summary: ${{ steps.summary.outputs.summary || steps.choose.outputs.summary }}
+    env:
+      GOLDENS: emmy/compiler/pipeline/search/golden/records
+      EMMY_RENTAL_TAGS: emmy,workflow:golden-fill,gh-job:${{ github.run_id }}-${{ github.run_attempt }}
+      SSH_KEY: /tmp/emmy-fill-ssh-${{ github.run_id }}-${{ github.run_attempt }}
+      PROVIDER_CONFIG: /tmp/emmy-fill-provider-${{ github.run_id }}-${{ github.run_attempt }}.yaml
+      CLOUDRIFT_TEAM_ID: ${{ vars.CLOUDRIFT_TEAM_ID }}
+      # The other jobs may land their files on main while this one measures; any other move stops the push.
+      TOLERATED_PATHS: >-
+        tests/durations_cpu.json
+        emmy/compiler/pipeline/search/prior/weights/schedule.json
+        emmy/compiler/pipeline/search/prior/weights/placement.json
+        recipes/*/recipe.yaml
+        recipes/*/DISCOVERY.md
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-emmy
+
+      - name: Choose a golden to fill
+        id: choose
+        env:
+          CLOUDRIFT_API_KEY: ${{ secrets.CLOUDRIFT_API_KEY }}
+        run: |
+          mkdir -p _data
+          ./venv/bin/emmy golden list "$GOLDENS" --missing --json _data/missing.json
+          if [ "$(jq length _data/missing.json)" -eq 0 ]; then
+            echo "summary=Skipped: every hardware golden row is measured." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -t cards < <(jq -r '[.[].gpu] | unique | .[]' _data/missing.json)
+          ./venv/bin/emmy vm available "${cards[@]}" > _data/available.json
+          jq -r -f .github/workflows/scripts/fill_choice.jq --slurpfile available _data/available.json _data/missing.json \
+            > _data/choice.json
+          golden=$(jq -r '.file // empty' _data/choice.json)
+          if [ -z "$golden" ]; then
+            cards_text=$(jq -r '[.[].gpu] | unique | join(", ")' _data/missing.json)
+            echo "summary=Skipped: no card with missing measurements is free on CloudRift ($cards_text)." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "golden=$golden"
+            echo "gpu=$(jq -r .gpu _data/choice.json)"
+            echo "rows=$(jq -r .rows _data/choice.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate ephemeral SSH key and isolated provider config
+        if: steps.choose.outputs.golden != ''
+        run: |
+          ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -q
+          printf 'providers:\n  cloudrift:\n    team_id: "%s"\n    with_public_ip: true\n' \
+            "$CLOUDRIFT_TEAM_ID" > "$PROVIDER_CONFIG"
+          chmod 600 "$PROVIDER_CONFIG"
+
+      # `emmy bench` rents the card, stages the checkout, runs the fill recipe and tears the VM down.
+      - name: Fill measurements on a rented card
+        if: steps.choose.outputs.golden != ''
+        timeout-minutes: 155
+        env:
+          CLOUDRIFT_API_KEY: ${{ secrets.CLOUDRIFT_API_KEY }}
+          GOLDEN: ${{ steps.choose.outputs.golden }}
+          GPU: ${{ steps.choose.outputs.gpu }}
+        run: |
+          billing=()
+          if [[ "$GPU" == *V100* ]]; then
+            billing+=(--billing-exempt)
+          fi
+          ./venv/bin/emmy bench .github/golden-fill --provider cloudrift --config "$PROVIDER_CONFIG" \
+            --ssh-key "$SSH_KEY" --filter "golden=$GOLDEN" "${billing[@]}"
+
+      - name: Terminate VMs this run left behind
+        if: always() && steps.choose.outputs.golden != ''
+        env:
+          CLOUDRIFT_API_KEY: ${{ secrets.CLOUDRIFT_API_KEY }}
+        run: |
+          ./venv/bin/emmy vm delete cloudrift --tag "$EMMY_RENTAL_TAGS"
+
+      # A partial fill is still progress: whatever the card recorded before the budget or the step limit ran out.
+      - name: Take the filled golden
+        id: take
+        if: always() && steps.choose.outputs.golden != ''
+        env:
+          GOLDEN: ${{ steps.choose.outputs.golden }}
+        run: |
+          working=$(find .github/golden-fill -name '*_working.json' | sort | tail -1)
+          [ -n "$working" ] || { echo "The fill returned no working golden." >&2; exit 1; }
+          cp "$working" "$GOLDEN"
+          ./venv/bin/emmy golden check "$GOLDEN"
+          ./venv/bin/emmy golden list "$GOLDEN" --missing --json _data/still_missing.json
+          failed=$(find .github/golden-fill -name '*_failed.txt' | sort | tail -1)
+          echo "failed=$(cat "${failed:-/dev/null}" | wc -l)" >> "$GITHUB_OUTPUT"
+          if git diff --quiet -- "$GOLDEN"; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit the filled golden to main
+        if: always() && steps.take.outputs.updated == 'true' && github.ref == 'refs/heads/main'
+        id: commit
+        uses: ./.github/actions/push-to-main
+        with:
+          app-id: ${{ secrets.EXPERIMENT_APP_ID }}
+          private-key: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
+          message: "goldens: fill missing measurements on ${{ steps.choose.outputs.gpu }}"
+          paths: ${{ steps.choose.outputs.golden }}
+
+      - name: Summarize the fill
+        id: summary
+        if: always() && steps.choose.outputs.golden != ''
+        env:
+          GOLDEN: ${{ steps.choose.outputs.golden }}
+          GPU: ${{ steps.choose.outputs.gpu }}
+          ROWS: ${{ steps.choose.outputs.rows }}
+          FAILED: ${{ steps.take.outputs.failed }}
+          COMMITTED: ${{ steps.commit.outcome }}
+        run: |
+          left=$(jq length _data/still_missing.json 2>/dev/null || echo "$ROWS")
+          summary="$(basename "$GOLDEN") on $GPU: $((ROWS - left)) of $ROWS missing measurements filled, ${FAILED:-0} failed"
+          if [ "$COMMITTED" = success ]; then
+            summary="$summary; committed to main"
+          fi
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+
+  discover:
+    runs-on:
+      group: agent-runners
+      labels: agents
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      partial: ${{ steps.partial.outputs.partial }}
+      modified_models: ${{ steps.lifecycle.outputs.modified_models }}
+    env:
+      MAINTAINED_MODEL_COUNT: 10
+      AGENT_MODEL: ${{ vars.ONBOARD_AGENT_MODEL || 'Qwen/Qwen3.8-27B-FP8' }}
+      CLOUDRIFT_INFERENCE_URL: ${{ vars.CLOUDRIFT_INFERENCE_URL || 'https://inference.cloudrift.ai/v1' }}
+      OPENCODE_DISABLE_AUTOUPDATE: "true"
+      OPENCODE_CONFIG_DIR: ${{ github.workspace }}/.opencode
+      AGENT_TASK: ${{ github.workspace }}/.emmy-discovery-task-${{ github.run_id }}-${{ github.run_attempt }}.json
+      AGENT_EVENTS: /tmp/emmy-discovery-events-${{ github.run_id }}-${{ github.run_attempt }}.jsonl
+      AGENT_SELECTION: /tmp/emmy-discovery-selection-${{ github.run_id }}-${{ github.run_attempt }}.json
+      AGENT_MANIFEST: /tmp/emmy-discovery-manifest-${{ github.run_id }}-${{ github.run_attempt }}.json
+      AGENT_REJECTION: /tmp/emmy-discovery-rejection-${{ github.run_id }}-${{ github.run_attempt }}.txt
+      DISCOVERY_SUMMARY: /tmp/emmy-discovery-summary-${{ github.run_id }}-${{ github.run_attempt }}.md
+      # The selection depends only on the recipes; a move of main elsewhere is rebased over, one in recipes stops the push.
+      GUARDED_PATHS: recipes
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The CLI imports the runtime extension, which ``make setup-agent`` builds with cargo.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Emmy
+        run: make setup-agent
+
+      # Under the job's limit, so a slow agent leaves time to report how far it got.
+      - name: Run discover-models agent
+        id: agent
+        timeout-minutes: 160
+        env:
+          CLOUDRIFT_API_KEY: ${{ secrets.CLOUDRIFT_API_KEY }}
+        run: |
+          trap 'rm -f -- "$AGENT_TASK"' EXIT
+          ./venv/bin/emmy recipe query \
+            --root recipes \
+            --filter 'tags not contains "lifecycle-locked"' \
+            --sort 'model_id asc' \
+            --sort 'deployment.index asc' \
+            --json \
+            | jq \
+                --argjson maintained_count "$MAINTAINED_MODEL_COUNT" \
+                --argjson batch_size 6 \
+                -f .github/workflows/scripts/discovery_task.jq \
+            > "$AGENT_TASK"
+          ./venv/bin/python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          task_path = Path(os.environ["AGENT_TASK"])
+          task = json.loads(task_path.read_text())
+          for batch in task["recipe_batches"]:
+              for recipe in batch:
+                  note = Path(recipe["path"]).with_name("DISCOVERY.md")
+                  recipe["discovery_note_lines"] = note.read_text().splitlines() if note.exists() else []
+          task_path.write_text(json.dumps(task, indent=2) + "\n")
+          PY
+          # One short line per agent event: the job log is the only view of a run in progress,
+          # and a rejected selection has to be readable after the fact.
+          run_agent() {
+            opencode run "$@" \
+              --agent discover-models \
+              --model cloudrift/agent \
+              --format json \
+              | tee -a "$AGENT_EVENTS" \
+              | jq -R --unbuffered -r 'fromjson? // {type: "raw", raw: .}
+                  | "agent-event: \(.type) \(.part.tool // "") \(.part.state.status // "")"
+                    + " \((.part.text // .error // .part.state.error // .raw // "") | tostring | .[0:300] | gsub("\n"; " "))"'
+            return "${PIPESTATUS[0]}"
+          }
+          build_manifest() {
+            jq -s -r '[.[] | select(.type == "text") | .part.text][-1] // empty' \
+              "$AGENT_EVENTS" > "$AGENT_SELECTION"
+            jq \
+              --rawfile selection "$AGENT_SELECTION" \
+              -f .github/workflows/scripts/discovery_manifest.jq \
+              "$AGENT_TASK" > "$AGENT_MANIFEST" 2> "$AGENT_REJECTION"
+            # A reply carrying no JSON object matches nothing and leaves jq successful but silent.
+            if [ -s "$AGENT_MANIFEST" ]; then
+              return 0
+            fi
+            if [ ! -s "$AGENT_REJECTION" ]; then
+              echo "Your reply carried no selection JSON object." > "$AGENT_REJECTION"
+            fi
+            return 1
+          }
+          set +e
+          : > "$AGENT_EVENTS"
+          run_agent "Complete the attached lifecycle task exactly. Its file is $AGENT_TASK." \
+            --file "$GITHUB_WORKSPACE/.agents/skills/discover-models/SKILL.md" \
+            --file "$GITHUB_WORKSPACE/prompts/model-fit.md" \
+            --file "$GITHUB_WORKSPACE/prompts/discover-models/lifecycle.md" \
+            --file "$GITHUB_WORKSPACE/prompts/discover-models/score-recipes.md" \
+            --file "$GITHUB_WORKSPACE/prompts/discover-models/size-deployments.md" \
+            --file "$AGENT_TASK"
+          agent_status=$?
+          build_manifest
+          manifest_status=$?
+          # A rejected selection goes back to the same session, with the exact reason.
+          session_id=$(jq -R -r -s '[splits("\n") | fromjson? | .sessionID // empty][0] // empty' "$AGENT_EVENTS")
+          for correction in 1 2; do
+            if [ "$manifest_status" -eq 0 ] || [ -z "$session_id" ]; then
+              break
+            fi
+            rejection=$(sed 's/^jq: error ([^)]*): //' "$AGENT_REJECTION")
+            echo "::warning::Discovery selection rejected, asking the agent to correct it: $rejection"
+            run_agent "The workflow rejected your final selection: $rejection
+          Correct only that problem, keeping the rest of your decisions, and reply with the complete corrected selection JSON object." \
+              --session "$session_id"
+            agent_status=$?
+            build_manifest
+            manifest_status=$?
+          done
+          set -e
+          if [ -s "$AGENT_SELECTION" ]; then
+            sed 's/^/discover-models: /' "$AGENT_SELECTION"
+          else
+            echo "::error::Discovery agent produced no final text output"
+          fi
+          if [ "$manifest_status" -ne 0 ]; then
+            cat "$AGENT_REJECTION" >&2
+            exit 1
+          fi
+          if [ "$agent_status" -ne 0 ]; then
+            echo "Agent confirmation failed after the manifest was written; continuing to repository validation."
+          fi
+
+      - name: Verify discovery edited only its research summary
+        run: |
+          set -e
+          test -z "$(git status --porcelain --untracked-files=all | sed -E '/^( M|\?\?) recipes\/[^/]+\/DISCOVERY\.md$/d')"
+          for note in $(git ls-files --others --exclude-standard -- 'recipes/*/DISCOVERY.md'); do
+            test -f "${note%/DISCOVERY.md}/recipe.yaml"
+          done
+
+      - name: Validate and apply model lifecycle
+        id: lifecycle
+        run: |
+          ./venv/bin/python .github/workflows/scripts/discovery_lifecycle.py \
+            --input "$AGENT_MANIFEST" \
+            --summary "$DISCOVERY_SUMMARY"
+          cat "$DISCOVERY_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          maintained_count="$(./venv/bin/emmy recipe query --root recipes --filter 'tags contains "maintained"' --filter 'tags not contains "lifecycle-locked"' --json | jq '.rows | length')"
+          if [ "$maintained_count" -ne "$MAINTAINED_MODEL_COUNT" ]; then
+            echo "Expected $MAINTAINED_MODEL_COUNT maintained recipes, found $maintained_count" >&2
+            exit 1
+          fi
+          ./venv/bin/python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          import yaml
+
+          paths = set()
+          for command in (
+              ["git", "diff", "--name-only", "-z", "HEAD", "--", "recipes"],
+              ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", "recipes"],
+          ):
+              paths.update(
+                  subprocess.run(command, capture_output=True, text=True, check=True)
+                  .stdout.rstrip("\0")
+                  .split("\0")
+              )
+          modified_models = []
+          for raw_path in sorted(filter(None, paths)):
+              path = Path(raw_path)
+              if path.name != "recipe.yaml":
+                  continue
+              recipe = yaml.safe_load(path.read_text()) or {}
+              model = recipe.get("model") or {}
+              model_id = model.get("huggingface")
+              heat = model.get("heat")
+              lifecycle = next(
+                  (
+                      tag
+                      for tag in ("maintained", "best-effort", "obsolete", "onboarding")
+                      if tag in (recipe.get("tags") or [])
+                  ),
+                  None,
+              )
+              if not isinstance(model_id, str) or lifecycle is None or not isinstance(heat, int):
+                  raise SystemExit(f"Modified recipe lacks a model ID, lifecycle, or heat score: {path}")
+              modified_models.append({"model_id": model_id, "lifecycle": lifecycle, "heat": heat})
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              payload = json.dumps(modified_models, separators=(",", ":"), sort_keys=True)
+              output.write(f"modified_models={payload}\n")
+          PY
+          git diff --check
+
+      - name: Check model discovery changes
+        id: changes
+        run: |
+          if [ -n "$(git status --porcelain -- recipes)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit the lifecycle update to main
+        if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+        uses: ./.github/actions/push-to-main
+        with:
+          app-id: ${{ secrets.EXPERIMENT_APP_ID }}
+          private-key: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
+          message: "recipes: refresh model lifecycle"
+          paths: recipes
+
+      # Only when the agent itself stopped short: a later step's failure says nothing about how far the agent got.
+      - name: Summarize partial discovery
+        id: partial
+        if: always() && (steps.agent.outcome == 'failure' || steps.agent.outcome == 'cancelled')
+        run: |
+          test -s "$AGENT_EVENTS" || exit 0
+          partial=$(jq -s -r -f .github/workflows/scripts/discovery_partial.jq "$AGENT_EVENTS")
+          echo "$partial"
+          echo "partial=$partial" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup discovery output
+        if: always()
+        run: |
+          rm -f \
+            "$AGENT_EVENTS" \
+            "$AGENT_TASK" \
+            "$AGENT_SELECTION" \
+            "$AGENT_MANIFEST" \
+            "$AGENT_REJECTION" \
+            "$DISCOVERY_SUMMARY"
+          git config --unset-all credential.helper || true
+
+  notify:
+    name: Notify Discord
+    needs: [durations, prior, gaps, fill, discover]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_EMMY_ROBOTS_WEBHOOK_URL }}
+      WORKFLOW_KIND: nightly
+      DURATIONS_RESULT: ${{ needs.durations.result }}
+      DURATIONS_UPDATED: ${{ needs.durations.outputs.updated }}
+      PRIOR_RESULT: ${{ needs.prior.result }}
+      SCHEDULE_PRIOR: ${{ needs.prior.outputs.schedule }}
+      PLACEMENT_PRIOR: ${{ needs.prior.outputs.placement }}
+      GAPS_RESULT: ${{ needs.gaps.result }}
+      FILL_RESULT: ${{ needs.fill.result }}
+      GOLDEN_FILL: ${{ needs.fill.outputs.summary }}
+      COMPILER_GAPS: ${{ needs.gaps.outputs.summary }}
+      DISCOVER_RESULT: ${{ needs.discover.result }}
+      DISCOVER_PARTIAL: ${{ needs.discover.outputs.partial }}
+      MODIFIED_MODELS: ${{ needs.discover.outputs.modified_models }}
+    steps:
+      - name: Checkout exact workflow source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Send nightly summary
+        continue-on-error: true
+        run: python3 .github/scripts/discord_notification.py

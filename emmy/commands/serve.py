@@ -57,13 +57,10 @@ def _add_own_flags(parser, *, suppress_defaults: bool) -> None:
         return argparse.SUPPRESS if suppress_defaults else value
 
     parser.add_argument(
-        "--stock", action="store_true", default=d(False), help="Serve stock vLLM kernels instead of the emmy plugin (A/B baseline)."
+        "--native", action="store_true", default=d(False), help="Use the experimental native text server (a generate runner only)."
     )
     parser.add_argument(
-        "--generate",
-        action="store_true",
-        default=d(False),
-        help="Serve a generative (chat) model via EmmyGenModel (--runner generate, fp16) instead of embeddings.",
+        "--stock", action="store_true", default=d(False), help="Serve stock vLLM kernels instead of the emmy plugin (A/B baseline)."
     )
     parser.add_argument(
         "--bench",
@@ -71,11 +68,11 @@ def _add_own_flags(parser, *, suppress_defaults: bool) -> None:
         default=d(False),
         help="Start the server, run `vllm bench serve` against it, print results, shut down.",
     )
-    parser.add_argument("--max-concurrency", type=int, default=d(32), help="Bench client concurrency (with --bench).")
+    parser.add_argument("--max-concurrency", type=int, default=d(None), help="Bench client concurrency (with --bench).")
     parser.add_argument("--num-prompts", type=int, default=d(256), help="Bench request count (with --bench).")
     parser.add_argument("--random-input-len", type=int, default=d(512), help="Bench tokens per request (with --bench).")
     parser.add_argument(
-        "--random-output-len", type=int, default=d(128), help="Bench tokens generated per request (with --bench --generate)."
+        "--random-output-len", type=int, default=d(128), help="Bench tokens generated per request (with --bench on a generate runner)."
     )
     parser.add_argument(
         "--bench-seed", type=int, default=d(0), help="Bench prompt-sampling seed (with --bench; `--seed` itself forwards to vllm serve)."
@@ -91,7 +88,7 @@ def _add_own_flags(parser, *, suppress_defaults: bool) -> None:
         "--golden",
         metavar="PATH",
         default=d(None),
-        help="A golden YAML whose measured rows are the golden evidence every program this boot compiles deploys "
+        help="A golden file whose measured rows are the golden evidence every program this boot compiles deploys "
         "from, instead of the repository goldens (published to the vLLM child as EMMY_GOLDEN_FILE).",
     )
     parser.add_argument(
@@ -167,15 +164,16 @@ def _spec_query_len(vllm_args: list[str]) -> int:
     return int(cfg.get("num_speculative_tokens", 0) or 0) + 1
 
 
-def _local_config(model: str, vllm_args: list[str]):
-    """The checkpoint's HF config, read LOCALLY (``local_files_only``) so command construction
-    stays hermetic — offline test doubles and uncached models resolve to ``None`` in
-    milliseconds. ``--trust-remote-code`` / ``--revision`` forward so custom-code checkpoints
-    still probe. Every caller treats a ``None`` as "no special case"."""
+def _hf_config(model: str, vllm_args: list[str], *, local: bool = True):
+    """The checkpoint's HF config. Read LOCALLY by default (``local_files_only``) so command
+    construction stays hermetic — offline test doubles and uncached models resolve to ``None``
+    in milliseconds; ``local=False`` fetches it from the hub, what vLLM itself reads at boot to
+    resolve its runner. ``--trust-remote-code`` / ``--revision`` forward so custom-code
+    checkpoints still probe. Every caller treats a ``None`` as "no special case"."""
     try:
         from transformers import AutoConfig  # noqa: PLC0415
 
-        kwargs = {"local_files_only": True}
+        kwargs = {"local_files_only": True} if local else {}
         if _has_flag(vllm_args, "--trust-remote-code"):
             kwargs["trust_remote_code"] = True
         revision = _flag_value(vllm_args, "--revision", "")
@@ -188,13 +186,22 @@ def _local_config(model: str, vllm_args: list[str]):
 
 def _is_moe_model(model: str, vllm_args: list[str]) -> bool:
     """True when the checkpoint's config declares token-choice experts. Best-effort LOCAL config
-    probe (:func:`_local_config`). The probe is UX only: the authoritative guard is in
+    probe (:func:`_hf_config`). The probe is UX only: the authoritative guard is in
     ``EmmyGenModel.__init__``, which validates an MoE capture boot against the runner (fixed-slot
     tier present, capture sizes capped at 1) — a probe miss here degrades to that clear boot
     error, never to a capture crash."""
-    cfg = _local_config(model, vllm_args)
+    cfg = _hf_config(model, vllm_args)
     cfg = getattr(cfg, "text_config", cfg)
     return bool(getattr(cfg, "num_experts", None) or getattr(cfg, "num_local_experts", None))
+
+
+def _has_gdn_layers(model: str, vllm_args: list[str]) -> bool:
+    """True when the checkpoint's config lists GDN layers (``linear_attention`` in ``layer_types``:
+    Qwen3.5 / Qwen3.8). Best-effort LOCAL config probe (:func:`_hf_config`), UX only: on a probe miss
+    the plain ``EmmyGenModel`` boots and refuses such a checkpoint, naming the class to use."""
+    cfg = _hf_config(model, vllm_args)
+    cfg = getattr(cfg, "text_config", cfg)
+    return "linear_attention" in (getattr(cfg, "layer_types", None) or ())
 
 
 def _chunk_capture_rungs(vllm_args: list[str], bucket: int) -> set[int]:
@@ -258,33 +265,29 @@ def _gen_graph_args(vllm_args: list[str], *, model: str | None = None) -> list[s
     are not spec-adjusted."""
     from emmy import config as emmy_config  # noqa: PLC0415
 
+    if _has_flag(vllm_args, "--enforce-eager") or _has_flag(vllm_args, "--compilation-config"):
+        return []  # the caller decided; forward theirs untouched (the boot guard in EmmyGenModel validates it)
+    if _has_flag(vllm_args, "--enable-lora"):
+        return ["--enforce-eager"]  # capture follows after mixed base/adapter replay has passed the behavior gate
+    if model is not None and _has_gdn_layers(model, vllm_args):
+        # A GDN layer reads each request's token range on the host, which no capture can record.
+        return ["--enforce-eager"]
     if model is not None and _is_moe_model(model, vllm_args):
         # MoE decode capture is FIXED-SLOT: single-token steps ride the runner's k-slot expert
         # dispatch (fixed launch set, no host sync — capture-legal), while wider decode steps
         # keep the routed dispatch, which host-syncs and stays eager. The ladder is therefore
-        # capped at capture size 1. Whether the fixed-slot tier actually built is unknowable
+        # capped at capture size 1 (a caller's config may reach the decode bucket on a
+        # tensor-parallel boot, where the slots serve batches). Whether the tier built is unknowable
         # pre-boot — the AUTHORITATIVE guard is in ``EmmyGenModel.__init__``, which inspects
         # the runner and rejects an MoE capture boot loudly when the tier is missing (serve
         # with --enforce-eager then). A caller-supplied config forwards untouched and faces
         # the same boot guard.
-        if _has_flag(vllm_args, "--enforce-eager") or _has_flag(vllm_args, "--compilation-config"):
-            return []  # the caller decided; the boot guard validates capture against the runner
-        cfg = _local_config(model, vllm_args)
-        cfg = getattr(cfg, "text_config", cfg)
-        if int(getattr(cfg, "hc_mult", 1) or 1) > 1:
-            # A hyper-connection MoE (DeepSeek V4) has no fixed-slot tier: its routed combine
-            # host-syncs on every step (the placement closes the layer after the shard
-            # reduction), so decode capture is unsupported — the boot guard rejects it too.
-            logger.warning("hyper-connection MoE: decode capture is not supported (the routed combine host-syncs); serving eager")
-            return ["--enforce-eager"]
         bucket = emmy_config.gen_decode_bucket()
         if bucket <= 0:
             logger.warning("decode bucket is off (EMMY_GEN_DECODE_BUCKET=0) — the symbolic decode path is not capturable; serving eager")
             return ["--enforce-eager"]
         cfg = '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1], "custom_ops": ["+rotary_embedding"]}'
         return ["--compilation-config", cfg]
-    if _has_flag(vllm_args, "--enforce-eager") or _has_flag(vllm_args, "--compilation-config"):
-        return []  # the caller decided; forward theirs untouched
     bucket = emmy_config.gen_decode_bucket()
     if bucket <= 0:
         logger.warning("decode bucket is off (EMMY_GEN_DECODE_BUCKET=0) — the symbolic decode path is not capturable; serving eager")
@@ -333,21 +336,61 @@ def _gen_graph_args(vllm_args: list[str], *, model: str | None = None) -> list[s
         sizes = sorted(set(sizes) | _chunk_capture_rungs(vllm_args, bucket))
         if not _has_flag(vllm_args, "--attention-backend"):
             backend_args = ["--attention-backend", "TRITON_ATTN"]
-    # ``custom_ops: +rotary_embedding``: the plugin runs the model EAGERLY inside the cudagraph
-    # (no inductor), but vLLM's CustomOp dispatch assumes compilation will fuse native ops and
-    # hands out ``forward_native`` — a per-layer torch-op soup (4 cats + 4 adds + an fp32
-    # promotion and two cast-backs per layer, ~0.9 ms/step on gemma-4-12B decode). Forcing the
-    # custom impl dispatches ``forward_cuda`` — vLLM's fused in-place rotary kernel (valid for
-    # every ``RotaryEmbedding`` subclass the plugin builds; gemma-4's proportional variant only
-    # overrides the cos/sin CACHE build, not the apply).
+    # ``custom_ops: +rotary_embedding`` is redundant since the plugin dispatches its RoPEs to vLLM's
+    # fused kernel itself (``_eager_dispatch``), but it stays: this argv mirrors serve.sh, whose
+    # rendered invocation is a cache-key input of every released image.
     cfg = f'{{"cudagraph_mode": "{mode}", "cudagraph_capture_sizes": {sizes}, "custom_ops": ["+rotary_embedding"]}}'
     return ["--compilation-config", cfg] + backend_args
+
+
+def _sentence_transformers(model: str, revision: str | None) -> bool:
+    """Whether the checkpoint carries a Sentence Transformers ``modules.json``, which makes vLLM pool
+    it whatever its architecture says: a local directory is looked at, a hub id is read from the
+    cache and fetched when the cache holds nothing about it."""
+    if os.path.isdir(model):
+        return os.path.exists(os.path.join(model, "modules.json"))
+    try:
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache  # noqa: PLC0415
+
+        cached = try_to_load_from_cache(model, "modules.json", revision=revision)
+        if cached is None:
+            hf_hub_download(model, "modules.json", revision=revision)
+            return True
+        return isinstance(cached, str)
+    except Exception:  # noqa: BLE001 — no such file, or no hub: the architecture decides
+        return False
+
+
+def serving_runner(model: str, vllm_args: list[str]) -> str:
+    """vLLM's runner for this launch, ``generate`` or ``pooling``, resolved the way vLLM resolves
+    ``--runner auto`` at boot: an explicit ``--runner`` wins; a ``--convert`` to a pooling task
+    means pooling; a Sentence Transformers checkpoint pools even when its architecture is a
+    ``*ForCausalLM``; otherwise the architecture's suffix decides, and an unknown one generates.
+    The checkpoint is read from the local cache and fetched when it is not there, so a bare
+    ``emmy serve MODEL`` needs no flag; a checkpoint that cannot be reached generates."""
+    runner = _flag_value(vllm_args, "--runner", "auto")
+    if runner != "auto":
+        return runner
+    if _flag_value(vllm_args, "--convert", "auto") not in ("auto", "none"):
+        return "pooling"
+    if _sentence_transformers(model, _flag_value(vllm_args, "--revision", "") or None):
+        return "pooling"
+    cfg = _hf_config(model, vllm_args) or _hf_config(model, vllm_args, local=False)
+    for arch in getattr(cfg, "architectures", None) or []:
+        if arch.endswith(("ForCausalLM", "ForConditionalGeneration", "LMHeadModel")):
+            return "generate"
+        if arch.endswith(("Model", "ForSequenceClassification", "ForTokenClassification", "ForRewardModel", "EmbeddingModel")):
+            return "pooling"
+    return "generate"
 
 
 def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str], generate: bool = False) -> list[str]:
     from emmy import config as emmy_config  # noqa: PLC0415
 
-    cmd = ["vllm", "serve", model, "--runner", "generate" if generate else "pooling"]
+    # The runner is vLLM's own flag: pass it only when the caller did not.
+    cmd = ["vllm", "serve", model]
+    if not _has_flag(vllm_args, "--runner"):
+        cmd += ["--runner", "generate" if generate else "pooling"]
     if not stock and generate:
         cmd += _gen_graph_args(vllm_args, model=model)
         # A checkpoint whose compressed weights emmy's loader owns end to end must be presented
@@ -356,15 +399,23 @@ def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str], generate: 
         # those are (naming a checkpoint format here would cross the band).
         from emmy.compiler.loader.quant import engine_config_overrides  # noqa: PLC0415
 
-        overrides: dict = {"architectures": ["EmmyGenModel"]}
-        overrides.update(engine_config_overrides(_local_config(model, vllm_args)))
+        # A checkpoint with GDN layers boots the hybrid class, which declares those layers'
+        # per-request state to vLLM.
+        architecture = (
+            "EmmyGenLoRAModel"
+            if _has_flag(vllm_args, "--enable-lora")
+            else "EmmyGenHybridModel"
+            if _has_gdn_layers(model, vllm_args)
+            else "EmmyGenModel"
+        )
+        overrides: dict = {"architectures": [architecture]}
+        overrides.update(engine_config_overrides(_hf_config(model, vllm_args)))
         cmd += ["--hf-overrides", json.dumps(overrides)]
-        # Force fp16 across the emmy↔vLLM seam: vLLM defaults --dtype auto → bf16 for a
-        # bf16 checkpoint, but the emmy trunk emits fp16. Reject an incompatible override.
+        # Keep the default fp16; an explicit bf16 or fp32 keeps the engine and trunk aligned.
         if _has_flag(vllm_args, "--dtype"):
             dt = _flag_value(vllm_args, "--dtype", "")
-            if dt not in ("float16", "half", "fp16"):
-                raise ValueError(f"generative serving requires fp16; --dtype {dt!r} is incompatible (use --dtype float16)")
+            if dt not in ("float16", "half", "fp16", "bfloat16", "bf16", "float32", "fp32"):
+                raise ValueError(f"generative serving requires fp16, bf16, or fp32; --dtype {dt!r} is incompatible")
         else:
             cmd += ["--dtype", "float16"]
         # The flattened width (sum of newly-scheduled tokens per step) must stay within the
@@ -376,7 +427,7 @@ def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str], generate: 
         # model's startup bound, so default it to the covered maximum here.
         bucket = emmy_config.gen_decode_bucket()
         capacity = emmy_config.gen_prefill_capacity()
-        top = (capacity if 0 < capacity else int(_DEFAULT_MAX_MODEL_LEN)) + max(bucket, 0)
+        top = (capacity if 0 < capacity else int(_DEFAULT_MAX_MODEL_LEN)) + (0 if _has_flag(vllm_args, "--enable-lora") else max(bucket, 0))
         if _has_flag(vllm_args, "--max-num-batched-tokens"):
             mnbt = _flag_value(vllm_args, "--max-num-batched-tokens", "")
             if mnbt.isdigit() and int(mnbt) > top:
@@ -397,12 +448,11 @@ def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str], generate: 
     if not _has_flag(vllm_args, "--max-model-len"):
         cmd += ["--max-model-len", _DEFAULT_MAX_MODEL_LEN]
     if not _has_flag(vllm_args, "--gpu-memory-utilization"):
-        # The emmy generative arm's weights/activations live in cupy, INVISIBLE to vLLM's
-        # torch-only memory profiler — vLLM budgets `util × total − currently-used`, so the
-        # default 0.90 line can land below what the emmy residents already consume and the
-        # boot dies on the min-KV fit check (measured: gemma-4-12B at mml 8448 left 1.37 GiB
-        # of the needed 1.7). 0.97 extends the budget line above the residents while keeping
-        # slack for capture; stock keeps 0.90 (its own sampler warmup OOMs at 0.97).
+        # The emmy generative arm's weights/activations are torch tensors the runtime borrows,
+        # so vLLM's memory profiler sees them; the line stays at 0.97, where it was measured
+        # when those residents were invisible to it (gemma-4-12B at mml 8448 left 1.37 GiB of
+        # the needed 1.7 at 0.90), until a serving A/B re-measures the headroom. Stock keeps
+        # 0.90 (its own sampler warmup OOMs at 0.97).
         util = _GENERATE_GPU_MEMORY_UTILIZATION if generate and not stock else _DEFAULT_GPU_MEMORY_UTILIZATION
         cmd += [f"--gpu-memory-utilization={util}"]
     return cmd + vllm_args
@@ -477,29 +527,56 @@ def _child_env() -> dict:
     return env
 
 
+def _golden_regime_env(golden: str, env: dict) -> dict:
+    """The ``EMMY_<KNOB>`` pins of the precision regime every measured row of ``golden`` was recorded
+    under, for the vLLM child. A row is evidence only in its own regime, and the child has no other
+    way to learn it: a golden recorded under a regime other than the default (a ``FAST_MATH: False``
+    file once fast math became the default) deployed as an empty evidence index, and a strict boot
+    refused at the first fork. Rows that disagree publish nothing, as a replay does; an environment
+    pin at another value fails the boot instead of being overridden."""
+    from emmy import config as emmy_config  # noqa: PLC0415
+    from emmy.compiler.pipeline.knob import get  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import GoldenFile  # noqa: PLC0415
+
+    out = {}
+    for name, value in GoldenFile.load(golden).shared_regime().items():
+        key = emmy_config.knob_var(name)
+        if key in env and get(name.split("@", 1)[0]).parse(env[key]) != value:
+            logger.error("%s: its rows were measured under %s=%s, but the environment pins %s=%r", golden, name, value, key, env[key])
+            sys.exit(1)
+        out[key] = str(value)
+    return out
+
+
 def handle_serve(args):
     from emmy.compiler.loader.safetensors import split_revision  # noqa: PLC0415
 
     vllm_args = _split_own_flags(args)  # re-parses own flags placed after MODEL into args
+    if args.native:
+        from emmy.serving.native.launch import launch
+
+        return launch(args, vllm_args)
     # ``<repo>@<revision>`` is emmy's pin spelling — ``compile``, ``pull``, the gen runner and the
     # twins all read it, and a repo publishing one quantization rung per branch is a DIFFERENT
     # model on each, so the default branch is never a safe stand-in. vLLM takes the two apart, and
     # leaving them joined does not merely lose the pin: every local config probe downstream
-    # (``_local_config``) fails on the unresolvable id and silently returns ``None``, so the
+    # (``_hf_config``) fails on the unresolvable id and silently returns ``None``, so the
     # coded-checkpoint unquantized override and the MoE capture-size cap both no-op.
     model, revision = split_revision(args.model)
     if revision and not _has_flag(vllm_args, "--revision"):
         vllm_args = [*vllm_args, "--revision", revision]
-    serve_cmd = build_serve_cmd(model, stock=args.stock, vllm_args=vllm_args, generate=args.generate)
+    # Resolved after the pin lands in the args, so the probe reads the pinned checkpoint's config.
+    generate = serving_runner(model, vllm_args) == "generate"
+    serve_cmd = build_serve_cmd(model, stock=args.stock, vllm_args=vllm_args, generate=generate)
     port = _flag_value(vllm_args, "--port", "8000")
     bench_cmd = build_bench_cmd(
         model,
         port=port,
-        max_concurrency=args.max_concurrency,
+        max_concurrency=args.max_concurrency if args.max_concurrency is not None else 32,
         num_prompts=args.num_prompts,
         random_input_len=args.random_input_len,
         seed=args.bench_seed,
-        generate=args.generate,
+        generate=generate,
         random_output_len=args.random_output_len,
     )
 
@@ -518,6 +595,7 @@ def handle_serve(args):
 
     if args.golden:
         env[emmy_config.GOLDEN_FILE] = str(Path(args.golden).resolve())
+        env.update(_golden_regime_env(args.golden, env))
     if args.strict_evidence:
         env[emmy_config.STRICT_EVIDENCE] = "1"
     if not args.bench:

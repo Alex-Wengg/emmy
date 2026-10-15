@@ -24,8 +24,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from emmy.compiler.ir.address import BYTE_SLAB_PAD
+from emmy.compiler.ir.address import BYTE_SLAB_PAD, gmem_axis_step
 from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import affine_form
 from emmy.compiler.ir.pure.fold import Fold
 from emmy.compiler.ir.schedule import ResolvedStage, Stage, Tile
 from emmy.compiler.ir.schedule.packing import block_scaled_atom, packed_readings
@@ -65,6 +66,17 @@ def stage_target(stage: Stage, ctx) -> str | None:
 SPLIT_COPY_DEPTH = 2
 
 
+def chunk_slab_pad(tile: Tile, stage: Stage) -> int:
+    """The row pad, in elements, of a chunk-tier slab the Volta blocking copy fills.
+
+    The Volta drain gathers each lane's four halves at ``row · ldm``, one row per lane, and the
+    chunk tier's slabs are 64 B or 256 B rows: unpadded, every row of a fragment starts on the same
+    bank and one read serializes eight or sixteen ways. Sixteen bytes of pad keep the fill's 16 B
+    vector stores aligned and spread the rows to a two-way conflict at worst. The copy transports
+    of the newer atoms swizzle their slabs instead, and pad nothing."""
+    return 8 if stage.transport == "smem" and tile.atom.sync_copy_staging else 0
+
+
 def _clamp_depth(depth: int, slot_bytes: int, budget: int) -> int:
     """The deepest ring the smem ``budget`` affords at ``slot_bytes`` per ringed slot, never deeper
     than asked. Shared by the warp copy ring and the fill's B-slab ring; the scalar resolver
@@ -73,13 +85,19 @@ def _clamp_depth(depth: int, slot_bytes: int, budget: int) -> int:
     return min(depth, budget // slot_bytes)
 
 
-def _tma_operand_rank(index: tuple, tile_name: str, k_name: str) -> bool:
-    """Whether TMA's box can encode this operand's gmem index. The data plane is the TRAILING 2
-    dims; extra LEADING dims ride as extent-1 box dims whose origin is evaluated once per fill, so
-    those exprs must not move with the tile or the K loop."""
-    if not 2 <= len(index) <= 4:
+def _tma_operand_box(index: tuple, tile_name: str, k_name: str, order: tuple[str, str] | None = None) -> bool:
+    names = {tile_name, k_name}
+    if not 2 <= len(index) <= 4 or any(names & expr.free_vars() for expr in index[:-2]):
         return False
-    return all(not ({tile_name, k_name} & e.free_vars()) for e in index[:-2])
+    # A box is a rectangle in the descriptor's coordinates, one tile coordinate per dim. A reshape
+    # that splits a coordinate across dims, or packs both into one, has no such rectangle: the box
+    # would copy the declared row pitch and deposit the wrong elements.
+    for expr in index[-2:]:
+        axes = expr.free_vars() & names
+        if len(axes) > 1 or (axes and affine_form(expr, axes) is None):
+            return False
+    physical = tuple(next(iter(axes)) for expr in index[-2:] if len(axes := expr.free_vars() & names) == 1)
+    return order is None or len(physical) != 2 or set(physical) != names or physical == order
 
 
 def _warp_vector_copy(k_axis: Axis, tile_n: int, bk_elems: int, mask_n: bool, b_trans: bool, *, ragged: bool = False) -> bool:
@@ -164,10 +182,10 @@ def chunk_key_stage(tile: Tile, stage: Stage, inputs, producer, producer_k, k_ax
     ragged = not k_axis.extent.is_static
     copies = (
         _warp_vector_copy(k_axis, span, bk_elems, False, False, ragged=ragged)
-        if stage.transport == "smem-async"
+        if stage.transport == "smem-async" or (stage.transport == "smem" and tile.atom.sync_copy_staging)
         else (
             stage.transport == "smem-tma"
-            and _tma_operand_rank(slab.load.index, producer_k.name, k_axis.name)
+            and _tma_operand_box(slab.load.index, producer_k.name, k_axis.name)
             and max(span, bk_elems) <= _TMA_MAX_BOX
             and _warp_tma(k_axis, producer_k, span, bk_elems, nbytes, nbytes, False, False, ragged=ragged)
         )
@@ -192,8 +210,11 @@ def _chunk_warp_stage(
     the chunk drain reads 16-bit fragments, and the gmem-direct fragment load converts per element
     correctly today.
 
-    The synchronous ``smem`` transport declines: it is the Volta atom's blocking vector copy, and
-    attention's chunk tier has no sm_70 kernel to serve. A SYMBOLIC key extent does NOT decline —
+    The synchronous ``smem`` transport is the Volta atom's blocking vector copy. It stages the same
+    slabs, row-padded (:func:`chunk_slab_pad`) because the Volta drain has no swizzled read, and rings
+    at most ``SPLIT_COPY_DEPTH`` slots through the register-staged split: the next chunk's key and
+    value load into registers under this chunk's softmax (the Qwen3-0.6B s512 GQA attention on a
+    V100, 78 -> 71 us). A SYMBOLIC key extent does NOT decline —
     see the ragged-tail reading below, which is what lets a serving-shaped attention kernel stage
     at all, though it keeps the single-buffer ring. On a STATIC extent depth is the ordinary budget
     clamp: the chunk loop carries the whole softmax between its fill and its drain, so a deeper ring
@@ -214,25 +235,29 @@ def _chunk_warp_stage(
     # dim, so the extent enters neither the chunk width nor the gmem row stride, and the last chunk
     # simply overhangs. Both ends of that tail are already disciplined: the fill clamps the
     # overhanging key row to the last valid one (a TMA box zero-fills instead), and the drain's
-    # boundary ``FragmentMask`` has put those keys at the pivot identity, so they weigh exactly
+    # boundary mask has put those keys at the pivot identity, so they weigh exactly
     # zero and the duplicate value rows fold to nothing. A TRANSPOSED value strides its gmem rows
     # BY the key extent, so it keeps the static, chunk-divisible demand every staged operand makes.
     ragged = not k_axis.extent.is_static and not view.b_trans
     vector_copy_ok = _warp_vector_copy(k_axis, n.tile, bk_elems, n.mask, view.b_trans, ragged=ragged)
     tma_ok = (
         stage.transport == "smem-tma"
-        and _tma_operand_rank(slab.load.index, n.axis.name, k_axis.name)
+        and _tma_operand_box(slab.load.index, n.axis.name, k_axis.name)
         and max(n.tile, bk_elems) <= _TMA_MAX_BOX
         and _warp_tma(k_axis, n.axis, n.tile, bk_elems, b_nbytes, b_nbytes, n.mask, view.b_trans, ragged=ragged)
     )
     cp_ok = stage.transport == "smem-async" and vector_copy_ok
-    if not (tma_ok or cp_ok):
+    # Volta has no cp.async: its ``smem`` transport is the blocking vector copy, which moves the
+    # same 16 B chunks, so it asks the same questions.
+    sync_ok = stage.transport == "smem" and atom.sync_copy_staging and vector_copy_ok
+    if not (tma_ok or cp_ok or sync_ok):
         return None
+    pad = chunk_slab_pad(tile, stage)
     b_rows, b_cols = (n.tile, bk_elems) if view.b_trans else (bk_elems, n.tile)
-    slot_bytes = b_rows * b_cols * b_nbytes
+    slot_bytes = b_rows * (b_cols + pad) * b_nbytes
     key = chunk_key_stage(tile, stage, inputs, producer, producer_k, k_axis)
     if key is not None:
-        slot_bytes += bk_elems * key[1] * b_nbytes
+        slot_bytes += bk_elems * (key[1] + pad) * b_nbytes
     if slot_bytes > budget:
         return None
     # A RAGGED stream keeps the single-buffer ring the tail discipline above was written for.
@@ -241,7 +266,11 @@ def _chunk_warp_stage(
     # run this tier at a symbolic key length); at one slot it is correct. What the runtime chunk
     # count does to the prefetch's clamp is not diagnosed, so the depth is refused here rather than
     # offered and left to fail at the card.
+    # The blocking copy rings through the register-staged split (``SPLIT_COPY_DEPTH`` slots): the next
+    # chunk's key and value sit in registers across the softmax instead of in the copy engine.
     depth = 1 if ragged else _clamp_depth(stage.depth, slot_bytes, budget)
+    if sync_ok:
+        depth = min(depth, SPLIT_COPY_DEPTH)
     choice = replace(stage, depth=depth, reg_depth=min(stage.reg_depth, tile.bk))
     return ResolvedStage(choice, bk_elems=bk_elems)
 
@@ -261,9 +290,11 @@ def _packed_warp_stage(c: Fold, tile: Tile, stage: Stage, budget: int, packed, i
     ``per_byte`` K elements, so the bits row is ``bk_elems / per_byte`` BYTES plus the cp.async
     row pad, and it must be 16-divisible for the same reason the fp8 one is: the fill copies 16 B
     chunks and a chunk never straddles a row. The gmem rows those chunks stride are ``K /
-    per_byte`` bytes, so that span is 16-divisible too. On top of the ring the budget carries ONE
-    scale slab, ``tile_n`` rows of one scale per block the chunk touches — single-buffer, because
-    it is compute-filled and ringing a compute fill buys no overlap. A packed pair's scale slab
+    per_byte`` bytes, so that span is 16-divisible too. On top of the ring the budget carries one
+    scale slab per channel, ``tile_n`` rows of one scale per block the chunk touches — single-buffer,
+    because it is compute-filled and ringing a compute fill buys no overlap. A node folding several
+    channels over one A (a gate/up edge over two packed weights) stages one bits slab and one
+    scale slab per channel, and every rule below is asked of each channel. A packed pair's scale slab
     holds the atom's element width; an fp8 byte's holds f32, the dtype its scale multiplies
     the decoded value in before the round to the fragment.
     """
@@ -280,9 +311,18 @@ def _packed_warp_stage(c: Fold, tile: Tile, stage: Stage, budget: int, packed, i
     a_dtype, b_dtype = atom.operand_dtype("a"), atom.operand_dtype("b")
     if a_dtype != b_dtype or a_dtype.name not in _PACKED_FRAGMENT_DTYPES:
         return None  # the drain has one value table and one scale multiply, both at the operand dtype
-    bits = inputs.get(packed.bits.input)
-    if bits is None:
-        return None
+    # One bits slab and one scale slab PER CHANNEL: a gate/up edge stages two weights beside its
+    # one A. Every channel is asked the same layout questions, since all ride one slab geometry.
+    channels = packed.channels
+    per_byte = packed.per_byte
+    for channel in channels:
+        bits = inputs.get(channel.bits.input) if channel.bits is not None else None
+        if bits is None:
+            return None
+        if bits.dtype.nbytes != 1 or bits.dtype.logical_elems != per_byte or len(bits.shape) != 2 or len(channel.bits.index) != 2:
+            return None
+        if k_axis.name not in channel.bits.index[-1].free_vars():
+            return None  # a K-strided packed weight is not the N-major layout the drain reads
     if c.operands[0].as_slab() is not None:
         a_tensor = inputs.get(c.operands[0].as_slab().load.input)
         if a_tensor is None or a_tensor.dtype != a_dtype:
@@ -290,11 +330,6 @@ def _packed_warp_stage(c: Fold, tile: Tile, stage: Stage, budget: int, packed, i
     # A COMPUTED A has no gmem tensor to match: it evaluates into its slab at the atom's operand
     # dtype, converting on the store, which is the compute fill's own contract.
 
-    per_byte = packed.per_byte
-    if bits.dtype.nbytes != 1 or bits.dtype.logical_elems != per_byte or len(bits.shape) != 2 or len(packed.bits.index) != 2:
-        return None
-    if k_axis.name not in packed.bits.index[-1].free_vars():
-        return None  # a K-strided packed weight is not the N-major layout the drain reads
     if not k_axis.extent.is_static:
         return None
     k = k_axis.extent.as_static()
@@ -310,8 +345,8 @@ def _packed_warp_stage(c: Fold, tile: Tile, stage: Stage, budget: int, packed, i
             return None
         if (bk_elems * a_dtype.nbytes) % _TMA_ALIGN or (k * a_dtype.nbytes) % _TMA_ALIGN:
             return None
-    slot_bytes = tile.m.tile * bk_elems * a_dtype.nbytes + tile.n.tile * (bk_elems // per_byte + pad)
-    scale_bytes = tile.n.tile * packed.scale_cols(bk_elems) * (b_dtype.nbytes if per_byte == 2 else 4)
+    slot_bytes = tile.m.tile * bk_elems * a_dtype.nbytes + len(channels) * tile.n.tile * (bk_elems // per_byte + pad)
+    scale_bytes = len(channels) * tile.n.tile * packed.scale_cols(bk_elems) * (b_dtype.nbytes if per_byte == 2 else 4)
     if scale_bytes + slot_bytes > budget:
         return None
     depth = _clamp_depth(stage.depth, slot_bytes, budget - scale_bytes)
@@ -321,7 +356,8 @@ def _packed_warp_stage(c: Fold, tile: Tile, stage: Stage, budget: int, packed, i
 
 def _row_major_k_inner(tensor, load, k_name: str) -> bool:
     """Whether a staged operand is ROW-MAJOR with the contraction axis innermost — the layout the
-    byte gathers walk, asked without pinning a rank.
+    byte gathers walk, asked without pinning a rank. Only the inner dimension contributes to
+    the row stride; the number of rows can be a runtime extent.
 
     A layer program and a weight constant carry the same operand at different ranks: a weight is
     ``[N, K/2]``, while an activation keeps its batch axis and its block axis as degenerate dims
@@ -336,7 +372,7 @@ def _row_major_k_inner(tensor, load, k_name: str) -> bool:
     while len(dims) > 2 and dims[0].is_static and dims[0].as_static() == 1:
         dims.pop(0)
         idx.pop(0)
-    return len(dims) == 2 and all(d.is_static for d in dims) and k_name in idx[-1].free_vars()
+    return len(dims) == 2 and dims[-1].is_static and k_name in idx[-1].free_vars()
 
 
 def _block_scaled_warp_stage(c: Fold, tile: Tile, stage: Stage, budget: int, pair, inputs, k_axis: Axis) -> ResolvedStage | None:
@@ -349,24 +385,39 @@ def _block_scaled_warp_stage(c: Fold, tile: Tile, stage: Stage, budget: int, pai
     matmul computes — its quantize fused in, leaving no buffer to copy from. The weight side is
     always stored, which is what the ``pair.b`` check below requires of every channel.
 
-    The scoped shape: cp.async (the four-descriptor TMA box copy is not built — a missing-code
-    fact, stated where the code would live), a k64 cell over 16-element blocks, both code
-    operands canonically laid out with k innermost, and a static k the tile divides.
+    The scoped shape: a copy transport, a k64 cell over 16-element blocks, both code operands
+    canonically laid out with k innermost, and a static k the tile divides.
 
     Sizing restates the byte-slab rule in the format's units, twice per side. A codes row is
-    ``bk_elems / 2`` bytes and a scales row ``bk_elems / block``; the fill copies 16 B chunks and
+    ``bk_elems / 2`` bytes and a scales row ``bk_elems / block``; each copy moves 16 B chunks and
     a chunk never straddles a row, so both spans — and the gmem rows they stride, ``k / 2`` and
     ``k / block`` — must be 16-divisible. That is what bounds the tile from below: at block 16 a
     scales row needs ``bk_elems`` to be a multiple of 256, so the narrow-k tiles decline here and
-    keep the generic reading.
+    keep the generic reading. The ring holds every slab of every channel: the A pair, and one
+    codes and one scales slab per weight.
+
+    TMA copies the same slabs as boxes, one descriptor per stored buffer. The same 16 B rules are
+    the box's own (inner span and gmem row stride), and every box dim must fit the hardware's 256
+    limit. A box writes its rows unpadded, so they carry no cp.async pad; every slot is then a multiple
+    of 128 B (8-row multiples of 16 B rows), which keeps each slot's destination aligned. Each slot
+    also takes one 8-byte mbarrier. TMA has no way to evaluate an activation's encode, so a matmul
+    that computes its own A codes declines it and keeps cp.async beside its compute fill.
     """
     atom = tile.atom
-    if stage.transport != "smem-async":
+    tma = stage.transport == "smem-tma"
+    if stage.transport != "smem-async" and not tma:
+        return None
+    if tma and pair.a.bits is None:
         return None
     if atom.atom_k != 64 or pair.block != _PACKED_BLOCK or atom.operand_dtype("a") != atom.operand_dtype("b"):
         return None
-    if not k_axis.extent.is_static or tile.n.mask:
-        return None  # an N tile the copy would clamp element-by-element along the contiguous span
+    # A unit N copies the sole complete row into every padded column; stores mask those columns.
+    # Other masked N extents stay outside the packed slab's supported geometry.
+    unit_n = not tma and tile.n.axis.extent.is_static and tile.n.axis.extent.as_static() == 1
+    if not k_axis.extent.is_static or (tile.n.mask and not unit_n):
+        return None
+    if tma and not tile.m.axis.extent.is_static:
+        return None  # runtime rows use cp.async's whole-row clamp, not a TMA box
     if any(op.bits is None for op in pair.b):
         return None  # only the ACTIVATION side's codes are ever computed here; a weight is stored
     k, bk_elems, block = k_axis.extent.as_static(), tile.bk * atom.atom_k, pair.block
@@ -390,8 +441,11 @@ def _block_scaled_warp_stage(c: Fold, tile: Tile, stage: Stage, budget: int, pai
             return None
     if k % bk_elems or (bk_elems // 2) % 16 or (bk_elems // block) % 16 or (k // block) % 16:
         return None
-    rows = (tile.m.tile, tile.n.tile)
-    slot_bytes = sum(r * (bk_elems // 2 + BYTE_SLAB_PAD) + r * (bk_elems // block + BYTE_SLAB_PAD) for r in rows)
+    if tma and max(tile.m.tile, tile.n.tile, bk_elems // 2) > _TMA_MAX_BOX:
+        return None
+    pad = 0 if tma else BYTE_SLAB_PAD
+    rows = (tile.m.tile, *(tile.n.tile for _ in pair.b))
+    slot_bytes = sum(r * (bk_elems // 2 + pad) + r * (bk_elems // block + pad) for r in rows) + (8 if tma else 0)
     if slot_bytes > budget:
         return None
     choice = replace(stage, depth=_clamp_depth(stage.depth, slot_bytes, budget), reg_depth=min(stage.reg_depth, tile.bk))
@@ -451,8 +505,18 @@ def resolve_warp_stage(
     bk_elems = tile.bk * atom.atom_k
     m, n = tile.m, tile.n
     a_nbytes, b_nbytes = atom.operand_dtype("a").nbytes, atom.operand_dtype("b").nbytes
+    # The node's B edges — one per fold channel. A gate/up node shares its A across two weights,
+    # so every rule below is asked of EACH B and the slot is sized for all of them; the
+    # single-channel form is the one-element case of the same walk.
+    b_edges = tuple(edge for _, edge in c.bilinear_channels())
     if inputs:
-        for edge, role in ((c.operands[0], "a"), (c.operands[1], "b")):
+        # Every channel shares ONE slab geometry and one ``b`` element width, so channels whose
+        # weights are stored at different widths have no single slot size and decline here rather
+        # than sizing the slab off whichever edge the walk reached first.
+        widths = {t.dtype for b in b_edges if (t := inputs.get(b.as_slab().load.input) if b.as_slab() is not None else None) is not None}
+        if len(widths) > 1:
+            return None
+        for edge, role in ((c.operands[0], "a"), *((b, "b") for b in b_edges)):
             t = inputs.get(edge.as_slab().load.input) if edge.as_slab() is not None else None
             if t is None or t.dtype == atom.operand_dtype(role):
                 continue
@@ -476,9 +540,9 @@ def resolve_warp_stage(
             return None  # canonical byte B: the 16 B gmem chunks stride rows of N bytes
     rank_ok = (
         c.operands[0].as_slab() is not None
-        and c.operands[1].as_slab() is not None  # a descriptor needs a gmem address on BOTH edges
-        and _tma_operand_rank(c.operands[0].as_slab().load.index, m.axis.name, k_axis.name)
-        and _tma_operand_rank(c.operands[1].as_slab().load.index, n.axis.name, k_axis.name)
+        and all(b.as_slab() is not None for b in b_edges)  # a descriptor needs a gmem address on EVERY edge
+        and _tma_operand_box(c.operands[0].as_slab().load.index, m.axis.name, k_axis.name)
+        and all(_tma_operand_box(b.as_slab().load.index, n.axis.name, k_axis.name) for b in b_edges)
     )
     box_ok = max(m.tile, n.tile, bk_elems) <= _TMA_MAX_BOX
     tma_ok = (
@@ -494,7 +558,7 @@ def resolve_warp_stage(
         return None
     pad_a, pad_b = (BYTE_SLAB_PAD if eb == 1 and cp_ok else 0 for eb in (a_nbytes, b_nbytes))
     b_rows, b_cols = (n.tile, bk_elems + pad_b) if c.as_contraction().b_trans else (bk_elems, n.tile + pad_b)
-    slot_bytes = m.tile * (bk_elems + pad_a) * a_nbytes + b_rows * b_cols * b_nbytes
+    slot_bytes = m.tile * (bk_elems + pad_a) * a_nbytes + len(b_edges) * b_rows * b_cols * b_nbytes
     if slot_bytes > budget:
         return None
     depth = _clamp_depth(stage.depth, slot_bytes, budget)
@@ -504,31 +568,71 @@ def resolve_warp_stage(
     return ResolvedStage(choice, bk_elems=bk_elems)
 
 
-def resolve_scalar_stage(c: Fold, tile: Tile, stage: Stage, inputs, budget: int, k_axis: Axis) -> ResolvedStage | None:
+def scalar_slab_pads(bk: int, a_bytes: int, b_bytes: int, b_trans: bool, transport: str) -> tuple[int, int]:
+    """Keep vector copies aligned while spreading scalar row reads across shared-memory banks.
+
+    A dense 128-byte row pitch aliases every row at one bank. A 16-byte pad spreads the
+    row owners across eight bank quartets. TMA deposits dense boxes and keeps no padding.
+    """
+    return tuple(
+        16 // width if rows and transport != "smem-tma" and bk * width % 128 == 0 else 0
+        for rows, width in ((True, a_bytes), (b_trans, b_bytes))
+    )
+
+
+def scalar_slab_elems(c: Fold, inputs) -> tuple:
+    """The scalar slabs' own dtypes, with one dtype shared by the streamed B channels."""
+    from emmy.compiler.ir.tile.ops import edge_dtypes  # noqa: PLC0415 — tile.ops reads this package
+
+    a = edge_dtypes(c.operands[0], inputs)[-1]
+    bs = {edge_dtypes(edge, inputs)[edge.exposes.index(value)] for _, edge, value in c.channel_operands()}
+    return (a, next(iter(bs))) if a is not None and len(bs) == 1 and None not in bs else ()
+
+
+def resolve_scalar_stage(
+    c: Fold, tile: Tile, stage: Stage, inputs, budget: int, k_axis: Axis, axes: tuple = (), *, seam: tuple | None = None
+) -> ResolvedStage | None:
     """Resolve an operand ``Stage`` against the scalar register-tile contraction ``c``, or ``None``
     (gmem-direct). The slab K-chunk ``bk_elems`` is DERIVED to fit ``depth`` operand slots in the
     smem ``budget`` (the largest offered chunk dividing K) — not codec-spelled, so no schema change;
     when no chunk fits at the requested depth the depth steps down, single-buffer last."""
-    if stage.transport not in ("smem", "smem-tma", "smem-async") or not k_axis.extent.is_static:
-        return None
-    # A masked-N B-slab fill would clamp a chunk-start column into a row-crossing gmem address and
-    # hang on the misaligned copy; a transposed B has no scalar drain variant (the warp tier stages
-    # it into an N-major slab).
-    if tile.n.mask or c.as_contraction().b_trans:
-        return None
-    if not inputs or c.operands[0].as_slab() is None or c.operands[1].as_slab() is None or c.operands[0].as_slab().load.input not in inputs:
-        return None
-    # 1-byte (fp8) elements decline: the fill's chunk-width and alignment math below is written
-    # for the 2/4-byte dtypes and is unaudited at nbytes == 1 — refusing keeps the tier
-    # gmem-direct (correct, converts per element) instead of risking a mis-sized slab.
-    if any(
-        t is not None and t.dtype.nbytes < 2
-        for t in (inputs.get(c.operands[0].as_slab().load.input), inputs.get(c.operands[1].as_slab().load.input))
+    channels = c.bilinear_channels()
+    if (
+        stage.transport not in ("smem", "smem-tma", "smem-async")
+        or not k_axis.extent.is_static
+        or c.twist is not None
+        or not c.tiles_whole()
     ):
         return None
+    # A K-major masked-N fill can clamp a chunk-start column into a row-crossing address.
+    # N-major B copies complete contiguous K chunks and clamps only its row.
+    b_trans = c.as_contraction().b_trans
+    copied = tuple(copied_b(c, edge, inputs) for _, edge in channels)
+    computes = c.operands[0].as_slab() is None or not all(copied)
+    if computes and (stage.transport != "smem" or stage.depth != 1):
+        return None
+    if tile.n.mask and any(copied) and not b_trans:
+        return None
+    elems = scalar_slab_elems(c, inputs)
+    if not elems or any(dt.nbytes < 2 for dt in elems):
+        return None
+    # The fill copies A's rows in chunks along K, so K must be A's gmem inner dim. A transposed A
+    # strides its columns instead, and a chunk copy there issues misaligned addresses and hangs.
+    a = c.operands[0].as_slab()
+    if a is not None and k_axis.name not in a.load.index[-1].free_vars():
+        return None
+    # A staged operand is shared along the other output coordinate. Cell-varying cones
+    # retain the direct tier, which evaluates them separately for each register cell.
+    if tile.n.axis.name in c.operands[0].free_axes or any(tile.m.axis.name in edge.free_axes for _, edge in channels):
+        return None
     if stage.transport == "smem-tma" and not (
-        _tma_operand_rank(c.operands[0].as_slab().load.index, tile.m.axis.name, k_axis.name)
-        and _tma_operand_rank(c.operands[1].as_slab().load.index, tile.n.axis.name, k_axis.name)
+        _tma_operand_box(c.operands[0].as_slab().load.index, tile.m.axis.name, k_axis.name, (tile.m.axis.name, k_axis.name))
+        and _tma_operand_box(
+            c.operands[1].as_slab().load.index,
+            tile.n.axis.name,
+            k_axis.name,
+            (tile.n.axis.name, k_axis.name) if b_trans else (k_axis.name, tile.n.axis.name),
+        )
     ):
         return None
     # Staging needs the CTA to BE one (tile_m x tile_n) output tile (the cooperative fill / drain
@@ -538,18 +642,31 @@ def resolve_scalar_stage(c: Fold, tile: Tile, stage: Stage, inputs, budget: int,
     if stage.transport == "smem-tma" and max(tile.m.tile, tile.n.tile) > _TMA_MAX_BOX:
         return None
     k = k_axis.extent.as_static()
-    elem_bytes = inputs[c.operands[0].as_slab().load.input].dtype.nbytes
-    # Every staged transport needs 16 B-aligned inner global strides — A's is K, B's is N.
+    elem_bytes, b_bytes = (dt.nbytes for dt in elems)
+    # Every staged transport needs 16 B-aligned inner global strides.
     n_ext = tile.n.axis.extent
-    if not n_ext.is_static or (k * elem_bytes) % _TMA_ALIGN or (n_ext.as_static() * elem_bytes) % _TMA_ALIGN:
+    if (
+        not n_ext.is_static
+        or (a is not None and (k * elem_bytes) % _TMA_ALIGN)
+        or (any(copied) and ((k if b_trans else n_ext.as_static()) * b_bytes) % _TMA_ALIGN)
+    ):
         return None
-    b_bytes = inputs[c.operands[1].as_slab().load.input].dtype.nbytes if c.operands[1].as_slab().load.input in inputs else elem_bytes
+    _, _, stats, chunk = (seam if seam is not None else cone_seam(c.operands[0], k_axis.name, axes)) if a is None else ((), (), (), ())
+    stat_bytes = (len(stats) + (len(chunk[1]) if chunk else 0)) * tile.m.tile * 4
     # A scalar tile always copies with the blocking load/store, so its ``smem`` ring splits too.
     requested = min(stage.depth, SPLIT_COPY_DEPTH) if stage.transport == "smem" else stage.depth
     depth, bk_elems = max(1, requested), 0
     while depth >= 1:
-        cap = budget // (depth * max(1, tile.m.tile * elem_bytes + tile.n.tile * b_bytes))
-        bk_elems = next((v for v in (128, 64, 32, 16, 8, 4) if v <= cap and k % v == 0), 0)
+
+        def fits(bk, slots):
+            pa, pb = scalar_slab_pads(bk, elem_bytes, b_bytes, b_trans, stage.transport)
+            size = (
+                tile.m.tile * (bk + pa) * elem_bytes
+                + sum(tile.n.tile * (bk + pb) if b_trans and copy else bk * tile.n.tile for copy in copied) * b_bytes
+            )
+            return slots * size + stat_bytes <= budget and (not chunk or chunk[2] % bk == 0)
+
+        bk_elems = next((v for v in (128, 64, 32, 16, 8, 4) if k % v == 0 and fits(v, depth)), 0)
         if bk_elems >= 4:
             break
         depth -= 1
@@ -576,13 +693,22 @@ def converting_a(node: Fold, atom, inputs) -> bool:
     return t is not None and t.dtype.nbytes >= 2 and t.dtype != atom.operand_dtype("a")
 
 
-def computed_operand_cover(c: Fold, tile: Tile, *, converting: bool = False, k_axis: Axis) -> str | None:
+def copied_b(c: Fold, edge: Fold, inputs) -> bool:
+    """A stored B needs a gather when neither matrix coordinate has unit element stride."""
+    slab = edge.as_slab()
+    if slab is None:
+        return False
+    view = c.as_contraction()
+    steps = [gmem_axis_step(slab.load, axis, inputs) for axis in (view.axis, *view.right_axes)]
+    return any(step is not None and step[0] == 1 for step in steps)
+
+
+def computed_operand_cover(c: Fold, tile: Tile, *, converting: bool = False, k_axis: Axis, inputs=None) -> str | None:
     """Geometry required by a smem compute-filled contraction operand.
 
-    A computed A leaves B on the async-copy path, whose contiguous N-vector copy cannot clamp a
-    partial inner row element-by-element, so N must be exact. A computed B leaves materialized A
-    as the async operand; M is its *outer* slab row and can be safely clamped as a whole. Computed
-    B's own per-cell fill clamps N before evaluating the generic producer cone.
+    A copied N-contiguous B cannot clamp a partial inner row element-by-element, so N must be
+    exact. A transposed B copies along K and safely clamps whole N rows, just as a copied A clamps
+    whole M rows. Computed B's own per-cell fill clamps N before evaluating the generic producer cone.
 
     A SYMBOLIC K rides the fill's own K mask: the cone's reads clamp in-bounds and every slab lane
     whose k index reaches past the runtime extent stores the fold identity 0 (the bilinear reading
@@ -606,12 +732,12 @@ def computed_operand_cover(c: Fold, tile: Tile, *, converting: bool = False, k_a
                 "a transposed B stages N-major (K contiguous), so its cp.async chunk runs along K "
                 "and cannot clamp a symbolic K's partial tail; pin a canonical B layout"
             )
-    materialized_b = [edge.as_slab() is not None for edge in c.operands[1:]]
+    materialized_b = [copied_b(c, edge, inputs) for edge in c.operands[1:]]
     if any(materialized_b) and not all(materialized_b):
         return "the smem compute fill requires homogeneous B channels; mixed computed/materialized B layouts stay on the demoted reading"
-    if tile.n.mask and any(edge.as_slab() is not None for edge in c.operands[1:]):
+    if tile.n.mask and any(materialized_b) and not c.as_contraction().b_trans:
         return (
-            f"a smem compute fill with a materialized B needs a TILE whose N width exactly covers "
+            f"a smem compute fill with an N-contiguous materialized B needs a TILE whose N width exactly covers "
             f"the static output columns (N={tile.n.axis.extent}; copied inner-row chunks cannot "
             f"clamp individual N cells); pick a dividing tile."
         )
@@ -627,7 +753,7 @@ def computed_operand_copy_dtype(c: Fold, tile: Tile, inputs, *, converting: bool
     are exempt because their slab store performs the normal typed conversion — ``converting``
     marks a materialized ``a`` that rides the converting fill rather than the copy."""
     for edge, role in ((c.operands[0], "a"), *((edge, "b") for edge in c.operands[1:])):
-        if edge.as_slab() is None or (role == "a" and converting):
+        if edge.as_slab() is None or (role == "a" and converting) or (role == "b" and not copied_b(c, edge, inputs)):
             continue
         tensor = inputs.get(edge.as_slab().load.input) if inputs else None
         # Structural scheduler fixtures intentionally do not carry Tensor metadata. Absence is not
@@ -646,51 +772,29 @@ def computed_operand_copy_dtype(c: Fold, tile: Tile, inputs, *, converting: bool
     return None
 
 
-def resolve_fill_stage(
-    c: Fold,
-    tile: Tile,
-    budget: int,
-    want_depth: int = 1,
-    *,
-    inputs=None,
-    why: list[str] | None = None,
-    seam: tuple | None = None,
-    k_axis: Axis,
-    producer: Fold | None = None,
-    producer_k: Axis | None = None,
-    axes: tuple = (),
-) -> ResolvedStage | None:
-    """The ``smem`` compute-fill :class:`Stage` for a computed-operand warp contraction under
-    ``tile`` — MANDATORY for this form (the gmem-direct mma leaf refuses a computed A, and the
-    byte-copy / cp.async / TMA transports move bytes and cannot evaluate a producer cone), so it
-    has no gmem-direct ``""`` sibling and a ``STAGE`` pin can only choose its DEPTH. ``None`` when
-    the slabs exceed ``budget``: one A slab, one B slab per channel, and one fp32 row per bridged
-    statistic (:func:`~emmy.compiler.ir.pure.fold.cone_seam`'s ``stats`` and its per-chunk ``chunk`` stats — the same
-    node boundary the materializer fills through).
+def fill_chunk_refusal(tile: Tile, k_axis: Axis) -> str | None:
+    """Why the compute fill cannot chunk K under ``tile`` whatever its transport, or ``None``: the staged
+    driver unrolls WHOLE K chunks — the same rule the copy transports state on their own."""
+    bk_elems = tile.bk * tile.atom.atom_k
+    if k_axis.extent.is_static and k_axis.extent.as_static() % bk_elems:
+        return (
+            f"the smem compute fill unrolls whole K chunks, but its {bk_elems}-element chunk "
+            f"does not divide the contraction K={k_axis.extent.as_static()}"
+        )
+    return None
 
-    ``want_depth >= 2`` is the asymmetric B-only prefetch ring: only the B cp.async slabs ring
-    (their copies for chunk ``i+d-1`` fly under chunk ``i``'s compute fill and drain), while the
-    compute-filled A slab and the stat rows stay single-buffer — ringing a compute fill buys no
-    overlap, it runs on the drain's own threads. Both depths are fork siblings, measured per shape.
 
-    ``k_axis`` is the contraction's K with its extent (the enclosing Fold's when the contraction
-    is a derived singleton marker), ``producer_k`` the nested producer's; ``axes`` is the kernel's
-    axis table for the seam's lowering. ``why`` collects the decline reason when the tier refuses,
-    so a PINNED caller reports the gate it actually hit."""
+def _fill_slabs(c: Fold, tile: Tile, budget: int, *, inputs, seam, k_axis: Axis, producer, producer_k, axes) -> tuple | str:
+    """The compute fill's slabs under ``tile`` at depth one — what its transport does not change — or why
+    the fill has none: ``(bk_elems, a_nbytes, b_nbytes, a_copied, sync_bytes, async_bytes, producer_bytes)``."""
     atom = tile.atom
     if atom.operand_dtype("a").nbytes < 2:
         # fp8 atoms: the compute fill's slab store + ldmatrix drain are 16-bit-only
-        _decline(why, f"the smem compute fill is 16-bit-only, but this atom's a operand is {atom.operand_dtype('a').nbytes}-byte")
-        return None
+        return f"the smem compute fill is 16-bit-only, but this atom's a operand is {atom.operand_dtype('a').nbytes}-byte"
     bk_elems = tile.bk * atom.atom_k
-    if k_axis.extent.is_static and k_axis.extent.as_static() % bk_elems:
-        # the staged driver unrolls WHOLE K chunks — the same rule the copy transports state on their own
-        _decline(
-            why,
-            f"the smem compute fill unrolls whole K chunks, but its {bk_elems}-element chunk "
-            f"does not divide the contraction K={k_axis.extent.as_static()}",
-        )
-        return None
+    a_converts = converting_a(c, atom, inputs)
+    if refusal := fill_chunk_refusal(tile, k_axis) or computed_operand_cover(c, tile, converting=a_converts, k_axis=k_axis, inputs=inputs):
+        return refusal
     a_nbytes = atom.operand_dtype("a").nbytes
     b_nbytes = atom.operand_dtype("b").nbytes
     _, _, stats, chunk = (
@@ -699,21 +803,20 @@ def resolve_fill_stage(
     if chunk and chunk[2] % bk_elems:
         # The chunk statistic is evaluated once per staged chunk, which is only its value when the
         # chunk sits inside one K group.
-        _decline(why, f"the fill's per-chunk statistic spans {chunk[2]}-element K groups, which a {bk_elems}-element chunk does not tile")
-        return None
+        return f"the fill's per-chunk statistic spans {chunk[2]}-element K groups, which a {bk_elems}-element chunk does not tile"
     a_bytes = tile.m.tile * bk_elems * a_nbytes
     stat_bytes = (len(stats) + (len(chunk[1]) if chunk else 0)) * tile.m.tile * 4
     sync_bytes = stat_bytes
     async_bytes = 0
     # A materialized A whose dtype the atom cannot bind rides the CONVERTING synchronous fill —
     # per-cell load + typed slab store — never the byte copy (which cannot convert).
-    a_converts = converting_a(c, atom, inputs)
-    if c.operands[0].as_slab() is not None and not a_converts:
+    a_copied = c.operands[0].as_slab() is not None and not a_converts
+    if a_copied:
         async_bytes += a_bytes
     else:
         sync_bytes += a_bytes
     for ch in c.operands[1:]:
-        if ch.as_slab() is not None:
+        if copied_b(c, ch, inputs):
             async_bytes += tile.n.tile * bk_elems * b_nbytes
         else:
             sync_bytes += tile.n.tile * bk_elems * b_nbytes
@@ -725,19 +828,98 @@ def resolve_fill_stage(
     )
     producer_bytes = producer_extent * (bk_elems * b_nbytes + tile.m.tile * a_nbytes)
     if sync_bytes + async_bytes + producer_bytes > budget:
-        _decline(why, f"the smem compute fill's slabs need {sync_bytes + async_bytes + producer_bytes} B, over the {budget} B smem budget")
+        return f"the smem compute fill's slabs need {sync_bytes + async_bytes + producer_bytes} B, over the {budget} B smem budget"
+    return bk_elems, a_nbytes, b_nbytes, a_copied, sync_bytes, async_bytes, producer_bytes
+
+
+def fill_slab_refusal(c: Fold, tile: Tile, budget: int, **kwargs) -> str | None:
+    """Why the compute fill cannot stage ``c`` under ``tile`` whatever its transport, or ``None``."""
+    slabs = _fill_slabs(c, tile, budget, **kwargs)
+    return slabs if isinstance(slabs, str) else None
+
+
+def resolve_fill_stage(
+    c: Fold,
+    tile: Tile,
+    budget: int,
+    want: Stage,
+    *,
+    inputs=None,
+    why: list[str] | None = None,
+    seam: tuple | None = None,
+    k_axis: Axis,
+    producer: Fold | None = None,
+    producer_k: Axis | None = None,
+    axes: tuple = (),
+) -> ResolvedStage | None:
+    """The compute-fill :class:`Stage` for a computed-operand warp contraction under ``tile`` —
+    MANDATORY for this form (the gmem-direct mma leaf refuses a computed A, and the byte-copy /
+    cp.async / TMA transports move bytes and cannot evaluate a producer cone), so it has no
+    gmem-direct ``""`` sibling. A ``STAGE`` pin (``want``) chooses the depth and how the stored
+    peers move: ``smem`` copies them with cp.async (the blocking copy where there is none),
+    ``smem-tma`` with TMA box copies, and then also the ``/p2`` register double buffer. The
+    computed slabs are always the fill's. ``None`` when the slabs exceed ``budget``: one A slab,
+    one B slab per channel, and one fp32 row per bridged statistic
+    (:func:`~emmy.compiler.ir.pure.fold.cone_seam`'s ``stats`` and its per-chunk ``chunk`` stats —
+    the same node boundary the materializer fills through).
+
+    ``want.depth >= 2`` is the asymmetric B-only prefetch ring: only the copied slabs ring
+    (their copies for chunk ``i+d-1`` fly under chunk ``i``'s compute fill and drain), while the
+    compute-filled A slab and the stat rows stay single-buffer — ringing a compute fill buys no
+    overlap, it runs on the drain's own threads. Both depths are fork siblings, measured per shape.
+
+    TMA asks of the copied slabs what :func:`resolve_warp_stage` asks of every slab it boxes, and
+    needs at least one copied slab: a stage whose every slab is computed has nothing to copy.
+
+    ``k_axis`` is the contraction's K with its extent (the enclosing Fold's when the contraction
+    is a derived singleton marker), ``producer_k`` the nested producer's; ``axes`` is the kernel's
+    axis table for the seam's lowering. ``why`` collects the decline reason when the tier refuses,
+    so a PINNED caller reports the gate it actually hit."""
+    atom = tile.atom
+    cones = c.operands[0].as_slab() is None or any(b.as_slab() is None for _, b in c.bilinear_channels())
+    computes = cones or converting_a(c, atom, inputs)
+    if want.depth >= 2 and atom.sync_copy_staging and computes:
+        # With no cp.async the ring's B copies are blocking copies, and on sm_70 the depth-2 ring
+        # returned silently wrong answers on nine of sixteen measured warp grids and fragments,
+        # every one of them correct at depth 1. That is the ring under a COMPUTE fill, whose
+        # deposit runs on the drain's own threads; a node whose operands are all materialized
+        # reaches this tier only because it folds several channels, and then the transport is the
+        # ordinary blocking-copy ring the single-channel tiers already stage (``SPLIT_COPY_DEPTH``).
+        _decline(why, "the smem compute fill's B prefetch ring needs cp.async; this atom stages with blocking copies")
         return None
+    want_depth = min(want.depth, SPLIT_COPY_DEPTH) if atom.sync_copy_staging else want.depth
+    slabs = _fill_slabs(c, tile, budget, inputs=inputs, seam=seam, k_axis=k_axis, producer=producer, producer_k=producer_k, axes=axes)
+    if isinstance(slabs, str):
+        _decline(why, slabs)
+        return None
+    bk_elems, a_nbytes, b_nbytes, a_copied, sync_bytes, async_bytes, producer_bytes = slabs
+    if want.transport == "smem-tma":
+        m, n, b_trans = tile.m, tile.n, c.as_contraction().b_trans
+        if not async_bytes:
+            _decline(why, "every slab of this contraction is computed, so a TMA stage has nothing to copy")
+            return None
+        boxed = [(c.operands[0], m.axis.name)] if a_copied else []
+        boxed += [(edge, n.axis.name) for edge in c.operands[1:] if copied_b(c, edge, inputs)]
+        if not (
+            all(_tma_operand_box(edge.as_slab().load.index, axis, k_axis.name) for edge, axis in boxed)
+            and max(m.tile, n.tile, bk_elems) <= _TMA_MAX_BOX
+            and _warp_tma(k_axis, n.axis, n.tile, bk_elems, a_nbytes, b_nbytes, n.mask, b_trans)
+        ):
+            _decline(why, "a copied slab has no valid TMA box: it needs static, tile-divisible K and N and 16 B-aligned rows")
+            return None
     fixed = sync_bytes + producer_bytes
     # Only the asynchronous peer slabs ring (the compute-filled slab and stat rows stay
     # single-buffer), so the clamp budgets the ringed slot against what the fixed slabs leave.
     depth = _clamp_depth(want_depth, async_bytes, budget - fixed) if async_bytes else 1
-    computed = [c.operands[0].exposes[-1]] if a_converts or c.operands[0].as_slab() is None else []
-    computed.extend(edge.exposes[-1] for edge in c.operands[1:] if edge.as_slab() is None)
-    return ResolvedStage(Stage(depth=depth, transport="smem"), smem=tuple(computed), bk_elems=bk_elems)
+    computed = [] if a_copied else [c.operands[0].exposes[-1]]
+    computed.extend(edge.exposes[-1] for edge in c.operands[1:] if not copied_b(c, edge, inputs))
+    choice = replace(want, depth=depth, reg_depth=min(want.reg_depth, tile.bk))
+    return ResolvedStage(choice, smem=tuple(computed), bk_elems=bk_elems)
 
 
 __all__ = [
     "chunk_key_stage",
+    "chunk_slab_pad",
     "computed_operand_copy_dtype",
     "computed_operand_cover",
     "converting_a",

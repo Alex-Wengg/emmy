@@ -10,6 +10,7 @@ from dataclasses import replace
 
 import pytest
 
+from tests.serving.helpers import per_expert
 from tests.support.checkpoints import exl3_linear_tensors
 
 
@@ -70,7 +71,12 @@ def _combine(gate, experts, expert, xn):
     the routing math itself is the SHARED ``combine_routed_experts`` serving runs."""
     from emmy.serving.gen_runner import combine_routed_experts
 
-    return combine_routed_experts(xn, gate(xn), lambda e, rows: expert(rows, experts.gate_up_proj[e], experts.down_proj[e]))
+    return combine_routed_experts(
+        xn,
+        gate(xn),
+        per_expert(lambda e, rows: expert(rows, experts.gate_up_proj[e], experts.down_proj[e])),
+        num_experts=experts.gate_up_proj.shape[0],
+    )
 
 
 def test_moe_split_matches_eager_block_tail():
@@ -281,7 +287,8 @@ def test_exl3_laguna_routed_scale_matches_reference_architecture():
     reference = combine_routed_experts(
         hidden,
         routed,
-        lambda e, rows: original_expert(rows, *experts.gate_up_proj[e].chunk(2, dim=0), experts.down_proj[e]),
+        per_expert(lambda e, rows: original_expert(rows, *experts.gate_up_proj[e].chunk(2, dim=0), experts.down_proj[e])),
+        num_experts=experts.gate_up_proj.shape[0],
     )
     assert moe_block_parts(dense) is None
     assert sparse.routed_scaling_factor == 2.5
@@ -306,7 +313,8 @@ def test_exl3_laguna_routed_scale_matches_reference_architecture():
     combined = combine_routed_experts(
         hidden,
         scaled_gate(hidden),
-        lambda e, rows: expert(rows, *experts.gate_up_proj[e].chunk(2, dim=0), experts.down_proj[e]),
+        per_expert(lambda e, rows: expert(rows, *experts.gate_up_proj[e].chunk(2, dim=0), experts.down_proj[e])),
+        num_experts=experts.gate_up_proj.shape[0],
     )
     assert torch.isfinite(combined).all()
     torch.testing.assert_close(combined, reference * 128.0, rtol=1e-5, atol=1e-5)
@@ -626,7 +634,7 @@ def test_combine_casts_fp32_router_scores():
     xn = torch.randn(5, 8, dtype=torch.float16)
     scores = torch.rand(5, 2, dtype=torch.float32)
     indices = torch.randint(0, 4, (5, 2))
-    out = combine_routed_experts(xn, (None, scores, indices), lambda e, rows: rows * (e + 1))
+    out = combine_routed_experts(xn, (None, scores, indices), per_expert(lambda e, rows: rows * (e + 1)), num_experts=4)
     assert out.dtype == torch.float16
     ref = torch.zeros_like(xn)
     for t in range(5):
@@ -650,8 +658,8 @@ def test_marked_moe_contributions_preserve_the_float32_residual():
     def run_expert(expert, rows):
         return partials[expert].expand_as(rows)
 
-    assert not torch.isfinite(combine_routed_experts(xn, gated, run_expert)).all()
-    routed = combine_routed_experts(xn, gated, run_expert, accumulate_float32=True)
+    assert not torch.isfinite(combine_routed_experts(xn, gated, per_expert(run_expert), num_experts=2)).all()
+    routed = combine_routed_experts(xn, gated, per_expert(run_expert), num_experts=2, accumulate_float32=True)
     slots = _combine_slot_partials(scores, partials, xn.dtype, accumulate_float32=True)
 
     torch.testing.assert_close(routed, torch.zeros_like(xn, dtype=torch.float32), rtol=0, atol=0)
@@ -964,10 +972,30 @@ def test_load_quantized_split_preserves_nonzero_laguna_router_bias(tmp_path):
         expected = reference(hidden)
         actual = loaded(hidden)
 
-    torch.testing.assert_close(loaded.e_score_correction_bias, correction.to(torch.float16), rtol=0, atol=0)
+    torch.testing.assert_close(loaded.e_score_correction_bias, correction, rtol=0, atol=0)
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
     torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+
+
+def test_the_serving_router_keeps_its_selection_bias_float32():
+    """Transformers keeps a router's correction bias float32 whatever the model dtype. A float16 copy
+    rounds 9.003 and 9.001 both to 9.0 — enough to change which experts make the top-k."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeTopkRouter
+
+    from emmy.serving.gen_runner import serving_router
+
+    gate = Glm4MoeTopkRouter(_tiny_glm4_moe_config(transformers)).eval()
+    gate.e_score_correction_bias.copy_(torch.tensor([9.0, 9.003, 9.001, 0.0]))  # zero weight: the bias alone picks
+    router = serving_router(gate, torch.float16)
+
+    assert router.weight.dtype == torch.float16
+    torch.testing.assert_close(router.e_score_correction_bias, gate.e_score_correction_bias, rtol=0, atol=0)
+    with torch.no_grad():
+        _logits, _weights, indices = router(torch.randn(3, gate.hidden_dim, dtype=torch.float16))
+    assert all(sorted(row) == [1, 2] for row in indices.tolist())
 
 
 def test_load_quantized_split_rejects_missing_laguna_router_bias(tmp_path):

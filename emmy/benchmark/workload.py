@@ -3,37 +3,58 @@
 import logging
 from pathlib import Path
 
-from emmy.deploy.compose import calculate_num_instances
+from emmy.deploy.compose import replica_services
+from emmy.deploy.orchestrate import baked_hf_cache
 from emmy.recipe.types import Recipe, VllmConfig
 from emmy.redact import redact_secrets
 
 
-def _bench_args(recipe: Recipe, repeat: int = 0) -> list[str]:
+def _bench_args(recipe: Recipe, repeat: int = 0, tokenizer: str | None = None) -> list[str]:
     """The vllm bench serve argument list shared by the display string and the
     docker invocation. Embedding recipes target /v1/embeddings via the
     openai-embeddings backend and have no output length (nothing is generated),
-    so the generation-only sampling knobs (temperature, ignore_eos) don't apply. Repeat ``i`` seeds
+    so the generation-only sampling knobs (temperature, ignore_eos) don't apply.
+    A transcription workload sends a speech dataset's clips to /v1/audio/transcriptions
+    through the openai-audio backend, which takes no sampling knobs; each clip sets its own lengths. Repeat ``i`` seeds
     ``seed + i`` (unset counts as 0): a replayed prompt set would hit the server's prefix cache."""
     bench = recipe.benchmark
     seed = None if bench.seed is None and not repeat else (bench.seed or 0) + repeat
-    num_instances = calculate_num_instances(recipe)
-    port = 8080 if num_instances > 1 else 8000
+    _, load_balancer = replica_services(recipe)
+    port = 8080 if load_balancer else 8000
     args = [
-        f"--model {recipe.model_name}",
+        f"--model {recipe.request_model_name}",
         "--trust-remote-code",
     ]
+    if tokenizer is None and recipe.request_model_name != recipe.model_name:
+        tokenizer = recipe.model_name
+    if tokenizer:
+        args.append(f"--tokenizer {tokenizer}")
     if recipe.is_embedding:
         args += ["--backend openai-embeddings", "--endpoint /v1/embeddings"]
+    if bench.transcription_dataset:
+        args += [
+            "--backend openai-audio",
+            "--endpoint /v1/audio/transcriptions",
+            "--dataset-name hf",
+            f"--dataset-path {bench.transcription_dataset}",
+        ]
+        if bench.transcription_subset:
+            args.append(f"--hf-subset {bench.transcription_subset}")
+        if bench.transcription_split:
+            args.append(f"--hf-split {bench.transcription_split}")
     args += [
         f"--max-concurrency {bench.max_concurrency}",
         f"--num-prompts {bench.num_prompts}",
-        f"--random-input-len {bench.random_input_len}",
     ]
+    if not bench.transcription_dataset:
+        args.append(f"--random-input-len {bench.random_input_len}")
+    if bench.random_prefix_len:
+        args.append(f"--random-prefix-len {bench.random_prefix_len}")
     if seed is not None:
         args.append(f"--seed {seed}")
     if bench.num_warmups:
         args.append(f"--num-warmups {bench.num_warmups}")
-    if not recipe.is_embedding:
+    if not recipe.is_embedding and not bench.transcription_dataset:
         args.append(f"--random-output-len {bench.random_output_len}")
         if bench.temperature is not None:
             args.append(f"--temperature {bench.temperature}")
@@ -62,7 +83,7 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     # Warn if input + output lengths risk exceeding context_length (embedding
     # workloads generate nothing — only the input length counts there).
     context_length = recipe.engine.llm.context_length
-    request_len = bench.random_input_len + (0 if recipe.is_embedding else bench.random_output_len)
+    request_len = bench.random_prefix_len + bench.random_input_len + (0 if recipe.is_embedding else bench.random_output_len)
     if context_length is not None and request_len >= context_length:
         logging.getLogger().warning(f"benchmark request length ({request_len}) >= context_length ({context_length})")
 
@@ -79,10 +100,17 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
 
     # benchmark.repeats reruns the client workload, with fresh prompts, against one deployed
     # server. The raw output retains one stanza per repeat; a failed repeat fails the task.
+    # The client runs in the serving image. One that bakes its model serves offline from its own HF
+    # cache, which holds the pinned snapshot and no branch ref, so a tokenizer lookup by repo id finds
+    # nothing there: name the snapshot instead.
+    tokenizer = None
+    if recipe.model.revision and (hf_home := await baked_hf_cache(run_cmd, image)):
+        tokenizer = f"{hf_home}/hub/models--{recipe.model_name.replace('/', '--')}/snapshots/{recipe.model.revision}"
+
     bench_command_str = build_bench_command(recipe)
     outputs = []
     for repeat in range(max(1, bench.repeats)):
-        args = " ".join(_bench_args(recipe, repeat))
+        args = " ".join(_bench_args(recipe, repeat, tokenizer))
         bench_cmd = f"docker run --rm --network host{device_flags} --entrypoint bash {image} -c 'vllm bench serve {args}'"
         rc, output, stderr = await run_cmd(bench_cmd, stream=False, timeout=10800)
         outputs.append(output)

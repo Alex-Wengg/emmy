@@ -1,4 +1,4 @@
-"""Conv1d and einsum reach the tensor dialect with torch's numbers.
+"""Conv1d, conv2d, conv_transpose1d and einsum reach the tensor dialect with torch's numbers.
 
 Both ops used to stop the tracer dead — ``aten.conv1d`` had no mapping at all, and
 ``aten.einsum`` fell into the elementwise fallback and failed to broadcast. They are the
@@ -65,34 +65,60 @@ def test_depthwise_conv1d_matches_eager(run_graph, conv_module) -> None:
     _assert_matches_eager(run_graph, conv_module(groups=8, padding=3), (x, w))
 
 
-def test_causal_conv1d_with_zero_width_chunk_pad_matches_eager(run_graph) -> None:
-    """The Qwen3.8 causal Conv1d target retains its empty chunk-alignment pad."""
+def test_bf16_depthwise_conv1d_accumulates_at_f32_and_rounds_once(conv_module) -> None:
+    """A bf16 depthwise convolution computes its tap products and partial sums at f32, as
+    ``torch.nn.functional.conv1d`` does; only the last node, which writes the result, converts to bf16."""
+    import torch
+
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+
+    x, w = torch.randn(1, 8, 16, dtype=torch.bfloat16), torch.randn(8, 1, 4, dtype=torch.bfloat16)
+    graph = _decompose(conv_module(groups=8, padding=3), (x, w))
+    (out,) = graph.outputs
+    chain = [node for node in graph.nodes.values() if isinstance(node.op, ElementwiseOp) and node.op.op.name in ("multiply", "add")]
+    assert len(chain) == 4 + 3, [node.id for node in chain]
+    assert {node.output.dtype.name for node in chain if node.id != out} == {"f32"}
+    assert graph.nodes[out].output.dtype.name == "bf16"
+
+
+def test_bf16_dense_conv1d_with_bias_rounds_once_after_the_bias() -> None:
+    """A bf16 dense convolution with a bias sums its contraction at f32 and adds the bias to that f32 sum; only the
+    bias add, which writes the result, converts to bf16."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F  # noqa: N812
+
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+
+    class Conv(nn.Module):
+        def forward(self, x, w, b):
+            return F.conv1d(x, w, b, padding=1)
+
+    x, w, b = torch.randn(1, 8, 16, dtype=torch.bfloat16), torch.randn(4, 8, 3, dtype=torch.bfloat16), torch.randn(4, dtype=torch.bfloat16)
+    graph = _decompose(Conv(), (x, w, b))
+    (out,) = graph.outputs
+    add = graph.nodes[out]
+    assert isinstance(add.op, ElementwiseOp) and add.op.op.name == "add"
+    assert add.output.dtype.name == "bf16"
+    [contraction] = [node for node in graph.nodes.values() if isinstance(node.op, ReduceOp)]
+    assert contraction.output.dtype.name == "f32"
+    assert sorted(graph.nodes[ref].output.dtype.name for ref in add.inputs) == ["bf16", "f32"], "the bias add reads the f32 sum"
+
+
+@pytest.mark.parametrize("padding", [(0, 0), (1, 0)])
+def test_causal_conv1d_with_chunk_pad_matches_eager(run_graph, padding) -> None:
+    """The causal convolution preserves values across empty and nonempty chunk padding."""
     import torch
     import torch.nn as nn
     import torch.nn.functional as F  # noqa: N812
 
     class CausalConv(nn.Module):
         def forward(self, x, w):
-            return F.pad(F.conv1d(x, w, padding=3, groups=8), (0, 0))
+            return F.pad(F.conv1d(x, w, padding=3, groups=8), padding)
 
     torch.manual_seed(0)
     x, w = torch.randn(2, 8, 16), torch.randn(8, 1, 4)
     _assert_matches_eager(run_graph, CausalConv(), (x, w))
-
-
-def test_causal_conv1d_rejects_nonzero_generic_pad() -> None:
-    """A coordinate-changing pad fails before the attribute-free elementwise fallback."""
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F  # noqa: N812
-
-    class CausalConv(nn.Module):
-        def forward(self, x, w):
-            return F.pad(F.conv1d(x, w, padding=3, groups=8), (1, 0))
-
-    x, w = torch.randn(1, 8, 16), torch.randn(8, 1, 4)
-    with pytest.raises(NotImplementedError, match="only explicit zero-width padding"):
-        _decompose(CausalConv(), (x, w))
 
 
 def test_dense_conv1d_im2col_matches_eager(run_graph, conv_module) -> None:
@@ -111,6 +137,100 @@ def test_conv1d_rejects_a_grouped_convolution(conv_module) -> None:
     x, w = torch.randn(1, 8, 16), torch.randn(8, 2, 4)
     with pytest.raises(NotImplementedError, match="groups=4"):
         _decompose(conv_module(groups=4), (x, w))
+
+
+@pytest.mark.parametrize(
+    ("taps", "stride", "padding", "output_padding"),
+    [
+        (16, 8, 0, 0),  # Qwen3-Omni code2wav's 8x upsampler: kernel twice the stride
+        (2, 2, 0, 0),  # its 2x upsampler: kernel equal to the stride, phases never overlap
+        (6, 3, 2, 1),  # padding crops both ends, output padding extends the right one
+    ],
+)
+def test_conv_transpose1d_matches_eager(run_graph, taps, stride, padding, output_padding) -> None:
+    """The polyphase GEMM and its interleave give torch's numbers, bias included."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F  # noqa: N812
+
+    class ConvTranspose(nn.Module):
+        def forward(self, x, w, b):
+            return F.conv_transpose1d(x, w, b, stride=stride, padding=padding, output_padding=output_padding)
+
+    torch.manual_seed(0)
+    x, w, b = torch.randn(2, 5, 9), torch.randn(5, 7, taps), torch.randn(7)
+    _assert_matches_eager(run_graph, ConvTranspose(), (x, w, b), tol=1e-5)
+
+
+def test_conv_transpose1d_rejects_groups() -> None:
+    """A grouped transposed convolution has no decomposition, and the tracer says so."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F  # noqa: N812
+
+    class Grouped(nn.Module):
+        def forward(self, x, w):
+            return F.conv_transpose1d(x, w, stride=2, groups=2)
+
+    with pytest.raises(NotImplementedError, match="groups=2"):
+        _decompose(Grouped(), (torch.randn(1, 4, 8), torch.randn(4, 3, 4)))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "w_shape"),
+    [
+        ({"stride": 2, "padding": 1}, (6, 3, 3, 3)),  # Qwen3-Omni's audio stem: 3x3, stride 2, padding 1
+        ({"stride": (1, 2), "dilation": (2, 1)}, (6, 3, 2, 3)),  # unequal axes, no padding
+    ],
+)
+def test_conv2d_im2col_matches_eager(run_graph, kwargs, w_shape) -> None:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F  # noqa: N812
+
+    class Conv(nn.Module):
+        def forward(self, x, w, b):
+            return F.conv2d(x, w, b, **kwargs)
+
+    torch.manual_seed(0)
+    x, w, b = torch.randn(2, 3, 9, 8), torch.randn(*w_shape), torch.randn(w_shape[0])
+    _assert_matches_eager(run_graph, Conv(), (x, w, b), tol=1e-5)
+
+
+def test_conv2d_rejects_groups() -> None:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F  # noqa: N812
+
+    class Grouped(nn.Module):
+        def forward(self, x, w):
+            return F.conv2d(x, w, groups=2)
+
+    with pytest.raises(NotImplementedError, match="groups=2"):
+        _decompose(Grouped(), (torch.randn(1, 4, 8, 8), torch.randn(4, 2, 3, 3)))
+
+
+@pytest.mark.parametrize(
+    ("x_shape", "w_shape"),
+    [
+        ((3, 3, 2, 4, 4), (5, 3, 2, 4, 4)),  # a video patch embedding: (C, T, P, P) blocks, conv3d
+        ((3, 2, 4, 4), (5, 2, 4, 4)),  # the image form, conv2d
+    ],
+)
+def test_patch_convolution_matches_eager(run_graph, x_shape, w_shape) -> None:
+    """A kernel covering its whole input is captured as the linear layer over flattened patches."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F  # noqa: N812
+
+    conv = F.conv3d if len(w_shape) == 5 else F.conv2d
+
+    class PatchEmbed(nn.Module):
+        def forward(self, x, w, b):
+            return conv(x, w, b, stride=w_shape[2:])
+
+    torch.manual_seed(0)
+    _assert_matches_eager(run_graph, PatchEmbed(), (torch.randn(*x_shape), torch.randn(*w_shape), torch.randn(w_shape[0])), tol=1e-5)
 
 
 @pytest.fixture

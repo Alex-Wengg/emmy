@@ -30,7 +30,7 @@ def test_iter_candidates_h200_default_picks_cloudrift_first():
     cands = iter_candidates("NVIDIA H200 141GB", 8, provider=None)
     # Cloudrift entry, then GCP entries (one per zone)
     assert cands[0].provider == "cloudrift"
-    assert cands[0].instance_type == "h200-8-generic.8"
+    assert cands[0].instance_type == "h200-26-200-500-packed.8"
     gcp_cands = [c for c in cands if c.provider == "gcp"]
     h200_zones = GPU_GCP_ZONES["NVIDIA H200 141GB"]
     assert len(gcp_cands) == len(h200_zones)  # one per zone
@@ -90,11 +90,13 @@ def test_iter_candidates_gcp_fallback_zone_when_not_in_table():
 
 
 def test_iter_candidates_a100_80gb_prefers_cloudrift():
-    """A100 80GB tries the CloudRift offering before falling back to GCP a2-ultragpu."""
+    """A100 80GB tries the CloudRift offering before falling back to GCP a2-ultragpu, one candidate per zone
+    that offers the machine type."""
     cands = iter_candidates("NVIDIA A100 80GB", 2, provider=None)
-    assert [c.provider for c in cands] == ["cloudrift", "gcp"]
+    assert [c.provider for c in cands] == ["cloudrift", *["gcp"] * len(GPU_GCP_ZONES["NVIDIA A100 80GB"])]
     assert cands[0].instance_type == "a100-16-210-800-generic.2"
-    assert cands[1].instance_type == "a2-ultragpu-2g"
+    assert {c.instance_type for c in cands[1:]} == {"a2-ultragpu-2g"}
+    assert [c.zone for c in cands[1:]] == GPU_GCP_ZONES["NVIDIA A100 80GB"]
 
 
 def test_vm_candidate_describe_cloudrift():

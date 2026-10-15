@@ -32,6 +32,9 @@ SUPPORTED = frozenset(
         "CatOp",
         "UnsqueezeOp",
         "LinearOp",
+        "Conv1dOp",
+        "Conv2dOp",
+        "ConvTranspose1dOp",
         "MatmulOp",
         "SdpaOp",
         "MeanOp",
@@ -139,6 +142,7 @@ def _build_elementwise_table() -> dict[str, Callable]:
         "multiply": lambda a: a[0] * a[1],
         "prod": lambda a: a[0] * a[1],
         "divide": lambda a: a[0] / a[1],
+        "divide_rn_f32": lambda a: a[0].float() / a[1].float(),
         "true_divide": lambda a: a[0] / a[1],
         "floor_divide": lambda a: torch.floor_divide(a[0], a[1]),
         "remainder": lambda a: torch.remainder(a[0], a[1]),
@@ -159,6 +163,7 @@ def _build_elementwise_table() -> dict[str, Callable]:
         "rsqrt": lambda a: torch.rsqrt(a[0]),
         "exp": lambda a: torch.exp(a[0]),
         "log": lambda a: torch.log(a[0]),
+        "floor": lambda a: torch.floor(a[0]),
         "sin": lambda a: torch.sin(a[0]),
         "cos": lambda a: torch.cos(a[0]),
         "tanh": lambda a: torch.tanh(a[0]),
@@ -247,8 +252,25 @@ def _eval(node, ins: list, sym_env: dict[str, int] | None = None, device=None):
         raise NotImplementedError(f"torch_ref: scan {fn!r} unmapped")
     if name == "LinearOp":
         return F.linear(ins[0], ins[1], ins[2] if op.has_bias else None)
+    if name == "Conv1dOp":
+        return F.conv1d(
+            ins[0],
+            ins[1],
+            ins[2] if len(ins) > 2 else None,
+            stride=op.stride,
+            padding=op.padding,
+            dilation=op.dilation,
+            groups=op.groups,
+        )
+    if name == "Conv2dOp":
+        return F.conv2d(ins[0], ins[1], ins[2] if len(ins) > 2 else None, stride=op.stride, padding=op.padding, dilation=op.dilation)
+    if name == "ConvTranspose1dOp":
+        return F.conv_transpose1d(
+            ins[0], ins[1], ins[2] if len(ins) > 2 else None, stride=op.stride, padding=op.padding, output_padding=op.output_padding
+        )
     if name == "MatmulOp":
-        out = ins[0] @ ins[1]
+        dtype = torch.promote_types(torch.promote_types(ins[0].dtype, ins[1].dtype), torch_dtype(node.output.dtype))
+        out = ins[0].to(dtype) @ ins[1].to(dtype)
         return out + ins[2] if op.has_bias else out
     if name == "SdpaOp":
         q, k, v = ins[0], ins[1], ins[2]
@@ -290,10 +312,9 @@ def _eval(node, ins: list, sym_env: dict[str, int] | None = None, device=None):
     if name == "SoftmaxOp":
         return torch.softmax(ins[0], dim=op.axis)
     if name == "TransposeOp":
-        ndim = ins[0].dim()
-        if len(op.axes) == ndim:
-            return ins[0].permute(*op.axes)
-        return ins[0].transpose(op.axes[0], op.axes[1])
+        if len(op.axes) == 2:
+            return ins[0].transpose(op.axes[0], op.axes[1])
+        return ins[0].permute(*op.axes)
     if name == "ReshapeOp":
         return ins[0].reshape(_shape_ints(node.output.shape, sym_env))
     if name == "UnsqueezeOp":
@@ -302,6 +323,8 @@ def _eval(node, ins: list, sym_env: dict[str, int] | None = None, device=None):
         t = ins[0]
         if op.dim is not None:
             dim, start = op.dim, op.start or 0
+            if start < 0:
+                start += t.shape[dim]
             extent = op.shape[dim]
             end = start + int(extent) if isinstance(extent, int) else t.shape[dim]
         else:  # legacy constant-input convention (pre-field IR dumps)
@@ -380,6 +403,21 @@ def _index_map(op, ins: list, sym_env: dict[str, int] | None = None, device=None
     from emmy.compiler.ir.expr import PLACEHOLDER_PREFIX  # noqa: PLC0415
 
     out_shape = _shape_ints(op.out_shape, sym_env or {})
+    if len(op.sources) == 1 and op.sources[0].select is None:
+        source = op.sources[0]
+        tensor = ins[source.input_idx]
+        if torch.is_tensor(tensor):
+            strides = [0] * len(out_shape)
+            axes = {f"{PLACEHOLDER_PREFIX}{i}": i for i in range(len(out_shape))}
+            for i, coord in enumerate(source.coord_map):
+                if tensor.shape[i] == 1 or (type(coord).__name__ == "Literal" and coord.value == 0):
+                    continue
+                axis = axes.get(getattr(coord, "name", None))
+                if axis is None or tensor.shape[i] != out_shape[axis]:
+                    break
+                strides[axis] += tensor.stride(i)
+            else:
+                return tensor.as_strided(out_shape, strides)
     # device / dtype from the first tensor-valued source (a source can be a
     # scalar constant — stored as a python float).
     base = next((ins[s.input_idx] for s in op.sources if torch.is_tensor(ins[s.input_idx])), None)
@@ -405,7 +443,7 @@ def _index_map(op, ins: list, sym_env: dict[str, int] | None = None, device=None
         else:
             idx = []
             for i, c in enumerate(src.coord_map):
-                if i < s.dim() and s.shape[i] == 1:  # size-1 source dim → index 0 (mirror lift)
+                if i < s.dim() and s.shape[i] == 1:  # size-1 source dim → index 0 (mirror loop lowering)
                     idx.append(torch.zeros(out_shape, dtype=torch.long, device=dev))
                 else:
                     v = _idx_expr(c, env)
@@ -426,8 +464,12 @@ def _index_map(op, ins: list, sym_env: dict[str, int] | None = None, device=None
     return result
 
 
-def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tuple[Callable, list]:
+def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor], *, compute_dtype=None) -> tuple[Callable, list]:
     """Build a torch callable for ``graph`` plus its positional input list.
+
+    ``compute_dtype`` (e.g. ``torch.float64``) evaluates every floating tensor of the graph in that dtype
+    instead of its declared one: the high-precision evaluation a correctness check measures both the
+    compiled program and the low-precision reference against.
 
     The returned ``fn(*tensors)`` runs the frontend ops in topological order and
     returns a tensor for a single-output graph or a tuple following
@@ -496,8 +538,14 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
             )(node, run_device)
         else:
             op_callable = (lambda n, d: lambda ins: _eval(n, ins, sym_env, d))(node, run_device)
-        compute_steps.append((nid, op_callable, list(node.inputs), torch_dtype(node.output.dtype)))
+        out_dtype = torch_dtype(node.output.dtype)
+        if compute_dtype is not None and out_dtype is not None and out_dtype.is_floating_point:
+            out_dtype = compute_dtype
+        compute_steps.append((nid, op_callable, list(node.inputs), out_dtype))
     out_ids = tuple(graph.outputs)
+    tensors = [input_tensors[i] for i in tensor_ids]
+    if compute_dtype is not None:
+        tensors = [t.to(compute_dtype) if torch.is_tensor(t) and t.is_floating_point() else t for t in tensors]
 
     def fn(*tensors):
         env = dict(scalars)
@@ -509,4 +557,4 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
             return env[out_ids[0]]
         return tuple(env[out_id] for out_id in out_ids)
 
-    return fn, [input_tensors[i] for i in tensor_ids]
+    return fn, tensors

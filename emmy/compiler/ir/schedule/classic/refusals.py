@@ -5,10 +5,12 @@ here too, so the context composes without owning legality."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from functools import cache
 from typing import TYPE_CHECKING
+
+from frozendict import frozendict
 
 from emmy.compiler.ir.address import gmem_axis_step, split_addressable
 from emmy.compiler.ir.atom import ATOM_REGISTRY, AtomKind, atoms_for, wide_accumulate
@@ -21,12 +23,13 @@ from emmy.compiler.ir.schedule.catalog import (
     warp_tile_in_catalog,
     warp_tile_moves,
 )
-from emmy.compiler.ir.schedule.choices import PlacedTile, Reduce, ResolvedStage, Stage, Tile
+from emmy.compiler.ir.schedule.choices import PlacedTile, Reduce, ResolvedStage, Stage, Tile, Work
+from emmy.compiler.ir.schedule.packing import block_scaled_atom
 from emmy.compiler.ir.schedule.views import ContractionFacts, NodeId
-from emmy.compiler.ir.stmt import Assign, Body, Load, Loop, Select, Write, mask_select_predicate
+from emmy.compiler.ir.stmt import Affine, Assign, Body, Load, Loop, Select, Stmt, Write, mask_select_predicate
 from emmy.compiler.ir.stmt.passes import has_contraction_tail
 
-from .schedule import NodeSchedule, node_id_spelling
+from .schedule import NodeSchedule, binds_root, node_id_spelling, packed_works
 
 if TYPE_CHECKING:
     from emmy.compiler.ir.tile import TileOp
@@ -48,7 +51,7 @@ def _transposed_reduction_ok(tile: TileOp) -> bool:
     return _inner_free(tile) is not None and not any(isinstance(stmt, Loop) for stmt in tail) and not has_contraction_tail(tail)
 
 
-def _reduction_domain(tile: TileOp, node) -> tuple[Reduce, ...]:
+def _reduction_domain(tile: TileOp, node, target) -> tuple[Reduce, ...]:
     """Project one plain reduction's legal choices from node and kernel facts only.
 
     The catalog is not capped by the axis extent: an over-wide band is legal and idles its extra
@@ -63,43 +66,58 @@ def _reduction_domain(tile: TileOp, node) -> tuple[Reduce, ...]:
         chain_form,
         chain_members,
         kernel_roots,
-        merges_partition,
     )
 
     roots = kernel_roots(tile.op)
     is_root = any(node is root for root in roots)
-    if node.observe is not None or not (is_root or any(node is member for root in roots for member in chain_members(root))):
+    owner = node if is_root else next((root for root in roots if any(node is member for member in chain_members(root))), None)
+    if node.carries or owner is None:
         return (Reduce(),)  # the binder partitions the roots it peels and their chain members; any other reduce lowers serially
-    if {axis.name for spec in tile.output_specs for axis in spec.sweep} & node.free_axes:
+    # A sweep the member's own ROOT is evaluated over wraps the whole chain, members included, and
+    # only the serial fold spells that: the chain arm closes one grid cell.
+    if {axis.name for spec in tile.output_specs for axis in spec.sweep} & (node.free_axes | owner.free_axes):
         return (Reduce(),)
-    if is_root and merges_partition(tile):
-        # A split's deferred finalize: one partial per split per cell, the parallelism is the cells,
-        # and a band over the few partials pays a barrier per cell.
-        return (Reduce(),)
-    transposed_ok = _transposed_reduction_ok(tile) and is_root and not chain_form(node)
+    if node.observe is not None:
+        # A prefix scan keeps every lane's inclusive state. Ordinary register partials, ``coop/v<n>`` runs,
+        # transposed bands and cross-warp trees do not preserve those states.
+        if not is_root or chain_form(node):
+            return (Reduce(),)
+        return (
+            Reduce(),
+            *(
+                choice
+                for choice in coop_reduce_moves()
+                if 1 < choice.coop <= WARP_LANES and choice.reg == choice.coop_columns == 1 and not choice.coop_transposed
+            ),
+        )
+    transposed_ok = _transposed_reduction_ok(tile) and is_root
+    lanes = (32, 8) if target.compute_capability == (7, 0) else (32,)
     return (
         Reduce(),
-        *(choice for choice in coop_reduce_moves() if not choice.coop_transposed or (choice.coop % WARP_LANES == 0 and transposed_ok)),
+        *(
+            choice
+            for choice in coop_reduce_moves(transposed_lanes=lanes)
+            if not choice.coop_transposed or (choice.coop % WARP_LANES == 0 and transposed_ok)
+        ),
     )
 
 
-def _contraction_reductions(tile: TileOp, node, facts: ContractionFacts) -> tuple[Reduce, ...]:
+def _contraction_reductions(tile: TileOp, node, facts: ContractionFacts, target) -> tuple[Reduce, ...]:
     """The per-cell tier's reductions of a contraction: the plain-reduction catalog, since a
     contraction is a monoid with a ⊗ lift and inherits the same serial-only exclusions with no
     carve-out of its own; the serial fold alone over a symbolic contraction extent."""
-    return _reduction_domain(tile, node) if facts.k_axis.extent.is_static else (Reduce(),)
+    return _reduction_domain(tile, node, target) if facts.k_axis.extent.is_static else (Reduce(),)
 
 
-def _fold_states(op) -> frozenset[str]:
-    """Return the Fold state names visible to the projection tail."""
-    if not isinstance(op, Fold):
-        return frozenset()
-    # What the term binds into its consumer, at either arity: a reducing fold exposes its carried
-    # state, a projection its operands'. ``lift.body`` holds statements only, so the terms below a
-    # projection are exactly its operands.
-    if op.axis is not None:
-        return frozenset(op.exposes)
-    return frozenset(name for edge in op.operands for name in edge.exposes)
+def _fragment_projection(tile: TileOp) -> tuple[list, frozenset[str]]:
+    """The lowered work outside the computed roots, including nested sibling projections."""
+    from emmy.compiler.ir.tile.ops import kernel_roots, refused_roots  # noqa: PLC0415 — tile.ops reads this package
+
+    roots = () if refused_roots(tile.op, tuple(tile.output_specs)) else kernel_roots(tile.op)
+    bound = frozenset(axis.name for axis in tile.place.free)
+    computed = {stmt for root in roots for stmt in root.lower(bound, axes=tile.axes)}
+    tail = [stmt for stmt in tile.op.lower(bound, tuple(tile.output_specs), tile.axes) if stmt not in computed]
+    return tail, frozenset(name for root in roots for name in root.exposes)
 
 
 def _fragment_epilogue_ok(tail: list, states: frozenset[str]) -> bool:
@@ -129,6 +147,26 @@ def _channel_dtype(tile: TileOp, node, target):
     return next(iter(eligible)) if len(eligible) == 1 else None
 
 
+def _fragment_rows_refusal(tile: TileOp) -> str | None:
+    """Why the M rows of a C fragment would have nowhere to land.
+
+    The grid's second-to-last free axis carries them, and each row needs its own address in the store. An axis no
+    output index mentions gives them one address between them: a plain store keeps the last row, a split's atomic
+    finalize sums all of them into that cell. One row is the exception — a matvec with a reshaped output stores
+    that way, the overhang guard predicating the rest. The case this rules out is a cross-CTA split's partition
+    axis standing in for an M that a size-one extent left without an axis of its own.
+    """
+    axis = tile.place.free[-2]
+    extent = getattr(axis.extent, "value", getattr(axis.extent, "extent", None))
+    if extent == 1 or not tile.output_specs:
+        # No specs is no statement: an authored tile carries the outputs alone, and the store this reads is the
+        # lowering's. One row needs no dimension of its own.
+        return None
+    if any(axis.name in index.free_vars() for spec in tile.output_specs for index in spec.write.index):
+        return None
+    return f"no output dimension carries the fragment's M rows ({axis.name})"
+
+
 def _node_refusal(tile: TileOp, target, node, fragment_epilogue: bool, packed: tuple = (None, None)) -> str | None:
     """Return why static node facts rule out every tensor-core atom."""
     from emmy.compiler.ir.tile.ops import edge_dtypes  # noqa: PLC0415 — tile.ops reads this package; module level would cycle
@@ -140,6 +178,8 @@ def _node_refusal(tile: TileOp, target, node, fragment_epilogue: bool, packed: t
         return "no typed inputs expose operand dtypes"
     if len(tile.place.free) < 2:
         return "the grid supplies no output-axis pair for a fragment"
+    if (why := _fragment_rows_refusal(tile)) is not None:
+        return why
     if not fragment_epilogue:
         return "the projection epilogue is not a per-fragment straight-line program"
     # The operand tuple in stored order — there is no named A/B role any more, and a nested
@@ -192,8 +232,6 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
 
     Stated at the enumeration, not at the binder: a row nothing realizes costs the greedy a
     blocklist retry per rank, and there are more ranked rows than the retry budget."""
-    from emmy.compiler.ir.tile.ops import projection_tail  # noqa: PLC0415 — tile.ops reads this package; module level would cycle
-
     facts = tile.contractions.get(tile.node_id(node))
     score = facts.producer if facts is not None else None
     # The chunk's score is CONTRACTED into its fragments when a nested contraction supplies it, and
@@ -213,20 +251,16 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
     # contraction, and what scales its raw accumulator lives in the lift above it. Its leaves past
     # the producer are read once ahead of the chunk, so none of them may vary over the chunk.
     prefix = node.applied.cone(node.roles[0])
-    if any(not isinstance(stmt, (Assign, Load, Select)) for stmt in prefix.body):
+    if any(not isinstance(stmt, (Affine, Assign, Load, Select)) for stmt in prefix.body):
         return "the score's own prefix holds more than a straight-line program"
     coord_axes = {node.axis, *node.as_contraction().left_axes}
     uniform = {name for edge in node.operands if not edge.free_axes for name in edge.exposes}
     for stmt in (stmt for stmt in prefix.body if isinstance(stmt, Select)):
-        consumers = [
-            consumer
-            for consumer in prefix.body
-            if isinstance(consumer, Assign) and consumer.op.name == "add" and stmt.name in consumer.args
-        ]
+        consumers = [consumer for consumer in prefix.body if _adds(consumer, stmt.name)]
         if (
             mask_select_predicate(stmt) is None
             or len(consumers) != 1
-            or not set(stmt.deps()) <= uniform
+            or not {branch.value for branch in stmt.branches} <= uniform
             or any(not branch.select.free_vars() <= coord_axes for branch in stmt.branches)
         ):
             return "the score's coordinate Select does not form a cell-uniform additive mask"
@@ -237,7 +271,7 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
     # register. A projection may read those registers, and a cross-CTA split's partial stores each
     # of them WHOLE to its workspace (broadcast per row into a fragment); what the tier cannot write
     # is a per-row state computed into an output of its own beside the expectation.
-    tail = projection_tail(tile)
+    tail, _ = _fragment_projection(tile)
     body = Body(tail)
     states = set(node.base.results)
     cell = {axis.name for axis in tile.place.free}
@@ -308,7 +342,8 @@ def _atom_families(tile: TileOp, target, node, tail: list, packed: tuple = (None
     # f32 carrier once per chunk — the reduced one therefore runs that chain at the full consumer-die
     # rate without moving the softmax statistics off f32 (the score keeps ``wide_accumulate``).
     if node.chunked():
-        dtype = edge_dtypes(a_edge, tile.inputs)[0]
+        # Scores accumulate at full width; the streamed value determines the repacked multiplicand width.
+        dtype = _channel_dtype(tile, node, target)
         offered = bindable((*atoms_for(dtype, ctx=target), *atoms_for(dtype, acc=dtype, ctx=target)))
         return tuple(dict.fromkeys(name for name in offered if ATOM_REGISTRY[name].c_to_a_repack))
     if (pair := packed[1]) is not None:
@@ -325,11 +360,9 @@ def _atom_families(tile: TileOp, target, node, tail: list, packed: tuple = (None
 
 def _warp_atoms(tile: TileOp, target, node) -> tuple[str, ...]:
     """Project tensor-core atoms from contraction, dtype, address, and target facts."""
-    from emmy.compiler.ir.tile.ops import projection_tail  # noqa: PLC0415 — tile.ops reads this package; module level would cycle
-
-    tail = projection_tail(tile)
+    tail, states = _fragment_projection(tile)
     packed = tile.packed_reading(node)
-    if _node_refusal(tile, target, node, _fragment_epilogue_ok(tail, _fold_states(tile.op)), packed) is not None:
+    if _node_refusal(tile, target, node, _fragment_epilogue_ok(tail, states), packed) is not None:
         return ()
     return _atom_families(tile, target, node, tail, packed)
 
@@ -361,10 +394,10 @@ def _warp_plan_ok(node, facts: ContractionFacts, plan: Tile) -> bool:
 def _uniform_extras(node) -> bool:
     # The scalar register tier replicates the TERM's own step per cell, so a recipe folds there
     # like any other algebra — three states under their own ops, seeded by the ⊕'s identities.
-    # What it has no residence for is an operand past the streamed one that VARIES: those are read
-    # once, ahead of the cells, so every one of them must be uniform across the tile (attention's
-    # scale and its mask fills are; a second streamed B is not, and rides the warp compute fill).
-    return len(node.operands) >= 2 and not any(edge.free_axes for edge in node.operands[2:])
+    # Product channels read their streamed edges per register column. Any remaining operand is
+    # read once ahead of the cells, so it must be uniform across the tile.
+    streamed = {id(edge) for _, edge in node.bilinear_channels()}
+    return len(node.operands) >= 2 and not any(edge.free_axes for edge in node.operands[1:] if id(edge) not in streamed)
 
 
 def _warp_plans(node, facts: ContractionFacts, atoms: tuple[str, ...]) -> Iterator[Tile]:
@@ -385,36 +418,130 @@ def _contraction_plans(node, facts: ContractionFacts, atoms: tuple[str, ...]) ->
     yield from _warp_plans(node, facts, atoms)
 
 
-def _contraction_plan_allowed(node, facts: ContractionFacts, atoms: tuple[str, ...], plan: Tile) -> bool:
-    """Whether one parsed contraction plan is a value the catalog would have offered."""
+def _contraction_plan_refusal(node, facts: ContractionFacts, atoms: tuple[str, ...], plan: Tile) -> str | None:
+    """Why one parsed contraction plan is not a value the catalog would have offered, or ``None``."""
     if not plan.is_warp:
-        return plan in _scalar_catalog() if _uniform_extras(node) else plan == Tile()
-    if plan.atom.name not in atoms or not _warp_plan_ok(node, facts, plan):
-        return False
-    return warp_tile_in_catalog(plan) or (plan.regs == (26, 4) and plan.bk == 2)
+        if _uniform_extras(node):
+            return None if plan in _scalar_catalog() else "not a scalar tile of the catalog"
+        return None if plan == Tile() else "this contraction takes no scalar register tile"
+    if plan.atom.name not in atoms:
+        return f"atom {plan.atom.name} is not offered here (offered: {', '.join(atoms) or 'none'})"
+    if (why := _kstep_refusal(facts.k_axis, plan) or _wgmma_refusal(plan)) is not None:
+        return why
+    if not _warp_plan_ok(node, facts, plan):
+        return f"the chunk width {plan.atom.atom_k * plan.bk} is not a multiple of the atom's N ({plan.atom.atom_n})"
+    if not (warp_tile_in_catalog(plan) or (plan.regs == (26, 4) and plan.bk == 2)):
+        return "not a warp tile of the catalog"
+    return None
 
 
-def _stage_candidates(tile: TileOp, target, node, choice: NodeSchedule) -> tuple[Stage, ...]:
-    """The transports one node choice can be fed by — the independent edge catalog."""
+def fill_stage_moves() -> tuple[Stage, ...]:
+    """The depths the smem fill tier names: single-buffer, and the peer prefetch ring.
+
+    Stated once because it is asked twice — the edge catalog offers these, and the local support
+    join re-checks that the stage it resolves is one of them. The two must agree: when they did
+    not, the catalog's value was silently overruled by the join's and a widened ladder read as no
+    change at all.
+
+    Deeper rings are deliberately absent. The peers already fly asynchronously at depth 2
+    (``resolve_fill_stage`` puts every gmem-read operand on ``cp.async``), so a third and fourth
+    slot buy no overlap and cost the occupancy their smem takes: measured on the frozen Qwen3
+    gate/up contraction, depth 3 and 4 run 1.38x and 2.22x slower than depth 2 on an A100 and
+    monotonically slower on an H100. The ladder is what the shape can use, not what the codec can
+    spell."""
+    return (Stage(depth=1), Stage(depth=2))
+
+
+def fill_tma_moves(ctx) -> tuple[Stage, ...]:
+    """The compute fill's stages with its stored peers on TMA instead of cp.async: the fill's own
+    depths, with and without the ``/p2`` register double buffer. The fill still evaluates every
+    computed slab, single-buffer; only the stored slabs ring as box copies.
+
+    Asked twice, like :func:`fill_stage_moves`: the edge catalog offers these, and the local
+    support join admits exactly them."""
+    depths = {stage.depth for stage in fill_stage_moves()}
+    return tuple(stage for stage in stage_moves(warp=True, ctx=ctx) if stage.transport == "smem-tma" and stage.depth in depths)
+
+
+def _stage_candidates(tile: TileOp, target, node, choice: NodeSchedule, paged: Mapping = frozendict()) -> tuple[Stage, ...]:
+    """The transports one node choice can be fed by — the independent edge catalog.
+
+    ``paged`` is the kernel's paged buffers (``ClassicProblem.paged``): a transport that takes an
+    operand's base address cannot feed a paged one. A TMA descriptor encodes the address on the host,
+    so TMA never reads a page; a buffer of several pages, or one written at a start, resolves a page
+    per element, which a cp.async copy's per-thread addresses cannot either. The lowering refuses what
+    the catalog would otherwise let the search pick."""
     direct = Stage.direct()
     if not choice.tile.is_tiled or (node.chunked() and not choice.tile.is_warp):
         # A chunked carrier's transport belongs to its own tier, which is the tensor-core one.
         # Its per-cell fallback folds the recipe in registers and reads no slab, so a stage
         # there would name a fill nothing performs.
         return (direct,)
+    if _multi_channel_cell(tile, node, choice.tile):
+        # The cell's copy transports: cp.async or TMA copies every stored slab, one codes and one
+        # scale slab per channel, and beside cp.async a compute fill writes the one computed slab
+        # (an activation's own codes) inside that stage (``staging._block_scaled_warp_stage``). Its
+        # operands are decode CONES, so the generic reading below would send it to the compute
+        # fill, which has no per-channel spelling of the pair; neither has the gmem-direct path.
+        return tuple(stage for stage in stage_moves(warp=True, ctx=target) if stage.is_async)
     if _needs_fill(tile, node, choice.tile):
-        candidates: tuple[Stage, ...] = (Stage(depth=1), Stage(depth=2))
+        candidates: tuple[Stage, ...] = fill_stage_moves()
         if tile.packed_reading(node)[0] is not None:
             candidates = (*candidates, *stage_moves(warp=True, ctx=target))
+        else:
+            candidates = (*candidates, *fill_tma_moves(target))
+    elif _multi_fold_direct_refusal(node, choice.tile, direct) is not None:
+        # Staged, a multi-channel fold is ordinary — one A slab beside one B per channel, the
+        # operand list the compute fill already builds and the copy transports now build too, read
+        # by the one drain. So both staging tiers are offered and only ``direct`` is withheld.
+        candidates = (*fill_stage_moves(), *stage_moves(warp=True, ctx=target))
     else:
         candidates = (direct, *stage_moves(warp=choice.tile.is_warp, ctx=target))
-    # The prefetching transports deposit ONE slab per fold, so a term folding several channels has
-    # no spelling there whatever tier carries it — the materializer emits a single deposit and then
-    # refuses the channel count it was handed. The warp tier states this as "needs the compute
-    # fill"; the per-cell tier has no fill to fall back to, so the refusal belongs on the transport.
-    if len(node.bilinear_channels()) > 1:
+    # Scalar multi-channel staging uses the blocking fill; the byte-copy catalogs below
+    # keep their single-channel scalar geometry.
+    if len(node.bilinear_channels()) > 1 and not choice.tile.is_warp:
         candidates = tuple(stage for stage in candidates if stage.transport not in ("smem-async", "smem-tma"))
+    if not (choice.tile.is_warp and choice.tile.atom.is_wgmma):
+        # An 8-deep ring has paid only on wgmma (the H100 down projection; depth 6 lost to 4 and 8).
+        # Elsewhere it only multiplies the stage space every compile prices.
+        candidates = tuple(stage for stage in candidates if stage.depth < 8)
+    if paged:
+        from emmy.compiler.dim import spans_one_page  # noqa: PLC0415
+        from emmy.compiler.ir.tile.ir import loaded_buffers  # noqa: PLC0415 — the tile IR imports this package
+
+        read = {load.input for load in loaded_buffers(node)} & paged.keys()
+        if read:
+            split = any(
+                start is not None or not spans_one_page(tile.inputs[n].shape, axis, page)
+                for n, (axis, page, start) in paged.items()
+                if n in read
+            )
+            banned = {"smem-tma", "smem-async"} if split else {"smem-tma"}
+            candidates = tuple(stage for stage in candidates if stage.transport not in banned)
     return candidates
+
+
+def _multi_fold_direct_refusal(node: Fold, plan: Tile, stage: Stage) -> str | None:
+    """Why a term folding several channels cannot run gmem-direct under ``plan`` — or ``None``.
+
+    The mma leaf folds ONE B straight out of registers, so a node folding several channels has no
+    direct form; staged it is ordinary, one A slab beside one B per channel. Stated once because
+    it is asked twice: the edge catalog withholds ``direct`` and the local-support join re-checks
+    the stage it was handed."""
+    if plan.is_warp and stage.is_direct and len(node.bilinear_channels()) > 1:
+        return "the gmem-direct mma leaf folds a single B; a multi-channel fold has to stage"
+    return None
+
+
+def _compute_filled(tile_op, node: Fold, plan: Tile) -> bool:
+    """Whether this node's ``smem`` transport is the COMPUTE fill rather than a blocking byte copy.
+
+    The fill is the only tier that evaluates a producer cone into its slab, and the only one that
+    deposits through the drain's own threads — so a computed operand has no other spelling. A
+    multi-channel fold reaches it too, beside the copy transports: both build the same operand list
+    (one A slab, one B per channel), and only the fill can also compute one of them.
+    :func:`_staged` materializes every ``smem`` stage through that fill, so the two agree."""
+    return _needs_fill(tile_op, node, plan) or (plan.is_warp and len(node.bilinear_channels()) > 1)
 
 
 def _computed_edge(node: Fold) -> bool:
@@ -427,20 +554,48 @@ def _computed_edge(node: Fold) -> bool:
     return any(edge.as_slab() is None for edge in node.operands)
 
 
+def _multi_channel_cell(tile_op, node: Fold, plan: Tile) -> bool:
+    """Whether ``plan`` lowers ``node`` as the block-scaled cell over SEVERAL channels: a warp plan
+    whose atom multiplies packed pairs, on a node that reads as one pair with more than one weight
+    channel (:func:`~emmy.compiler.ir.schedule.packing.match_packed_pair_node` — a fused gate/up
+    edge over one quantized activation). The reading is asked per plan because a 16-bit atom on
+    the same node keeps the single-sided shape and its compute fill; only the pair-multiplying
+    atom stages the pair. A single-channel pair keeps the general path, which offers it the same
+    cell beside the compute fill."""
+    return (
+        plan.is_warp and len(node.bilinear_channels()) > 1 and tile_op.packed_reading(node)[1] is not None and block_scaled_atom(plan.atom)
+    )
+
+
 def _needs_fill(tile_op, node: Fold, plan: Tile) -> bool:
+    # Asked per transport and per refusal of one choice: kept on the kernel, keyed like its packed readings.
+    memo = tile_op.__dict__.setdefault("_needs_fill_memo", {})
+    key = (id(node), plan)
+    if key not in memo:
+        memo[key] = _derive_needs_fill(tile_op, node, plan)
+    return memo[key]
+
+
+def _derive_needs_fill(tile_op, node: Fold, plan: Tile) -> bool:
     from emmy.compiler.ir.schedule import staging  # noqa: PLC0415
 
+    if _multi_channel_cell(tile_op, node, plan):
+        # The cell's stage copies and fills its slabs itself (``staging._block_scaled_warp_stage``);
+        # its operands are decode cones, so the generic reading below would send it to the compute
+        # fill and the fill's cover and dtype rules would refuse every plan.
+        return False
     if node.chunked():
         # The chunk tier's A is the WEIGHT, which never leaves registers: it is what the chunk's
         # own score fragments repack into. There is no operand to fill and no slab to fill it from.
         return False
-    # CHANNELS, not operand slots. The staged transports fill one slab per fold, so a fold count
-    # above one belongs on the smem compute fill — and a B slab reused by several channels occupies
-    # ONE operand slot, so counting operands reads a two-channel node as single-fold, offers it
-    # cp.async, and the materializer then asserts on the channel count it actually emits (Qwen3-8B
-    # decode on sm_80, channels=2 operands=2). The channel count subsumes the operand one.
+    # Only a COMPUTED operand forces the fill: a copy transport moves bytes and cannot evaluate a
+    # producer cone. A multi-channel node whose weights are all materialized is not that — it
+    # stages one A slab beside one B per channel, which is the same operand list the fill builds
+    # and the same order the drain reads (the gate/up pair on sm_80 and sm_90).
     return plan.is_warp and (
-        _computed_edge(node) or len(node.bilinear_channels()) > 1 or staging.converting_a(node, plan.atom, tile_op.inputs)
+        _computed_edge(node)
+        or staging.converting_a(node, plan.atom, tile_op.inputs)
+        or any(not staging.copied_b(node, edge, tile_op.inputs) for edge in node.operands[1:])
     )
 
 
@@ -472,18 +627,73 @@ def _wgmma_refusal(plan: Tile, stage: Stage | None = None) -> str | None:
     return None
 
 
+#: Registers a ``wgmma`` lane keeps live beside its accumulators: descriptors, addresses, the ring
+#: counters. ptxas asked for 154 at an m64n192 (96 accumulator registers) and refused the 128 a
+#: sixteen-warp CTA leaves each lane.
+_WGMMA_LIVE_REGISTERS = 58
+
+
+def _wgmma_register_refusal(node: Fold, plan: Tile) -> str | None:
+    """Why a warp-group row's accumulators cannot fit its CTA's register envelope, or ``None``. A
+    ``wgmma`` holds the whole instruction's accumulator in registers at once, so a row past the
+    envelope does not spill: ptxas refuses the kernel."""
+    if not (plan.is_warp and plan.atom.is_wgmma):
+        return None
+    from emmy.compiler.ir.schedule.catalog import MAX_REGISTERS_PER_CTA, MAX_REGISTERS_PER_THREAD  # noqa: PLC0415
+
+    channels = max(1, len(node.bilinear_channels()))
+    required = channels * plan.reg_m * plan.reg_n * plan.atom.accumulator_registers_per_lane + _WGMMA_LIVE_REGISTERS
+    available = min(MAX_REGISTERS_PER_THREAD, MAX_REGISTERS_PER_CTA // plan.block_threads)
+    if required <= available:
+        return None
+    return (
+        f"wgmma accumulators need about {required} registers/thread, over the {available}-register envelope "
+        f"at {plan.block_threads} threads/CTA"
+    )
+
+
+def _adds(consumer: Stmt, name: str) -> bool:
+    """Whether ``consumer`` adds the value ``name`` to something: a sum with it as a unit term."""
+    if isinstance(consumer, Affine):
+        return any(arg == name and coefficient == 1 for coefficient, arg in consumer.terms)
+    return isinstance(consumer, Assign) and consumer.op.name == "add" and name in consumer.args
+
+
 def _plan_node_refusal(tile_op, node: Fold, plan: Tile, placed: PlacedTile, facts: ContractionFacts) -> str | None:
     from emmy.compiler.ir.schedule import staging  # noqa: PLC0415
 
-    refusal = _kstep_refusal(facts.k_axis, plan) or _wgmma_refusal(plan)
+    refusal = _kstep_refusal(facts.k_axis, plan) or _wgmma_refusal(plan) or _wgmma_register_refusal(node, plan)
     if refusal is not None or not _needs_fill(tile_op, node, plan):
         return refusal
+    if tile_op.packed_reading(node)[0] is None and (refusal := staging.fill_chunk_refusal(plan, facts.k_axis)) is not None:
+        return refusal  # every transport of a fill choice reaches the fill resolver, which refuses it there
     converting = staging.converting_a(node, plan.atom, tile_op.inputs)
-    return staging.computed_operand_cover(node, placed, converting=converting, k_axis=facts.k_axis) or staging.computed_operand_copy_dtype(
+    return staging.computed_operand_cover(
+        node, placed, converting=converting, k_axis=facts.k_axis, inputs=tile_op.inputs
+    ) or staging.computed_operand_copy_dtype(
         node,
         placed,
         tile_op.inputs,
         converting=converting,
+    )
+
+
+def _fill_budget_refusal(tile_op, target, node: Fold, plan: Tile, placed: PlacedTile, facts: ContractionFacts) -> str | None:
+    """Why a fill choice's slabs exceed ``target``'s smem whatever transport feeds them, or ``None``."""
+    from emmy.compiler.ir.schedule import staging  # noqa: PLC0415
+
+    if tile_op.packed_reading(node)[0] is not None or not _needs_fill(tile_op, node, plan):
+        return None
+    return staging.fill_slab_refusal(
+        node,
+        placed,
+        target.max_dynamic_smem,
+        inputs=tile_op.inputs,
+        seam=facts.seam,
+        k_axis=facts.k_axis,
+        producer=facts.producer,
+        producer_k=tile_op.axis_of(facts.producer.axis) if facts.producer is not None else None,
+        axes=tile_op.axes,
     )
 
 
@@ -502,12 +712,15 @@ def _resolve_stage(
         return None  # the chunked carrier's per-cell fallback reads no slab (``_edge_domain``)
     packed = tile_op.packed_reading(node)
     packed_copy = packed[0] is not None and choice.transport in ("smem-async", "smem-tma")
-    if _needs_fill(tile_op, node, plan) and not packed_copy:
+    # A packed weight has its own copy stage; any other computed operand keeps the compute fill,
+    # whose stored peers may ride TMA instead of cp.async.
+    fill_tma = choice.transport == "smem-tma" and not packed_copy and _needs_fill(tile_op, node, plan)
+    if (choice.transport == "smem" and _compute_filled(tile_op, node, plan) and not packed_copy) or fill_tma:
         return staging.resolve_fill_stage(
             node,
             placed,
             target.max_dynamic_smem,
-            choice.depth,
+            choice,
             inputs=tile_op.inputs,
             seam=facts.seam,
             k_axis=facts.k_axis,
@@ -527,10 +740,12 @@ def _resolve_stage(
             producer=facts.producer,
             producer_k=tile_op.axis_of(facts.producer.axis) if facts.producer is not None else None,
         )
-    return staging.resolve_scalar_stage(node, placed, choice, tile_op.inputs, target.max_dynamic_smem, facts.k_axis)
+    return staging.resolve_scalar_stage(
+        node, placed, choice, tile_op.inputs, target.max_dynamic_smem, facts.k_axis, tile_op.axes, seam=facts.seam
+    )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _AxisAgreement:
     """One physical-axis geometry claim carried by a local schedule offer."""
 
@@ -539,7 +754,7 @@ class _AxisAgreement:
     units: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _FragmentAgreement:
     """One producer or consumer claim at a fragment seam."""
 
@@ -550,6 +765,111 @@ class _FragmentAgreement:
     def __post_init__(self) -> None:
         if self.role not in ("need", "offer"):
             raise ValueError(f"fragment agreement role must be need or offer, got {self.role!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class _Relation:
+    """What a prefix has decided that the compatibility of a later pick reads — the worker inventory it
+    claimed, its physical-axis and fragment-seam agreements, and the decided nodes where a rule reads them:
+    every one while no inventory is claimed (the canonical-form check runs over them), and all of them at a
+    site that is a shared root, a chain member, or either end of a nested tile. Two prefixes equal here admit the same picks at a site,
+    whatever else they decided, which is what lets a site keep one filtered answer per relation."""
+
+    work: Work | None = None
+    axes: Mapping[str, tuple[int, int]] = field(default_factory=frozendict)
+    fragments: Mapping[tuple[str, str], tuple] = field(default_factory=frozendict)
+    nodes: Mapping[NodeId, NodeSchedule] = field(default_factory=frozendict)
+
+    def __post_init__(self) -> None:
+        for name in ("axes", "fragments", "nodes"):
+            object.__setattr__(self, name, frozendict(getattr(self, name)))
+
+
+def _relation_refusal(site: NodeId, pick, relation: _Relation, *, roots, pairs, nests, allowed_works) -> str | None:
+    """Why ``pick`` cannot extend a prefix whose compatibility facts are ``relation``, or ``None``.
+
+    ``pick`` is a site's tile choice or one of its supports; both carry ``node``, ``work``, ``axes`` and
+    ``fragments``, and the rules read nothing else. The shared-root, chain and nested-tile rules (``roots``,
+    ``pairs``, ``nests``: the kernel's) are the binder's dispatch applied at the offer; the inventory, canonical-form and physical-axis
+    rules read the tile; the seam rule reads the claims, which only a support completes with its transport's K
+    slab — so a choice passing here may still have no support that does."""
+    node = pick.node
+    if site in roots and binds_root(node) and any(binds_root(relation.nodes[other]) for other in roots if other in relation.nodes):
+        return "a second scheduled root on a projection its outputs do not partition by root"
+    for root, member in pairs:
+        if site not in (root, member):
+            continue
+        picks = {**relation.nodes, site: node}
+        if root not in picks or member not in picks or picks[member].reduce == Reduce():
+            continue
+        if picks[root].tile.is_tiled:
+            return "a partitioned chain member under an output-tiled root, whose fill owns its cone"
+        if picks[root].reduce.coop_transposed:
+            return "a partitioned chain member under a transposed band, which binds its fold alone"
+    for root, nested in nests:
+        if site not in (root, nested):
+            continue
+        picks = {**relation.nodes, site: node}
+        if root in picks and nested in picks and picks[nested].tile.is_tiled and not picks[root].tile.is_tiled:
+            return "a contraction tile under a root that is not output-tiled, whose serial lowering would drop it"
+    work = relation.work
+    if work is not None and pick.work is not None and pick.work != work:
+        return "pick requires a different worker inventory"
+    resolved = pick.work or work
+    if (
+        allowed_works is not None
+        and resolved is not None
+        and (resolved.kind, resolved.units) not in allowed_works
+        and not any((packed.kind, packed.units) in allowed_works for packed in packed_works(resolved))
+    ):
+        return "pick cannot reach a kernel allowed by the schedule restriction"
+    if work is None and resolved is not None:
+        if not all(choice.tile.is_canonical_for(resolved) for choice in (*relation.nodes.values(), node)):
+            return "pick is not canonical for the worker inventory"
+    elif not node.tile.is_canonical_for(resolved):
+        return "pick is not canonical for the worker inventory"
+    axis_values = dict(relation.axes)
+    for claim in pick.axes:
+        value = (claim.tile, claim.units)
+        if axis_values.get(claim.name, value) != value:
+            return "pick disagrees on physical-axis geometry"
+    fragment_values = dict(relation.fragments)
+    for claim in pick.fragments:
+        key = (claim.role, claim.edge)
+        if fragment_values.setdefault(key, claim.value) != claim.value:
+            return "pick repeats a fragment endpoint inconsistently"
+        other_role = "need" if claim.role == "offer" else "offer"
+        other = fragment_values.get((other_role, claim.edge))
+        if other is None:
+            continue
+        need, offer = (claim.value, other) if claim.role == "need" else (other, claim.value)
+        if need[0] == "chunk":
+            rows, keys = offer[5] if offer[0] == "warp" else ((), ())
+            if offer[0] != "warp":
+                return "the chunk tier's score must be warp-tiled"
+            if need[1:3] != offer[1:3]:
+                return f"the score's cell {offer[1]} {offer[2]} is not the carrier's {need[1]} {need[2]}"
+            if keys[0] != need[5]:  # the producer's N is the carrier's key: a (row, chunk) tile
+                return "the score's N tile is not the carrier's key axis"
+            if keys[1:3] != (1, need[3]):  # one warp column, and that column IS the chunk
+                return f"the score's N tile ({keys[1]} warp columns, {keys[2]} wide) is not the carrier's chunk ({need[3]} wide)"
+            if rows[3] != need[4]:  # the same register rows the carrier holds
+                return f"the score holds {rows[3]} register rows where the carrier holds {need[4]}"
+            compatible = True
+        elif offer[0] == "free":
+            compatible = need[0] != "step"
+        else:
+            compatible = (
+                need[0] in ("warp", "step")
+                and offer[0] == "warp"
+                and need[1] == offer[1]
+                and need[2] == offer[2]
+                and offer[3] == 1
+                and offer[4] == need[3]
+            )
+        if not compatible:
+            return "pick is incompatible at a fragment seam"
+    return None
 
 
 def _fragment_agreements(
@@ -571,7 +891,7 @@ def _fragment_agreements(
             # whichever side carries ITS key, and the term's canonical orientation decides which
             # that is (a score whose A edge is the key tiles the key as M).
             sides = tuple((side.axis.name, side.units, side.tile, side.reg) for side in (placed.m, placed.n))
-            offer = ("warp", plan.atom.shape, plan.atom.fragment_layout, placed.n.units, placed.n.tile, sides)
+            offer = ("warp", plan.atom.shape, _seam_layout(plan.atom), placed.n.units, placed.n.tile, sides)
         else:
             offer = ("scalar",)
         out.append(_FragmentAgreement("offer", node_id_spelling(site), offer))
@@ -584,13 +904,21 @@ def _fragment_agreements(
             # this atom with the chunk as its N tile, one warp column wide and the same register
             # rows. Stated as a need of its own because the ordinary one accepts an untiled
             # producer, and that row would be stamped on a kernel whose emission ignored it.
-            need = ("chunk", plan.atom.shape, plan.atom.fragment_layout, plan.atom.atom_k * plan.bk, placed.m.reg, node.axis)
+            need = ("chunk", plan.atom.shape, _seam_layout(plan.atom), plan.atom.atom_k * plan.bk, placed.m.reg, node.axis)
         elif plan.is_warp and stage is not None and stage.transport == "smem":
             need = ("step" if facts.need_step else "warp", plan.atom.shape, plan.atom.fragment_layout, stage.bk_elems)
         else:
             need = ("free",)
         out.append(_FragmentAgreement("need", node_id_spelling(facts.need), need))
     return tuple(out)
+
+
+def _seam_layout(atom) -> str:
+    """The register layout a fragment seam hands over. A ``wgmma`` cell's accumulator is, per warp,
+    the ``m16n8k16`` C fragment repeated along N, and its register-A form takes that layout's A
+    fragment, so across a seam it IS that layout: a warp-group expectation reads an ``mma.sync``
+    score's fragments as they stand."""
+    return "m16n8k16" if atom.is_wgmma else atom.fragment_layout
 
 
 def _fragment_registers(atom, role: str) -> int:
@@ -606,33 +934,57 @@ def _fragment_registers(atom, role: str) -> int:
     return m * n // (64 if dtype.nbytes == 2 else 32)
 
 
-def _paired_budget_refusal(node: Fold, producer: Fold | None, placed: PlacedTile, stage: ResolvedStage | None) -> str | None:
-    if not (placed.is_warp and stage is not None and producer is not None):
-        return None
-    from emmy.compiler.ir.schedule.catalog import MAX_REGISTERS_PER_CTA, MAX_REGISTERS_PER_THREAD  # noqa: PLC0415
-
+def _paired_registers(node: Fold, producer: Fold, placed: PlacedTile, stage: ResolvedStage, partial_columns: int) -> int:
+    """The live fragment registers one thread of a paired contraction needs, with ``partial_columns``
+    register columns of reduced partials live at once."""
     atom = placed.atom
-    if stage.bk_elems % atom.atom_n:
-        return None
     a_regs = _fragment_registers(atom, "a")
     b_regs = _fragment_registers(atom, "b")
-    c_regs = _fragment_registers(atom, "c")
+    cells = placed.reg_m * placed.reg_n
+    cell_regs = cells * _fragment_registers(atom, "c")
     if atom.operand_dtype("c").nbytes == 2:
-        c_regs += atom.atom_m * atom.atom_n // 32
+        # A reduced accumulator promotes into an f32 shadow per cell, beside its live partials.
+        cell_regs = cells * (atom.atom_m * atom.atom_n // 32) + placed.reg_m * partial_columns * _fragment_registers(atom, "c")
     depth = max(1, stage.reg_depth)
     # C fragment SETS the consumer holds. A fused multi-channel edge keeps one per streamed
     # operand; a TWISTED carrier keeps one — its bilinear channel — beside per-row registers for
     # the states that are no product, so counting its operands claimed fragments it never declares.
     channels = len(node.bilinear_channels()) if node.chunked() else len(node.operands) - 1
-    consumer_c = channels * placed.reg_m * placed.reg_n * c_regs
-    consumer = placed.reg_m * depth * a_regs + channels * (placed.reg_n * depth * b_regs + placed.reg_m * placed.reg_n * c_regs)
+    consumer_c = channels * cell_regs
+    consumer = placed.reg_m * depth * a_regs + channels * (placed.reg_n * depth * b_regs + cell_regs)
     producer_n = stage.bk_elems // atom.atom_n
     # The producer accumulates at ITS own cell: a chunked consumer on the reduced-accumulate cell
     # still scores in f32 (``wide_accumulate``), so its score tile is no wider for it.
     producer_c = _fragment_registers(wide_accumulate(atom), "c")
     producer_regs = placed.reg_m * a_regs + (len(producer.operands) - 1) * (producer_n * b_regs + placed.reg_m * producer_n * producer_c)
-    required = max(consumer, consumer_c + producer_regs)
-    available = min(MAX_REGISTERS_PER_THREAD, MAX_REGISTERS_PER_CTA // placed.block_threads)
+    return max(consumer, consumer_c + producer_regs)
+
+
+def _register_envelope(placed: PlacedTile) -> int:
+    from emmy.compiler.ir.schedule.catalog import MAX_REGISTERS_PER_CTA, MAX_REGISTERS_PER_THREAD  # noqa: PLC0415
+
+    return min(MAX_REGISTERS_PER_THREAD, MAX_REGISTERS_PER_CTA // placed.block_threads)
+
+
+def chunk_partial_columns(node: Fold, producer: Fold | None, placed: PlacedTile, stage: ResolvedStage | None) -> int:
+    """How many register columns of reduced chunk partials a chunked carrier keeps live — the one rule the
+    offer and the emitter share. The whole row while the thread's envelope holds it: every key step then drains
+    the row at once, which measures faster (14.8 us against 16.6 at head width 128 on an RTX 5090). Past the
+    envelope the chunk drains one column pair through all its steps and folds it at once — a pair, because that
+    is what one paired ldmatrix fills."""
+    row = placed.reg_n
+    if not node.chunked() or producer is None or stage is None or stage.bk_elems % placed.atom.atom_n:
+        return row
+    return row if _paired_registers(node, producer, placed, stage, row) <= _register_envelope(placed) else min(row, 2)
+
+
+def _paired_budget_refusal(node: Fold, producer: Fold | None, placed: PlacedTile, stage: ResolvedStage | None) -> str | None:
+    if not (placed.is_warp and stage is not None and producer is not None):
+        return None
+    if stage.bk_elems % placed.atom.atom_n:
+        return None
+    required = _paired_registers(node, producer, placed, stage, chunk_partial_columns(node, producer, placed, stage))
+    available = _register_envelope(placed)
     if required <= available:
         return None
     return (

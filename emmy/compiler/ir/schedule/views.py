@@ -8,7 +8,6 @@ from frozendict import frozendict
 
 from emmy.compiler.ir.pure.fold import ContractionView, Fold
 from emmy.compiler.ir.stmt import Body
-from emmy.compiler.ir.stmt.body import dedup_recomputes
 
 type NodeId = int
 type EdgeSite = tuple[NodeId, int]
@@ -143,7 +142,7 @@ def cone_seam(cone, k_name: str, axes: tuple = ()) -> tuple[tuple, tuple, tuple[
 
     Two cell edges may lower one traced fold twice — attention's output and its own row sum, read
     through the normalize and through a derived edge — and the cell keeps the first lowering only
-    (:func:`dedup_recomputes`): the per-cell fill would otherwise declare that fold's states twice.
+    (:meth:`Body.coalesce`): the per-cell fill would otherwise declare that fold's states twice.
 
     ``chunk`` is the same bridge one level down, ``(prologue, stats, block)`` or ``()``: a reduce
     edge that varies with K only through one block guard — a per-row statistic over each K group,
@@ -151,8 +150,14 @@ def cone_seam(cone, k_name: str, axes: tuple = ()) -> tuple[tuple, tuple, tuple[
     holds, so the fill evaluates it once per row per chunk instead of once per cell. Which chunks a
     group holds is the stage's choice, so the resolver refuses a chunk that does not tile the
     block."""
-    if not isinstance(cone, Fold) or cone.axis is not None or not cone.operands:
-        return (), tuple(cone.lift.body) if isinstance(cone, Fold) and cone.axis is None else (), (), ()
+    if not isinstance(cone, Fold):
+        return (), (), (), ()
+    if cone.axis is not None:
+        # A reducing cone — a nested contraction no tile of its own covers — is per-cell work whole:
+        # every cell runs its serial fold, so the cell is the cone's own lowering.
+        return (), tuple(cone.lower(axes=axes)), (), ()
+    if not cone.operands:
+        return (), tuple(cone.lift.body), (), ()
     # Split by DECLARATION: an edge whose index space holds the reduction axis varies with it and
     # rides the cell; the rest are row-invariant and lower once into the prologue. Same reading as
     # ``Fold.lower``'s hoist, asked of the same property.
@@ -160,9 +165,13 @@ def cone_seam(cone, k_name: str, axes: tuple = ()) -> tuple[tuple, tuple, tuple[
     blocks = [_chunk_block(edge, k_name, axes) if varies else None for edge, varies in zip(cone.operands, varying, strict=True)]
     block = next((b for b in blocks if b is not None), None)
     chunked = [b is not None and b == block for b in blocks]
-    pro = tuple(s for e, k in zip(cone.operands, varying, strict=True) if not k for s in e.lower(axes=axes))
-    chunk_pro = tuple(s for e, c in zip(cone.operands, chunked, strict=True) if c for s in e.lower(axes=axes))
-    cell = dedup_recomputes(
+    # Row-invariant edges lower independently too, so two of them over one shared statistic each
+    # carry its fold under the same accumulator names; the prologue keeps the first lowering, as the
+    # cell does, or the stat fill would run that fold twice in one scope (two declarations of one
+    # accumulator — the fused GDN norm→linear cone on a V100).
+    pro = tuple(Body([s for e, k in zip(cone.operands, varying, strict=True) if not k for s in e.lower(axes=axes)]).coalesce())
+    chunk_pro = tuple(Body([s for e, c in zip(cone.operands, chunked, strict=True) if c for s in e.lower(axes=axes)]).coalesce())
+    cell = Body(
         [
             stmt
             for edge, varies, c in zip(cone.operands, varying, chunked, strict=True)
@@ -170,10 +179,11 @@ def cone_seam(cone, k_name: str, axes: tuple = ()) -> tuple[tuple, tuple, tuple[
             for stmt in edge.lower(axes=axes)
         ]
         + list(cone.step())
-    )
+    ).coalesce()
     chunk_results = {nm for edge, c in zip(cone.operands, chunked, strict=True) if c for nm in edge.exposes}
-    chunk_stats = tuple(sorted(chunk_results & Body(cell).ssa_uses))
+    cell_reads = Body(cell).ssa_uses - Body(cell).ssa_defs
+    chunk_stats = tuple(sorted(chunk_results & cell_reads))
     chunk = (chunk_pro, chunk_stats, block) if chunk_stats else ()
     pro_results = {nm for edge, varies in zip(cone.operands, varying, strict=True) if not varies for nm in edge.exposes}
-    stats = tuple(sorted(pro_results & (Body(cell).ssa_uses | Body(chunk_pro).ssa_uses)))
+    stats = tuple(sorted(pro_results & (cell_reads | (Body(chunk_pro).ssa_uses - Body(chunk_pro).ssa_defs))))
     return (pro, cell, stats, chunk) if stats else ((), cell, (), chunk)

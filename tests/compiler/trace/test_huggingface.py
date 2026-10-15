@@ -12,11 +12,33 @@ unchanged path (no ``ple`` buffer, no extra kwarg). The attention-split carve
 import pytest
 
 from emmy.compiler.trace.torch import has_torch
+from tests.serving.helpers import QWEN3_5_TINY
 
 pytestmark = pytest.mark.skipif(not has_torch(), reason="PyTorch not available")
 
 HIDDEN = 16
 PLE_DIM = 4
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_transformers():
+    """Build one transformers model before the tests, so none of them is charged for the first.
+
+    Resolving a lazy ``transformers`` model module and constructing a torch module for the first
+    time in a process costs ~1.3 s here and several seconds on a CI runner; every later build is
+    free. Whichever test got there first paid it and read as a 5 s test, which skewed the duration
+    baseline in ``tests/conftest.py``. Recording that test moved the cost to a different one on
+    the next run. Fixture setup is not the call phase, so paying it here charges nobody.
+    """
+    import torch
+    import transformers
+
+    config = transformers.Qwen3Config(
+        vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16, max_position_embeddings=64,
+    )  # fmt: skip
+    with torch.device("meta"):
+        transformers.Qwen3ForCausalLM(config)
 
 
 def _fake_rotary(sample, full_pos):
@@ -390,6 +412,67 @@ def test_trace_inventory_replaces_router_with_representative_expert():
     assert replace_moe_with_traceable_expert(block)
     torch.testing.assert_close(block.mlp(x, input_ids=torch.zeros(2, dtype=torch.long)), expected)
     assert block.mlp.w_gate_up.untyped_storage().data_ptr() == expert_module.gate_up_proj.untyped_storage().data_ptr()
+
+
+def test_representative_expert_keeps_the_shared_expert_gate():
+    """Qwen-MoE scales its shared expert by a per-token sigmoid gate; dropping it changes every token."""
+    from types import SimpleNamespace
+
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    from emmy.compiler.trace.huggingface import replace_moe_with_traceable_expert
+
+    hidden, intermediate, experts_count = 4, 3, 2
+
+    class Experts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Parameter(torch.randn(experts_count, 2 * intermediate, hidden))
+            self.down_proj = nn.Parameter(torch.randn(experts_count, hidden, intermediate))
+            self.act_fn = nn.SiLU()
+
+    torch.manual_seed(0)
+    experts, shared, shared_gate = Experts(), nn.Linear(hidden, hidden, bias=False), nn.Linear(hidden, 1, bias=False)
+    block = SimpleNamespace(
+        mlp=SimpleNamespace(gate=nn.Linear(hidden, experts_count), experts=experts, shared_expert=shared, shared_expert_gate=shared_gate)
+    )
+    x = torch.randn(2, hidden)
+    gate, up = F.linear(x, experts.gate_up_proj[0]).chunk(2, dim=-1)
+    expected = F.linear(F.silu(gate) * up, experts.down_proj[0]) + torch.sigmoid(shared_gate(x)) * shared(x)
+
+    assert replace_moe_with_traceable_expert(block)
+    torch.testing.assert_close(block.mlp(x), expected)
+
+
+def _decoder_stack():
+    import torch.nn as nn
+
+    stack = nn.Module()
+    stack.layers, stack.rotary_emb, stack.config = nn.ModuleList([nn.Identity()]), nn.Identity(), object()
+    return stack
+
+
+def test_find_text_decoder_takes_the_nested_stack_and_refuses_siblings():
+    """A wrapper's nested decoder is found; two sibling stacks need --decoder, which selects one by path."""
+    import torch.nn as nn
+
+    from emmy.compiler.trace.huggingface import find_text_decoder
+
+    wrapper = nn.Module()
+    wrapper.model = _decoder_stack()
+    wrapper.model.language_model = _decoder_stack()
+    assert find_text_decoder(wrapper) is wrapper.model.language_model
+
+    omni = nn.Module()
+    omni.thinker, omni.talker = nn.Module(), nn.Module()
+    omni.thinker.model, omni.talker.model = _decoder_stack(), _decoder_stack()
+    with pytest.raises(ValueError, match=r"\['thinker.model', 'talker.model'\]; name one with --decoder"):
+        find_text_decoder(omni)
+    assert find_text_decoder(omni, "talker.model") is omni.talker.model
+    with pytest.raises(ValueError, match="not a decoder stack"):
+        find_text_decoder(omni, "talker")
 
 
 # ===================================================================
@@ -922,23 +1005,6 @@ def test_expert_slot_reads_per_expert_fp8_modules_and_stacks_them():
 # that both halves of the carve survive ``torch.export`` and reach Loop IR, since that is the whole
 # point of carving them out of a recurrence torch keeps.
 
-_QWEN3_5_TINY = dict(
-    vocab_size=64,
-    hidden_size=64,
-    intermediate_size=128,
-    num_hidden_layers=2,
-    num_attention_heads=4,
-    num_key_value_heads=2,
-    head_dim=16,
-    linear_key_head_dim=16,
-    linear_value_head_dim=16,
-    linear_num_key_heads=2,
-    linear_num_value_heads=4,
-    linear_conv_kernel_dim=4,
-    max_position_embeddings=64,
-    layer_types=["linear_attention", "full_attention"],
-)
-
 
 def _qwen3_5_linear_block():
     import pytest
@@ -949,8 +1015,272 @@ def _qwen3_5_linear_block():
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
     torch.manual_seed(0)
-    model = Qwen3_5TextModel(Qwen3_5TextConfig(**_QWEN3_5_TINY)).eval()
+    model = Qwen3_5TextModel(Qwen3_5TextConfig(**QWEN3_5_TINY)).eval()
     return model.layers[0]
+
+
+@pytest.mark.parametrize("length", [1, 16, 63, 64, 65])
+def test_gdn_chunk_padding_keeps_the_logical_sequence_length(length):
+    import torch
+
+    from emmy.compiler.trace.torch import trace_module
+
+    pytest.importorskip("transformers.models.qwen3_5")
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+
+    class Chunk(torch.nn.Module):
+        def forward(self, q, k, v, g, beta, state):
+            return torch_chunk_gated_delta_rule(q, k, v, g, beta, initial_state=state, output_final_state=True)
+
+    vectors = [torch.randn(1, length, 2, 8) * 0.1 for _ in range(3)]
+    args = (*vectors, -torch.rand(1, length, 2), torch.rand(1, length, 2), torch.randn(1, 2, 8, 8) * 0.1)
+    graph = trace_module(Chunk(), args)
+    assert tuple(graph.buffer(graph.outputs[0]).shape) == (1, length, 2, 8)
+    assert tuple(graph.buffer(graph.outputs[1]).shape) == (1, 2, 8, 8)
+
+
+@pytest.mark.parametrize("length", [1, 16, 65])
+def test_gdn_state_wrapper_continues_resets_and_isolates_requests(length):
+    import torch
+    from transformers.cache_utils import DynamicCache
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    from emmy.compiler.trace.huggingface import build_gdn_state_wrapper
+
+    block = _qwen3_5_linear_block()
+    mixer = block.linear_attn
+    wrapper = build_gdn_state_wrapper(block)
+    state = torch.zeros(2, mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim)
+    history = torch.zeros(2, mixer.conv_dim, mixer.conv_kernel_size)
+    cache = DynamicCache(config=Qwen3_5TextConfig(**QWEN3_5_TINY))
+    chunks = [torch.randn(2, rows, mixer.hidden_size) * 0.1 for rows in (length, 1, 3)]
+    first = None
+    with torch.no_grad():
+        for x in chunks:
+            old_state, old_history = state.clone(), history.clone()
+            actual, next_state, next_history = wrapper(x, state, history)
+            expected = block(x, position_embeddings=None, past_key_values=cache)
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(next_state, cache.layers[0].recurrent_states[0], rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(next_history, cache.layers[0].conv_states[0])
+            torch.testing.assert_close(state, old_state, rtol=0, atol=0)
+            torch.testing.assert_close(history, old_history, rtol=0, atol=0)
+            for row in range(2):
+                isolated = wrapper(x[row : row + 1], state[row : row + 1], history[row : row + 1])
+                for single, batched in zip(isolated, (actual, next_state, next_history), strict=True):
+                    torch.testing.assert_close(single, batched[row : row + 1], rtol=1e-4, atol=1e-5)
+            if first is None:
+                first = tuple(t.clone() for t in (actual, next_state, next_history))
+            state, history = next_state, next_history
+        reset = wrapper(chunks[0], torch.zeros_like(state), torch.zeros_like(history))
+        for actual, expected in zip(reset, first, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("length", [1, 16])
+def test_gdn_state_wrapper_traces_both_state_outputs(length):
+    import numpy as np
+    import torch
+
+    from emmy.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.trace.huggingface import build_gdn_state_wrapper
+    from emmy.compiler.trace.torch import trace_module_with_constants
+
+    block = _qwen3_5_linear_block()
+    mixer = block.linear_attn
+    state = torch.randn(1, mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim) * 0.1
+    history = torch.randn(1, mixer.conv_dim, mixer.conv_kernel_size) * 0.1
+    x = torch.randn(1, length, mixer.hidden_size) * 0.1
+    wrapper = build_gdn_state_wrapper(block)
+    graph, targets = trace_module_with_constants(wrapper, (x, state, history))
+    assert len(graph.inputs) == len(graph.outputs) == 3
+    for name, value in zip(graph.outputs, (x, state, history), strict=True):
+        assert tuple(graph.buffer(name).shape) == tuple(value.shape)
+    tensors = dict(wrapper.named_parameters()) | dict(wrapper.named_buffers())
+    inputs = {name: value.numpy() for name, value in zip(graph.inputs, (x, state, history), strict=True)}
+    inputs.update({name: tensors[path].detach().numpy() for name, path in targets.items()})
+    result, _ = NumpyBackend().run(graph, input_data=inputs)
+    with torch.no_grad():
+        reference = wrapper(x, state, history)
+    for name, expected in zip(graph.outputs, reference, strict=True):
+        np.testing.assert_allclose(result.outputs[name], expected.numpy(), rtol=1e-4, atol=1e-5)
+
+
+def _tiny_gdn_cuda_programs(prefill, paged):
+    """The one-layer tiny GDN block, its state wrapper compiled on CUDA at widths 1 and ``prefill``.
+    With ``paged``, state and history are page tables on both sides: one page per batch row, no
+    start, so a step's rows land in the page the table names."""
+    import torch
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+    from emmy.compiler.trace.huggingface import build_gdn_state_wrapper
+    from emmy.compiler.trace.torch import trace_module_with_constants
+    from tests.compiler.helpers import inject_constants
+
+    config = Qwen3_5TextConfig(
+        **(
+            QWEN3_5_TINY
+            | dict(
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=4,
+                linear_key_head_dim=4,
+                linear_value_head_dim=4,
+                linear_num_key_heads=1,
+                linear_num_value_heads=1,
+                linear_conv_kernel_dim=3,
+                layer_types=["linear_attention"],
+            )
+        )
+    )
+    torch.manual_seed(0)
+    block = Qwen3_5TextModel(config).eval().layers[0]
+    wrapper = build_gdn_state_wrapper(block)
+    examples = (torch.zeros(2, 1, 8), torch.zeros(2, 1, 4, 4), torch.zeros(2, 12, 3))
+    tensors = dict(wrapper.named_parameters()) | dict(wrapper.named_buffers())
+    programs = {}
+    for length in sorted({1, prefill}):
+        graph, targets = trace_module_with_constants(wrapper, (torch.zeros(2, length, 8), *examples[1:]))
+        if paged:
+            carried = (*graph.inputs[1:], *graph.outputs[1:])
+            graph.hints.set("cuda.paged_buffers", tuple((name, 0, 1, None) for name in carried))
+        weights = {name: tensors[path].detach().numpy() for name, path in targets.items()}
+        with pinned_knobs({"FAST_MATH": False, "PLACE": "fuse"}):
+            compiled = CudaBackend().compile(graph)
+        programs[length] = (graph, compiled, inject_constants(weights, compiled))
+    return config, block, programs
+
+
+def _gdn_handoff_chunks(prefill):
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    chunks = [(rng.standard_normal((2, length, 8)) * 0.1).astype(np.float32) for length in (prefill, 1, 1)]
+    seeded_state = (rng.standard_normal((2, 1, 4, 4)) * 0.1).astype(np.float32)
+    seeded_history = (rng.standard_normal((2, 12, 3)) * 0.1).astype(np.float32)
+    return chunks, seeded_state, seeded_history
+
+
+def _check_gdn_handoff(config, block, run, prefill):
+    """Two independent batch rows, a seeded request, and two identical fresh requests after reset.
+    ``run(x, state, history)`` executes the compiled width for ``x`` and returns ``(y, state, history)``."""
+    import numpy as np
+    import torch
+    from transformers.cache_utils import DynamicCache
+
+    chunks, seeded_state, seeded_history = _gdn_handoff_chunks(prefill)
+    fresh = None
+    for seeded in (True, False, False):
+        state = seeded_state if seeded else np.zeros((2, 1, 4, 4), np.float32)
+        history = seeded_history if seeded else np.zeros((2, 12, 3), np.float32)
+        cache = DynamicCache(config=config)
+        cache.update_conv_state(torch.from_numpy(history.copy()), 0)
+        cache.update_recurrent_state(torch.from_numpy(state.copy()), 0)
+        for index, x in enumerate(chunks):
+            values = run(x, state, history)
+            with torch.no_grad():
+                y = block(torch.from_numpy(x), position_embeddings=None, past_key_values=cache)
+            expected = (y, cache.layers[0].recurrent_states[0], cache.layers[0].conv_states[0])
+            for actual, reference in zip(values, expected, strict=True):
+                np.testing.assert_allclose(actual, reference.numpy(), rtol=1e-3, atol=1e-4)
+            if not seeded and index == 0:
+                if fresh is None:
+                    fresh = tuple(value.copy() for value in values)
+                else:
+                    for actual, reference in zip(values, fresh, strict=True):
+                        np.testing.assert_array_equal(actual, reference)
+            _, state, history = values
+
+
+@pytest.mark.xdist_group("cuda")
+@pytest.mark.parametrize("prefill", [1, 2])
+def test_gdn_state_wrapper_cuda_handoff_and_reset(prefill):
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from tests.compiler.helpers import skip_if_no_cuda
+
+    skip_if_no_cuda()
+    config, block, programs = _tiny_gdn_cuda_programs(prefill, paged=False)
+    backend = CudaBackend()
+
+    def run(x, state, history):
+        graph, compiled, weights = programs[x.shape[1]]
+        inputs = weights | dict(zip(graph.inputs, (x, state, history), strict=True))
+        result, _ = backend.run(compiled, input_data=inputs)
+        return tuple(result.outputs[name] for name in graph.outputs)
+
+    _check_gdn_handoff(config, block, run, prefill)
+
+
+@pytest.mark.xdist_group("cuda")
+@pytest.mark.parametrize("prefill", [1, 4])
+def test_gdn_state_wrapper_cuda_paged_state_exchange(prefill):
+    """The native step's state mechanism, on the compiler alone: state and history are paged
+    buffers the step reads through one table and writes through another, every table a device
+    allocation of fixed address whose CONTENTS the host rewrites between launches. A step never
+    updates a page in place; after it, the read table names the page just written and the write
+    table the other. Reset points the read tables at a zero page nobody writes. Both compiled
+    widths bind the same four tables, as prefill and decode share the cache."""
+    import numpy as np
+    import torch
+
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from tests.compiler.helpers import skip_if_no_cuda
+
+    skip_if_no_cuda()
+    config, block, programs = _tiny_gdn_cuda_programs(prefill, paged=True)
+    carried = {"state": (1, (1, 4, 4)), "history": (2, (12, 3))}
+
+    def page_set():
+        return {kind: [torch.zeros(shape, dtype=torch.float32, device="cuda") for _ in range(2)] for kind, (_, shape) in carried.items()}
+
+    with gpu_lock():
+        pages = [page_set(), page_set()]
+        zero = page_set()
+        tables = {kind: [torch.zeros(2, dtype=torch.int64, device="cuda") for _ in range(2)] for kind in carried}
+        torch.cuda.synchronize()
+        built = {}
+        for length, (graph, compiled, weights) in programs.items():
+            # The wrapper's state and history inputs carry no bytes of their own: only tables are bound.
+            feed = weights | {graph.inputs[0]: np.zeros((2, length, 8), np.float32)}
+            program = CompiledProgram.build(compiled, feed)
+            for kind, (slot, _) in carried.items():
+                program.alias_buffer(f"{graph.inputs[slot]}__pages", tables[kind][0])
+                program.alias_buffer(f"{graph.outputs[slot]}__pages", tables[kind][1])
+            built[length] = program
+        current = {"slot": 0}
+
+        def point(table, page_list):
+            table.copy_(torch.tensor([page.data_ptr() for page in page_list], dtype=torch.int64))
+            torch.cuda.synchronize()
+
+        def run(x, state, history):
+            reading, writing = current["slot"], 1 - current["slot"]
+            # A request starts from the zero page, a seeded one from pages the host filled; the
+            # test knows which by the values it is handed.
+            for kind, value in (("state", state), ("history", history)):
+                if not value.any():
+                    point(tables[kind][0], zero[kind])
+                else:
+                    for row, page in enumerate(pages[reading][kind]):
+                        page.copy_(torch.from_numpy(value[row]))
+                    point(tables[kind][0], pages[reading][kind])
+                point(tables[kind][1], pages[writing][kind])
+            graph, program = programs[x.shape[1]][0], built[x.shape[1]]
+            program.upload_prefix({graph.inputs[0]: x})
+            program.run_once()
+            y = program.outputs()[graph.outputs[0]]
+            written = {kind: np.stack([page.cpu().numpy() for page in pages[writing][kind]]) for kind in carried}
+            current["slot"] = writing
+            return y, written["state"], written["history"]
+
+        _check_gdn_handoff(config, block, run, prefill)
 
 
 # --- checkpoint keys vs twin parameter names ---------------------------------------------------
@@ -966,7 +1296,7 @@ def _qwen3_5_multimodal_config():
     pytest.importorskip("transformers.models.qwen3_5")
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
-    return Qwen3_5Config(text_config=_QWEN3_5_TINY)
+    return Qwen3_5Config(text_config=QWEN3_5_TINY)
 
 
 def _graph_with_input(name: str, *, consumed: bool):
@@ -1167,3 +1497,31 @@ def test_serving_retargeting_lands_on_checkpoint_keys_so_the_speller_fires(tmp_p
     retarget_constants_to_model(g, post, twin)
     assert g.nodes["w"].op.source_path == ckpt_key, "retargeting must land on the checkpoint's own key"
     assert spell_quantized_constants(g, str(tmp_path / "ck")) == 1, "the NVFP4 speller must fire through the serving lane's path"
+
+
+def test_mistral3_architecture_twin_traces_a_layer_and_names_checkpoint_keys(tmp_path):
+    """Mistral 3 is registered only as image-text-to-text, so the architecture twin builds the
+    whole wrapper. Its checkpoints store ``language_model.model.layers.*``, which Transformers
+    renames through a chain of two renamings; the reverse renamer must undo the whole chain. Its
+    attention scales queries by position, so the dynamic layer wrapper must pass positions."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+
+    from emmy.compiler.trace.huggingface import _checkpoint_key_renamer, build_layer_wrapper, load_architecture_trace_twin
+
+    text = transformers.Ministral3Config(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, max_position_embeddings=64,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "llama_4_scaling_beta": 0.1,
+                         "original_max_position_embeddings": 16},
+    )  # fmt: skip
+    vision = transformers.PixtralVisionConfig(hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, head_dim=8)
+    transformers.Mistral3Config(text_config=text.to_dict(), vision_config=vision.to_dict()).save_pretrained(tmp_path)
+
+    model = load_architecture_trace_twin(tmp_path, torch.float32, 0)
+    to_checkpoint = _checkpoint_key_renamer(model, reverse=True)
+    assert to_checkpoint("model.language_model.layers.0.input_layernorm.weight") == "language_model.model.layers.0.input_layernorm.weight"
+
+    decoder = model.model.language_model
+    wrapper = build_layer_wrapper(decoder.layers[0], decoder.rotary_emb, 32, torch.float32)
+    assert wrapper(torch.randn(1, 20, 32)).shape == (1, 20, 32)

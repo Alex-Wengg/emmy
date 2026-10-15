@@ -103,18 +103,18 @@ def test_boolean_bitwise_not_lowers_from_graph_loop_to_logical_cuda():
 
 
 def test_reduce_emits_k_loop():
-    compiled = CudaBackend().compile(_reduce_sum_graph())
+    # The scalar serial emitter with its K loop retained; the greedy pick may unroll the loop away.
+    with pinned_knobs({"UNROLL": 0, "TILE": "", "REDUCE": ""}):
+        compiled = CudaBackend().compile(_reduce_sum_graph())
     source = _cuda_nodes(compiled)[0].op.kernel_source
     assert "for (int" in source
     assert "+=" in source
 
 
 def test_contraction_emits_matmul():
-    # The deploy may be a split-K pair (partial + finalize) — since the reduce-partition
-    # featurization came alive, the cold prior actively ranks the per-cell contraction's
-    # REDUCE fork instead of tie-breaking to option-0 — so the accumulator fold is
-    # asserted on the kernel set, not a single node.
-    compiled = CudaBackend().compile(_matmul_graph())
+    # Inspect the scalar serial emitter with its K loop retained.
+    with pinned_knobs({"UNROLL": 0, "TILE": "", "REDUCE": ""}):
+        compiled = CudaBackend().compile(_matmul_graph())
     sources = [n.op.kernel_source for n in _cuda_nodes(compiled)]
     assert any("for (int " in s and "+=" in s for s in sources)  # accumulator fold
 

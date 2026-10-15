@@ -8,7 +8,7 @@ sliding/global attention rides vLLM's `per_layer_sliding_window` + a per-layer-t
       --dtype float16 --hf-overrides '{"architectures":["EmmyGenModel"]}' \\
       --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1, 2, 4, 8, 16]}'
 
-(the whole-step decode-capture default `emmy serve --generate` assembles; add `--enforce-eager`
+(the whole-step decode-capture default `emmy serve --runner generate` assembles; add `--enforce-eager`
 instead to serve eager — the runner's `run_device` is capture-aware either way).
 
 NOT ``IsAttentionFree``: it constructs real vLLM ``Attention`` layers (one per decoder
@@ -39,6 +39,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.utils import get_pp_indices
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import (
     _encode_layer_name,
@@ -46,13 +48,15 @@ from vllm.model_executor.layers.attention.attention import (
     unified_kv_cache_update,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import YaRNScalingRotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import IsHybrid, SupportsMRoPE, SupportsPP
 from vllm.model_executor.models.utils import PPMissingLayer, make_empty_intermediate_tensors_factory
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from emmy import config as emmy_config  # aliased: `config` is the HF config in this module
 from emmy.serving.gen_runner import EmmyGenRunner
@@ -109,16 +113,31 @@ class _BoundedYaRNScalingRotaryEmbedding(YaRNScalingRotaryEmbedding):
         return torch.cat((cos, sin), dim=-1)
 
 
+def _eager_dispatch(rope):
+    """Dispatch ``rope`` the way vLLM does when nothing compiles the model, whatever
+    ``--compilation-config`` says. The plugin runs its forward eagerly inside the cudagraph, but
+    under vLLM's default inductor mode ``custom_ops`` is ``none``, so CustomOp hands out
+    ``forward_native`` for inductor to fuse — and nothing ever does: on Gemma 4 decode that is 17
+    small kernels per layer, 0.8 ms per step. ``enforce_enable`` is vLLM's own per-instance
+    override; re-running the dispatch with it set selects the fused in-place kernel."""
+    if isinstance(rope, CustomOp):
+        rope._enforce_enable = True
+        rope._forward_method = rope.dispatch_forward(compile_native=False)
+    return rope
+
+
 def _get_rope(head_dim, max_position, rope_parameters, dtype):
     """Build one dtype-correct RoPE whose cache is bounded by the served context length."""
     rope_parameters = rope_parameters or {}
     if rope_parameters.get("rope_type", "default") != "yarn" or "mrope_section" in rope_parameters:
-        return get_rope(
-            head_dim,
-            max_position=max_position,
-            rope_parameters=rope_parameters,
-            is_neox_style=True,
-            dtype=dtype,
+        return _eager_dispatch(
+            get_rope(
+                head_dim,
+                max_position=max_position,
+                rope_parameters=rope_parameters,
+                is_neox_style=True,
+                dtype=dtype,
+            )
         )
 
     partial_rotary_factor = rope_parameters.get("partial_rotary_factor", 1.0)
@@ -130,16 +149,18 @@ def _get_rope(head_dim, max_position, rope_parameters, dtype):
         for key, value in rope_parameters.items()
         if key in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow", "apply_yarn_scaling", "truncate")
     }
-    return _BoundedYaRNScalingRotaryEmbedding(
-        head_dim,
-        rotary_dim,
-        rope_parameters["original_max_position_embeddings"],
-        rope_parameters.get("rope_theta", 10000),
-        True,
-        rope_parameters["factor"],
-        dtype,
-        cache_max_position=max_position,
-        **extra_kwargs,
+    return _eager_dispatch(
+        _BoundedYaRNScalingRotaryEmbedding(
+            head_dim,
+            rotary_dim,
+            rope_parameters["original_max_position_embeddings"],
+            rope_parameters.get("rope_theta", 10000),
+            True,
+            rope_parameters["factor"],
+            dtype,
+            cache_max_position=max_position,
+            **extra_kwargs,
+        )
     )
 
 
@@ -175,7 +196,8 @@ def _build_rotaries(config, runner, n_layers, max_position, dtype):
                 hd = runner.layer_meta(i)[0]
                 by_type[lt] = _get_rope(hd, max_position, rope_params[lt], dtype)
         return [by_type[layer_types[runner.global_layer_id(i)]] for i in range(n_layers)]
-    return [_build_rotary(config, runner.layer_meta(0)[0], max_position, dtype)] * n_layers
+    # ``runner.head_dim`` is the first attention layer's: layer 0 may be a GDN layer, which has no RoPE.
+    return [_build_rotary(config, runner.head_dim, max_position, dtype)] * n_layers
 
 
 def _rope_cache_limit(model_config, config) -> int:
@@ -355,7 +377,55 @@ class _EmmyTargetInner(nn.Module):
         self.embed_tokens = embed_tokens
 
 
-class EmmyGenModel(nn.Module, SupportsPP):
+def _captures_cuda_graphs(vllm_config) -> bool:
+    """Whether this boot records whole-step CUDA graphs: not under ``--enforce-eager``, and only when the
+    compilation config asks for a capture mode other than ``NONE``."""
+    mode = getattr(vllm_config.compilation_config, "cudagraph_mode", None)
+    return not vllm_config.model_config.enforce_eager and (mode is None or getattr(mode, "name", str(mode)) != "NONE")
+
+
+def _gdn_state_layout(config, dtype):
+    """``(shapes, dtypes)`` of one request's state for one GDN layer, in the order vLLM stores them: the
+    convolution history ``[conv_dim, kernel]`` in the trunk dtype, then the recurrent matrix
+    ``[value heads, key head dim, value head dim]`` in float32. These are the ``history`` and ``state``
+    inputs of a GDN layer program, without their leading axis."""
+    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    history = (2 * key_dim + value_dim, config.linear_conv_kernel_dim)
+    state = (config.linear_num_value_heads, config.linear_key_head_dim, config.linear_value_head_dim)
+    return (history, state), (dtype, torch.float32)
+
+
+class _GdnStateLayer(nn.Module, MambaBase):
+    """One GDN layer's per-request state, as vLLM sees it. vLLM allocates the state in its KV cache
+    blocks, frees it with the request, and binds the cache here as ``kv_cache``: ``(history, state)``,
+    each with the KV cache block index as its leading axis. The runner computes the layer; this module
+    only declares the layout, and has no weights."""
+
+    def __init__(self, vllm_config, layout, prefix):
+        super().__init__()
+        self._shapes, self._dtypes = layout
+        self.prefix = prefix
+        self.kv_cache = (torch.tensor([]), torch.tensor([]))
+        context = vllm_config.compilation_config.static_forward_context
+        if prefix in context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        context[prefix] = self
+
+    def get_state_shape(self):
+        return self._shapes
+
+    def get_state_dtype(self):
+        return self._dtypes
+
+    @property
+    def mamba_type(self):
+        # The plain linear-attention backend: its metadata carries each request's token range, sequence
+        # length and state block, and none of the kernel-specific inputs of vLLM's own GDN layer.
+        return MambaAttentionBackendEnum.LINEAR
+
+
+class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
     def __init__(self, *, vllm_config, prefix: str = ""):
         super().__init__()
         mc = vllm_config.model_config
@@ -433,19 +503,13 @@ class EmmyGenModel(nn.Module, SupportsPP):
         prefill_bucket = emmy_config.gen_prefill_bucket()
         if prefill_bucket < 0:
             prefill_bucket = capacity or 0
-        # Routed experts are sharded across the tensor-parallel group: the runner loads only this
-        # rank's contiguous expert slice, its combine yields a PARTIAL sum over the rank's own
-        # hits, and the group all-reduce (installed below) completes it. A rank cannot hold every
-        # expert of the models this exists for — one DeepSeek V4 stage's experts alone outweigh a
-        # 32 GB card.
+        # Routed experts are sliced across the tensor-parallel group along their intermediate axis:
+        # every rank holds 1/world of EVERY expert (a rank cannot hold whole experts of the models
+        # this exists for — one DeepSeek V4 stage's experts alone outweigh a 32 GB card), runs the
+        # same picks, and the group all-reduce (installed below) sums the slices. Every rank doing
+        # the same work is what keeps the ranks in step and the fixed-slot decode tier legal.
         tp = get_tp_group()
-        expert_range = None
-        n_routed = getattr(config, "n_routed_experts", None) or getattr(config, "num_local_experts", None)
-        if tp.world_size > 1 and n_routed:
-            if n_routed % tp.world_size:
-                raise ValueError(f"{n_routed} routed experts do not divide across tensor_parallel_size={tp.world_size}")
-            per_rank = n_routed // tp.world_size
-            expert_range = (tp.rank_in_group * per_rank, (tp.rank_in_group + 1) * per_rank)
+        expert_slice = (tp.rank_in_group, tp.world_size) if tp.world_size > 1 else None
         self.runner = EmmyGenRunner.create(
             model_id=self._model_id,
             dtype_str=_trunk_dtype_str(mc.dtype),
@@ -455,7 +519,7 @@ class EmmyGenModel(nn.Module, SupportsPP):
             layer_range=(self.start_layer, self.end_layer),
             include_embed=self._is_first_rank,
             include_norm=self._is_last_rank,
-            expert_range=expert_range,
+            expert_slice=expert_slice,
         )
         if max_batched and max_batched > max(self.runner.prefill_capacity, self.runner.prefill_bucket + self.runner.rider_width):
             # The over-cap headroom was granted on the promise of the split; if the twin
@@ -473,48 +537,32 @@ class EmmyGenModel(nn.Module, SupportsPP):
         self.make_empty_intermediate_tensors = _hidden_intermediate_tensors_factory(self.runner.carrier_size, self.runner.residual_dtype)
 
         # AUTHORITATIVE MoE capture guard (the serve command's config probe is best-effort UX
-        # only): single-token decode is capture-legal through the runner's FIXED-SLOT tier
-        # (``_moe_combine_slots`` — fixed launch set, no host sync), so an MoE boot may keep
-        # whole-step decode capture at capture size 1. Every wider decode step still rides the
-        # routed dispatch, which host-syncs and cannot be recorded — so capture sizes above 1,
-        # or a boot where the fixed-slot tier failed to build (M=1 expert compile failure, or a
-        # schedule that stages weights through TMA descriptors), are rejected LOUDLY here.
+        # only): a decode step is capture-legal while the runner's FIXED-SLOT tier serves it
+        # (``_moe_combine_slots`` — fixed launch set, no host sync): one token on a rank holding
+        # whole experts, up to the decode bucket where each rank holds a slice of every expert.
+        # Every wider step rides the routed dispatch, which host-syncs and cannot be recorded —
+        # so capture sizes above that width, or a boot where the fixed-slot tier failed to build
+        # (M=1 expert compile failure, or a schedule that stages weights through TMA
+        # descriptors), are rejected LOUDLY here.
         # Failing with the real reason beats the cryptic CUDA 'operation not permitted during
         # stream capture' crash vLLM's capture pass would hit later.
-        if self.runner._moe is not None and not mc.enforce_eager:
-            cg_mode = getattr(vllm_config.compilation_config, "cudagraph_mode", None)
-            if cg_mode is None or getattr(cg_mode, "name", str(cg_mode)) != "NONE":
-                if self.runner.hc_mult > 1:
-                    # The hyper-connection combine always rides the routed dispatch (the placement
-                    # closes the layer AFTER the shard reduction) — no fixed-slot tier serves it,
-                    # so every decode step host-syncs and capture would crash mid-record.
-                    raise ValueError(
-                        "hyper-connection MoE decode capture is not supported (the routed combine "
-                        "host-syncs on every step); serve with --enforce-eager"
-                    )
-                if expert_range is not None:
-                    # The fixed-slot selector writes the router's GLOBAL expert ids into the slot
-                    # tables, which under sharding hold only this rank's experts — capture would
-                    # record reads past (or into the wrong rows of) the shard's tables.
-                    raise ValueError(
-                        "MoE decode capture is not supported with tensor-parallel expert shards "
-                        "(the fixed-slot selector is unsharded); serve with --enforce-eager"
-                    )
-                if not self.runner.has_moe_fixed_slot:
-                    raise ValueError(
-                        "MoE decode capture needs the fixed-slot expert tier, which is unavailable on this "
-                        "boot (the M=1 expert program failed to build, or its schedule stages weights through "
-                        "TMA descriptors — see the gen_runner warnings above); serve with --enforce-eager"
-                    )
-                sizes = getattr(vllm_config.compilation_config, "cudagraph_capture_sizes", None) or []
-                over = sorted(s for s in sizes if s > 1)
-                if over:
-                    raise ValueError(
-                        f"MoE decode capture is limited to capture size 1 (the fixed-slot tier covers "
-                        f"single-token steps only; wider decode steps run the routed dispatch eager) — "
-                        f"capture sizes {over} exceed that; use cudagraph_capture_sizes [1] (the "
-                        f"emmy serve --generate default for MoE) or --enforce-eager"
-                    )
+        if self.runner._moe is not None and _captures_cuda_graphs(vllm_config):
+            width = self.runner.moe_slot_width
+            if not width:
+                raise ValueError(
+                    "MoE decode capture needs the fixed-slot expert tier, which is unavailable on this "
+                    "boot (the M=1 expert program failed to build, or its schedule stages weights through "
+                    "TMA descriptors — see the gen_runner warnings above); serve with --enforce-eager"
+                )
+            sizes = getattr(vllm_config.compilation_config, "cudagraph_capture_sizes", None) or []
+            over = sorted(s for s in sizes if s > width)
+            if over:
+                raise ValueError(
+                    f"MoE decode capture is limited to capture sizes up to {width} (the fixed-slot tier "
+                    f"covers no wider step on this boot; wider decode steps run the routed dispatch "
+                    f"eager) — capture sizes {over} exceed that; use cudagraph_capture_sizes [1] (the "
+                    f"emmy serve --runner generate default for MoE) or --enforce-eager"
+                )
 
         sliding_window = getattr(config, "sliding_window", None)
 
@@ -538,6 +586,22 @@ class EmmyGenModel(nn.Module, SupportsPP):
                 [nn.Parameter(torch.empty(self.runner.layer_meta(i)[1], dtype=mc.dtype), requires_grad=False) for i in range(n_layers)]
             )
 
+        # GDN layers (Qwen3.5 / Qwen3.8 ``linear_attention``): the runner computes the whole layer, and
+        # vLLM keeps each request's recurrent state in its KV cache blocks. One state layer per GDN
+        # layer declares that state to vLLM; an attention layer holds ``None`` here, and a GDN layer
+        # holds ``None`` among the attention modules below.
+        gdn_layers = [self.runner.layer_meta(i) is None for i in range(n_layers)]
+        if any(gdn_layers):
+            self._check_gdn_serving(vllm_config)
+        self.gdn_state = nn.ModuleList(
+            _GdnStateLayer(
+                vllm_config, _gdn_state_layout(config, mc.dtype), f"{prefix}.layers.{self.runner.global_layer_id(i)}.linear_attn"
+            )
+            if gdn
+            else None
+            for i, gdn in enumerate(gdn_layers)
+        )
+
         # One real vLLM Attention per layer — unique prefix (vLLM keys static_forward_context /
         # cache-spec discovery by it and rejects duplicates). No weights (except sinks, above).
         # per_layer_sliding_window makes vLLM's paged attention window that layer (and size its
@@ -556,6 +620,9 @@ class EmmyGenModel(nn.Module, SupportsPP):
         else:
             attn = []
             for i in range(n_layers):
+                if gdn_layers[i]:
+                    attn.append(None)
+                    continue
                 global_i = self.runner.global_layer_id(i)
                 hd, nh, nkv, scaling = self.runner.layer_meta(i)
                 attn.append(
@@ -577,8 +644,8 @@ class EmmyGenModel(nn.Module, SupportsPP):
             max_pos = _rope_cache_limit(mc, config)
             self.rotary_emb = nn.ModuleList(_build_rotaries(config, self.runner, n_layers, max_pos, mc.dtype))
 
-        # The shard's combine is a PARTIAL sum; the group reduction completes it before the
-        # placement closes the layer.
+        # A rank's routed output is its slice's PARTIAL sum; the group reduction completes it before
+        # the placement closes the layer.
         if tp.world_size > 1:
             from vllm.distributed import tensor_model_parallel_all_reduce
 
@@ -638,7 +705,9 @@ class EmmyGenModel(nn.Module, SupportsPP):
         # scatter itself lives inside the graph; only this host read is capture-excluded.
         self.runner.maybe_log_routing_histogram()
         device = positions.device
-        t = int(positions.shape[0])
+        # Under M-RoPE (Qwen3.5 / Qwen3.8: ``mrope_section`` in the rope parameters) vLLM hands positions
+        # as ``[3, T]``, one row per rotary axis; the per-layer rotary modules take either form.
+        t = int(positions.shape[-1])
         # Every rank clamps the step's ids (vLLM hands them to all pipeline stages): the first rank
         # embeds them, and any rank's hash-routed MoE layers select experts by them. The clamp
         # guards vLLM's _dummy_run garbage-id profiling batches (out-of-vocab → IndexError).
@@ -670,10 +739,15 @@ class EmmyGenModel(nn.Module, SupportsPP):
                 f"token width {t} exceeds the compiled widths for this hyper-connection model "
                 f"(prefill capacity {self.runner.prefill_capacity}); lower --max-num-batched-tokens"
             )
+        if self.runner.residual_dtype == torch.bfloat16:
+            raise ValueError(
+                f"BF16 token width {t} exceeds the compiled widths (prefill capacity {self.runner.prefill_capacity}); "
+                "lower --max-num-batched-tokens"
+            )
         hidden_np = hidden.detach().cpu().numpy()
         for layer in range(self.runner.num_layers):
             residual_np = hidden_np
-            q_np, k_np, v_np = self.runner.forward_layer_pre(layer, hidden_np, positions)
+            q_np, k_np, v_np, *gate = self.runner.forward_layer_pre(layer, hidden_np, positions)
             q = torch.from_numpy(np.ascontiguousarray(q_np)).to(device)
             k = torch.from_numpy(np.ascontiguousarray(k_np)).to(device)
             v = torch.from_numpy(np.ascontiguousarray(v_np)).to(device)
@@ -682,7 +756,7 @@ class EmmyGenModel(nn.Module, SupportsPP):
             # rejects anything but fp16/bf16, so restore the trunk dtype (no-op when already right).
             q, k = q.to(self.dtype), k.to(self.dtype)
             attn_out = self.attn[layer](q, k, v)  # vLLM paged attention (pulls attn_metadata from forward context)
-            hidden_np = self.runner.forward_layer_post(layer, attn_out.detach().cpu().numpy(), residual_np)
+            hidden_np = self.runner.forward_layer_post(layer, attn_out.detach().cpu().numpy(), residual_np, *gate)
         if self._is_last_rank:
             hidden_np = self.runner.final_norm(hidden_np)
             return torch.from_numpy(np.ascontiguousarray(hidden_np)).to(device)
@@ -711,18 +785,99 @@ class EmmyGenModel(nn.Module, SupportsPP):
         tensors through RoPE + vLLM attention — no per-layer numpy↔torch host hop."""
         if self.fork_attn is not None:
             return self._forward_streams(hidden, positions, token_ids)
+        requests = None  # the step's request layout, read from the first GDN layer's metadata
+        state_indices = {}
         for layer in range(self.runner.num_layers):
+            if self.gdn_state[layer] is not None:
+                hidden, requests = self._forward_gdn(layer, hidden, requests, state_indices)
+                continue
             residual = hidden
-            q, k, v = self.runner.forward_layer_pre_device(layer, hidden)
+            # A gated layer's fourth tensor is its attention output gate; it skips attention and goes to ``post``.
+            q, k, v, *gate = self.runner.forward_layer_pre_device(layer, hidden)
             q, k = self.rotary_emb[layer](positions, q, k)  # A2: per-layer RoPE (Gemma local/global theta)
             q, k = q.to(self.dtype), k.to(self.dtype)  # rotary may promote to fp32; flash-attn needs fp16/bf16
             attn_out = self._attn_aliased(layer, q, k, v) if self._alias_attn else None  # A4: any tier; the backing router decides
             if attn_out is None:
                 attn_out = self.attn[layer](q, k, v)  # vLLM paged attention
-            hidden = self.runner.forward_layer_post_device(layer, attn_out, residual)
+            hidden = self.runner.forward_layer_post_device(layer, attn_out, residual, *gate)
         if self._is_last_rank:
             return self.runner.final_norm_device(hidden)
         return IntermediateTensors({"hidden_states": hidden})
+
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        """M-RoPE positions for a text prompt: vLLM asks for them whenever the config carries ``mrope_section``
+        (Qwen3.5 / Qwen3.8), and for text every rotary axis carries the plain token position. The checkpoints'
+        vision inputs are not served, so a prompt with multimodal features is refused."""
+        if mm_features:
+            raise NotImplementedError("EmmyGenModel serves text only: multimodal inputs are not supported")
+        positions = torch.arange(len(input_tokens), dtype=torch.int64).unsqueeze(0).expand(3, -1)
+        return positions, 0
+
+    @classmethod
+    def _check_gdn_serving(cls, vllm_config):
+        """Refuse, with the reason, what serving a model with GDN layers does not support."""
+        if not getattr(cls, "is_hybrid", False):
+            raise ValueError(
+                "this checkpoint has GDN (linear_attention) layers; serve it with the architecture "
+                "EmmyGenHybridModel, which declares their per-request state to vLLM"
+            )
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise NotImplementedError(
+                "prefix caching is not supported on a model with GDN layers: a request keeps one recurrent "
+                "state and no snapshot that a cached prefix could resume from; serve with --no-enable-prefix-caching"
+            )
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "speculative decoding is not supported on a model with GDN layers: a rejected draft token "
+                "would already have advanced the recurrent state; serve without --speculative-config"
+            )
+        if _captures_cuda_graphs(vllm_config):
+            raise ValueError(
+                "CUDA graph capture is not supported on a model with GDN layers: a GDN layer reads each "
+                "request's token range on the host, which a capture cannot record; serve with --enforce-eager"
+            )
+
+    def _forward_gdn(self, layer, hidden, requests, state_indices):
+        """One GDN layer over a step that may hold the tokens of several requests.
+
+        vLLM's metadata for the layer gives, per request, its token range in the step, its sequence
+        length, and the KV cache block that holds its state. The runner then runs the layer for one
+        request after another, each on its own state. vLLM never zeroes a KV cache block: a request
+        whose scheduled tokens are its whole sequence has no computed token yet, so its state is zeroed
+        here first. ``requests`` is the step's ``[(start, end, fresh)]`` list once a GDN layer has read
+        it (the token ranges are the same for every layer; only the state blocks differ), or ``None``
+        on the first GDN layer. ``state_indices`` holds each metadata tensor's host list for this forward,
+        keeping distinct cache groups separate. Returns ``(hidden, requests)``."""
+        module = self.gdn_state[layer]
+        metadata = get_forward_context().attn_metadata
+        if metadata is None:
+            # vLLM's memory-profiling run carries no metadata and no request: run on a scratch state,
+            # so that the programs' own memory still falls inside the profiled footprint.
+            scratch = [
+                torch.zeros(1, *shape, dtype=dtype, device=hidden.device)
+                for shape, dtype in zip(module.get_state_shape(), module.get_state_dtype(), strict=True)
+            ]
+            return self.runner.forward_layer_gdn_device(layer, hidden, scratch[1], scratch[0]), requests
+        metadata = metadata[module.prefix]
+        if requests is None:
+            bounds = metadata.query_start_loc.tolist()
+            # A request whose sequence is exactly its scheduled tokens has no computed token yet.
+            requests = [
+                (start, end, seq_len == end - start)
+                for start, end, seq_len in zip(bounds[:-1], bounds[1:], metadata.seq_lens.tolist(), strict=True)
+            ]
+        history_cache, state_cache = module.kv_cache
+        out = torch.empty_like(hidden)
+        key = id(metadata.state_indices_tensor)
+        if key not in state_indices:
+            state_indices[key] = metadata.state_indices_tensor.tolist()
+        for block, (start, end, fresh) in zip(state_indices[key], requests, strict=True):
+            state, history = state_cache[block : block + 1], history_cache[block : block + 1]
+            if fresh:
+                state.zero_()
+                history.zero_()
+            out[start:end] = self.runner.forward_layer_gdn_device(layer, hidden[start:end], state, history)
+        return out, requests
 
     def _attn_aliased(self, layer, q, k, v):
         """vLLM paged attention writing INTO the post program's ``attn_out`` input backing —
@@ -905,7 +1060,7 @@ class EmmyGenModel(nn.Module, SupportsPP):
         # shared table stays raw (the head must read it unscaled).
         if tied and param.data.is_cuda:
             self.runner.adopt_embed_table(param.data, scale=getattr(self.runner, "_embed_scale", 1.0))
-        # RECLAIM, unconditionally: empty_cache + the cupy pool trim RELEASE freed blocks back to
+        # RECLAIM, unconditionally: empty_cache RELEASES freed blocks back to
         # the driver, and vLLM's KV-cache sizing (which runs right after load) budgets
         # ``util x total - currently-used`` off the driver's own accounting — it cannot see that a
         # cached block is free. Everything this boot churned through counts: the adopted table's
@@ -921,17 +1076,13 @@ class EmmyGenModel(nn.Module, SupportsPP):
 
     @staticmethod
     def reclaim_device_memory() -> None:
-        """Return both allocators' free blocks to the driver (torch's caching allocator and
-        cupy's memory pool). Idempotent and cheap; call it before anything sizes itself off the
-        driver's free-memory reading.
+        """Return the caching allocator's free blocks to the driver. Idempotent and cheap; call it
+        before anything sizes itself off the driver's free-memory reading.
 
         Logged in the driver's own units, because that is the accounting vLLM's KV sizing reads
         and the reclaim is otherwise invisible — which is how the untied path went without one."""
-        import cupy as cp
-
         before = torch.cuda.mem_get_info()[0]
         torch.cuda.empty_cache()
-        cp.get_default_memory_pool().free_all_blocks()
         free, total = torch.cuda.mem_get_info()
         logger.info(
             "[EmmyGenModel] reclaimed %.3f GiB of allocator free blocks; %.3f of %.3f GiB now free for the KV cache",
@@ -939,3 +1090,30 @@ class EmmyGenModel(nn.Module, SupportsPP):
             free / 2**30,
             total / 2**30,
         )
+
+
+class EmmyGenHybridModel(EmmyGenModel, IsHybrid):
+    """``EmmyGenModel`` for a checkpoint that mixes attention layers with GDN layers (Qwen3.5 /
+    Qwen3.8). vLLM asks a hybrid class for the layout of the per-request state before it builds the
+    model, then allocates that state in its KV cache blocks beside the attention layers' pages. It is
+    an architecture of its own because the hybrid flag belongs to the class: on ``EmmyGenModel`` it
+    would switch every model emmy serves to hybrid KV cache sizing."""
+
+    @classmethod
+    def _state_layout(cls, vllm_config):
+        mc = vllm_config.model_config
+        return _gdn_state_layout(getattr(mc.hf_config, "text_config", mc.hf_config), mc.dtype)
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        return cls._state_layout(vllm_config)[0]
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        return cls._state_layout(vllm_config)[1]
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        # vLLM copies state between KV cache blocks only for prefix caching and speculative decoding,
+        # and ``_check_gdn_serving`` refuses both.
+        raise NotImplementedError("a model with GDN layers serves without prefix caching and speculative decoding")

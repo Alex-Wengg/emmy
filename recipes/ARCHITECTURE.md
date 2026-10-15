@@ -18,27 +18,43 @@ here for lifecycle continuity, but their tags disable deployment. The recipe for
 Every runnable `recipe.yaml` here also ships inside the published wheel. `--recipe <model>` (a bare name, no path)
 copies from this live tree in an editable install or from the packaged catalog in a wheel install, then uses that
 working copy. Obsolete recipes and onboarding shells remain repository-only, while canonical model goldens ship for
-all lifecycle states because they remain deploy evidence. `RESULTS.md` and local benchmark output do not travel.
+all lifecycle states because they remain deploy evidence. `DISCOVERY.md`, `RESULTS.md`, and local benchmark output do
+not travel.
+
+## Recipe evidence
+
+Keep discovery and serving evidence beside the recipe they describe. `DISCOVERY.md` records the research behind its
+heat and lifecycle decision; `RESULTS.md` interprets qualification and benchmark results; a
+`results_<gpu-short>x<gpu-count>.tar.gz` archive keeps the exact platform's raw results. These are the recipe-level
+evidence files beside `recipe.yaml` and the established `golden/` compiler evidence. Do not add other research or
+results reports to a recipe directory. Discovery creates a missing `DISCOVERY.md` and edits an existing one only when
+a factual correction or substantial new evidence changes its assessment. Small changes in daily source metrics or
+wording do not justify an edit. The nightly task carries each recipe's note to the agent; new onboarding shells first
+receive a note on the next discovery run, after their directory exists.
 
 ## Canonical model goldens
 
 A reviewed model golden belongs beside the recipe whose exact checkpoint it describes:
 
-`recipes/<model>/golden/<gpu-slug>_<compute-cap>.yaml`
+`recipes/<model>/golden/<gpu-slug>_<compute-cap>.json`
 
 Keep exactly one file per exact GPU in each recipe. The recipe directory already identifies the model, so the file
 name identifies only the GPU and compute capability; merge new realizations into that file instead of adding a second
 model- or run-suffixed YAML. Preserve the document's exact model and optional revision provenance. Model-agnostic
-hardware/kernel goldens have no recipe owner and remain under `emmy/compiler/pipeline/search/goldens/`.
+the maintained golden records have no recipe owner and live under `emmy/compiler/pipeline/search/golden/records/`.
 
 If complete compiler qualification produces a model golden before serving qualification produces a runnable recipe,
 create the normal `onboarding`/`untested` shell first and store the golden beneath it. The nightly `onboard-model`
-workflow owns repository validation, strict decode, and exact-GPU replay for recipe-local goldens; the default
-test suite does not load checked-in golden YAML.
+workflow owns exact-GPU replay for recipe-local goldens. Only a `maintained` recipe's golden is a repository golden:
+compiles read it as evidence, refits train on it, and the default suite holds every stored kernel to the fresh
+lowering of its program (`emmy golden check`), without requiring the target GPU. Any other recipe's golden is evidence
+only where a command names it (`--golden PATH`, a release env).
 
 ## Lifecycle
 
-Discovery keeps exactly ten fully configured recipes tagged `maintained` for periodic testing and optimization. Other
+Discovery keeps exactly ten fully configured recipes tagged `maintained` for periodic testing and optimization. A
+person can add `lifecycle-locked` beside any lifecycle tag; discovery then leaves the recipe out entirely — it is not
+scored, not reclassified and not counted among the ten — so a locked `maintained` recipe is in addition to them. Other
 useful complete recipes are tagged `best-effort`: they remain runnable and bundled, but are not selected for periodic
 work. `obsolete` is reserved for a recipe with an all-around better replacement for the same task at a comparable or
 lower practical VRAM footprint and no retained material advantage in capability or operation, or a clear technical
@@ -113,6 +129,12 @@ compare configurations, add an experiment; then fold the winner back into the re
   SGLang recipes do not set Emmy knobs.
 - **The target hardware**, as a single-entry `matrices:` block. `deploy` resolves it against the detected GPU and
   aborts early if the host cannot satisfy it.
+- **The input modalities**, for a multimodal checkpoint. `model.input_modalities: [text, image]` serves images and
+  requires engine flags that keep the vision path on (no `--language-model-only`, a non-zero `--limit-mm-per-prompt`,
+  and a bounded `--mm-processor-kwargs` `max_pixels`); leaving it unset serves text only and should pair with
+  disabling the tower. The claim belongs to a deployment entry: a matrix entry declares it for itself as
+  `model.input_modalities: [[text, image]]` when the recipe's other lanes stay text-only, and the catalog exports it per
+  deployment, so it is a claim the smoke test and qualification of that entry must cover.
 
 ## What limits the values you can pin
 
@@ -142,7 +164,7 @@ sweep rather than guessing (`release-serving-image` skill, Step 4).
    [`docker/vllm-emmy-serve/ARCHITECTURE.md`](../docker/vllm-emmy-serve/ARCHITECTURE.md). The headroom sweep there
    produces the shape the recipe must match.
 2. Add `recipes/<model>/recipe.yaml` pinning that image and that shape, one variant, no `benchmark:` block.
-3. Store each qualified GPU's compiler evidence in `recipes/<model>/golden/<gpu-slug>_<compute-cap>.yaml`.
+3. Store each qualified GPU's compiler evidence in `recipes/<model>/golden/<gpu-slug>_<compute-cap>.json`.
 4. If a configuration choice needs justifying, put the A/B in `experiments/<model>/<name>/` and reference the
    finding from the recipe's header comment — not the grid itself.
 

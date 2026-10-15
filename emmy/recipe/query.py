@@ -11,7 +11,7 @@ from functools import cmp_to_key
 from pathlib import Path
 from typing import Any
 
-from emmy.provisioning.candidates import iter_candidates
+from emmy.provisioning.candidates import rentable
 from emmy.provisioning.cloudrift import list_available_instance_types, validate_team_id_access
 from emmy.recipe.catalog import HF_ID
 from emmy.recipe.lifecycle import BEST_EFFORT_TAG, LIFECYCLE_TAGS, MAINTAINED_TAG, OBSOLETE_TAG
@@ -19,7 +19,7 @@ from emmy.recipe.lifecycle import BEST_EFFORT_TAG, LIFECYCLE_TAGS, MAINTAINED_TA
 QUERY_SCHEMA_VERSION = 1
 
 _FIELD = r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*"
-_PREDICATE = re.compile(rf"^\s*({_FIELD})\s*(==|!=|>=|<=|>|<|in|contains|matches)\s*(.+?)\s*$")
+_PREDICATE = re.compile(rf"^\s*({_FIELD})\s*(==|!=|>=|<=|>|<|in|not contains|contains|matches)\s*(.+?)\s*$")
 _ORDER_SORT = re.compile(rf"^\s*({_FIELD})\s+order\s+(.+?)\s*$")
 _DIRECTION_SORT = re.compile(rf"^\s*({_FIELD})\s+(asc|desc)(?:\s+(nulls-first|nulls-last))?\s*$")
 
@@ -32,6 +32,7 @@ RECIPE_FIELDS = frozenset(
         "lifecycle",
         "task",
         "runnable",
+        "emmy_serving",
         "rationale",
         "heat",
         "operation",
@@ -39,6 +40,7 @@ RECIPE_FIELDS = frozenset(
         "deployment.index",
         "deployment.gpu",
         "deployment.gpu_count",
+        "deployment.gpu_memory_utilization",
         "deployment.context_length",
         "deployment.availability.cloudrift",
         "results.path",
@@ -165,6 +167,7 @@ def _base_row(record: dict | None, model_id: str) -> dict:
         "lifecycle": lifecycle,
         "task": record["task"] if record is not None else None,
         "runnable": record["runnable"] if record is not None else False,
+        "emmy_serving": record["emmy_serving"] if record is not None else False,
         "rationale": record["rationale"] if record is not None else None,
         "heat": record["heat"] if record is not None else None,
         "operation": operation,
@@ -217,6 +220,7 @@ def build_query_rows(
                     "index": index,
                     "gpu": deployment["gpu"],
                     "gpu_count": deployment["gpu_count"],
+                    "gpu_memory_utilization": deployment.get("gpu_memory_utilization"),
                     "context_length": deployment.get("context_length"),
                     "availability": {"cloudrift": None},
                 }
@@ -247,11 +251,11 @@ def _matches(row: dict, predicate: Predicate) -> bool:
         return current != expected
     if operator == "in":
         return current in expected
-    if operator == "contains":
+    if operator in ("contains", "not contains"):
         try:
-            return expected in current
+            return (expected in current) == (operator == "contains")
         except TypeError as exc:
-            raise ValueError(f"Field {predicate.field} does not support 'contains'") from exc
+            raise ValueError(f"Field {predicate.field} does not support '{operator}'") from exc
     if operator == "matches":
         if not isinstance(current, str):
             return False
@@ -325,19 +329,8 @@ def query_rows(
 def _annotate_cloudrift_availability(rows: list[dict], available: set[str]) -> None:
     for row in rows:
         deployment = row["deployment"]
-        if deployment is None:
-            continue
-        try:
-            candidates = iter_candidates(
-                deployment["gpu"],
-                deployment["gpu_count"],
-                "cloudrift",
-                exact_gpu_count=True,
-            )
-        except (TypeError, ValueError):
-            deployment["availability"]["cloudrift"] = False
-            continue
-        deployment["availability"]["cloudrift"] = any(candidate.instance_type in available for candidate in candidates)
+        if deployment is not None:
+            deployment["availability"]["cloudrift"] = rentable(deployment["gpu"], deployment["gpu_count"], "cloudrift", available)
 
 
 def _git_root() -> Path:

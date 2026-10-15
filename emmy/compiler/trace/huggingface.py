@@ -230,6 +230,8 @@ def build_layer_wrapper(block, rotary_emb, hidden_size: int, dtype, *, layer_typ
     ``layer_type`` feeds rotary modules that key cos/sin on the layer's
     attention type (e.g. Gemma's sliding/global split); ``None`` for the
     common single-rope architectures."""
+    import inspect  # noqa: PLC0415
+
     import torch
     import torch.nn as nn
 
@@ -251,6 +253,10 @@ def build_layer_wrapper(block, rotary_emb, hidden_size: int, dtype, *, layer_typ
     # the unchanged path below.
     ple = build_synthetic_ple(block, n_pos, dtype)
     ple_dim = 0 if ple is None else ple.shape[-1]
+    # An attention that reads positions beyond the rotary (Ministral 3's position-dependent query
+    # scale) gets them sliced the same way, as the static-shape trace passes them.
+    self_attn = getattr(block, "self_attn", None)
+    wants_positions = self_attn is not None and "position_ids" in inspect.signature(self_attn.forward).parameters
 
     class LayerWrapper(nn.Module):
         def __init__(self) -> None:
@@ -260,28 +266,96 @@ def build_layer_wrapper(block, rotary_emb, hidden_size: int, dtype, *, layer_typ
             self.register_buffer("sin", sin)
             if ple is not None:
                 self.register_buffer("ple", ple)
+            if wants_positions:
+                self.register_buffer("positions", full_pos)
 
         def forward(self, x):
             s = x.shape[1]
-            pe = (self.cos[:, :s], self.sin[:, :s])
+            kwargs = {"position_embeddings": (self.cos[:, :s], self.sin[:, :s])}
+            if wants_positions:
+                kwargs["position_ids"] = self.positions[:, :s]
             if ple_dim:
-                return self.block(x, per_layer_input=self.ple[:, :s], position_embeddings=pe)
-            return self.block(x, position_embeddings=pe)
+                return self.block(x, per_layer_input=self.ple[:, :s], **kwargs)
+            return self.block(x, **kwargs)
 
     return LayerWrapper()
 
 
-def find_text_decoder(model):
-    """Return the deepest module owning the text decoder layers and rotary embedding."""
+def build_gdn_state_wrapper(block, *, float32_residual: bool = False) -> nn.Module:
+    """Expose a GDN block as ``(x, state, history) -> (y, state, history)`` without input mutation.
+
+    State is the FP32 recurrent matrix; history holds the last convolution-kernel-width projected
+    inputs. Zero tensors start a request. Batch rows own independent state and history. The block's
+    installed forward supplies both the prefill and single-token decode math.
+
+    With ``float32_residual`` the residual stream enters and leaves in FP32 and each projection is
+    fed the model dtype — the seam form of the attention split, so both layer types meet at one
+    seam dtype.
+    """
+    import torch.nn as nn
+
+    mixer = getattr(block, "linear_attn", None)
+    if mixer is None:
+        raise ValueError("a GDN state wrapper requires a linear_attn block")
+    dtype = mixer.in_proj_qkv.weight.dtype
+
+    class State:
+        def __init__(self, state, history):
+            self.recurrent_states = [state]
+            self.conv_states = [history.clone()]
+            self.layers = {mixer.layer_idx: self}
+
+        def has_previous_state(self, layer_idx):
+            return True
+
+        def update_conv_state(self, value, layer_idx):
+            self.conv_states[0] = value
+
+        def update_recurrent_state(self, value, layer_idx):
+            self.recurrent_states[0] = value
+
+    class StatefulGDN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = block
+
+        def forward(self, x, state, history):
+            cache = State(state, history)
+            if not float32_residual:
+                y = self.block(x, position_embeddings=None, past_key_values=cache)
+            else:
+                # The block's own forward, with the residual adds in FP32.
+                h = x + self.block.linear_attn(hidden_states=self.block.input_layernorm(x).to(dtype), cache_params=cache)
+                y = h + self.block.mlp(self.block.post_attention_layernorm(h).to(dtype))
+            return y, cache.recurrent_states[0], cache.conv_states[0]
+
+    return StatefulGDN()
+
+
+def find_text_decoder(model, path: str | None = None):
+    """Return the module owning the text decoder layers and rotary embedding.
+
+    ``path`` names one stack by its dotted module path (``talker.model``) in a model that holds several,
+    like a speech model's thinker, talker and codec decoders. Without it the deepest stack is returned (a
+    vision-language wrapper nests its text decoder inside the model), and two stacks neither of which holds
+    the other are refused: taking either one would trace a model the caller did not name."""
     import torch.nn as nn  # noqa: PLC0415
 
-    decoder = None
-    for _name, module in model.named_modules():
-        if isinstance(getattr(module, "layers", None), nn.ModuleList) and hasattr(module, "rotary_emb") and hasattr(module, "config"):
-            decoder = module
-    if decoder is None:
+    def is_stack(module) -> bool:
+        return isinstance(getattr(module, "layers", None), nn.ModuleList) and hasattr(module, "rotary_emb") and hasattr(module, "config")
+
+    if path is not None:
+        decoder = model.get_submodule(path)
+        if not is_stack(decoder):
+            raise ValueError(f"{path!r} in {type(model).__name__} is not a decoder stack (no layers, rotary_emb and config)")
+        return decoder
+    found = {name: module for name, module in model.named_modules() if is_stack(module)}
+    leaves = [name for name in found if not any(other.startswith(f"{name}.") or (not name and other) for other in found)]
+    if not leaves:
         raise ValueError(f"could not locate a text decoder in {type(model).__name__}")
-    return decoder
+    if len(leaves) > 1:
+        raise ValueError(f"{type(model).__name__} holds several decoder stacks {leaves}; name one with --decoder")
+    return found[leaves[0]]
 
 
 def selected_layer_type(decoder, block, layer: int):
@@ -365,7 +439,7 @@ def specialize_deepseek_full_coverage_compressor(block, seq_len: int) -> bool:
     return True
 
 
-def trace_selected_layer(model, layer: int, seq_len: int, dtype, *, dynamic_shapes: dict | None = None):
+def trace_selected_layer(model, layer: int, seq_len: int, dtype, *, dynamic_shapes: dict | None = None, decoder_path: str | None = None):
     """Trace one already-loaded decoder layer through the canonical model-layer path.
 
     This is the library primitive shared by ``emmy trace --layer`` and config-only
@@ -379,7 +453,7 @@ def trace_selected_layer(model, layer: int, seq_len: int, dtype, *, dynamic_shap
 
     from emmy.compiler.trace.torch import trace_module  # noqa: PLC0415
 
-    decoder = find_text_decoder(model)
+    decoder = find_text_decoder(model, decoder_path)
     if not 0 <= layer < len(decoder.layers):
         raise ValueError(f"layer {layer} not found (model has {len(decoder.layers)} layers)")
     block = decoder.layers[layer]
@@ -770,13 +844,61 @@ def moe_expert_layout(experts):
     )
 
 
+def expert_intermediate_slice(name: str, tensor, rank: int, world: int, *, stacked: bool = False):
+    """Tensor-parallel rank ``rank``'s slice of one expert tensor along the intermediate axis.
+
+    ``name`` is an expert program input name in its stored ``(out, in, …)`` layout, behind a leading
+    expert axis when ``stacked``: gate and up (``w_gate*``, ``w_up*``, ``w_gate_up*``) keep rows, down
+    (``w_down*``) keeps columns — for a block-coded tensor that axis counts blocks, so the slice stays
+    block-aligned. A concatenated ``w_gate_up`` keeps the same rows of each half."""
+    import torch  # noqa: PLC0415
+
+    axis = (1 if name.startswith("w_down") else 0) + int(stacked)
+    halves = 2 if name.startswith("w_gate_up") else 1
+    extent = tensor.shape[axis] // halves
+    if extent == 1:
+        return tensor  # a scale broadcast along the intermediate axis: every rank keeps it whole
+    if extent % world:
+        raise ValueError(f"expert input {name!r} has {extent} intermediate entries on axis {axis}, not divisible by {world} ranks")
+    width = extent // world
+    parts = [tensor.narrow(axis, half * extent + rank * width, width) for half in range(halves)]
+    return torch.cat(parts, dim=axis).contiguous()
+
+
+def slice_routed_experts(model, rank: int, world: int) -> None:
+    """Slice every routed expert of ``model`` to tensor-parallel rank ``rank``'s 1/``world`` of its
+    intermediate axis, in place.
+
+    Each rank then holds a slice of EVERY expert instead of a subset of whole experts: gate and up
+    keep the same intermediate rows, down the matching columns, so a rank's expert output is a partial
+    sum the group all-reduce completes and every rank runs the same picks. A meta parameter is
+    re-declared at the sliced shape; a real one keeps its sliced values. Only the concatenated, biasless
+    ``F.linear`` layout (DeepSeek, OLMoE) is sliced."""
+    from torch import nn  # noqa: PLC0415
+
+    trunk = getattr(model, "model", model)
+    trunk = getattr(trunk, "language_model", trunk)
+    for block in trunk.layers:
+        parts = moe_block_parts(block.mlp) if hasattr(block, "mlp") else None
+        if parts is None:
+            continue
+        experts = parts[1]
+        if moe_expert_layout(experts) != (False, False, False):
+            raise NotImplementedError(
+                f"slicing routed experts across ranks needs the (out, in), concatenated, biasless layout; got {moe_expert_layout(experts)}"
+            )
+        for attr, name in (("gate_up_proj", "w_gate_up"), ("down_proj", "w_down")):
+            sliced = expert_intermediate_slice(name, getattr(experts, attr), rank, world, stacked=True)
+            setattr(experts, attr, nn.Parameter(sliced, requires_grad=False))
+
+
 def replace_moe_with_traceable_expert(block) -> bool:
     """Replace token routing with one representative expert for trace inventory.
 
     Routing (top-k/sort/group/combine) is host orchestration in Emmy serving and
     is not a tuneable tensor kernel.  Inventory tracing still needs the routed
     expert algebra, so use expert zero with the same per-expert weights and keep
-    any always-on shared expert.  The replacement is intentionally limited to
+    any always-on shared expert with its gate.  The replacement is intentionally limited to
     the biasless, concatenated ``F.linear`` layout used by DeepSeek/OLMoE; other
     layouts retain their normal module and return ``False``.
     """
@@ -798,6 +920,7 @@ def replace_moe_with_traceable_expert(block) -> bool:
         (module for attr in ("shared_experts", "shared_expert") if (module := getattr(block.mlp, attr, None)) is not None),
         None,
     )
+    shared_expert_gate = getattr(block.mlp, "shared_expert_gate", None)
     raw_routed_scale = getattr(block.mlp, "routed_scaling_factor", 1.0)
     routed_scaling_factor = float(1.0 if raw_routed_scale is None else raw_routed_scale)
 
@@ -811,6 +934,7 @@ def replace_moe_with_traceable_expert(block) -> bool:
             self.act_fn = act_fn
             self.limit = limit
             self.shared_experts = shared_experts
+            self.shared_expert_gate = shared_expert_gate
             self.routed_scaling_factor = routed_scaling_factor
             self._emmy_traceable_expert = True
 
@@ -826,7 +950,11 @@ def replace_moe_with_traceable_expert(block) -> bool:
             output = nn.functional.linear(self.act_fn(gate) * up, self.w_down)
             output = output * self.routed_scaling_factor
             if self.shared_experts is not None:
-                output = output + self.shared_experts(x)
+                shared = self.shared_experts(x)
+                if self.shared_expert_gate is not None:
+                    # Qwen-MoE scales its shared expert by a per-token sigmoid gate.
+                    shared = nn.functional.sigmoid(self.shared_expert_gate(x)) * shared
+                output = output + shared
             return output
 
     block.mlp = RepresentativeExpert()
@@ -1487,12 +1615,20 @@ def _auto_config_from_pretrained(model_dir, **kwargs):
 
 
 def _auto_model_from_config(config, **kwargs):
-    """Build an auto model with the same guarded custom-code retry as its config."""
-    from transformers import AutoModelForCausalLM  # noqa: PLC0415
+    """Build an auto model with the same guarded custom-code retry as its config.
+
+    A wrapper Transformers registers only as image-text-to-text (Mistral 3) or as a multimodal LM
+    (Qwen3-Omni's thinker, talker and codec) is built as that whole model: its checkpoint names follow
+    the wrapper, and the decoder inside it is found the same way as in a causal LM."""
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForMultimodalLM  # noqa: PLC0415
 
     try:
         return AutoModelForCausalLM.from_config(config, **kwargs)
     except ValueError as e:
+        if "Unrecognized configuration class" in str(e):
+            for auto in (AutoModelForImageTextToText, AutoModelForMultimodalLM):
+                if type(config) in auto._model_mapping:
+                    return auto.from_config(config, **kwargs)
         if "trust_remote_code" not in str(e):
             raise
         return AutoModelForCausalLM.from_config(config, trust_remote_code=True, **kwargs)
@@ -1692,7 +1828,10 @@ def _checkpoint_key_renamer(model, *, reverse: bool = False):
     # argument, but all it does is run the converters before the renamings instead of after, and
     # the converter list passed here is empty — so it would change nothing, while costing the
     # supported 5.14, whose ``rename_source_key`` has no such parameter.
-    inverted = [t.reverse_transform() for t in renamings]
+    # Every matching renaming fires in turn, so a key may pass through a chain (Mistral 3's
+    # ``language_model.model.`` → ``language_model.`` → ``model.language_model.``); undoing a
+    # chain runs its inverses in reverse order.
+    inverted = [t.reverse_transform() for t in reversed(renamings)]
     return lambda path: rename_source_key(path, inverted, [])[0]
 
 
@@ -1782,7 +1921,7 @@ def load_quantized_split(
     layer_range=None,
     include_embed=True,
     include_norm=True,
-    expert_range=None,
+    expert_slice=None,
 ):
     """Architecture twin + expert store for a quantized (MoE) checkpoint — SHARD-STREAMED.
 
@@ -1830,6 +1969,11 @@ def load_quantized_split(
     decoder interval. ``include_embed`` and ``include_norm`` assign the two boundary tensors;
     all unowned parameters remain meta and must never be read by that stage.
 
+    ``expert_slice=(rank, world)`` keeps tensor-parallel rank ``rank``'s slice of every per-expert
+    tensor along the intermediate axis (:func:`expert_intermediate_slice`) and re-declares the twin's
+    experts at the sliced shapes (:func:`slice_routed_experts`), so the store and the twin agree. Only
+    per-expert-module checkpoints are sliced; an E-stacked or EXL3 expert table is refused.
+
     Returns ``(model, expert_store)`` with ``expert_store = {"fmt": "mxfp4" | "f8e4m3" | "exl3" | None,
     "layers": {layer_index: {input_name: tensor}}}`` (``fmt`` None = experts unquantized), plus
     ``"codebooks": {layer_index: {input_name: cb}}`` on the EXL3 path (the codebook id the
@@ -1852,6 +1996,7 @@ def load_quantized_split(
         _is_skipped,
         _mxfp4_quant_config,
         _packed_int4_config,
+        _packed_int4_spent,
         _skip_patterns,
         dequantize,
         dequantize_nvfp4,
@@ -1936,10 +2081,10 @@ def load_quantized_split(
                 continue
             f = _open(shard_path)
             for k in owned_keys:
-                if packed4 is not None and k.endswith(".qweight"):
+                if packed4 is not None and k.endswith("." + packed4[1].leaves[0]):
                     qc4, layout = packed4
-                    base = k[: -len(".qweight")]
-                    qzeros_key, scales_key = base + ".qzeros", base + ".scales"
+                    base = k[: -len("." + layout.leaves[0])]
+                    qzeros_key, scales_key = base + "." + layout.leaves[1], base + "." + layout.leaves[2]
                     if qzeros_key not in index or scales_key not in index:
                         raise ValueError(f"packed int4 linear {base!r} is missing qzeros or scales")
                     model_key = _checkpoint_to_model_key(rename(base + ".weight"))
@@ -1949,26 +2094,22 @@ def load_quantized_split(
                         values = dequantize_packed_int4(
                             f.get_tensor(k).numpy(),
                             _sibling(qzeros_key).numpy(),
-                            _sibling(scales_key).numpy(),
+                            _sibling(scales_key).float().numpy(),  # numpy has no bfloat16
                             int(qc4.get("group_size", qc4.get("q_group_size", -1))),
                             layout=layout,
                         ).T
                         state[model_key] = torch.from_numpy(values).to(dtype)
                     fmt = layout.name
                     continue
-                if packed4 is not None and k.endswith((".qzeros", ".scales", ".g_idx")):
+                if packed4 is not None and k.endswith(_packed_int4_spent(packed4[1])):
                     base = k.rsplit(".", 1)[0]
-                    if base + ".qweight" in index:
+                    if base + "." + packed4[1].leaves[0] in index:
                         continue
                 slot = _expert_slot(rename(k))
                 if slot is not None:
                     layer, name, expert = slot
-                    if expert is not None and expert_range is not None:
-                        if not expert_range[0] <= expert < expert_range[1]:
-                            continue  # another tensor-parallel rank owns this expert; never read its bytes
-                        # The store's expert axis is RANK-LOCAL: a shard stacks its own experts from
-                        # index 0, and the router maps global selections onto that axis at dispatch.
-                        expert -= expert_range[0]
+                    if expert_slice is not None and expert is None:
+                        raise NotImplementedError(f"slicing an E-stacked expert table across ranks is not supported: {k!r}")
                     t = f.get_tensor(k)
                     if native_experts:
                         # The published MXFP4 dialect: ``I8 [out, in/2]`` nibble pairs beside
@@ -2003,6 +2144,10 @@ def load_quantized_split(
                     else:
                         if t.dtype == torch.int16 or name.endswith(("_suh", "_svh")):
                             fmt = "exl3"
+                            if expert_slice is not None:
+                                raise NotImplementedError(f"slicing EXL3 trellis experts across ranks is not supported: {k!r}")
+                        if expert_slice is not None:
+                            t = expert_intermediate_slice(name, t, *expert_slice)
                         per_expert.setdefault(layer, {}).setdefault(name, {})[expert] = t
                         if t.dtype == torch.int16:
                             codebooks.setdefault(layer, {})[name] = _exl3_codebook(index, k[: -len(".trellis")])
@@ -2050,13 +2195,20 @@ def load_quantized_split(
                 if t.dtype in torch_f8:
                     scale_key = next((c for c in (mk + "_scale", mk + "_scale_inv") if c in renamed), None)
                     if scale_key is not None and not _is_skipped(k, patterns):
+                        if compress_trunk:
+                            # The serving lane, as for the packed formats above: the bits stay
+                            # coded and the caller re-sources them from the checkpoint.
+                            coded_trunk.add(_checkpoint_to_model_key(rename(k)))
+                            continue
                         scale_key = renamed[scale_key]
                         s = _open(str(index[scale_key])).get_tensor(scale_key)
                         vals = dequantize(t.float().numpy(), s.float().numpy(), inverse=scale_is_reciprocal(scale_key))
                         state[_checkpoint_to_model_key(rename(k))] = torch.from_numpy(vals).to(dtype)
                         continue
                     t = t.float()  # unpaired / skipped fp8: exact value decode, no scale
-                state[_checkpoint_to_model_key(rename(k))] = t.to(dtype) if t.is_floating_point() else t
+                model_key = _checkpoint_to_model_key(rename(k))
+                cast_to = torch.float32 if model_key.endswith(".e_score_correction_bias") else dtype  # see ``serving_router``
+                state[model_key] = t.to(cast_to) if t.is_floating_point() else t
 
     # POP per layer: the stacked tensors are a full second copy of the expert bytes, so holding the
     # per-expert dict alive across the whole loop peaks at 2× (GLM-4.5-Air: 50 GiB, which no 60 GB
@@ -2102,6 +2254,8 @@ def load_quantized_split(
             if param is not None:
                 state[key] = torch.empty(param.shape, dtype=dtype, device="cpu")
 
+    if expert_slice is not None:
+        slice_routed_experts(model, *expert_slice)
     _trim_padded_weights(model, state)  # EXL3 pads both dims of every coded linear to 128
     missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
     if unexpected:
@@ -2288,7 +2442,7 @@ def load_quantized_twin(model_dir, dtype):
     return model
 
 
-def load_architecture_trace_twin(model_id_or_path, dtype, layer: int, *, revision: str | None = None):
+def load_architecture_trace_twin(model_id_or_path, dtype, layer: int, *, revision: str | None = None, decoder_path: str | None = None):
     """Config-only architecture twin for a selected-layer ``emmy trace``.
 
     Build the complete module hierarchy on ``meta`` so model weights are never
@@ -2299,11 +2453,11 @@ def load_architecture_trace_twin(model_id_or_path, dtype, layer: int, *, revisio
     tensor algebra.
 
     ``revision`` is kept separate from ``model_id_or_path`` so Hub revision pins
-    use the same config-only path as ordinary repository IDs.
+    use the same config-only path as ordinary repository IDs. ``decoder_path`` names the
+    decoder stack in a model that holds several (see :func:`find_text_decoder`).
     """
     import torch  # noqa: PLC0415
-    import torch.nn as nn  # noqa: PLC0415
-    from transformers import AutoConfig, AutoModelForCausalLM  # noqa: PLC0415
+    from transformers import AutoConfig  # noqa: PLC0415
 
     config_kwargs = {} if revision is None else {"revision": revision}
     try:
@@ -2316,19 +2470,9 @@ def load_architecture_trace_twin(model_id_or_path, dtype, layer: int, *, revisio
         delattr(config, "quantization_config")
 
     with torch.device("meta"):
-        try:
-            model = AutoModelForCausalLM.from_config(config, dtype=dtype)
-        except ValueError as exc:
-            if "trust_remote_code" not in str(exc):
-                raise
-            model = AutoModelForCausalLM.from_config(config, dtype=dtype, trust_remote_code=True)
+        model = _auto_model_from_config(config, dtype=dtype)
 
-    decoder = None
-    for _name, module in model.named_modules():
-        if isinstance(getattr(module, "layers", None), nn.ModuleList) and hasattr(module, "rotary_emb"):
-            decoder = module
-    if decoder is None:
-        raise ValueError(f"could not locate a text decoder in {type(model).__name__}")
+    decoder = find_text_decoder(model, decoder_path)
     if not 0 <= layer < len(decoder.layers):
         raise ValueError(f"layer {layer} not found (model has {len(decoder.layers)} layers)")
 

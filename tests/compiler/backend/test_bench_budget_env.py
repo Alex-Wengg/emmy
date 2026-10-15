@@ -25,21 +25,17 @@ class _StubBackend(Backend):
 def test_defaults_unchanged_without_env(monkeypatch):
     monkeypatch.delenv(config.BENCH_COMPILE_TIMEOUT_S, raising=False)
     monkeypatch.delenv(config.BENCH_RUN_TIMEOUT_S, raising=False)
-    monkeypatch.delenv(config.BENCH_WALL_TIMEOUT_S, raising=False)
     backend = _StubBackend()
     assert backend.bench_compile_timeout_s == 30.0
     assert backend.bench_run_timeout_s == 10.0
-    assert backend.bench_wall_timeout_s is None
 
 
 def test_env_overrides_constructor_policy(monkeypatch):
-    backend = CudaBackend(bench_compile_timeout_s=12.0, bench_run_timeout_s=2.0, bench_wall_timeout_s=16.0)
+    backend = CudaBackend(bench_compile_timeout_s=12.0, bench_run_timeout_s=2.0)
     monkeypatch.setenv(config.BENCH_COMPILE_TIMEOUT_S, "120")
     monkeypatch.setenv(config.BENCH_RUN_TIMEOUT_S, "300")
-    monkeypatch.setenv(config.BENCH_WALL_TIMEOUT_S, "500")
     assert backend.bench_compile_timeout_s == 120.0
     assert backend.bench_run_timeout_s == 300.0
-    assert backend.bench_wall_timeout_s == 500.0
 
 
 def test_reads_are_live_not_cached(monkeypatch):
@@ -48,12 +44,6 @@ def test_reads_are_live_not_cached(monkeypatch):
     assert backend.bench_run_timeout_s == 90.0
     monkeypatch.delenv(config.BENCH_RUN_TIMEOUT_S)
     assert backend.bench_run_timeout_s == 10.0
-
-
-def test_wall_env_selects_isolated_budget_over_none(monkeypatch):
-    backend = CudaBackend()  # constructor default: None (in-process bench)
-    monkeypatch.setenv(config.BENCH_WALL_TIMEOUT_S, "42.5")
-    assert backend.bench_wall_timeout_s == 42.5
 
 
 def test_unparseable_env_falls_back_to_policy_value(monkeypatch):
@@ -104,7 +94,7 @@ def test_launch_deadline_uses_the_first_iter_budget_on_iter_zero_only(monkeypatc
 
 
 def _stub_plan(*names):
-    """The fields ``_load_plan`` reads — kernels to compile, and the pure data it adopts."""
+    """The fields ``_compile_kernels`` and the build read — kernels to compile, and the pure data."""
     from types import SimpleNamespace
 
     return SimpleNamespace(
@@ -134,7 +124,7 @@ def test_compile_budget_stops_between_kernels_instead_of_after_the_whole_load(mo
     from emmy.compiler.backend.cuda import program
 
     compiled = []
-    monkeypatch.setattr(program, "_load_kernel", lambda name, spec: compiled.append(name))
+    monkeypatch.setattr(program, "_cubin_path", lambda name, spec, **kwargs: compiled.append(name))
 
     def _at(*ticks):
         clock = iter(ticks)
@@ -142,13 +132,13 @@ def test_compile_budget_stops_between_kernels_instead_of_after_the_whole_load(mo
 
     _at(1.0, 9.0, 9.0)
     with pytest.raises(program.CompileBudgetExceeded) as exc:
-        program._load_plan(_stub_plan("k_one", "k_two", "k_three"), deadline=5.0)
+        program._compile_kernels(_stub_plan("k_one", "k_two", "k_three"), deadline=5.0)
     assert compiled == ["k_one", "k_two"], "the third kernel is never handed to nvcc"
     assert "2 of 3 kernel(s)" in str(exc.value) and config.BENCH_COMPILE_TIMEOUT_S in str(exc.value)
 
     compiled.clear()
     _at(1.0, 2.0, 3.0)
-    program._load_plan(_stub_plan("k_one", "k_two", "k_three"), deadline=5.0)
+    program._compile_kernels(_stub_plan("k_one", "k_two", "k_three"), deadline=5.0)
     assert compiled == ["k_one", "k_two", "k_three"], "a compile inside the budget is not cut short"
 
 
@@ -160,11 +150,11 @@ def test_the_compile_budget_reaches_the_kernel_load_as_a_deadline(monkeypatch):
     seen = {}
     monkeypatch.setattr(program, "_time_module", SimpleNamespace(monotonic=lambda: 100.0))
 
-    def _capture(plan, *, deadline=None):
+    def _capture(plan, *, deadline=None, cubin_dir=None):
         seen["deadline"] = deadline
         raise program.CompileBudgetExceeded("stop here")
 
-    monkeypatch.setattr(program, "_load_plan", _capture)
+    monkeypatch.setattr(program, "_compile_kernels", _capture)
     with pytest.raises(program.CompileBudgetExceeded):
         program.CompiledProgram.build_from_plan(_stub_plan("k_one"), None, compile_timeout_s=7.5)
     assert seen["deadline"] == 107.5

@@ -32,6 +32,7 @@ from emmy.compiler.loader.quant import (
     spell_quantized_constants,
     spell_quantized_inputs,
     spell_static_fp4_activations,
+    spell_static_fp8_activations,
     unpack_int4,
 )
 from emmy.compiler.loader.safetensors import load_constants_from_safetensors
@@ -489,6 +490,42 @@ def test_spell_dynamic_activations_reuses_one_shared_w8a8_value(tmp_path):
     materialized = {node.output.dtype.name for node in g.nodes.values() if node.hints.get("trace.materialize")}
     assert materialized == {"f32", "f8e4m3"}
     assert spell_dynamic_fp8_activations(g, str(tmp_path)) == 0
+
+
+def test_spell_static_activations_share_one_round_trip_per_scale(tmp_path):
+    bits = _finite_bits((8, 16))
+    weight_scale = torch.ones((1,), dtype=torch.float32)
+    tensors = {}
+    for name, act_scale in (("q", 0.5), ("k", 0.5), ("o", 2.0)):
+        tensors[f"layer.{name}.weight"] = _fp8_tensor(bits)
+        tensors[f"layer.{name}.weight_scale_inv"] = weight_scale
+        tensors[f"layer.{name}.activation_scale"] = torch.tensor(act_scale, dtype=torch.float32)
+    _write_checkpoint(tmp_path, tensors, {**_FP8_QC, "activation_scheme": "static"})
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 16), "f16"), node_id="x")
+    for name in ("q", "k", "o"):
+        weight = f"p_{name}"
+        g.add_node(
+            ConstantOp(name=weight, source_path=f"layer.{name}.weight", source_shape=(8, 16), source_dtype="f16"),
+            [],
+            Tensor(weight, (8, 16), "f16"),
+            node_id=weight,
+        )
+        g.add_node(LinearOp(), ["x", weight], Tensor(f"y_{name}", (4, 8), "f16"), node_id=f"y_{name}")
+    g.inputs, g.outputs = ["x"], ["y_q", "y_k", "y_o"]
+
+    assert spell_quantized_constants(g, str(tmp_path)) == 3
+    assert spell_dynamic_fp8_activations(g, str(tmp_path)) == 0
+    assert spell_static_fp8_activations(g, str(tmp_path)) == 3
+
+    # q and k were calibrated to one scale and read one round trip; o has its own.
+    assert g.nodes["y_q"].inputs[0] == g.nodes["y_k"].inputs[0] != g.nodes["y_o"].inputs[0]
+    assert len([n for n in _ops_by_type(g, ElementwiseOp) if n.op.op.name == "to_f8e4m3"]) == 2
+    assert not [n for n in _ops_by_type(g, ReduceOp) if n.op.op.name == "maximum"]
+    assert not any(node.hints.get("trace.materialize") for node in g.nodes.values())
+    scale_paths = {op.source_path for op in _constants(g).values() if op.source_path and op.source_path.endswith("activation_scale")}
+    assert scale_paths == {"layer.q.activation_scale", "layer.o.activation_scale"}
+    assert spell_static_fp8_activations(g, str(tmp_path)) == 0
 
 
 def test_spell_dynamic_activations_requires_checkpoint_declaration(tmp_path):
@@ -1014,6 +1051,39 @@ def test_quantized_checkpoint_dir_detects_ct_int4(tmp_path):
     assert quantized_checkpoint_dir(str(tmp_path)) == tmp_path
 
 
+def test_load_quantized_split_decodes_ct_int4_linears(tmp_path):
+    """The shard-streamed layer load reads compressed-tensors' own sibling names, not AWQ's
+    ``qweight``, and its bfloat16 scales: a coded projection left out of the state dict stays META
+    and fails the trace."""
+    transformers = pytest.importorskip("transformers")
+    from safetensors.torch import save_file
+
+    from emmy.compiler.trace.huggingface import load_quantized_split
+
+    cfg = transformers.Qwen3Config(
+        hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1, head_dim=8, vocab_size=32
+    )
+    model = transformers.AutoModelForCausalLM.from_config(cfg).half()
+    tensors = {k: v.clone() for k, v in model.state_dict().items()}
+    q = "model.layers.0.self_attn.q_proj"
+    integers = (np.arange(16 * 16, dtype=np.int32).reshape(16, 16) * 7 + 3) % 16
+    zeros = (np.arange(4 * 16, dtype=np.int32).reshape(4, 16) * 5 + 1) % 16
+    scales = (np.arange(4 * 16, dtype=np.float32).reshape(4, 16) + 1) / 128  # exact in bfloat16
+    del tensors[q + ".weight"]
+    tensors[q + ".weight_packed"] = torch.from_numpy(_pack_gptq4(integers, rows=True).T.copy())
+    tensors[q + ".weight_zero_point"] = torch.from_numpy(_pack_gptq4(zeros, rows=False).T.copy())
+    tensors[q + ".weight_scale"] = torch.from_numpy(scales.T.copy()).bfloat16()  # the real checkpoint's dtype
+    tensors[q + ".weight_shape"] = torch.tensor([16, 16], dtype=torch.int64)
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps({**cfg.to_dict(), "quantization_config": _CT_INT4_QC}))
+
+    loaded, _store = load_quantized_split(tmp_path, torch.float16)
+    ref = (integers - np.repeat(zeros, 4, axis=0)) * np.repeat(scales, 4, axis=0)
+    weight = loaded.state_dict()[q + ".weight"]
+    assert not weight.is_meta
+    np.testing.assert_array_equal(weight.float().numpy(), ref.T.astype(np.float16).astype(np.float32))
+
+
 @pytest.mark.parametrize("field, value", [("desc_act", True), ("sym", False), ("bits", 8), ("checkpoint_format", "gptq_v2")])
 def test_gptq_config_rejects_unverified_variants(tmp_path, field, value):
     """Each of these would decode without complaint and produce wrong weights, so each must raise."""
@@ -1530,13 +1600,13 @@ def _w4a4_graph(modules, *, k=32, dtype="f32"):
 
 
 def _static_quantize_ref(x, s2):
-    """The spelled quantize's numpy twin: :func:`quantize_nvfp4` with the static ``s2``, the
-    divisor floored the way the graph floors it (a zero fused scale divides by the floor; the
-    decode multiplies those blocks back to zero either way)."""
+    """The spelled quantize's f32 activation algebra, with exact division in NumPy."""
     blocks = x.astype(np.float32).reshape(*x.shape[:-1], -1, 16)
-    scale_bits = encode_f8(np.abs(blocks).max(axis=-1) / 6.0 / s2, "f8e4m3")
-    fused = fuse_nvfp4_scales(scale_bits, np.float32(s2).reshape(1)).astype(np.float32)
-    quot = blocks / np.maximum(fused[..., None], 1e-12)
+    ratio = (np.abs(blocks).max(axis=-1) * (np.float32(1) / np.float32(6))) * (np.float32(1) / np.float32(s2))
+    scale_bits = encode_f8(ratio, "f8e4m3")
+    decoded = decode_f8(scale_bits, "f8e4m3")
+    fused = decoded * np.float32(s2)
+    quot = blocks / np.maximum(fused[..., None], np.float32(1e-12))
     return dequantize_nvfp4(encode_f4x2(quot.reshape(x.shape)), scale_bits, np.float32(s2).reshape(1))
 
 
@@ -1566,6 +1636,30 @@ def test_spell_static_fp4_matches_the_quantize_oracle(tmp_path):
     ref = _static_quantize_ref(x, s2) @ dequantize_nvfp4(packed, scale_bits, np.array(0.25, dtype=np.float32)).T
     assert not np.any(np.isnan(got))
     np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6)
+
+
+def test_spell_static_fp4_encodes_before_f16_fused_scale_rounding(tmp_path):
+    """A value at the 2/3 FP4 midpoint catches an f16 cast before code selection.
+
+    This pins the graph's f32 algebra, not exact CUDA ``rcp.approx`` byte parity.
+    Zero E4M3 scales retain the graph's finite divisor floor, which differs from
+    stock's explicit zero output scale for tiny nonzero blocks.
+    """
+    from emmy.compiler.backend.numpy import NumpyBackend
+
+    _w4a4_checkpoint(tmp_path, {"layer": (8, 0.1)})
+    g = _w4a4_graph({"layer": 8})
+    assert spell_quantized_constants(g, str(tmp_path)) == 1
+    assert spell_static_fp4_activations(g, str(tmp_path)) == 1
+    assert g.buffer("x_static_fp4_fused32").dtype.name == "f32"
+    g.outputs.extend(["x_static_fp4_scale_bits", "x_static_fp4_bits"])
+
+    x = np.zeros((4, 32), dtype=np.float32)
+    x[0, :2] = (0.625, 0.25)
+    data = load_constants_from_safetensors(g, str(tmp_path))
+    result, _ = NumpyBackend().run(g, input_data={**data, "x": x})
+    assert int(result.outputs["x_static_fp4_scale_bits"][0, 0, 0]) == 0x38  # E4M3 1.0
+    assert int(result.outputs["x_static_fp4_bits"][0, 0]) == 0x47  # FP4 [6, 2]
 
 
 def test_spell_static_fp4_shares_equal_scales_and_splits_unequal(tmp_path):
@@ -1945,6 +2039,8 @@ _FRONTEND_BAND_ALLOWLIST = {
     "emmy/compiler/loader/safetensors.py",  # checkpoint reads (fp8 bits, scale tensors)
     "emmy/compiler/loader/synthesize.py",  # writes the checkpoint ``--quantize`` then reads back through the speller
     "emmy/compiler/trace/huggingface.py",  # quantized-twin construction + detection
+    "emmy/serving/mlp.py",  # checkpoint leaf/profile reader and post-trace spelling for the mixed MLP lane
+    "emmy/serving/native/prepare.py",  # checkpoint preparation: loads a quantized checkpoint onto the checkpoint-sourced lane
     "emmy/serving/vllm_model_gen.py",  # loader-role: routes checkpoint keys (scale siblings included) into the fork's attention
 }
 

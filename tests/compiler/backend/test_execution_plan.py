@@ -7,6 +7,7 @@ including the composite ceil-div grid factors that the Graph-JSON path can't
 round-trip — and (3) the pack-side weight load-op vocabulary matching the binder.
 """
 
+import dataclasses
 import json
 
 import numpy as np
@@ -15,6 +16,7 @@ import pytest
 from emmy.compiler.backend.plan import (
     PLAN_FORMAT_GENERATED,
     PLAN_FORMAT_INDIRECT,
+    PLAN_FORMAT_PAGED,
     PLAN_FORMAT_VERSION,
     WeightSpec,
     _encode_load_ops,
@@ -28,6 +30,7 @@ from emmy.compiler.ir.base import ConstantOp, InputOp
 from emmy.compiler.ir.cuda import CudaOp, TmaDescMeta
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.frontend.ir import ReshapeOp, TransposeOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 from emmy.compiler.loader.binder import apply_load_ops
 
 
@@ -99,6 +102,22 @@ def test_a_plan_stored_under_the_old_tma_key_still_reads():
     assert plan_from_dict(wire).kernels["k_test"].arch_specific is True
 
 
+def test_only_a_kernel_that_waits_on_its_predecessor_launches_dependent():
+    """A programmatic dependent launch may start a kernel before the grid ahead of it finished, so
+    only a kernel whose source waits on that grid (``griddepcontrol.wait``) is marked, and a plan
+    stored before the mark existed reads unmarked: its kernels launch serialized."""
+    graph = _sample_graph()
+    assert plan_from_graph(graph).kernels["k_test"].dependent_launch is False
+    node = graph.nodes["y"]
+    node.op = dataclasses.replace(node.op, kernel_source='__global__ void k_test() { asm volatile("griddepcontrol.wait;"); }')
+    plan = plan_from_graph(graph)
+    assert plan.kernels["k_test"].dependent_launch is True
+    wire = json.loads(json.dumps(plan_to_dict(plan)))
+    assert plan_from_dict(wire).kernels["k_test"].dependent_launch is True
+    del wire["kernels"]["k_test"]["dependent_launch"]
+    assert plan_from_dict(wire).kernels["k_test"].dependent_launch is False
+
+
 def test_a_plan_without_the_dtype_field_keeps_the_stored_dtype_read():
     """A pack baked before ``WeightSpec.graph_dtype`` existed must keep loading.
 
@@ -138,7 +157,7 @@ def test_plan_round_trip_preserves_binary_key():
 
 def test_plan_format_version_gate():
     d = plan_to_dict(plan_from_graph(_sample_graph()))
-    d["format"] = max(PLAN_FORMAT_INDIRECT, PLAN_FORMAT_GENERATED) + 1  # past every format the runtime speaks
+    d["format"] = max(PLAN_FORMAT_INDIRECT, PLAN_FORMAT_GENERATED, PLAN_FORMAT_PAGED) + 1  # past every format the runtime speaks
     with pytest.raises(ValueError, match="format"):
         plan_from_dict(d)
 
@@ -200,6 +219,8 @@ def test_grid_expr_survives_round_trip():
         (TransposeOp(axes=(2, 0, 1)),),
         (ReshapeOp(shape=(6, -1)),),
         (TransposeOp(axes=(1, 0, 2)), ReshapeOp(shape=(4, 6))),
+        (ElementwiseOp(op="reciprocal"),),
+        (ElementwiseOp(op="reciprocal"), ReshapeOp(shape=(4, 6))),
     ],
 )
 def test_apply_weight_loads_matches_binder(load_ops):
@@ -282,6 +303,18 @@ def _one_weight_plan(op, nid="w"):
     return plan_from_graph(g)
 
 
+def test_reciprocal_load_op_rebinds_after_plan_json_round_trip():
+    """A saved plan replays the same f32 reciprocal as direct constant binding."""
+    source = np.array([[0.1, 0.03, 2.0, 4.0]] * 4, dtype=np.float32)
+    ops = (ElementwiseOp(op="reciprocal"),)
+    plan = _one_weight_plan(ConstantOp(name="w", source_path="model.w", source_shape=(4, 4), source_dtype="f32", load_ops=ops))
+    wire = json.loads(json.dumps(plan_to_dict(plan)))
+    assert wire["weights"]["w"]["ops"] == [["reciprocal", []]]
+    restored = plan_from_dict(wire)
+    assert restored.weights["w"].load_ops == (("reciprocal", ()),)
+    np.testing.assert_array_equal(apply_weight_loads(source, restored.weights["w"].load_ops), apply_load_ops(source, ops))
+
+
 def _slice_index_map(out_shape, spans):
     """A single-source ``IndexMapOp`` reading ``spans`` (per-axis ``(start, step)``)."""
     from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
@@ -317,19 +350,23 @@ def test_non_affine_index_map_stays_outside_the_vocabulary():
 
 
 def test_unreproducible_bind_record_marks_the_weight_unbindable(caplog):
-    """A record the plan cannot reproduce (leaves it would have to read from the checkpoint)
-    must mark the weight ``load_ops=None`` — the pack save then refuses, rather than writing a
-    pack whose boot silently drops the weight."""
+    """A record the plan cannot reproduce (more than one leaf it would have to read from the
+    checkpoint) must mark the weight ``load_ops=None`` — the pack save then refuses, and the
+    serving runner's binding raises, rather than a boot that silently drops the weight."""
     import logging
 
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+
     record = Graph()
-    record.add_node(
-        op=ConstantOp(name="leaf", source_path="model.external", source_shape=(4, 4), source_dtype="f32"),
-        inputs=[],
-        output=Tensor("leaf", (4, 4)),
-        node_id="leaf",
-    )
-    record.outputs = ["leaf"]
+    for leaf in ("a", "b"):
+        record.add_node(
+            op=ConstantOp(name=leaf, source_path=f"model.{leaf}", source_shape=(4, 4), source_dtype="f32"),
+            inputs=[],
+            output=Tensor(leaf, (4, 4)),
+            node_id=leaf,
+        )
+    record.add_node(op=ElementwiseOp(op="add"), inputs=["a", "b"], output=Tensor("sum", (4, 4)), node_id="sum")
+    record.outputs = ["sum"]
     with caplog.at_level(logging.WARNING, logger="emmy.compiler.backend.plan"):
         plan = _one_weight_plan(ConstantOp(name="h", source_graph=record, source_shape=(4, 4)))
     assert plan.weights["w"].load_ops is None

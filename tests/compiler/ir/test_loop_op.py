@@ -3,11 +3,13 @@
 from dataclasses import replace
 
 import pytest
+from frozendict import frozendict
 
 from emmy.compiler.ir.elementwise import ElementwiseImpl
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.loop import (
     Accum,
+    Affine,
     Assign,
     Axis,
     Load,
@@ -17,6 +19,7 @@ from emmy.compiler.ir.loop import (
     SelectBranch,
     Write,
 )
+from emmy.compiler.ir.stmt.body import Body
 
 
 def Port(index=()):
@@ -223,7 +226,6 @@ def test_injective_buffer_rename_preserves_normal_form_cache() -> None:
     rename = {"X": "z_input", "Y": "a_input", "O": "renamed_output"}
     renamed = op.rename_buffers(rename)
     assert renamed.body._normalized is renamed.body
-    assert renamed.body._normalized_without_hoist is renamed.body
     assert replace(renamed, outputs=renamed.outputs).body is renamed.body
     assert tuple(load.input for load in renamed.loads) == tuple(rename[load.input] for load in op.loads)
     assert renamed.identity_key() == op.identity_key()
@@ -241,7 +243,6 @@ def test_aliasing_buffer_rename_does_not_preserve_normal_form_cache() -> None:
 
     renamed = op.rename_buffers({"X": "input", "Y": "input"})
     assert "_normalized" not in renamed.body.__dict__
-    assert "_normalized_without_hoist" not in renamed.body.__dict__
 
 
 def test_update_synthesizes_accum_decl():
@@ -367,6 +368,7 @@ def test_kernel_softmax_two_accumulators():
             Accum(name="mx", value="$0", op="maximum"),
             Accum(name="sm", value="$0"),
             Write(output="out_0", index=(Var("a0"),), value="mx"),
+            Write(output="out_1", index=(Var("a0"),), value="sm"),
         ),
     )
     # rename_ssa_sequential renames Accums to acc0, acc1 in definition order.
@@ -424,7 +426,7 @@ def test_ssa_rejects_undefined_arg():
         _loop(
             axes=axes,
             inputs=(p,),
-            body=(Assign("y", ElementwiseImpl("exp"), args=("z",)),),
+            body=(Assign("y", ElementwiseImpl("exp"), args=("z",)), Write(output="out_0", index=(Var("a0"),), value="y")),
         )
 
 
@@ -438,6 +440,7 @@ def test_ssa_rejects_duplicate_name():
             body=(
                 Assign("y", ElementwiseImpl("exp"), args=("$0",)),
                 Assign("y", ElementwiseImpl("negative"), args=("y",)),
+                Write(output="out_0", index=(Var("a0"),), value="y"),
             ),
         )
 
@@ -458,9 +461,9 @@ def test_ssa_topo_sorts_forward_reference():
         ),
     )
     # After normalization the rename pass canonicalizes to v0, v1; the
-    # exp-Assign (originally "b") must precede the add-Assign that uses it.
-    fns = [s.op.name for s in k.body[0].body if isinstance(s, Assign)]
-    assert fns == ["exp", "add"], fns
+    # exp-Assign (originally "b") must precede the Affine sum that uses it.
+    kinds = [s.op.name if isinstance(s, Assign) else type(s).__name__ for s in k.body[0].body if isinstance(s, (Assign, Affine))]
+    assert kinds == ["exp", "Affine"], kinds
 
 
 def test_ssa_allows_input_name_reuse_in_multiple_args():
@@ -476,8 +479,8 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
             Write(output="out_0", index=(Var("a0"),), value="c"),
         ),
     )
-    # 1 synthesized Load + 3 Assigns + 1 Write.
-    assert sum(1 for s in k if not isinstance(s, Loop)) == 5
+    # 1 synthesized Load + exp + one Affine (the negation folded into the sum) + 1 Write.
+    assert sum(1 for s in k if not isinstance(s, Loop)) == 4
 
 
 def test_update_op_conflict_rejected():
@@ -492,6 +495,7 @@ def test_update_op_conflict_rejected():
             body=(
                 Accum(name="acc", value="$0", op="maximum"),
                 Accum(name="acc", value="$0", op="add"),
+                Write(output="out_0", index=(), value="acc"),
             ),
         )
 
@@ -640,3 +644,63 @@ def test_execute_loop_op_handles_nested_body():
     out_flat = flat.forward(x)
     out_nested = nested.forward(x)
     np.testing.assert_allclose(out_flat, out_nested, rtol=1e-5)
+
+
+def test_structural_key_is_the_same_bare_and_through_a_loop_op() -> None:
+    """Identity keys the executable normal form: hoisting a loop-invariant read at Loop op
+    construction must not key the op apart from the bare body it was built from."""
+    i = Var("i")
+    raw = Body(
+        (
+            Loop(
+                axis=Axis("i", 8),
+                body=(
+                    Load(name="s", input="S", index=()),
+                    Load(name="x", input="X", index=(i,)),
+                    Assign(name="y", op="multiply", args=("x", "s")),
+                    Write(output="O", index=(i,), value="y"),
+                ),
+            ),
+        )
+    )
+    op = LoopOp(body=raw)
+    assert op.body != raw, "the invariant read hoists"
+    assert op.body.structural_key() == raw.structural_key()
+
+
+def test_identity_binds_buffer_types_to_roles() -> None:
+    """``identity_key(with_io=True)`` types the ROLE a buffer plays. Two kernels whose typed
+    argument lists read the same in declaration order but assign the types to different roles
+    key apart; declaring the same typed roles in another order keys the same."""
+    from emmy.compiler.dtype import F16, F32  # noqa: PLC0415
+    from emmy.compiler.tensor import Tensor  # noqa: PLC0415
+
+    i = Var("i")
+
+    def body(product_left: str, product_right: str, subtrahend: str) -> Body:
+        return Body(
+            (
+                Loop(
+                    axis=Axis("i", 8),
+                    body=(
+                        Load(name="p", input=product_left, index=(i,)),
+                        Load(name="q", input=product_right, index=(i,)),
+                        Load(name="r", input=subtrahend, index=(i,)),
+                        Assign(name="m", op="multiply", args=("p", "q")),
+                        Assign(name="o", op="subtract", args=("m", "r")),
+                        Write(output="O", index=(i,), value="o"),
+                    ),
+                ),
+            )
+        )
+
+    def op(stmts: Body, *declared: tuple[str, object]) -> LoopOp:
+        inputs = frozendict({name: Tensor(name, (8,), dtype) for name, dtype in declared})
+        return LoopOp(body=stmts, inputs=inputs, outputs=frozendict({"O": Tensor("O", (8,), F32)}))
+
+    halves_f16 = op(body("A", "B", "C"), ("A", F16), ("B", F16), ("C", F32))
+    mixed_product = op(body("A", "C", "B"), ("A", F16), ("B", F16), ("C", F32))
+    redeclared = op(body("A", "B", "C"), ("C", F32), ("B", F16), ("A", F16))
+    assert halves_f16.identity_key() == mixed_product.identity_key(), "untyped, the bodies are one structure"
+    assert halves_f16.identity_key(with_io=True) != mixed_product.identity_key(with_io=True)
+    assert halves_f16.identity_key(with_io=True) == redeclared.identity_key(with_io=True)

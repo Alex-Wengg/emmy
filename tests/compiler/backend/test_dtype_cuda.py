@@ -11,14 +11,85 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from emmy import config
 from emmy.compiler import dtype as dt
 from emmy.compiler.backend.cuda.dtype import canonical_from_cuda_name, cuda_name, nbytes_of
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import InputOp
-from emmy.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SoftmaxOp
+from emmy.compiler.ir.frontend.ir import MatmulOp, RmsNormOp
 from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 from tests.compiler.helpers import requires_cuda
+
+
+@requires_cuda
+def test_f16_to_bf16_intermediate_rounds_before_multiply():
+    """A fused kernel must keep the BF16 cast between an FP16 scale and its use."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.numpy import NumpyBackend
+
+    graph = Graph()
+    graph.add_node(InputOp(), [], Tensor("scale", (16,), dt.F16), node_id="scale")
+    graph.add_node(InputOp(), [], Tensor("code", (16,), dt.BF16), node_id="code")
+    graph.add_node(ElementwiseOp("copy"), ["scale"], Tensor("rounded", (16,), dt.BF16), node_id="rounded")
+    graph.add_node(ElementwiseOp("multiply"), ["rounded", "code"], Tensor("out", (16,), dt.BF16), node_id="out")
+    graph.inputs, graph.outputs = ["scale", "code"], ["out"]
+
+    scale = np.array([1.00390625, -1.00390625] * 8, dtype=np.float16)
+    code = dt.encode_bf16(np.array([3.0, -3.0] * 8, dtype=np.float32))
+    feed = {"scale": scale, "code": code}
+    expected, _ = NumpyBackend().run(graph, input_data=feed)
+    shortcut = dt.encode_bf16(scale.astype(np.float32) * dt.decode_bf16(code))
+    assert np.any(expected.outputs["out"] != shortcut), "fixture must distinguish the intermediate BF16 round"
+
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if hasattr(n.op, "kernel_source"))
+    assert "__float2bfloat16" in sources
+    actual, _ = backend.run(compiled, input_data=feed)
+    np.testing.assert_array_equal(actual.outputs["out"], expected.outputs["out"])
+
+
+@requires_cuda
+@pytest.mark.parametrize(("dtype", "delta"), [(dt.F16, 2**-10), (dt.F32, 2**-13)])
+def test_separate_multiply_and_add_preserve_rounding(dtype, delta):
+    """A multiply and an add round separately, as eager does. f16 needs no flag: its ops are spelled
+    ``__hmul_rn`` / ``__hadd_rn``, which nvcc never contracts. f32 keeps nvcc's default contraction,
+    so the check turns it off explicitly."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+
+    graph = Graph()
+    for name in ("a", "b", "c"):
+        graph.add_node(InputOp(), [], Tensor(name, (32,), dtype), node_id=name)
+    graph.add_node(ElementwiseOp("multiply"), ["a", "b"], Tensor("product", (32,), dtype), node_id="product")
+    graph.add_node(ElementwiseOp("add"), ["product", "c"], Tensor("out", (32,), dtype), node_id="out")
+    graph.inputs, graph.outputs = ["a", "b", "c"], ["out"]
+    inputs = {name: np.full(32, value, dtype=dtype.np) for name, value in (("a", 1 + delta), ("b", 1 - delta), ("c", -1))}
+    backend = CudaBackend()
+    flags = config.nvcc_flags() if dtype == dt.F16 else f"{config.nvcc_flags()} --fmad=false"
+    with config.nvcc_flags_override(flags):
+        compiled = backend.compile(graph)
+        result, _ = backend.run(compiled, input_data=inputs)
+    np.testing.assert_array_equal(result.outputs["out"], inputs["a"] * inputs["b"] + inputs["c"])
+
+
+@requires_cuda
+def test_scalar_fp16_matmul_widens_products_before_accumulation():
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    graph = Graph()
+    graph.add_node(InputOp(), [], Tensor("a", (1, 3), dt.F16), node_id="a")
+    graph.add_node(InputOp(), [], Tensor("b", (3, 1), dt.F16), node_id="b")
+    graph.add_node(MatmulOp(), ["a", "b"], Tensor("out", (1, 1), dt.F16), node_id="out")
+    graph.inputs, graph.outputs = ["a", "b"], ["out"]
+    a = np.array([[300, 300, 1.001]], dtype=np.float16)
+    b = np.array([[300], [-300], [1.001]], dtype=np.float16)
+    backend = CudaBackend()
+    with pinned_knobs({"TILE": "", "REDUCE": "", "PLACE": ""}):
+        compiled = backend.compile(graph)
+    result, _ = backend.run(compiled, input_data={"a": a, "b": b})
+    np.testing.assert_array_equal(result.outputs["out"], a @ b)
 
 
 def test_cuda_name_int_dtypes():
@@ -84,6 +155,27 @@ def test_fp8_cuda_traits():
         assert nbytes_of(spelling) == 1
 
 
+@requires_cuda
+@pytest.mark.parametrize("output_dtype", [dt.F16, dt.F32])
+def test_e4m3_decode_exhaustive_cuda(output_dtype):
+    """Every code, including subnormals, signed zero and both NaNs, matches the storage oracle."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+
+    graph = Graph()
+    graph.add_node(InputOp(), [], Tensor("bits", (256,), dt.F8E4M3), node_id="bits")
+    graph.add_node(ElementwiseOp("from_f8e4m3"), ["bits"], Tensor("decoded", (256,), output_dtype), node_id="decoded")
+    graph.inputs, graph.outputs = ["bits"], ["decoded"]
+    bits = np.arange(256, dtype=np.uint8)
+    backend = CudaBackend()
+    result, _ = backend.run(backend.compile(graph), input_data={"bits": bits})
+    got = result.outputs["decoded"]
+    expected = dt.decode_f8(bits, "f8e4m3").astype(got.dtype)
+    finite = np.isfinite(expected)
+    np.testing.assert_array_equal(np.isnan(got), np.isnan(expected))
+    np.testing.assert_array_equal(got[finite], expected[finite])
+    np.testing.assert_array_equal(np.signbit(got[finite]), np.signbit(expected[finite]))
+
+
 def _fp16_chain_graph() -> Graph:
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1024,), dt.F16), node_id="x")
@@ -95,9 +187,11 @@ def _fp16_chain_graph() -> Graph:
 
 
 @requires_cuda
-def test_fp16_elementwise_chain_cuda():
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_fp16_elementwise_chain_cuda(monkeypatch, fast_math):
     from emmy.compiler.backend.cuda.backend import CudaBackend
 
+    monkeypatch.setenv("EMMY_FAST_MATH", str(int(fast_math)))
     graph = _fp16_chain_graph()
     compiled = CudaBackend().compile(Pipeline.build(LOOP_PASSES).run(graph))
     # Verify the rendered CUDA source picked up fp16 signature + include
@@ -109,11 +203,11 @@ def test_fp16_elementwise_chain_cuda():
     sources = "\n".join(n.op.kernel_source for n in cuda_nodes)
     assert "__half" in sources, f"expected __half in kernel sources, got:\n{sources}"
     assert "cuda_fp16.h" in sources, f"expected cuda_fp16.h include, got:\n{sources}"
-    # Native fp16 chain — no boundary conversions on the data path.
-    # ``hexp`` (fp16 exp) + ``__float2half(0.0f)`` for the negation literal,
-    # native ``operator-`` on __half. No ``__half2float`` anywhere.
-    assert "hexp" in sources, f"expected native hexp, got:\n{sources}"
-    assert "__half2float" not in sources, f"native fp16 chain should not promote to float, got:\n{sources}"
+    if fast_math:
+        assert "__expf" in sources and "__float2half" in sources and "__half2float" in sources
+    else:
+        assert "hexp" in sources, f"expected native hexp, got:\n{sources}"
+        assert "__half2float" not in sources, f"native fp16 chain should not promote to float, got:\n{sources}"
 
     rng = np.random.default_rng(0)
     x_data = (rng.standard_normal(1024) * 0.5).astype(np.float16)
@@ -147,7 +241,7 @@ def test_fp16_fallback_to_float_for_non_native_op():
     sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
     # Signature stays __half; the fallback inserts __half2float on the
     # input and __float2half on the store, with f32 erff in between.
-    assert "__half* y" in sources or "__half* x" in sources, sources
+    assert "__half* __restrict__ y" in sources or "__half* __restrict__ x" in sources, sources
     assert "erff" in sources, f"expected fallback to f32 erff, got:\n{sources}"
     assert "__half2float" in sources, f"expected promote-to-float at use, got:\n{sources}"
     assert "__float2half" in sources, f"expected demote-to-half at store, got:\n{sources}"
@@ -234,35 +328,6 @@ def test_fp16_matmul_cuda():
 
 
 @requires_cuda
-@pytest.mark.xfail(strict=True, reason="fused value channel on tensor cores: not on this tree yet (PR #699)")
-def test_fp16_softmax_cuda():
-    """fp16 softmax along last dim: two reductions (max + sum) on f16
-    values with f32 accumulators, then a per-element divide."""
-    from emmy.compiler.backend.cuda.backend import CudaBackend
-
-    rows, cols = 4, 64
-    g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (rows, cols), dt.F16), node_id="x")
-    g.add_node(op=SoftmaxOp(axis=-1), inputs=["x"], output=Tensor("y", (rows, cols), dt.F16), node_id="y")
-    g.inputs = ["x"]
-    g.outputs = ["y"]
-
-    rng = np.random.default_rng(4)
-    x_data = rng.standard_normal((rows, cols)).astype(np.float16)
-
-    be = CudaBackend()
-    result, _ = be.run(be.compile(g), input_data={"x": x_data})
-    out = next(iter(result.outputs.values())).reshape(rows, cols)
-    assert out.dtype == np.float16
-
-    xf = x_data.astype(np.float32)
-    m = xf.max(axis=-1, keepdims=True)
-    e = np.exp(xf - m)
-    expected = (e / e.sum(axis=-1, keepdims=True)).astype(np.float16)
-    np.testing.assert_allclose(out, expected, rtol=5e-3, atol=5e-3)
-
-
-@requires_cuda
 def test_fp16_rmsnorm_cuda():
     """fp16 RMSNorm: ``x * rsqrt(mean(x*x) + eps) * weight``. The
     sum-of-squares reduction needs the f32 accumulator (x^2 in fp16
@@ -313,3 +378,22 @@ def test_fp16_max_reduction_stays_in_fp16():
     assert "__half acc" in sources, f"expected fp16 accumulator for max, got:\n{sources}"
     # The combine uses __hmax (native fp16 max), not fmaxf.
     assert "__hmax" in sources, f"expected __hmax intrinsic for fp16 max, got:\n{sources}"
+
+
+@requires_cuda
+def test_f32_floor_renders_and_rounds_down():
+    """``floor`` (Ministral 3's position-dependent query scale) renders as ``floorf``."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda import CudaOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1024,), dt.F32), node_id="x")
+    g.add_node(op=ElementwiseOp("floor"), inputs=["x"], output=Tensor("y", (1024,), dt.F32), node_id="y")
+    g.inputs, g.outputs = ["x"], ["y"]
+    compiled = CudaBackend().compile(Pipeline.build(LOOP_PASSES).run(g))
+    sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
+    assert "floorf" in sources, sources
+
+    x_data = (np.random.default_rng(2).standard_normal(1024) * 8).astype(np.float32)
+    result, _ = CudaBackend().run(compiled, input_data={"x": x_data})
+    np.testing.assert_array_equal(next(iter(result.outputs.values())).reshape(-1), np.floor(x_data))

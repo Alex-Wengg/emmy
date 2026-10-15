@@ -4,7 +4,7 @@ One :class:`TileOp` is the article's reduction skeleton — ``project ∘ reduce
 scheduled but not yet bound to hardware threads. It sits between Loop IR (pure iteration) and
 Kernel IR (threads / smem):
 
-    Loop IR ──lowering/tile──▶ Tile IR ──lowering/kernel──▶ Kernel IR
+    Loop IR ──tile/*──▶ Tile IR ──lowering/kernel──▶ Kernel IR
 
 The whole point of the layer is the article's thesis: **the schedule is separate from the
 combine.** The combine is not defined here — it is the :class:`~emmy.compiler.ir.pure.fold.Fold`
@@ -37,7 +37,7 @@ from frozendict import frozendict
 
 from emmy.compiler.dim import Dim
 from emmy.compiler.ir.axis import Axis
-from emmy.compiler.ir.base import Op
+from emmy.compiler.ir.base import Op, buffer_types
 from emmy.compiler.ir.expr import BinaryExpr, Interval, Literal, SimplifyCtx, Var
 from emmy.compiler.ir.pure.fold import Fold
 from emmy.compiler.ir.schedule import Placement, WarpSpec
@@ -50,20 +50,10 @@ from emmy.compiler.ir.schedule.views import (
     contraction_facts,
 )
 from emmy.compiler.ir.stmt import Body, Load, Loop, OutputSpec, Stmt, Write
-from emmy.compiler.ir.stmt.body import free_names
+from emmy.compiler.ir.tile.boundary import apply_output_specs
 from emmy.compiler.ir.tile.normalize import normalize_fold_tree
+from emmy.compiler.ir.tile.ops import Sched, chain_members, kernel_roots, refused_roots
 from emmy.compiler.ir.tile.path import Site, sites
-
-
-def _sweep_start(stmts, axis_name: str) -> int:
-    """The first index of the trailing projection run a ``sweep`` store's output ``Loop``
-    wraps — the earliest stmt reading the sweep axis. The trailing-RUN rule (everything from that
-    stmt on is swept) is deliberately simple; the :func:`extract_output_specs` round-trip gate is
-    what proves it reproduces the captured loop."""
-    for i, s in enumerate(stmts):
-        if axis_name in free_names(s):
-            return i
-    return len(stmts)
 
 
 def observed_result_names(op) -> frozenset[str]:
@@ -79,79 +69,11 @@ def observed_result_names(op) -> frozenset[str]:
             continue
         if node.observe is not None:
             names.update(node.observe.results)
+        if node.carries:  # a carried state's per-step outputs stream the same way
+            names.update(node.exposes[len(node.base.results) :])
         stack.extend(node.operands)
         stack.extend(s for s in node.lift.body if isinstance(s, Fold))
     return frozenset(names)
-
-
-def _splice_streamed(stmts: list, write: Write) -> bool:
-    """Splice a streamed store into the (deepest) reduce ``Loop`` whose body defines its observed
-    values — at the body end, after the observer stmts the derived step placed last. ``False``
-    when no such loop is present (a term-level stream, where the store stays at its post-node
-    position)."""
-    values = set(write.values)
-    for i, stmt in enumerate(stmts):
-        if not isinstance(stmt, Loop):
-            continue
-        inner = list(stmt.body)
-        if _splice_streamed(inner, write):
-            stmts[i] = stmt.with_bodies((Body(tuple(inner)),))
-            return True
-        if stmt.is_reduce and values <= set().union(*(Body((s,)).ssa_defs for s in inner)):
-            stmts[i] = stmt.with_bodies((Body((*inner, write)),))
-            return True
-    return False
-
-
-def apply_output_specs(stmts, specs, *, observed: frozenset = frozenset()) -> Body:
-    """Reassemble the EFFECTFUL stmt stream from a pure statement STREAM + the kernel-boundary
-    output specifications — the materializer's spelling, where the grid binds every free axis
-    and nothing is a term: a store appends as the kernel tail, consecutive ``sweep`` stores on one
-    axis path wrap the trailing run of stmts reading that path's axes (:func:`_sweep_start`) into
-    a per-cell output ``Loop`` nest, and a store over OBSERVED values streams into its reduce loop
-    when that loop is present. A group's loops open innermost-out along its path, stopping at the
-    deepest PREFIX a later spec's path also carries — the last group carrying a shared prefix
-    opens those loops, each wrapping every store and nest already built inside its trailing run —
-    so one source loop is opened exactly once however many specs rode it. (Prefixes, not names:
-    sibling nests legitimately reuse inner axis names, and only an identical prefix is the same
-    source loop.) The ONE reconstitution rule the scheduler's tail gates, the materializer's
-    zero-axis ``Fold`` peel and ``030_cut`` share, so the lowered kernels stay byte-identical to
-    the stored-``Write`` era. A TERM places its stores itself (:meth:`Fold.lower`)."""
-    out = list(stmts)
-    stores = list(specs)
-    index = 0
-    while index < len(stores):
-        st = stores[index]
-        if not st.sweep:
-            # At term level — the fold not yet a ``Loop`` — an observed store keeps its post-node
-            # position, which is also where extraction's round-trip gate expects it.
-            if not (observed and set(st.write.values) <= observed and _splice_streamed(out, st.write)):
-                out.append(st.write)
-            index += 1
-            continue
-        end = index + 1
-        while end < len(stores) and stores[end].sweep == st.sweep:
-            end += 1
-        later = stores[end:]
-        writes = tuple(store.write for store in stores[index:end])
-        if _shares_prefix(later, st.sweep, len(st.sweep)):
-            out.extend(writes)  # the last group with this path opens the loop and collects these
-        else:
-            start = _sweep_start(out, st.sweep[-1].name)
-            out = [*out[:start], Loop(axis=st.sweep[-1], body=Body((*out[start:], *writes)))]
-            for depth in range(len(st.sweep) - 1, 0, -1):
-                if _shares_prefix(later, st.sweep, depth):
-                    break  # a shared prefix stays open for its last carrier (sharing is monotone)
-                axis = st.sweep[depth - 1]
-                start = _sweep_start(out, axis.name)
-                out = [*out[:start], Loop(axis=axis, body=Body(tuple(out[start:])))]
-        index = end
-    return Body(tuple(out))
-
-
-def _shares_prefix(later, path: tuple, length: int) -> bool:
-    """Whether a spec in ``later`` rides the same source loops as ``path``'s first ``length``."""
-    return any(spec.sweep[:length] == path[:length] for spec in later)
 
 
 def _dense_axis_suffix(index: tuple, name: str) -> bool:
@@ -200,23 +122,27 @@ def promoted_sweep(op, output_specs: tuple[OutputSpec, ...], *, free: tuple[Axis
     - every reduce the term holds reads the axis, so each cell folds its own and binding the axis
       replicates none of them — the NVFP4 encode's packed codes over a maximum taken across each
       sixteen of them. A term with NO reduce satisfies that vacuously, and then it promotes only
-      when ``free`` is empty: a kernel with no free axis launches ONE block whatever it does, so
-      its shared sweep is the only axis the launch could spread over. Where the placement already
+      when ``free`` launches ONE block — no free axis, or only static unit ones (a decode row) —
+      so its shared sweep is the only axis the launch could spread over. Where the placement already
       has an axis, a bare elementwise sweep stays a sweep — the kernel materializer distributes
       exactly that across a worker inventory (``_lane_close``, the close a cooperating reduce's
       projection takes), and binding it here would decide for the schedule that measured the
-      alternative (``cases/reduce/rms-norm-cut-sweep-work.yaml``: 885.9 us walked in one thread,
+      alternative (``cases/reduce/rms-norm-cut-sweep-work.json``: 885.9 us walked in one thread,
       4.2 us split across 512).
 
     The complement is what the reduce clause protects: a reduce that does NOT read the axis is the
     row's statistic, evaluated once for the whole sweep — softmax's maximum, rms-norm's sum of
     squares. Binding the sweep would recompute it per output element, so that sweep stays a loop.
 
+    A STATIC UNIT axis promotes on neither ground and still binds: it spreads the launch over one
+    cell, so it replicates nothing whatever the term does, and it is the geometry a contraction's
+    ``(m, n)`` pair is read off — sweeping it drops an elided matrix row.
+
     Three readers, one rule. :meth:`TileOp.__post_init__` applies it. The cut pass asks it of a
     candidate piece, to decide whether peeling an output off a multi-output kernel would give that
     piece a grid pair the fused kernel cannot have. And the full-projection cut reads its refusal
     from the other side: a reduce this will not bind past is one that cut hands its own kernel
-    (both in ``lowering/tile/_cut.py``).
+    (both in ``tile/_cut.py``).
     """
     if not output_specs:
         return set()
@@ -235,33 +161,38 @@ def promoted_sweep(op, output_specs: tuple[OutputSpec, ...], *, free: tuple[Axis
     nodes = tuple(site.node for site in sites(op))
     contractions = tuple(node for node in nodes if node.as_contraction() is not None)
     reduces = tuple(node for node in nodes if isinstance(node, Fold) and node.axis is not None)
+    one_block = all(axis.extent.is_static and axis.extent.as_static() == 1 for axis in free)
     return {
         name
         for name in shared
-        if any(any(name in edge.free_axes for edge in con.operands) for con in contractions)
-        or (all(name in reduce.free_axes for reduce in reduces) and (reduces or not free))
+        if (rides[0][name].is_static and rides[0][name].as_static() == 1)
+        or any(any(name in edge.free_axes for edge in con.operands) for con in contractions)
+        or (all(name in reduce.free_axes for reduce in reduces) and (reduces or one_block))
     }
 
 
 def _implicit_unit_row(specs: tuple[OutputSpec, ...], free: tuple[Axis, ...]) -> Axis | None:
-    """Recover an elided matrix row when every boundary write proves ``[0..., n]``.
+    """Recover an elided matrix row when every boundary write proves leading zero coordinates.
 
     The column axis may already be free or may still be the one shared output sweep that
     contraction canonicalization will promote. The unit coordinates must be a non-empty leading
-    zero prefix, followed by the dense column coordinate directly or through a row-major reshape.
+    zero prefix, followed by dense column coordinates directly or through a row-major reshape.
+    Several free coordinates may partition the columns into groups.
     """
     if not specs:
         return None
-    if len(free) == 1 and all(not spec.sweep for spec in specs):
-        n_name = free[0].name
+    if free and all(not spec.sweep for spec in specs):
+        columns = tuple(axis.name for axis in free)
     elif not free and all(len(spec.sweep) == 1 for spec in specs) and len({spec.sweep[0].name for spec in specs}) == 1:
-        n_name = specs[0].sweep[0].name
+        columns = (specs[0].sweep[0].name,)
     else:
         return None
     for spec in specs:
         index = spec.write.index
         split = next((position for position, expr in enumerate(index) if not (isinstance(expr, Literal) and expr.value == 0)), len(index))
-        if split == 0 or not _dense_axis_suffix(index[split:], n_name):
+        suffix = tuple(expr for expr in index[split:] if not (isinstance(expr, Literal) and expr.value == 0))
+        dense = _dense_axis_suffix(suffix, columns[0]) if len(columns) == 1 else suffix == tuple(Var(name) for name in columns)
+        if split == 0 or not dense:
             return None
     return Axis("_um", Dim(1))
 
@@ -346,6 +277,13 @@ def _reads_move_with(edge: Fold, coord: str, ctx: SimplifyCtx) -> bool:
     return any(coord in index.simplify(ctx).free_vars() for index in _index_reads(edge) if coord in index.free_vars())
 
 
+def loaded_buffers(term):
+    """Every ``Load`` the STORED tree reads — each lift body's loads, through the operand edges."""
+    yield from term.lift.body.loads
+    for edge in term.operands:
+        yield from loaded_buffers(edge)
+
+
 @dataclass(frozen=True)
 class TileOp(Op):
     """One scheduled map/reduce kernel (see module docstring).
@@ -391,9 +329,16 @@ class TileOp(Op):
     # the effectful stmt stream via ``apply_output_specs`` — never read a ``Write`` out of the term.
     output_specs: tuple[OutputSpec, ...] = ()
     # Whether the graph-level Fold-edge placement decision is consumed. Unpinned cut pieces keep
-    # the default ``False`` and may expose their own smaller seam set; a pinned cut sets it on both
-    # pieces because its authoritative decision cannot name a fresh tree.
+    # the default ``False`` and may expose their own smaller seam set; a pinned cut can close
+    # a piece once the pins addressing it have been consumed.
     placement_decided: bool = False
+    # Scoped placement pins already consumed on this kernel's same-name remainder.
+    placement_consumed: frozenset[str] = field(default=frozenset(), compare=False, repr=False)
+    # Number of placement cuts taken by this kernel's same-name remainder.
+    placement_step: int = field(default=0, compare=False, repr=False)
+    # Folded constant inputs whose layout choice this kernel already declined. The source arm
+    # replaces its input with a new constant, so only the folded arm needs this receipt.
+    layout_decided: tuple[str, ...] = field(default=(), compare=False, repr=False)
     # Whether the split QUESTION is consumed for this kernel: the structural cross-CTA fork
     # (``030_cut``) declined it (the unsplit arm), or the kernel is a realized split's
     # independent projection SIBLING — which has no sliced axis, so it carries this flag as its
@@ -412,6 +357,10 @@ class TileOp(Op):
         # the bound row gives a contraction its missing LEFT axis, this one gives a term with no row
         # at all a geometry, and a matvec against a 1-D operand can only be served by the latter.
         unit_row = _implicit_unit_row(self.output_specs, self.place.free)
+        if len(self.place.free) > 1:
+            view = normalized.as_contraction()
+            if view is None or view.left_axes or view.shared_axes:
+                unit_row = None
         if unit_row is not None and any(site.node.as_contraction() is not None for site in sites(normalized)):
             object.__setattr__(self, "place", replace(self.place, free=(unit_row, *self.place.free)))
         if self.schedule is not None and normalized != self.op:
@@ -420,6 +369,7 @@ class TileOp(Op):
 
         promoted = promoted_sweep(normalized, self.output_specs, free=self.place.free)
         if not promoted:
+            self._rowless_unit_row()
             self._own_axes()
             self._validate_schedule()
             return
@@ -444,8 +394,51 @@ class TileOp(Op):
                 for store in self.output_specs
             ),
         )
+        self._rowless_unit_row()
         self._own_axes()
         self._validate_schedule()
+
+    def _rowless_unit_row(self) -> None:
+        """Give a matvec its missing physical axis after output sweeps join the grid: when every kernel root is a
+        vector against a matrix (:meth:`_vector_against_matrix`), a unit axis ``_um`` is placed before the trailing
+        free axis, so a tensor-core tile has both a row and a column whichever operand role the vector fills."""
+        free = self.place.free
+        if not free or any(axis.name == "_um" for axis in free):
+            return
+        if self.place.is_mapped and (not self.place.grid or self.place.grid[-1].name != free[-1].name):
+            return
+        roots = kernel_roots(self.op)
+        if not roots or not all(self._vector_against_matrix(root.as_contraction()) for root in roots):
+            return
+        unit = Axis("_um", Dim(1))
+        grid = self.place.grid
+        if self.place.is_mapped:
+            grid = (*grid[:-1], unit, grid[-1])
+        object.__setattr__(self, "place", replace(self.place, free=(*free[:-1], unit, free[-1]), grid=grid))
+
+    def _vector_against_matrix(self, view) -> bool:
+        """Whether contraction ``view`` has one empty operand role, the other role owning the trailing free axis, and
+        the free axes are that role's axes, one dense column every boundary store writes, or shared batch coordinates
+        beside a column. The physical matrix pair then puts the unit coordinate in the empty role."""
+        free = self.place.free
+        if view is None or (view.left_axes and view.right_axes):
+            return False
+        role = view.left_axes | view.right_axes
+        if free[-1].name not in role:
+            return False
+        if view.shared_axes:
+            return len(free) >= 2
+        if len(free) == 1:
+            return all(_dense_axis_suffix(spec.write.index, free[0].name) for spec in self.output_specs)
+        return {axis.name for axis in free} == role
+
+    @cached_property
+    def carries(self) -> bool:
+        """Whether this kernel carries a state: a fold of its tree folds the action ``next``
+        (:attr:`Fold.carries`), so its steps run in order inside one loop and the kernel stays one
+        kernel — the classic schedule realizes the loop as one launch per step over a state buffer,
+        the register schedule as a loop inside each CTA."""
+        return any(site.node.carries for site in self.sites)
 
     def _own_axes(self) -> None:
         """The kernel owns its axis table, COMPLETE by construction: the free axes' extents are the
@@ -456,7 +449,7 @@ class TileOp(Op):
         if self.op is None:
             return
         table = {axis.name: axis for axis in self.axes}
-        for axis in self.place.free:
+        for axis in (*self.place.serial, *self.place.free):
             table.setdefault(axis.name, axis)
         needed = {site.node.axis for site in sites(self.op) if site.node.axis is not None}
         needed |= {axis.name for spec in self.output_specs for axis in spec.sweep}
@@ -479,14 +472,19 @@ class TileOp(Op):
         validate(self.schedule, self, place=self.place, workers=self.workers)
 
     @cached_property
+    def register_program(self):
+        """The rectangular loop whose state can be owned by independent register rows."""
+        from emmy.compiler.ir.schedule.register import RegisterProgram  # noqa: PLC0415
+
+        return RegisterProgram.from_tile(self)
+
+    @cached_property
     def grid_sched(self):
         """This kernel read on the grid — the view a legality check offers a CANDIDATE plan to.
 
         Built ONCE per kernel, like :attr:`sites`: everything it caches is a site fact, and a
         candidate plan changes tile sizes, never which output axes a slice tiles. The reading takes
         no target either, so one view serves every compile of this kernel."""
-        from emmy.compiler.ir.tile.ops import Sched  # noqa: PLC0415
-
         return Sched(self, place=self.place.on_grid())
 
     @cached_property
@@ -548,11 +546,10 @@ class TileOp(Op):
     def contracts(self, site: NodeId) -> bool:
         """Whether one site is a contraction-capable reduction — the shape TILE and STAGE want.
 
-        A bilinear pair with a role-less side qualifies only while every coordinate it shares with
-        the other side is one no tile strides: a split-K partition (it only ever composes with the
-        reduction index) or a reshape residue the other side's reads are value-dead in under this
-        kernel's extents. A B that changes with the row it is contracted against — a storage-decode scale
-        read per row, a grouped weight addressed by the row — is no slab per tile.
+        A bilinear pair with a role-less side qualifies only while every shared coordinate in
+        the placed matrix pair leaves the other side's reads value-dead under this kernel's
+        extents. A shared grid coordinate outside that pair is a batch coordinate: both operands
+        may vary between batches. A B that changes with the fragment row is no slab per tile.
 
         A carrier the tiers cannot fold WHOLE is no tile site however bilinear one channel reads
         (:meth:`Fold.tiles_whole`): a twisted carrier holds a running maximum and a denominator
@@ -565,12 +562,34 @@ class TileOp(Op):
         view = node.as_contraction()
         if view is None or not node.tiles_whole():
             return False
+        mn = self.grid_sched._mn_for(node)
+        if (
+            mn is not None
+            and all(not (axis.extent.is_static and axis.extent.as_static() == 1) for axis in mn)
+            and any({axis.name for axis in mn} <= owned for owned in (view.left_axes, view.right_axes))
+        ):
+            return False  # both output axes of one operand are not a matrix-multiply pair
+        if mn is not None and any(
+            axis.name in view.shared_axes
+            and not (axis.extent.is_static and axis.extent.as_static() == 1)
+            and any(_partitions_the_reduction(edge, view.axis, axis.name) for edge in node.operands[:2])
+            for axis in mn
+        ):
+            # A split-K partition BOTH operands read (``x[p·bk + k]`` beside ``w[n, p·bk + k]``) is
+            # a batch of independent products, not a fragment row or column: tiled, one staged
+            # operand slab serves every column of the tile at the tile's first partition, and every
+            # other column contracts against the wrong slice of it. Only a coordinate composed with
+            # the reduction index is such a partition: a grouped-query head, which the query reads
+            # as ``h`` and the key as ``h / 2``, is not, and refusing it took the chunk tier off
+            # every sequence-major attention.
+            return False
         if not view.shared_axes or (view.left_axes and view.right_axes):
             return True
         roleless, roled = (node.operands[0], node.operands[1]) if not view.left_axes else (node.operands[1], node.operands[0])
+        tiled = {axis.name for axis in mn} if mn is not None else view.shared_axes
         return all(
             _partitions_the_reduction(roleless, view.axis, coord) or not _reads_move_with(roled, coord, self._simplify_ctx())
-            for coord in view.shared_axes
+            for coord in view.shared_axes & tiled
         )
 
     def _simplify_ctx(self) -> SimplifyCtx:
@@ -631,6 +650,48 @@ class TileOp(Op):
         """The per-contraction structure every schedule choice over this kernel shares."""
         return contraction_facts(self) if isinstance(self.op, Fold) else frozendict()
 
+    @cached_property
+    def shared_roots(self) -> frozenset[NodeId]:
+        """The contraction roots a schedule may not bind together, as sites
+        (:func:`~emmy.compiler.ir.tile.ops.refused_roots`): where the projection does not partition its
+        outputs by root, one root is the kernel's and every other reduce lowers serially inside it, so a
+        schedule selecting a second — an output tile, a cooperative or ILP reduce — spells a kernel the
+        binder never builds. The binder's rule, read at the offer by the classic compatibility."""
+        if not isinstance(self.op, Fold):
+            return frozenset()
+        return frozenset(self.node_id(root) for root in refused_roots(self.op, tuple(self.output_specs)))
+
+    @cached_property
+    def chain_pairs(self) -> tuple[tuple[NodeId, NodeId], ...]:
+        """The ``(root, member)`` site pairs whose two partitions the binder cannot both realize: a chain
+        binds in ONE of the binder's arms, and a root that leaves it — output-tiled, or a transposed band —
+        cannot carry a partitioned member, whose partition nothing would then read. A member that is itself
+        a kernel root is no pair: it binds through its own arm whatever its neighbour took. Identity is the
+        site table's, never ``node_id``: the peel and the cone walk reach Folds the site walk does not carry."""
+        if not isinstance(self.op, Fold):
+            return ()
+        sites = {id(self.sites[site].node): site for site in self.node_sites}
+        roots = {sites[id(root)] for root in kernel_roots(self.op) if id(root) in sites}
+        return tuple(
+            (sites[id(root)], sites[id(member)])
+            for root in kernel_roots(self.op)
+            if id(root) in sites
+            for member in chain_members(root)
+            if id(member) in sites and sites[id(member)] not in roots
+        )
+
+    @cached_property
+    def nested_tiles(self) -> tuple[tuple[NodeId, NodeId], ...]:
+        """The ``(root, site)`` pairs of a kernel root (``ops.kernel_roots``) and a site below it that can
+        take a ``TILE``. The binder lowers such a tile only inside a root it output-tiles, and even there
+        only where the tier folds it (the chunked carrier's score); any other root lowers its subtree
+        serially, which would drop the tile, so the binder refuses the row instead. The classic
+        compatibility rules (``refusals._relation_refusal``) apply this binder rule at the offer."""
+        if not isinstance(self.op, Fold):
+            return ()
+        roots = [self._node_ids[id(root)] for root in kernel_roots(self.op) if id(root) in self._node_ids]
+        return tuple((root, site) for root in roots for site in self.family_sites["TILE"] if self.sites[site].under(self.sites[root]))
+
     def __getstate__(self):
         """Pickle stored fields only; derived schedule inventories recompute after transport."""
         return {name: self.__dict__[name] for name in self.__dataclass_fields__ if name in self.__dict__}
@@ -663,8 +724,11 @@ class TileOp(Op):
         # evaluated over it — is the kernel's to bind: the term opens every coordinate it declares
         # and those loops wrap outside, in grid order.
         glue = tuple(axis for axis in self.place.free if axis.name not in self.op.free_axes)
-        body = self.op.lower(frozenset(axis.name for axis in glue), self.output_specs, self.axes)
-        for axis in reversed(glue):
+        serial = tuple(self.place.serial)
+        body = self.op.lower(frozenset(axis.name for axis in (*glue, *serial)), self.output_specs, self.axes)
+        # A serial axis is time: it encloses every cell, so a lagged read of this kernel's own
+        # output sees the previous step's stores from every cell.
+        for axis in reversed((*serial, *glue)):
             body = Body((Loop(axis=axis, body=body),))
         return body
 
@@ -675,19 +739,17 @@ class TileOp(Op):
         except StopIteration:
             raise KeyError(f"axis {name!r} is not in this kernel's axis table {[axis.name for axis in self.axes]}") from None
 
-    def _body_identity(self, *, structural: bool = True) -> str | None:
+    def _body_identity(self, *, structural: bool = True, typed: bool = False):
         """Override :meth:`Op._body_identity` with the DERIVED body: :attr:`loop_body`'s
-        canonical digest, so a golden record derives the SAME key from its persisted program
-        (both sides lower through the one spelling) and term re-spellings that lower alike
-        share it."""
+        identity, so a golden record derives the SAME key from its persisted program (both
+        sides lower through the one spelling) and term re-spellings that lower alike share it."""
         body = self.loop_body
-        return None if body is None else body.structural_key(structural=structural)
+        return None if body is None else body.identity(structural=structural, types=buffer_types(self) if typed else None)
 
 
 __all__ = [
     "OutputSpec",
     "TileOp",
-    "apply_output_specs",
     "extract_output_specs",
     "observed_result_names",
     "promoted_sweep",

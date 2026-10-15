@@ -7,6 +7,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
+from emmy.compiler.pipeline.search.space import COLD_CACHE
 from emmy.compiler.trace.dynamic import DYNAMIC_DIM_MAX
 from emmy.publish import model_slug
 
@@ -37,6 +38,12 @@ class ServingConfig:
     golden_file: Path
     realizations: tuple[ServingRealization, ...]
     static_only: bool
+    tensor_parallel_size: int = 1
+    #: The trunk's data type as a torch name: the ``--dtype`` the engine serves with, ``float16`` when absent
+    #: (``emmy serve``'s own default).
+    dtype: str = "float16"
+    #: Maximum adapter rank carried by the pre/post programs, when LoRA serving is enabled.
+    lora_rank: int | None = None
 
     @property
     def model_provenance(self) -> str:
@@ -45,6 +52,25 @@ class ServingConfig:
     @property
     def static_widths(self) -> tuple[int, ...]:
         return tuple(sorted({dict(row.bindings)["num_tokens"] for row in self.realizations if row.bindings}))
+
+    def realizations_for(self, width: int | None, *, expert: bool = False, gdn: bool = False) -> tuple[ServingRealization, ...]:
+        """The rows a twin at ``width`` reaches: a static twin is compiled at its own width only,
+        so its target carries that width's rows; a symbolic twin (``None``) carries the dynamic
+        rows, the any-width compile. An ``expert`` twin at width 1 carries the standard lane's M=1 row
+        even when the config serves no M=1 trunk: every MoE boot compiles that expert program for the
+        fixed-slot tier. A ``gdn`` twin at width 1 carries an M=1 row in every lane: a gated DeltaNet
+        layer has no any-width program, so every lane builds its width-1 program."""
+        rows = tuple(row for row in self.realizations if (dict(row.bindings).get("num_tokens") if row.bindings else None) == width)
+        if expert and width == 1 and not rows:
+            [pins] = {row.pins for row in self.realizations if not dict(row.pins).get("FAST_MATH")}
+            return (ServingRealization(name="m1", bindings=(("num_tokens", 1),), pins=pins),)
+        if gdn and width == 1:
+            lanes = {row.pins for row in self.realizations} - {row.pins for row in rows}
+            return rows + tuple(
+                ServingRealization(name="m1.fm" if dict(pins).get("FAST_MATH") else "m1", bindings=(("num_tokens", 1),), pins=pins)
+                for pins in sorted(lanes)
+            )
+        return rows
 
 
 def _read_env(path: Path) -> dict[str, str]:
@@ -89,6 +115,20 @@ def _integer(values: dict[str, str], field: str, *, default: int | None = None, 
     if value < minimum:
         raise ValueError(f"{field} must be >= {minimum}, got {value}")
     return value
+
+
+def _cache_regime(values: dict[str, str], source: Path) -> dict[str, bool]:
+    """The cache regime ``SERVE_ENV`` declares: ``serve.sh`` exports its words before the server starts, so an
+    ``EMMY_COLD_CACHE`` among them is the regime every lane compiles in and records its rows under. The value is
+    read through the knob's own parser, so the spelling is the knob's."""
+    for word in values.get("SERVE_ENV", "").split():
+        name, _, raw = word.partition("=")
+        if name == COLD_CACHE.env:
+            try:
+                return {COLD_CACHE.name: True} if COLD_CACHE.parse(raw) else {}
+            except ValueError as exc:
+                raise ValueError(f"{source}: SERVE_ENV: {exc}") from exc
+    return {}
 
 
 def _root(source: Path) -> Path:
@@ -143,7 +183,9 @@ def _realizations(values: dict[str, str], source: Path, *, static_only: bool) ->
     if m1_value not in {0, 1}:
         raise ValueError(f"{source}: SERVE_M1_TIER must be 0 or 1")
     m1 = bool(m1_value)
-    lanes = [(pinned_decode, pinned_prefill, max_tokens, (("FAST_MATH", False),))]
+    regime = _cache_regime(values, source)
+    lane_pins = {fast: tuple(sorted({**regime, "FAST_MATH": fast}.items())) for fast in (False, True)}
+    lanes = [(pinned_decode, pinned_prefill, max_tokens, lane_pins[False])]
     for spec in values.get("SERVE_WARM_SHAPES", "").split():
         fields = spec.split(":")
         if len(fields) not in {3, 4}:
@@ -156,9 +198,9 @@ def _realizations(values: dict[str, str], source: Path, *, static_only: bool) ->
             raise ValueError(f"{source}: warm shape {spec!r} has unsupported lane {lane!r}")
         if min(decode, prefill) < 0 or maximum <= 0:
             raise ValueError(f"{source}: warm shape {spec!r} requires non-negative buckets and positive max tokens")
-        lanes.append((decode, prefill, maximum, (("FAST_MATH", lane == "fm"),)))
+        lanes.append((decode, prefill, maximum, lane_pins[lane == "fm"]))
 
-    standard_m1 = (1, 0, 1, (("FAST_MATH", False),))
+    standard_m1 = (1, 0, 1, lane_pins[False])
     if static_only and any(lane != standard_m1 for lane in lanes):
         raise ValueError(f"{source}: static-only release warm shapes must stay in the standard M=1 envelope")
 
@@ -206,7 +248,7 @@ def load_serving_config(path: str | Path) -> ServingConfig:
     if not golden_path.is_absolute():
         golden_path = _root(source) / golden_path
     realizations = _realizations(values, source, static_only=static_only)
-    if static_only and realizations != (ServingRealization(name="m1", bindings=(("num_tokens", 1),), pins=(("FAST_MATH", False),)),):
+    if static_only and [(row.name, row.bindings) for row in realizations] != [("m1", (("num_tokens", 1),))]:
         raise ValueError(f"{source}: static-only release warm shapes must stay in the standard M=1 lane")
     return ServingConfig(
         source=source,
@@ -216,7 +258,46 @@ def load_serving_config(path: str | Path) -> ServingConfig:
         golden_file=golden_path.resolve(),
         realizations=realizations,
         static_only=static_only,
+        tensor_parallel_size=_tensor_parallel_size(values.get("SERVE_EXTRA_ARGS", ""), source),
+        dtype=_trunk_dtype(values.get("SERVE_EXTRA_ARGS", ""), source),
+        lora_rank=_integer(values, "SERVE_LORA_RANK", minimum=1) if values.get("SERVE_LORA_RANK") else None,
     )
+
+
+def _flag_value(extra_args: str, flags: tuple[str, ...]) -> tuple[str, str] | None:
+    """``(flag, value)`` for the first of ``flags`` in ``SERVE_EXTRA_ARGS``, either spelling, or ``None``."""
+    args = shlex.split(extra_args)
+    for i, arg in enumerate(args):
+        flag, eq, value = arg.partition("=")
+        if flag in flags:
+            return flag, value if eq else (args[i + 1] if i + 1 < len(args) else "")
+    return None
+
+
+def _tensor_parallel_size(extra_args: str, source: Path) -> int:
+    """The tensor-parallel width ``SERVE_EXTRA_ARGS`` serves at: each rank holds that slice of every
+    routed expert, so the expert twins are traced at it."""
+    found = _flag_value(extra_args, ("--tensor-parallel-size", "-tp"))
+    if found is None:
+        return 1
+    flag, value = found
+    if not value.isdigit() or int(value) < 1:
+        raise ValueError(f"{source}: {flag} must be a positive integer, got {value!r}")
+    return int(value)
+
+
+_TRUNK_DTYPES = {"float16": "float16", "half": "float16", "fp16": "float16", "bfloat16": "bfloat16", "bf16": "bfloat16"}
+
+
+def _trunk_dtype(extra_args: str, source: Path) -> str:
+    """The data type ``SERVE_EXTRA_ARGS`` serves the trunk in, as a torch name: the twins are traced in it,
+    because buffer types are part of a kernel's identity."""
+    found = _flag_value(extra_args, ("--dtype",))
+    if found is None:
+        return "float16"
+    if found[1] not in _TRUNK_DTYPES:
+        raise ValueError(f"{source}: --dtype must be one of {sorted(_TRUNK_DTYPES)}, got {found[1]!r}")
+    return _TRUNK_DTYPES[found[1]]
 
 
 def revision_matches(golden_revision: str | None, serving_revision: str | None) -> bool:

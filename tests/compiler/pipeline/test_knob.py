@@ -13,7 +13,6 @@ from emmy.compiler.pipeline.knob import (
     axis_of,
     family_of,
     family_value,
-    format_tuning_knobs,
     is_off_value,
     pin_key_matches,
     tuning_knob_items,
@@ -207,6 +206,16 @@ def test_warp_tile_features_from_warp_tile():
     assert _warp_tile_features({"TILE@map.1/inner": "f2x4", "WORK": "t32x8"}) == {}  # scalar fragment → empty
 
 
+def test_wave_fill_reads_how_full_the_last_wave_is():
+    """170 CTAs on 170 SMs fill one wave; one CTA more opens a second wave holding it alone."""
+    from emmy.compiler.pipeline.search.features import _warp_tile_features  # noqa: PLC0415
+
+    knobs = {"TILE@map.1/inner": "mma_m16n8k16_f16_f32/f2x2/k2", "WORK": "w2x2", "H_sm_count": 170}
+    area = 2 * 2 * 16 * 2 * 2 * 8  # tile_m · tile_n
+    assert _warp_tile_features({**knobs, "S_ext_free_prod": area * 170})["D_wave_fill"] == 1.0
+    assert _warp_tile_features({**knobs, "S_ext_free_prod": area * 171})["D_wave_fill"] == pytest.approx(171 / 340)
+
+
 # ---------------------------------------------------------------------------
 # EMMY_KNOBS aggregate env var
 # ---------------------------------------------------------------------------
@@ -360,6 +369,8 @@ def test_knob_features_stage_codec():
     pp = knob_features({"STAGE@map.1/inner": "d3/smem-async/p2"})
     assert pp["D_stage_depth"] == 3.0 and pp["D_stage_reg_depth"] == 2.0
     assert not any(k.startswith("D_stage_") for k in knob_features({"STAGE@map.1/inner": ""}))
+    reg = knob_features({"STAGE": "d1/reg"})
+    assert {k: v for k, v in reg.items() if k.startswith("D_stage_")} == {"D_stage_reg": 1.0}
 
 
 def test_stage_codec_reg_depth_roundtrip():
@@ -406,19 +417,6 @@ def test_knob_features_differs_by_one_knob():
     assert a["S_n_write"] == b["S_n_write"]
 
 
-def test_format_tuning_knobs_skips_struct():
-    out = format_tuning_knobs({"BN": 64, "S_n_load": 3.0, "S_ext_free_prod": 512.0})
-    assert "S_n_load" not in out and "S_ext_free_prod" not in out
-    assert "BN=64" in out
-
-
-def test_format_tuning_knobs_canonical_order():
-    """The codec knobs render in canonical order (``KNOB_ORDER`` = ``TILE``, ``REDUCE``,
-    ``STAGE``), not alphabetical — shared with the ``emmy eval`` golden tables."""
-    out = format_tuning_knobs({"STAGE": "d2/smem-async", "REDUCE": "coop", "TILE": "mma_m16n8k16_f16_f32/f1x1"})
-    assert out == "TILE=mma_m16n8k16_f16_f32/f1x1, REDUCE=coop, STAGE=d2/smem-async"
-
-
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):
     """With no ``raw`` argument, the function reads ``EMMY_KNOBS``."""
     monkeypatch.delenv("EMMY_BK", raising=False)
@@ -441,6 +439,11 @@ def test_family_value_reads_bare_or_suffixed():
     assert family_value({"TILE@d": "x"}, "TILE") == "x"
     assert family_value({"TILE": "x"}, "TILE") == "x"
     assert family_value({"REDUCE": "coop"}, "TILE") is None
+
+
+def test_reduce_family_validation_accepts_output_lanes_without_an_inventory() -> None:
+    assert knob_mod.validate_family_value("REDUCE", "coop-t") == "coop-t"
+    assert knob_mod.validate_family_value("REDUCE", "coop-t/n8") == "coop-t/n8"
 
 
 def test_pin_key_matches():
@@ -493,9 +496,19 @@ def test_is_off_value(monkeypatch):
     _pin_registry(monkeypatch)
     assert is_off_value("TILE", "")
     assert is_off_value("FAST_EXP", False)
+    for spelling in ("0", "off", "false", "no"):
+        assert is_off_value("FAST_EXP", spelling)
+    assert not is_off_value("FAST_EXP", "on")
+    assert not is_off_value("FAST_EXP", "typo")
+    assert not is_off_value("TILE", " ")  # schedule codecs compare their exact wire spelling
     assert not is_off_value("TILE", "w2x1")
     assert not is_off_value("BN", 0)  # BN declares no OFF
     assert not is_off_value("NOSUCH", "")
+
+
+def test_integer_off_values_use_the_registered_parser():
+    assert is_off_value("LOOPIFY", "0x0")
+    assert not is_off_value("LOOPIFY", "0x4")
 
 
 def test_exact_site_featurizes_consistently():
@@ -556,20 +569,22 @@ def test_multinode_flash_keys_apart_and_pools_per_node():
 
 def test_precision_pin_precedence(monkeypatch):
     """The precision-knob precedence (the FAST_MATH family): a knob's own ``EMMY_<NAME>`` pin >
-    the ``FAST_MATH`` umbrella > ``None`` (neither set — the caller's conservative default). The
+    the ``FAST_MATH`` umbrella > the enabled default. The
     umbrella itself is ``unfeatured`` (a meta gate over other knobs), so ``knob_features`` must
     never see it as a ranking dimension."""
     from emmy.compiler.pipeline.search.space import F16_MMA_F32_ACC, FAST_EXP, FAST_MATH, precision_pin
 
     for var in ("EMMY_FAST_MATH", "EMMY_FAST_EXP", "EMMY_F16_MMA_F32_ACC"):
         monkeypatch.delenv(var, raising=False)
-    assert precision_pin(FAST_EXP) is None and precision_pin(F16_MMA_F32_ACC) is None
+    assert precision_pin(FAST_MATH) is True
+    assert precision_pin(FAST_EXP) is True and precision_pin(F16_MMA_F32_ACC) is True
     monkeypatch.setenv("EMMY_FAST_MATH", "1")
     assert precision_pin(FAST_EXP) is True and precision_pin(F16_MMA_F32_ACC) is True
     monkeypatch.setenv("EMMY_FAST_EXP", "0")
     assert precision_pin(FAST_EXP) is False, "the individual pin must win over the umbrella"
     assert precision_pin(F16_MMA_F32_ACC) is True
     monkeypatch.setenv("EMMY_FAST_MATH", "0")
+    assert precision_pin(FAST_MATH) is False and precision_pin(F16_MMA_F32_ACC) is False
     monkeypatch.setenv("EMMY_F16_MMA_F32_ACC", "1")
     assert precision_pin(F16_MMA_F32_ACC) is True, "the individual pin must win in the enabling direction too"
     assert FAST_MATH.unfeatured, "the umbrella is a meta gate — it must never enter the feature vector"
@@ -634,11 +649,9 @@ def test_complete_kernel_row_requires_the_emitted_exact_schedule():
         "TILE": "mma_m16n8k16_f16_f32/f1x1",
         "REDUCE": "",
         "STAGE": "",
-        "S_ext_free_prod": 64.0,
     }
     out = complete_kernel_row(row)
     assert out["TILE"] == "mma_m16n8k16_f16_f32/f1x1"
-    assert "S_ext_free_prod" not in out
     assert complete_kernel_row(out) == out
 
     # A kernel with neither a contraction nor a reduction site carries no TILE and no REDUCE key,
@@ -717,3 +730,81 @@ def test_evidence_row_vouches_reads_a_bare_row_key_like_a_bare_pin() -> None:
     assert not evidence_row_vouches({"WORK": "t32", "REDUCE@map.1/twist": "", "REDUCE@map.1/twist.1/inner": ""}, row), "no site carries it"
     assert evidence_row_vouches({"WORK": "t32", "REDUCE": "coop", "TILE": "f1"}, row), "an exact key compares exactly; TILE is free"
     assert not evidence_row_vouches({"WORK": "t32", "REDUCE": "r4"}, row)
+
+
+def test_a_kernel_pin_reaches_only_the_piece_it_names(monkeypatch):
+    """``REDUCE@place_<token>`` is the REDUCE pin of the one cut piece named ``…__place_<token>`` and of
+    the partial and finalize its split mints; a piece of another token, or a token that only starts the
+    same way, keeps the bare pin. Site readers never see it as a site key."""
+    from importlib import import_module
+
+    pin_row = import_module("emmy.compiler.pipeline.passes.tile.schedule.040_schedule").pin_row
+    monkeypatch.setenv("EMMY_REDUCE", "coop")
+    monkeypatch.setenv("EMMY_REDUCE@place_ab12", "g16k/coop-t")
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_ab12") == "g16k/coop-t"
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_ab12__partial") == "g16k/coop-t"
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_ab12_1") is None, "a sibling piece of the same seam"
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_ab12_1__partial") is None
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_ab123") is None
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_cd34") is None
+    assert knob_mod.family_pins("REDUCE") == (("REDUCE", "coop"),)
+    assert pin_row("k_x__place_ab12", split_consumed=True) == {"REDUCE": "coop-t"}
+    assert pin_row("k_x__place_cd34", split_consumed=False) == {"REDUCE": "coop"}
+    assert pin_row("k_x__place_ab12__partial", "add_7__place_ab12_0__partial", split_consumed=True) == {"REDUCE": "coop-t"}
+
+
+def test_the_most_specific_kernel_pin_wins(monkeypatch):
+    """A pin naming a split's partial beats the pin naming the piece it was split from, which also
+    reaches the partial: a sweep sets the piece's split factor and the partial's tier together."""
+    from importlib import import_module
+
+    pin_row = import_module("emmy.compiler.pipeline.passes.tile.schedule.040_schedule").pin_row
+    monkeypatch.setenv("EMMY_REDUCE@place_ab12", "g8k")
+    monkeypatch.setenv("EMMY_REDUCE@place_ab12__partial", "coop-t")
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_ab12") == "g8k"
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_ab12__partial") == "coop-t"
+    assert knob_mod.kernel_pin("REDUCE", "k_x__place_ab12", "add_7__place_ab12_0") == "g8k", "the finalize keeps the piece's pin"
+    assert pin_row("k_x__place_ab12__partial", split_consumed=True) == {"REDUCE": "coop-t"}
+
+
+def test_a_node_pin_reaches_the_uncut_root_and_its_split(monkeypatch):
+    """``REDUCE@node_<id>`` pins the kernel whose graph node is ``<id>`` — the uncut remainder of a route,
+    which has no ``__place_`` token — and its split's partial and finalize, never a cut piece; a pin on
+    the partial beats it there."""
+    from importlib import import_module
+
+    pin_row = import_module("emmy.compiler.pipeline.passes.tile.schedule.040_schedule").pin_row
+    monkeypatch.setenv("EMMY_REDUCE@node_add_7", "g16k")
+    monkeypatch.setenv("EMMY_REDUCE@node_add_7__partial", "coop-t/v2")
+    assert knob_mod.kernel_pin("REDUCE", "k_sdpa_x_7e7a8a", "add_7") == "g16k"
+    assert knob_mod.kernel_pin("REDUCE", "", "add_7__partial") == "coop-t/v2"
+    assert knob_mod.kernel_pin("REDUCE", "k_add_7__partial") == "coop-t/v2", "the partial's kernel name"
+    assert knob_mod.kernel_pin("REDUCE", "k_add_7__place_ab12", "add_7__place_ab12_0") is None, "a cut piece"
+    assert knob_mod.kernel_pin("REDUCE", "k_add_70", "add_70") is None
+    assert knob_mod.family_pins("REDUCE") == ()
+    assert pin_row("", "add_7__partial", split_consumed=True) == {"REDUCE": "coop-t/v2"}
+
+
+def test_a_kernel_pin_is_checked_as_its_family():
+    """A kernel pin is checked against the kernels it names; given no names, against every kernel, as a bare pin."""
+    from emmy.compiler.pipeline.search.pins import unreproducible_pin_flag
+
+    rows = [{"WORK": "w1x16", "REDUCE": ""}, {"WORK": "t128", "REDUCE": "coop-t"}]
+    assert unreproducible_pin_flag({"WORK@place_ab12": "t128"}, rows) is None
+    assert unreproducible_pin_flag({"WORK@place_ab12": "w4x1"}, rows) is not None
+    # Named, it is asked of the kernels it reaches alone: the piece that ran w1x16 did not realize t128.
+    names = [("k_x__place_ab12__partial",), ("k_x__place_cd34__partial",)]
+    assert "WORK@place_ab12=t128" in unreproducible_pin_flag({"WORK@place_ab12": "t128"}, rows, kernel_names=names)
+    assert unreproducible_pin_flag({"WORK@place_cd34": "t128"}, rows, kernel_names=names) is None
+    # A cut piece's node id carries its ordinal and its kernel name does not; the pin reaches the kernel by either.
+    pieces = [("k_x__place_ab12", "add_7__place_ab12_0"), ("k_x__place_cd34", "add_7__place_cd34_0")]
+    assert unreproducible_pin_flag({"WORK@place_cd34": "t128"}, rows, kernel_names=pieces) is None
+
+
+def test_a_kernel_scoped_place_pin_is_not_realized_by_a_sibling_seam():
+    """Placement receipts name seams, so ``PLACE@place_<token>`` is never read as a bare PLACE pin."""
+    from emmy.compiler.pipeline.search.pins import unreproducible_pin_flag
+
+    receipts = [{"PLACE@map.1/inner": "cut"}]
+    assert unreproducible_pin_flag({"PLACE@map.1/inner": "cut"}, [{}], placement_knobs=receipts) is None
+    assert unreproducible_pin_flag({"PLACE@place_ab12": "cut"}, [{}], placement_knobs=receipts) is not None

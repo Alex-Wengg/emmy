@@ -23,13 +23,15 @@ from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F16, F32, U8
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.elementwise import ElementwiseImpl
-from emmy.compiler.ir.expr import Expr, Literal, Var
+from emmy.compiler.ir.expr import Expr, Literal, TernaryExpr, Var
 from emmy.compiler.ir.schedule import Tile, Work
 from emmy.compiler.ir.schedule.packing import PackedKBlockB
+from emmy.compiler.ir.schedule.staging import copied_b
 from emmy.compiler.ir.stmt import Load
 from emmy.compiler.ir.stmt.leaves import Assign
 from emmy.compiler.pipeline.passes.lowering.kernel._atom import _packed_operands, _slab_operands, _sync_operands, _tile_base
 from emmy.compiler.pipeline.passes.lowering.kernel._stage import CtaTile
+from emmy.compiler.tensor import Tensor
 from tests.compiler.terms import contraction, projection
 
 K16 = "mma_m16n8k16_f16_f32"
@@ -91,9 +93,20 @@ def test_sync_transport_async_b_binds_the_sibling_axis():
     b = Load(name="in0", input="w", index=(_row_residue(Var("m"), Var("n")), Var("k")), dtype=F16)
     c = contraction(ka, a, (b, "acc"))
     cta = CtaTile(linear_tid=Var("_t"), n_threads=32)
-    _, _, async_ops, *_ = _sync_operands(c, 128, mn, cta, k_axis=ka)
+    inputs = {"x": Tensor("x", (32, 2048), dtype=F16), "w": Tensor("w", (1024, 2048), dtype=F16)}
+    _, _, async_ops, *_ = _sync_operands(c, 128, mn, cta, k_axis=ka, inputs=inputs)
     b_op = next(op for op in async_ops if op.tag == "b")
     _assert_sibling_bound(b_op, "m", "m_b")
+
+
+def test_a_conditional_inner_coordinate_requires_a_compute_fill():
+    ka = Axis("k", 64)
+    a = Load(name="a", input="x", index=(Var("m"), Var("k")))
+    col = TernaryExpr(Var("batch").lt(_lit(1)), Var("n"), _lit(0))
+    b = Load(name="b", input="w", index=(Var("k"), col))
+    c = contraction(ka, a, (b, "acc"))
+    inputs = {"x": Tensor("x", (32, 64), dtype=F32), "w": Tensor("w", (64, 128), dtype=F32)}
+    assert not copied_b(c, c.operands[1], inputs)
 
 
 def _packed_matvec():
@@ -177,3 +190,26 @@ def test_a_ringed_group_still_publishes_the_slab_it_fills_this_iteration() -> No
     scheduled = transport((SimpleNamespace(producer="its own segment"),))
     assert not scheduled.fills_current_slot, "an op with a scheduled producer fills in its own segment"
     assert barriers(scheduled) == []
+
+
+def test_a_slab_streamed_along_its_sibling_axis_keeps_its_rows():
+    """The chunk tier's query slab for a warp-group score: its rows ARE the m axis, which is also
+    the sibling side's axis, so the fill streams along the sibling. Binding that sibling to its
+    block base overwrote the streamed coordinate, and every query row read row 0 of the tile (the
+    Qwen3 attention piece on an H100: 256089 of 262144 outputs wrong)."""
+    q = Axis("m", Dim(512))
+    d = Axis("d", Dim(64))
+    tile = Tile.parse(f"{K16}/f1x4/k8", Work.parse("w1x1"))
+    m_side, d_side = tile.at(q, d).mn
+    (op,) = _slab_operands(
+        index_srcs=(None, (Var("m"), Var("d"))),
+        bufs=(None, "q"),
+        mn=(m_side, d_side),
+        k_axis=q,
+        bk_elems=64,
+        base=(_lit(0), _lit(0)),
+        roles=(1,),
+    )
+    row_index, col_index = op.index(Var("m_b"))(Var("_row"), Var("_col"))
+    assert "_row" in _free((row_index,)), "the query slab's row must select the query row"
+    assert "_col" in _free((col_index,)), "the query slab's column must select the head dim"

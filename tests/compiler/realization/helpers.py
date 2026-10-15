@@ -1,52 +1,45 @@
-"""Loading, regeneration and the four realization oracles for the corpus cases.
+"""Loading, regeneration and the realization oracles for the corpus cases.
 
-A case file is a working golden document carrying exactly one config whose realizations are the
-authored ``pins`` / ``knobs`` the compiler is expected to realize: one entry per kernel of the set
-the target compiles to, each addressed by the ``identity`` of the kernel it decides (the first
-entry is the target's own). ``offered`` asks each entry of the pinned enumeration; ``realized``,
-``built`` and ``correct`` ask the whole set of the compile the way a deploy would — the case's
-entries are the compile's only evidence, strict, and no hand pin rides beside them
+A case file is a golden with one traced program and one target kernel; its rows are the authored schedules the
+compiler is expected to realize — one per kernel of the set the target compiles to — and its routing rows the
+kernel-set decisions that mint the pieces. ``realized``, ``built`` and ``correct`` ask the whole set of the compile
+the way a deploy would: the case is the compile's only evidence, strict, and no hand pin rides beside it
 (:func:`evidence_scope`). Everything here is GPU-free except :func:`built` and :func:`correct`.
 """
 
 from __future__ import annotations
 
 import re
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
-import yaml
 
 from emmy.compiler.context import Context
 from emmy.compiler.pipeline.knob import KERNEL_DECISION_FAMILIES, family_of, validate_family_value
-from emmy.compiler.pipeline.search.golden import (
-    GoldenRecord,
-    dump_golden_file,
-    golden_record_from_entry,
-    kernel_identity,
-    load_golden_file,
-    sole_evidence,
-)
-from emmy.compiler.pipeline.search.golden_eval import enumerate_graph
+from emmy.compiler.pipeline.search.db import RoutingRow
+from emmy.compiler.pipeline.search.golden import GoldenFile, Kernel, Latency, Measurements, Row, definition, restamp, sole_evidence
+from emmy.compiler.pipeline.search.inventory import KernelInventory
 from emmy.compiler.pipeline.search.pins import parse_reduce, pinned_knobs, unreproducible_pin_flag
-from emmy.compiler.pipeline.strategy import PipelineStrategy
+from emmy.compiler.specialize import specialize_program
 
 CASES_DIR = Path(__file__).parent / "cases"
 
-#: The four assertions a case walks, in order. A case's filename may name one of them as the
-#: stage it is expected to fail at; the walker stops there.
-STAGES = ("offered", "realized", "built", "correct")
+#: The three assertions a case walks, in order. A case's filename may name one of them as the stage it is expected
+#: to fail at; the walker stops there.
+STAGES = ("realized", "built", "correct")
 
 _XFAIL = re.compile(r"_xfail_(?P<stage>[a-z_]+)$")
 
-#: Families whose pin is consumed structurally rather than stamped on a kernel, so "the pinned
-#: family is stamped" cannot be asked of them. ``PLACE`` is consumed by a splice; a ``REDUCE``
-#: cross-CTA split replaces the kernel outright. :func:`unreproducible_pin_flag` already reads
-#: both the same way — this is the same rule for the complementary stamping check.
+#: Families whose pin is consumed structurally rather than stamped on a kernel, so "the pinned family is stamped"
+#: cannot be asked of them. ``PLACE`` is consumed by a splice; a ``REDUCE`` cross-CTA split replaces the kernel.
 _UNSTAMPABLE = ("PLACE", "REDUCE")
+
+#: The stand-in measurement a case's rows carry as evidence: a case authors schedules rather than measuring them,
+#: and a proposal is no evidence, so each row stands in as a measured row — with one case in scope the microseconds
+#: only have to exist, not rank.
+STAND_IN = Measurements(emmy_us=1.0, reference_us=1.0, reference_backend="corpus")
 
 
 class CaseError(Exception):
@@ -55,19 +48,33 @@ class CaseError(Exception):
 
 @dataclass(frozen=True)
 class Case:
-    """One corpus case: its file, its document, its records (the target's own entry first, then
-    one per further kernel of the set), and its expectation."""
+    """One corpus case: its file, its document and its expectation."""
 
     path: Path
-    document: dict
-    records: tuple[GoldenRecord, ...]
+    document: GoldenFile
     #: The stage this case is expected to fail at, or ``None`` when every stage must pass.
     xfail_stage: str | None
 
     @property
-    def record(self) -> GoldenRecord:
-        """The target's own entry — the one the perf lane benches by name."""
-        return self.records[0]
+    def target(self) -> Kernel:
+        """The one kernel the case's traced program lowers to — what every stage compiles."""
+        [target] = self.document.targets()
+        return target
+
+    @property
+    def rows(self) -> list[Row]:
+        return self.document.rows
+
+    @property
+    def row(self) -> Row:
+        """The row the perf lane benches by name — the first of the file. A cut target never runs, so a case whose
+        target is cut has no row of its own: any row of the set names the compile."""
+        return self.rows[0]
+
+    @property
+    def regime(self) -> dict:
+        """The input regime the case was authored under — its pins less any kernel decision."""
+        return {str(name): value for name, value in self.row.pins.items() if family_of(str(name)) not in KERNEL_DECISION_FAMILIES}
 
     @property
     def id(self) -> str:
@@ -76,38 +83,26 @@ class Case:
 
     @property
     def compute_cap(self) -> tuple[int, int]:
-        return tuple(self.document["compute_cap"])
-
-    @property
-    def pinned(self) -> dict:
-        """The target entry's full hand pin: input pins plus the authored schedule row."""
-        return pin_of(self.record)
+        return tuple(self.document.compute_cap)
 
     def context(self) -> Context:
-        """The case's own context — its declared capability, never the live card's. This is what
-        makes stages 1 and 2 machine-independent, so an sm_70 lockout is exercised on any box."""
+        """The case's own context — its declared capability, never the live card's. This is what makes the GPU-free
+        stages machine-independent, so an sm_70 lockout is exercised on any box."""
         return Context.from_target(self.compute_cap)
 
-    def union_context(self) -> Context:
-        """The case context for enumerating under its pin across structural alternatives.
-
-        Site identities are local to one classic problem.  A corpus row therefore prunes a peer
-        kernel whose coincident identity cannot realize its exact pin, while :func:`offered` still
-        requires every pin to occur somewhere in the offered kernel set.
-        """
-        return replace(self.context(), validate_pins=False)
+    def program(self):
+        """The target kernel as a standalone program, its weights bound beside its twin's — what every stage starts from."""
+        return self.document.executable(self.target, {})
 
 
 def case_files() -> list[Path]:
-    return sorted(CASES_DIR.rglob("*.yaml"))
+    return sorted(CASES_DIR.rglob("*.json"))
 
 
 def expectation(path: Path) -> str | None:
-    """The stage named by the filename suffix, or ``None`` for a closed case.
-
-    An ``_xfail``-shaped token that is not one of the four stages is a hard error: the filename is
-    semantic, so a typo would otherwise quietly strengthen the assertion into a closed case.
-    """
+    """The stage named by the filename suffix, or ``None`` for a closed case. An ``_xfail``-shaped token that is not
+    one of the stages is a hard error: the filename is semantic, so a typo would otherwise quietly strengthen the
+    assertion into a closed case."""
     stem = path.stem
     if "_xfail" not in stem:
         return None
@@ -118,157 +113,39 @@ def expectation(path: Path) -> str | None:
 
 
 def load_case(path: Path) -> Case:
-    """Load one case, enforcing the one-config / one-realization invariant the harness relies on."""
+    """Load one case, enforcing the one-program / one-target invariant the harness relies on and the exact classic
+    spelling of every authored knob."""
     try:
-        document = load_golden_file(path)
+        document = GoldenFile.load(path)
     except ValueError as exc:
         raise CaseError(str(exc)) from exc
-    configs = document["configs"]
-    if len(configs) != 1 or not configs[0]["realizations"]:
-        raise CaseError(f"{path.name}: a case holds exactly one config with at least one realization")
-    for realization in configs[0]["realizations"]:
-        if "knobs" not in realization:
-            raise CaseError(f"{path.name}: every entry must carry a knobs mapping, empty only for a forkless kernel")
+    if len(document.programs) != 1 or len(document.targets()) != 1 or not document.rows:
+        raise CaseError(f"{path.name}: a case holds one traced program, one target kernel and at least one row")
+    parents = {route.parent for route in document.routing}
+    for row in document.rows:
+        if row.knobs is None:
+            raise CaseError(f"{path.name}: every row must carry a knobs mapping, empty only for a forkless kernel")
+        if row.kernel in parents:
+            raise CaseError(f"{path.name}: {row.name} schedules a kernel a decision cuts, which never runs")
+        canonical_knobs(row.knobs)
     stage = expectation(path)
-    if stage is not None and not evidence_line(path):
-        raise CaseError(f"{path.name}: an open case must carry a leading '# evidence:' comment naming why it should realize")
-    records = tuple(golden_record_from_entry(document, configs[0], realization) for realization in configs[0]["realizations"])
-    return Case(path=path, document=document, records=records, xfail_stage=stage)
+    if stage is not None and not evidence_line(document):
+        raise CaseError(f"{path.name}: an open case must carry a note with an 'evidence:' paragraph naming why it should realize")
+    return Case(path=path, document=document, xfail_stage=stage)
 
 
-def pin_of(record: GoldenRecord) -> dict:
-    """One entry as the hand pin ``offered`` publishes: its input pins plus its authored row."""
-    return {**record.pin_map, **record.knobs}
+def pin_of(case: Case, row: Row) -> dict:
+    """One row as the hand pin its bench publishes: its input pins, the decisions that mint its kernel, its row."""
+    route = {str(key): str(value) for step in case.document.path_to(row.kernel) for key, value in step.arm.items()}
+    return {**row.pins, **route, **(row.knobs or {})}
 
 
-def set_decisions(case: Case) -> dict:
-    """The kernel-set decisions the case's entries spell — every ``PLACE`` key and every ``REDUCE``
-    value carrying a cross-CTA half — as one hand pin: what mints the pieces the other entries
-    decorate."""
-    decisions: dict = {}
-    for record in case.records:
-        for key, value in pin_of(record).items():
-            family = family_of(str(key))
-            if family == "PLACE" or (family == "REDUCE" and (plan := parse_reduce(value)) is not None and plan.needs_split):
-                decisions[key] = value
-    return decisions
-
-
-def evidence_line(path: Path) -> str | None:
-    """The case's ``# evidence:`` citation, read out of its leading comment block."""
-    for line in leading_comment(path).splitlines():
-        body = line.lstrip("#").strip()
-        if body.lower().startswith("evidence:"):
-            return body
+def evidence_line(document: GoldenFile) -> str | None:
+    """The case's ``evidence:`` citation: the paragraph of its note that starts with it."""
+    for paragraph in (document.note or "").split("\n\n"):
+        if paragraph.lower().startswith("evidence:"):
+            return paragraph
     return None
-
-
-def leading_comment(path: Path) -> str:
-    """The file's leading ``#`` block. ``dump_golden_file`` is a plain YAML dump and drops
-    comments, so regeneration captures this and re-prepends it."""
-    lines: list[str] = []
-    for line in path.read_text().splitlines(keepends=True):
-        if not line.startswith("#"):
-            break
-        lines.append(line)
-    return "".join(lines)
-
-
-# --- the derived half -------------------------------------------------------------------------
-#
-# Program wire, target, realization name and identity are all *derived* from the stored program by
-# the compiler in front of you; the authored pins and knobs are not, and regeneration structurally
-# cannot produce them. Recomputing the first group and comparing is what keeps a stored case from
-# rotting into a phantom lockout when a kernel identity or a schedule codec changes.
-
-
-def regenerate(document: dict) -> dict:
-    """The case document as the current compiler would derive it, authored fields preserved.
-
-    Runs the inventory writer through the library under an explicit ``Context.from_target`` — not
-    through ``emmy trace``, which stamps ``gpu_name`` from the live card and needs torch. The
-    result is machine-independent, so this check fires and its fix works on any box.
-    """
-    from emmy.compiler.pipeline.search.working_golden import write_trace_inventory  # noqa: PLC0415
-    from emmy.compiler.torch_wire import graph_from_wire  # noqa: PLC0415
-
-    entry = document["configs"][0]
-    realizations = entry["realizations"]
-    ctx = Context.from_target(tuple(document["compute_cap"]))
-    graph = graph_from_wire(document["programs"][entry["program"]])
-    with tempfile.TemporaryDirectory() as directory:
-        destination = Path(directory) / "regenerated.yaml"
-        write_trace_inventory(graph, destination, ctx=ctx, model=document.get("model"), force_loop_targets="loop" in entry["target"])
-        fresh = yaml.safe_load(destination.read_text())
-
-    matched = _matching_entry(fresh, entry)
-    rebuilt = dict(fresh)
-    rebuilt["configs"] = [matched]
-    template = dict(matched["realizations"][0])
-    rows = []
-    for index, realization in enumerate(realizations):
-        # The target's own entry takes the inventory writer's name; a further entry decides another
-        # kernel of the set and keeps the name and identity it was authored with.
-        row = dict(template) if index == 0 else {key: realization[key] for key in ("name",) if key in realization}
-        row["bindings"] = dict(realization.get("bindings") or {})
-        row["pins"] = dict(realization.get("pins") or {})
-        row["knobs"] = canonical_knobs(realization["knobs"])
-        identity = realization.get("identity") if index else kernel_identity(golden_record_from_entry(rebuilt, matched, row))
-        if identity is not None:
-            row["identity"] = identity
-        if realization.get("latency") is not None:
-            # Measured on a card, never derived from the program: a regeneration on a CPU box must
-            # not erase a 4090's recorded timings.
-            row["latency"] = dict(realization["latency"])
-        rows.append(row)
-    matched["realizations"] = rows
-    if document.get("model") is not None:
-        rebuilt["model"] = document["model"]
-    return rebuilt
-
-
-def complete(document: dict) -> dict:
-    """The case with an entry for every kernel of its set no entry decides yet.
-
-    The set is replayed the way the deploy reads it (``golden._replay`` with the entries as one
-    another's siblings); a scheduled kernel no entry names by identity and no entry's row vouches
-    for gets an entry of its own: that kernel's identity, the input regime, and the schedule row
-    the replay realized on it. Strict evidence then has a row at every fork. Authoring, not
-    derivation — the added rows are enumerable schedules of those kernels, and the case pins them
-    from then on."""
-    from emmy.compiler.pipeline.knob import family_of  # noqa: PLC0415
-    from emmy.compiler.pipeline.search.golden import _replay, lead_of, siblings_of  # noqa: PLC0415
-
-    entry = document["configs"][0]
-    records = [golden_record_from_entry(document, entry, realization) for realization in entry["realizations"]]
-    primary = records[0]
-    covered = {record.identity for record in records if record.identity is not None}
-    replays = [_replay(record, siblings=siblings_of(record, records), lead=lead_of(record, records)) for record in records]
-    for replay in replays:
-        covered |= set(replay.holders)
-    regime = {key: value for key, value in primary.pin_map.items() if family_of(str(key)) != "PLACE"}
-    added = [
-        {
-            "name": f"{primary.name}.{identity[:12]}",
-            "bindings": dict(primary.bindings),
-            "pins": dict(regime),
-            "knobs": dict(replays[0].realized.get(identity, {})),
-            "identity": identity,
-        }
-        for identity in sorted(replays[0].kernels - covered)
-    ]
-    if added:
-        entry["realizations"] = [*entry["realizations"], *added]
-    return document
-
-
-def _matching_entry(fresh: dict, entry: dict) -> dict:
-    """The regenerated config that selects the same target as the stored one."""
-    for candidate in fresh["configs"]:
-        if candidate["target"] == entry["target"]:
-            return dict(candidate)
-    targets = ", ".join(repr(candidate["target"]) for candidate in fresh["configs"])
-    raise CaseError(f"the stored target {entry['target']!r} no longer resolves; the program now offers {targets}")
 
 
 def canonical_knobs(knobs: dict) -> dict:
@@ -282,105 +159,122 @@ def canonical_knobs(knobs: dict) -> dict:
     return canonical
 
 
-def write_case(path: Path, document: dict) -> None:
-    """Persist a regenerated case, restoring the leading comment block the YAML dump drops."""
-    comment = leading_comment(path)
-    dump_golden_file(document, path, overwrite=True)
-    if comment:
-        path.write_text(comment + path.read_text())
+# --- the derived half -------------------------------------------------------------------------
+#
+# A case's kernels are DERIVED from its program by the compiler in front of you — the restamp every golden gets —
+# while the authored rows, names and note are not, and regeneration structurally cannot produce them. Recomputing
+# the kernels and comparing is what keeps a stored case from rotting into a phantom lockout when a kernel identity
+# or a body spelling changes.
 
 
-# --- the four oracles -------------------------------------------------------------------------
+def regenerate(document: GoldenFile) -> GoldenFile:
+    """The case document as the current compiler would derive it: its kernels restamped, its authored rows and note
+    preserved (``golden.restamp``, the same rewrite every repository golden gets)."""
+    fresh, _report = restamp(document)
+    return replace(fresh, rows=[replace(row, knobs=canonical_knobs(row.knobs or {})) for row in fresh.rows])
+
+
+def complete(document: GoldenFile, settled: dict[str, dict[str, str]] | None = None) -> GoldenFile:
+    """The document with a row for every kernel of each target's set and a routing row for every decision that
+    mints one.
+
+    Each target is compiled with the document as its evidence; a kernel no row schedules gets a row of its own — that
+    kernel, the input regime, and the schedule row the compile realized on it (a traced-only row of it takes that
+    row); each kernel-set decision the compile took is recorded as the splice watcher reports it. A row naming a
+    kernel the set does not run — one a decision cuts, or one the compiler no longer mints — is dropped, and the
+    kernel standing in its place gets a fresh row. Strict evidence then has a row at every fork, each kernel's own.
+    ``settled`` maps a row name's prefix before the first ``.`` — the captured graph's key (``g000`` …) — to the weight
+    layouts that program compiled with in its runner (``settled_layouts``), so the set completed is the set serving
+    runs. Authoring, not derivation."""
+    from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from emmy.compiler.pipeline import CUDA_PASSES, Pipeline  # noqa: PLC0415
+    from emmy.compiler.pipeline.knob import schedule_row_key  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.tile._layout import settled_layouts  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import evidence_scope  # noqa: PLC0415
+    from emmy.compiler.wire import kernel_bindings, kernel_tile  # noqa: PLC0415
+
+    ctx = Context.from_target(tuple(document.compute_cap))
+    ran: set[str] = set()
+    for target in document.targets():
+        seed = next((row for row in document.rows if row.kernel == target.ref), None)
+        seed = seed or next(
+            row
+            for row in document.rows
+            if (document.path_to(row.kernel) or [None])[0] and document.path_to(row.kernel)[0].parent == target.ref
+        )
+        regime = {str(name): value for name, value in seed.pins.items() if family_of(str(name)) not in KERNEL_DECISION_FAMILIES}
+        taken: list = []
+        watcher = KernelInventory(on_routing=lambda parent, arm, pieces, _ids, taken=taken: taken.append((parent, arm, pieces)))
+        layouts = (settled or {}).get(seed.name.split(".", 1)[0], {})
+        with evidence_scope([_measured(document)]), pinned_knobs(regime), settled_layouts(layouts):
+            graph = Pipeline.build(CUDA_PASSES).with_strategies(watcher).run(target.program({}), ctx=ctx, db=None)
+        for parent, arm, pieces in taken:
+            stored = document.add_kernel(definition(parent, parent.name))
+            children = [document.add_kernel(definition(piece, piece.name)) for piece in pieces]
+            arm = {str(k): str(v) for k, v in arm.items()}
+            document.add_routing(RoutingRow(stored.ref, arm, tuple(c.ref for c in children)))
+        for node in graph.nodes.values():
+            if not isinstance(node.op, CudaOp) or (tile := kernel_tile(node.op)) is None:
+                continue
+            stored = document.add_kernel(definition(tile, node.op.kernel_name))
+            ran.add(stored.ref)
+            realized = dict(schedule_row_key(dict(node.op.knobs or {})))
+            existing = [index for index, row in enumerate(document.rows) if row.kernel == stored.ref and row.pins == regime]
+            if any(document.rows[index].knobs is not None for index in existing):
+                continue
+            if existing:
+                document.rows[existing[0]] = replace(document.rows[existing[0]], knobs=realized)
+                continue
+            name = seed.name if seed.kernel == stored.ref else f"{seed.name}.{stored.exact_identity[:12]}"
+            document.rows.append(Row(name=name, kernel=stored.ref, bindings=kernel_bindings(tile), pins=dict(regime), knobs=realized))
+    document.rows[:] = [row for row in document.rows if row.kernel in ran]
+    return document
+
+
+# --- the oracles -------------------------------------------------------------------------------
+
+
+def _measured(document: GoldenFile) -> GoldenFile:
+    """The case with every unmeasured row standing in as a measured one (:data:`STAND_IN`)."""
+    rows = [replace(row, measurements=STAND_IN) if row.measurements is None and row.knobs is not None else row for row in document.rows]
+    return replace(document, rows=rows)
 
 
 @contextmanager
 def evidence_scope(case: Case):
     """The case as a compile's ONLY evidence — how its schedule reaches a deploy.
 
-    Its entries are the whole golden scope, strictly (``golden.sole_evidence``: the machine-local
-    online prior is out of the way), and its input pins — the regime it was measured under, never
-    its route or its schedule row — are the environment. No hand pin rides beside it: the route and the schedule reach the compile as
-    measured rows of the kernels they decide, through the same evidence pick every ``compile`` /
-    ``run`` / ``serve`` uses, or they do not reach it at all. A case authors schedules rather than
-    measuring them, and a proposal is no evidence, so each entry stands in as a measured row: with
-    one case in scope the microseconds only have to exist, not rank. Strict: a fork no entry
-    decides is an ``EvidenceError`` naming the kernel, never a prior's guess.
-    """
-    records = [
-        replace(record, measurements={"emmy_us": 1.0, "reference_us": 1.0, "reference_backend": "corpus"})
-        if record.measurements is None
-        else record
-        for record in case.records
-    ]
-    regime = {name: value for name, value in case.record.pin_map.items() if family_of(str(name)) not in KERNEL_DECISION_FAMILIES}
-    with sole_evidence(records), pinned_knobs(regime):
+    Its file is the whole golden scope, strictly (``golden.sole_evidence``: the machine-local tune DB and the prior are
+    out of the way), and its input pins — the regime it was authored under, never a route or a schedule row — are
+    the environment. No hand pin rides beside it: the route and the row reach the compile as rows of the kernels
+    they decide, through the same evidence pick every ``compile`` / ``run`` / ``serve`` uses, or they do not reach
+    it at all. Strict: a fork no row decides is an ``EvidenceError`` naming the kernel, never a prior's guess."""
+    with sole_evidence([_measured(case.document)]), pinned_knobs(case.regime):
         yield
 
 
-class _Splices(PipelineStrategy):
-    """Every kernel-set decision a compile took, as the arm knobs each splice carried."""
-
-    def __init__(self) -> None:
-        self.taken: list[dict[str, str]] = []
-
-    def on_splice(self, e) -> None:
-        self.taken.append({str(key): str(value) for key, value in e.knobs.items()})
-
-
 def lowered(case: Case, ctx: Context):
-    """The case's target lowered through ``CUDA_PASSES`` at ``ctx`` with the case as its only
-    evidence. Returns ``(graph, kernel-set decisions taken)``; the tune DB is not consulted."""
+    """The case's target lowered through ``CUDA_PASSES`` at ``ctx`` with the case as its only evidence. Returns
+    ``(graph, kernel-set decisions taken)`` — each decision as the arm knobs its splice carried; the tune DB is not
+    consulted."""
     from emmy.compiler.pipeline import CUDA_PASSES, Pipeline  # noqa: PLC0415
 
-    splices = _Splices()
+    taken: list[dict[str, str]] = []
+    watcher = KernelInventory(on_routing=lambda _parent, arm, _pieces, _ids: taken.append({str(k): str(v) for k, v in arm.items()}))
     with evidence_scope(case):
-        graph = Pipeline.build(CUDA_PASSES).with_strategies(splices).run(case.record.target_program.copy(), ctx=ctx, db=None)
-    return graph, splices.taken
-
-
-def offered(case: Case) -> str | None:
-    """Stage 1 — under the case's pin, does the planner still enumerate its schedule?
-
-    Pinned-enumeration membership is the primary oracle, not ``unreproducible_pin_flag`` alone:
-    the flag answers ``None`` for a registered family that nothing stamped, so a pin that cannot
-    be offered at all would read as satisfied. Membership is asked per row, *through* the flag, so
-    the structural families it already reads correctly stay correctly read here.
-    """
-    for record in case.records:
-        # An entry's row beside the SET's kernel-set decisions: a piece exists to be enumerated
-        # only once the cuts and splits that mint it are pinned.
-        pinned = {**set_decisions(case), **pin_of(record)}
-        try:
-            with pinned_knobs(pinned):
-                rows = enumerate_graph(record.target_program.copy(), case.union_context()).rows
-        except Exception as exc:  # noqa: BLE001 — a pin the enumeration refuses outright is not offered
-            return f"{record.name}: {type(exc).__name__}: {exc}"
-        # Site identities are problem-local, so one structural target may contain several fresh
-        # classic problems whose exact pins are realized by different kernel rows. Every schedule pin
-        # must appear somewhere in the offered kernel set; no family-wide alias is used to bridge it.
-        if rows and unreproducible_pin_flag(pinned, rows) is None:
-            continue
-        if not record.knobs:
-            # A FORKLESS kernel: its schedule space collapsed to one row, so it opens no fork and the
-            # enumeration has nothing to return. There is no schedule to be denied, so nothing here can
-            # fail — `realized` still proves it lowers, and the later stages still prove it runs. This
-            # mirrors how `golden._replay` reads a forkless kernel's row off the resolved op.
-            continue
-        return f"{record.name}: no enumerated row carries the pin ({len(rows)} rows offered at sm_{''.join(map(str, case.compute_cap))})"
-    return None
+        graph = Pipeline.build(CUDA_PASSES).with_strategies(watcher).run(case.program(), ctx=ctx, db=None)
+    return graph, taken
 
 
 def realized(case: Case) -> str | None:
-    """Stage 2 — with the case as its only evidence, does the compile realize its schedule?
+    """Stage 1 — with the case as its only evidence, does the compile realize its schedule?
 
-    The deploy contract, asked of the case: no hand pin, the record as the whole golden scope
-    (:func:`evidence_scope`), and the same lowering ``compile`` runs. Four questions, because each
-    catches a different way the row is lost: the lowering itself may refuse; a kernel may realize
-    a *different* value; the pinned family may reach no kernel at all, which
-    ``unreproducible_pin_flag`` deliberately treats as ungateable; and a kernel-set decision the
-    case spells — a placement cut, a cross-CTA split — may not have been taken, which no stamp
-    on the resulting kernels can show.
-    """
+    The deploy contract, asked of the case: no hand pin, the file as the whole golden scope (:func:`evidence_scope`),
+    and the same lowering ``compile`` runs. Four questions, because each catches a different way a row is lost: the
+    lowering itself may refuse — strict evidence names a kernel whose row the enumeration no longer offers, the
+    lockout a case exists to catch; a kernel may realize a *different* value; the authored family may reach no
+    kernel at all, which ``unreproducible_pin_flag`` deliberately treats as ungateable; and a kernel-set decision the
+    case records may not have been taken, which no stamp on the resulting kernels can show."""
     from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
     try:
@@ -390,13 +284,13 @@ def realized(case: Case) -> str | None:
     rows = [dict(node.op.knobs or {}) for node in graph.nodes.values() if isinstance(node.op, CudaOp)]
     if not rows:
         return "lowering produced no CUDA kernel"
-    for record in case.records:
-        flag = unreproducible_pin_flag(pin_of(record), rows)
+    for row in case.rows:
+        flag = unreproducible_pin_flag(pin_of(case, row), rows)
         if flag is not None:
-            return f"{record.name}: {flag}"
-        unstamped = _unstamped_families(record.knobs, rows)
+            return f"{row.name}: {flag}"
+        unstamped = _unstamped_families(row.knobs or {}, rows)
         if unstamped:
-            return f"{record.name}: pinned but unstamped: {', '.join(sorted(unstamped))}"
+            return f"{row.name}: authored but unstamped: {', '.join(sorted(unstamped))}"
     untaken = _untaken_decisions(case, taken)
     if untaken:
         return f"kernel-set decision not taken: {', '.join(untaken)}"
@@ -404,105 +298,109 @@ def realized(case: Case) -> str | None:
 
 
 def _untaken_decisions(case: Case, taken: list[dict[str, str]]) -> list[str]:
-    """The kernel-set decisions the case spells that no splice of the compile carried: each
-    ``PLACE`` key marked ``cut`` (a bare one is any cut), and each ``REDUCE`` value with a
-    cross-CTA ``g<n>`` half (matched on that half alone — the rest is a piece's own schedule)."""
+    """The kernel-set decisions the case records that no splice of the compile carried: each ``PLACE`` key marked
+    ``cut`` (a bare one is any cut), and each ``REDUCE`` value with a cross-CTA ``g<n>`` half (matched on that half
+    alone — the rest is a piece's own schedule)."""
     missing: list[str] = []
-    for record in case.records:
-        for key, value in record.route.items():
-            if value != "cut":
-                continue
-            if not any(v == "cut" and (k == key or key == "PLACE") for arm in taken for k, v in arm.items() if family_of(k) == "PLACE"):
-                missing.append(f"{key}=cut")
-        for key, value in pin_of(record).items():
-            want = parse_reduce(value) if family_of(str(key)) == "REDUCE" else None
-            if want is None or not want.needs_split:
-                continue
-            got = (parse_reduce(v) for arm in taken for k, v in arm.items() if family_of(k) == "REDUCE")
-            if not any(plan is not None and plan.cta == want.cta and plan.finalize == want.finalize for plan in got):
-                missing.append(f"{key}={value}")
+    for route in case.document.routing:
+        for key, value in route.arm.items():
+            if family_of(key) == "PLACE" and value == "cut":
+                if not any(v == "cut" and (k == key or key == "PLACE") for arm in taken for k, v in arm.items() if family_of(k) == "PLACE"):
+                    missing.append(f"{key}=cut")
+            elif family_of(key) == "REDUCE" and (want := parse_reduce(value)) is not None and want.needs_split:
+                got = (parse_reduce(v) for arm in taken for k, v in arm.items() if family_of(k) == "REDUCE")
+                if not any(plan is not None and plan.cta == want.cta and plan.finalize == want.finalize for plan in got):
+                    missing.append(f"{key}={value}")
     return missing
 
 
 def _unstamped_families(knobs: dict, rows: list[dict]) -> set[str]:
-    """The authored schedule families no kernel carries a key for.
-
-    Only the authored ``knobs`` are asked, never ``pins``: an input pin like ``FAST_MATH`` is an
-    umbrella that gates which forks are offered and is never a stamped kernel property itself.
-    """
+    """The authored schedule families no kernel carries a key for. Only the authored ``knobs`` are asked, never
+    ``pins``: an input pin like ``FAST_MATH`` gates which forks are offered and is never a stamped kernel property."""
     stamped = {family_of(key) for row in rows for key in row}
     wanted = {family_of(name) for name in knobs} - set(_UNSTAMPABLE)
     return wanted - stamped
 
 
 def built(case: Case):
-    """Stage 3 — nvcc accepts the kernel the evidence picks. Returns the compiled graph, raising
-    on refusal."""
+    """Stage 2 — nvcc accepts the kernel the evidence picks. Returns the compiled graph, raising on refusal."""
     from emmy.compiler.backend.cuda.program import CompiledProgram  # noqa: PLC0415
     from emmy.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     graph, _taken = lowered(case, Context.probe())
     with gpu_lock():
-        CompiledProgram.build(graph, seeded_inputs(case.record.target_program))
+        CompiledProgram.build(graph, seeded_inputs(case.program()))
     return graph
 
 
 def correct(case: Case, compiled) -> None:
-    """Stage 4 — the kernel the evidence picks computes the reference answer.
-
-    The reference is derived from the target, the way ``emmy run`` already derives it: a frontend
-    program (``target: {origins: …}``) has a numpy twin; an exact Loop target has none, so it
-    compares against the same-input greedy execution of the same program.
-    """
+    """Stage 3 — the kernel the evidence picks computes the reference answer: the kernel's traced ops run on the
+    numpy backend (``GoldenFile.reference_program``); a kernel with no exact frontend twin compares against the
+    same-input greedy execution of the same program."""
     from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
     from emmy.compiler.backend.numpy import NumpyBackend  # noqa: PLC0415
 
-    program = case.record.target_program
-    feed = seeded_inputs(program)
+    program = case.program()
+    sources = {}
+    feed = seeded_inputs(program, sources=sources)
     result, _ = CudaBackend().run(compiled, input_data=dict(feed))
-    if case.record.loop_wire is None:
+    if (twin := case.document.reference_program(case.target)) is not None:
         reference = NumpyBackend()
-        want, _ = reference.run(reference.compile(program.copy()), input_data=dict(feed))
+        # The twin reads the kernel's inputs, plus any checkpoint-backed weight of its own.
+        twin_feed = {**seeded_inputs(twin, sources=sources), **{name: feed[name] for name in twin.inputs}}
+        # NumPy evaluates frontend shapes statically; only its reference twin is bound to the runtime inputs.
+        bindings = {name: int(twin_feed[buf].shape[index]) for name, (buf, index) in twin.symbolic_bindings().items()}
+        want, _ = reference.run(reference.compile(specialize_program(twin, bindings)), input_data=twin_feed)
     else:
         greedy = CudaBackend()
         want, _ = greedy.run(greedy.compile(program.copy()), input_data=dict(feed))
     narrow = _has_narrow_operand(program)
     for name in program.outputs:
-        reference = np.asarray(want.outputs[name])
-        np.testing.assert_allclose(
-            np.asarray(result.outputs[name]), reference, err_msg=f"{case.id}: output {name}", **_tolerance(narrow, reference)
-        )
+        got, reference = _comparable(program, name, np.asarray(result.outputs[name]), np.asarray(want.outputs[name]))
+        np.testing.assert_allclose(got, reference, err_msg=f"{case.id}: output {name}", **_tolerance(narrow, reference))
 
 
-def seeded_inputs(program) -> dict[str, np.ndarray]:
-    """Deterministic inputs for the target's declared shapes, scaled so an fp16 reduction of a
-    model-sized K does not saturate.
+def _comparable(program, name: str, got: np.ndarray, reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The two sides of one output as the VALUES they stand for. A packed-pair output (two e2m1 codes to the byte)
+    is decoded first: its bytes are not values, and the same value has two spellings at zero."""
+    from emmy.compiler.dtype import decode_f4x2  # noqa: PLC0415
 
-    A symbolic axis resolves to its own ``Dim`` hint — the size ``emmy run`` already resolves a
-    symbolic reproducer to. The corpus therefore exercises a symbolic kernel at its hint; it has no
-    spelling for "compile at the hint, run at some other size", because binding a symbol in a case
-    file SPECIALIZES the program rather than sizing a run of it.
+    tensor = program.buffer(name)
+    if tensor is not None and tensor.dtype.logical_elems == 2 and got.dtype == np.uint8 and reference.dtype == np.uint8:
+        return decode_f4x2(got), decode_f4x2(reference)
+    return got, reference
 
-    An input is a BUFFER name, not a node id: a Loop target's slice boundary mirrors every buffer of
-    the producer it stands in for, and a multi-buffer producer (an NVFP4 encode, which emits packed
-    codes beside their block scales) names its second buffer after the tensor rather than the node.
-    """
-    from emmy.compiler.dim import DEFAULT_SEQ_HINT  # noqa: PLC0415
+
+def seeded_inputs(program, *, sources: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+    """Deterministic inputs for the target's declared shapes, scaled so an fp16 reduction of a model-sized K does
+    not saturate. A symbolic axis resolves to its own ``Dim`` hint — the size ``emmy run`` already resolves a
+    symbolic reproducer to. An input is a BUFFER name, not a node id."""
+    from emmy.compiler.dim import DEFAULT_SEQ_HINT, Dim  # noqa: PLC0415
     from emmy.compiler.ir.base import ConstantOp  # noqa: PLC0415
+    from emmy.compiler.loader.binder import bind_constants  # noqa: PLC0415
 
     rng = np.random.default_rng(0)
+    sources = {} if sources is None else sources
 
     def seeded(dims) -> np.ndarray:  # noqa: ANN001
+        dims = tuple(Dim(dim) for dim in dims)
         shape = tuple(dim.as_static() if dim.is_static else (dim.hint or DEFAULT_SEQ_HINT) for dim in dims)
         return (rng.standard_normal(shape) * 0.05).astype(np.float32)
 
     feed: dict[str, np.ndarray] = {name: seeded(program.buffer(name).shape) for name in program.inputs}
     for node_id, node in program.nodes.items():
-        if not isinstance(node.op, ConstantOp) or node_id in feed:
+        # A constant the runtime derives from a symbolic extent (a dynamic mean's count) is the backend's to fill.
+        if not isinstance(node.op, ConstantOp) or node_id in feed or node.op.context_value is not None:
             continue
-        # A checkpoint-backed weight reaches a case with its shape but no value — the corpus has no
-        # checkpoint to bind it from — so it is seeded exactly like an input.
-        feed[node_id] = np.array([node.op.value], dtype=np.float32) if node.op.value is not None else seeded(node.output.shape)
+        op = node.op
+        parts = op.source_parts or (((op.source_path, op.source_shape or node.output.shape),) if op.source_path else ())
+        for path, shape in parts:
+            if path not in sources:
+                sources[path] = seeded(shape)
+        if not parts:
+            feed[node_id] = np.array([op.value], dtype=np.float32) if op.value is not None else seeded(node.output.shape)
+    # Both graphs bind the same source weights through their own transpose / reshape chains.
+    feed.update(bind_constants(program, sources))
     return feed
 
 
@@ -511,12 +409,8 @@ _NARROW_DTYPES = ("f16", "bf16", "e4m3", "e5m2")
 
 
 def _has_narrow_operand(program) -> bool:
-    """Whether any buffer in the target is narrow enough to set the drift bound.
-
-    Read across the whole program, not off the output. An f16-by-f16 contraction that STORES f32
-    still carries a full f16 ulp of operand rounding, and a bound picked from the store alone sits
-    below it — no amount of correct codegen can pass that.
-    """
+    """Whether any buffer in the target is narrow enough to set the drift bound — read across the whole program, not
+    off the output: an f16-by-f16 contraction that STORES f32 still carries a full f16 ulp of operand rounding."""
     for node in program.nodes.values():
         tensor = getattr(node, "output", None)
         if tensor is not None and tensor.dtype.name in _NARROW_DTYPES:
@@ -525,49 +419,29 @@ def _has_narrow_operand(program) -> bool:
 
 
 def _tolerance(narrow: bool, reference: np.ndarray) -> dict[str, float]:
-    """Comparison bounds, scaled by the reference's own peak when an operand is narrow.
-
-    A fixed absolute bound cannot serve both a 128-long f16 reduction and a 4096-long one: the
-    drift bound is roughly K times the peak times the operand epsilon, so a constant either fails
-    the long case or stops asserting anything about the short one. This is the same peak-relative
-    form the e2e coverage matrices this corpus replaces already use.
-    """
+    """Comparison bounds, scaled by the reference's own peak when an operand is narrow: the drift bound is roughly K
+    times the peak times the operand epsilon, so a constant either fails the long case or stops asserting anything
+    about the short one."""
     if not narrow:
         return {"rtol": 1e-4, "atol": 1e-5}
     peak = float(np.max(np.abs(reference))) if reference.size else 0.0
     return {"rtol": 0.05, "atol": max(5e-3, 0.05 * peak)}
 
 
-# --- stage 5: latency ---------------------------------------------------------------------------
+# --- latency ------------------------------------------------------------------------------------
 #
-# Stages 1 to 4 answer "can this schedule be realized and is it correct". This answers "and is it
-# still as fast as it was" — the failure a lockout leaves behind when the compiler quietly stops
-# selecting a schedule and falls back to a slower tier.
-#
-# It cannot ride the correctness walker. `make test` compiles at `-Xcicc -O1`, which by the
-# glossary's own definition is not a measurement lane, so a latency assertion there would measure
-# the wrong regime entirely.
+# The stages above answer "can this schedule be realized and is it correct". This answers "and is it still as fast
+# as it was" — the failure a lockout leaves behind when the compiler quietly stops selecting a schedule and falls
+# back to a slower tier. It cannot ride the correctness walker: `make test` compiles at `-Xcicc -O1`, which is not a
+# measurement lane.
 
-#: Where a stored latency stops being a match. MEASURED, not guessed: ten estimates per case over
-#: four repeats on an idle RTX 5090, spanning 1.5 us to 579 us, put the best-of-three estimator's
-#: own run-to-run spread at a median of 0.17% and a maximum of 0.74%. Five percent is roughly seven
-#: times that worst case — enough headroom for a card that throttles under a sustained sweep, and
-#: still tight enough to see a five-percent regression rather than only a cliff.
-#:
-#: The ~7% gap `run --json` documents between two timing semantics does not apply here: a stored
-#: latency and a fresh one are the same measurement of the same pinned row, compared like with
-#: like. And a case outside the band only REPORTS, so a false positive costs a line of output
-#: rather than a red build — which is itself an argument for the tighter bound.
+#: Where a stored latency stops being a match. MEASURED, not guessed: ten estimates per case over four repeats on an
+#: idle RTX 5090, spanning 1.5 us to 579 us, put the best-of-three estimator's own run-to-run spread at a median of
+#: 0.17% and a maximum of 0.74%. Five percent is roughly seven times that worst case.
 LATENCY_BAND = 0.05
 
-#: Interference is one-sided — a busy machine makes a kernel slower, never faster than the hardware
-#: can go — so the minimum of several runs is the honest estimator, and requiring every run to be
-#: slow is what keeps a developer box that is also compiling something from crying wolf.
-#:
-#: Taken lazily: a run inside the band ends the case, because the minimum can only fall and no
-#: later run could lift it back out. Only a case that looks slow pays for the extra runs, which is
-#: exactly the case where interference is the question. On an idle card, where the measured spread
-#: is under 1%, that makes the lane three times cheaper at identical strength.
+#: Interference is one-sided — a busy machine makes a kernel slower, never faster — so the minimum of several runs
+#: is the honest estimator. Taken lazily: a run inside the band ends the case.
 LATENCY_REPEATS = 3
 
 
@@ -575,18 +449,14 @@ def live_hardware_id() -> str:
     return Context.probe().hardware_id()
 
 
-def recorded_latency(case: Case, hardware_id: str) -> dict | None:
-    return (case.record.latency or {}).get(hardware_id)
+def recorded_latency(case: Case, hardware_id: str) -> Latency | None:
+    return (case.row.latency or {}).get(hardware_id)
 
 
 def bench_command(case: Case, output: Path) -> list[str]:
-    """The one way to bench a case: `emmy run`, replaying the realization the case authors.
-
-    Naming the realization makes the case's record the deploy tier's whole scope for that compile,
-    measurement state notwithstanding — a corpus case is deliberately not `VERIFIED`, so it never
-    enters the replay tooling's trusted evidence, and it still benches as a pinned row beside the
-    greedy pick because it was asked for by name.
-    """
+    """The one way to bench a case: `emmy run`, replaying the row the case authors for its target. Naming the row
+    makes the case's file the compile's whole golden scope, and the row benches as a pinned row beside the greedy
+    pick because it was asked for by name."""
     import sys  # noqa: PLC0415
 
     return [
@@ -597,7 +467,7 @@ def bench_command(case: Case, output: Path) -> list[str]:
         "--golden",
         str(case.path),
         "--realization",
-        case.record.name,
+        case.row.name,
         "--bench",
         "--bench-backends",
         "eager,tcompile,emmy",
@@ -607,14 +477,9 @@ def bench_command(case: Case, output: Path) -> list[str]:
 
 
 def measure(case: Case, *, within: float | None = None) -> tuple[list[float], float]:
-    """Best-of-N emmy microseconds for the case's own schedule, and the torch.compile number.
-
-    Stops early once a sample lands at or below ``within``: the minimum can only fall, so a run
-    already inside the band settles the case and the remaining runs would change nothing.
-
-    Deployable optimization is forced: the correctness lane's `-O1` changes runtime performance,
-    and a timing measured there is not one a deploy would ever see.
-    """
+    """Best-of-N emmy microseconds for the case's own schedule, and the torch.compile number. Stops early once a
+    sample lands at or below ``within``. Deployable optimization is forced: the correctness lane's `-O1` changes
+    runtime performance."""
     import json  # noqa: PLC0415
     import os  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
@@ -641,15 +506,12 @@ def measure(case: Case, *, within: float | None = None) -> tuple[list[float], fl
 
 
 def describe(case: Case) -> dict[str, str]:
-    """What a case is, for a report: its operations, its input shapes and its dtype.
-
-    Derived from the stored program rather than carried as metadata. A curated case list has to
-    keep these in sync by hand — which is how the list it replaces came to claim a dtype the
-    compiler had outgrown.
-    """
-    program = case.record.program_wire
+    """What a case is, for a report: its operations, its input shapes and its dtype — derived from the stored
+    program rather than carried as metadata."""
+    target = case.target
+    program = case.document.programs[target.traced]
     by_id = {node["id"]: node for node in program["nodes"]}
-    ops = [by_id[origin]["op"] for origin in case.record.origins if origin in by_id]
+    ops = [by_id[origin]["op"] for origin in target.origins if origin in by_id]
     inputs = [by_id[name]["outputs"][0] for name in program["inputs"] if name in by_id]
     shapes = " x ".join("(" + ",".join(str(dim) for dim in spec[2]) + ")" for spec in inputs)
     dtypes = {spec[1] for spec in inputs} or {"?"}

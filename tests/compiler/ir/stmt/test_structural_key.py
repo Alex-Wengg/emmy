@@ -10,7 +10,6 @@ from itertools import permutations, product
 
 from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F32
-from emmy.compiler.ir.atom import SCALAR_ATOM
 from emmy.compiler.ir.axis import Axis, Window
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.stmt.blocks import Cond, Loop
@@ -18,44 +17,52 @@ from emmy.compiler.ir.stmt.body import Body
 from emmy.compiler.ir.stmt.identity import canonicalize_identity
 from emmy.compiler.ir.stmt.leaves import (
     Accum,
+    Affine,
     Assign,
-    Const,
     Init,
+    Let,
     Load,
-    Mma,
     Write,
 )
-from emmy.compiler.ir.stmt.normalize import normalize_body, sort_commutative_args
+from emmy.compiler.ir.stmt.normalize import _canonicalize_exprs, normalize_body, prepare_body, rename_ssa_sequential
 
 # ---------------------------------------------------------------------------
 # sort_commutative_args
 # ---------------------------------------------------------------------------
 
 
-def test_sort_commutative_args_orders_add() -> None:
-    body = Body((Assign(name="v0", op="add", args=("y", "x")),))
-    out = sort_commutative_args(body)
-    assert out[0].args == ("x", "y")
-
-
-def test_sort_commutative_args_leaves_subtract_alone() -> None:
-    body = Body((Assign(name="v0", op="subtract", args=("y", "x")),))
-    out = sort_commutative_args(body)
-    assert out[0].args == ("y", "x")
-
-
-def test_sort_commutative_args_recurses_into_loop() -> None:
-    a = Axis("a", 4)
-    body = Body((Loop(axis=a, body=(Assign(name="v0", op="multiply", args=("y", "x")),)),))
-    out = sort_commutative_args(body)
-    assert out[0].body[0].args == ("x", "y")
-
-
-def test_sort_commutative_args_idempotent() -> None:
-    body = Body((Assign(name="v0", op="add", args=("y", "x")),))
-    once = sort_commutative_args(body)
-    twice = sort_commutative_args(once)
-    assert tuple(once) == tuple(twice)
+def test_affine_index_equivalence_and_cse_have_one_exact_identity() -> None:
+    keys = set()
+    for row, column in (("i", "j"), ("z", "q")):
+        i, j = Var(row), Var(column)
+        forms = (i + 2 * j + 3, 3 + j + (i + j), 3 * (i + j + 1) - (2 * i + j))
+        for first, second in product(forms, repeat=2):
+            body = Body(
+                (
+                    Loop(
+                        axis=Axis(row, 4),
+                        body=(
+                            Loop(
+                                axis=Axis(column, 4),
+                                body=(
+                                    Load(name="a", input="x", index=(first,)),
+                                    Load(name="b", input="x", index=(second,)),
+                                    Assign(name="left", op="exp", args=("a",)),
+                                    Assign(name="right", op="exp", args=("b",)),
+                                    Assign(name="sum", op="add", args=("right", "left")),
+                                    Write(output="out", index=(i, j), value="sum"),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+            )
+            normalized = normalize_body(body)
+            assert len(normalized.loads) == 1
+            assert len([s for s in normalized.iter() if isinstance(s, (Assign, Affine))]) == 2
+            assert normalize_body(Body(tuple(normalized))) == normalized
+            keys.add(body.structural_key(structural=False))
+    assert len(keys) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +282,10 @@ def test_structural_key_equal_for_reordered_reduction_axis_metadata() -> None:
         )
 
     assert make(("row", "column")).structural_key(structural=False) == make(("column", "row")).structural_key(structural=False)
-    assert make(("row",)).structural_key(structural=False) != make(("column",)).structural_key(structural=False)
+    inner = Body((Load(name="x", input="X", index=(Var("row"), Var("column"))), Accum(name="total", value="x", axes=("column",))))
+    per_row_cell = (Loop(axis=Axis("column", 4), body=inner), Write(output="O", index=(Var("row"),), value="total"))
+    per_row = Body((Loop(axis=Axis("row", 4), body=per_row_cell),))
+    assert make(("row", "column")).structural_key(structural=False) != per_row.structural_key(structural=False)
 
 
 def test_structural_key_equal_for_ambiguous_free_axis_renaming() -> None:
@@ -292,6 +302,27 @@ def test_structural_key_equal_for_ambiguous_free_axis_renaming() -> None:
 
     assert normalize_body(make("z", "a")) == normalize_body(make("a", "z"))
     assert make("z", "a").structural_key(structural=False) == make("a", "z").structural_key(structural=False)
+
+
+def test_atomic_partition_axis_order_converges_independently_of_affine_spelling() -> None:
+    """An axis absent from an atomic output must not trade places with a scaled output axis every round."""
+    forms = set()
+    for names, reverse_loops, reverse_sum in product((("row", "part"), ("z", "a")), (False, True), (False, True)):
+        row, part = names
+        terms = (Var(row) * 256, Var(part) * 64)
+        index = terms[1] + terms[0] if reverse_sum else terms[0] + terms[1]
+        body = Body((Load(name="x", input="X", index=(index,)), Write(output="O", index=(Var(row) * 2,), value="x", atomic=True)))
+        for name in names if reverse_loops else reversed(names):
+            body = Body((Loop(axis=Axis(name, 2), body=body),))
+        prepared = rename_ssa_sequential(body)
+        # Check a bounded number of rounds before calling the fixed-point driver: the regression used to cycle.
+        for _ in range(4):
+            prepared = prepare_body(prepared)
+        assert prepare_body(prepared) == prepared
+        normalized = normalize_body(body)
+        assert normalize_body(Body.from_wire(normalized.to_wire())) == normalized
+        forms.add(normalized)
+    assert len(forms) == 1
 
 
 def test_normalize_body_keeps_shared_axes_outside_known_output_geometry() -> None:
@@ -487,6 +518,37 @@ def test_structural_key_equal_for_equivalent_index_and_comparison_expressions() 
     assert left.structural_key(structural=False) == right.structural_key(structural=False)
 
 
+def test_a_commutative_comparison_orders_its_axes_by_binding_not_spelling() -> None:
+    """Normalization orders a commutative comparison's operands by where each axis is bound. Ordered by spelling, a
+    body re-spelled by its own normalization — as a golden's stored kernel is when it is read back — normalized again
+    to another body, and the kernel's identity moved."""
+
+    def condition(outer: str, inner: str) -> BinaryExpr:
+        body = Body(
+            (
+                Loop(
+                    axis=Axis(outer, 4),
+                    body=(
+                        Loop(
+                            axis=Axis(inner, 4),
+                            body=(
+                                Load(name="x", input="X", index=(Var(outer), Var(inner))),
+                                Cond(
+                                    BinaryExpr("==", Var(inner), Var(outer)),
+                                    body=(Write(output="O", index=(Var(outer), Var(inner)), value="x"),),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+        return _canonicalize_exprs(body)[0].body[0].body[1].cond
+
+    assert condition("a10", "a5") == BinaryExpr("==", Var("a10"), Var("a5"))
+    assert condition("a5", "a10") == BinaryExpr("==", Var("a5"), Var("a10"))
+
+
 def test_structural_key_equal_for_affine_index_spellings() -> None:
     """Constant folding and association do not split equivalent affine addresses."""
     element = Var("element")
@@ -553,7 +615,7 @@ def test_structural_key_equal_for_renamed_const_and_init() -> None:
     def make(constant: str, initial: str) -> Body:
         return Body(
             (
-                Const(name=constant, value=2),
+                Let(name=constant, value=2),
                 Init(name=initial, identity=0, dtype=F32),
                 Assign(name="result", op="add", args=(constant, initial)),
                 Write(output="O", index=(), value="result"),
@@ -707,31 +769,6 @@ def test_normalize_body_canonicalizes_outer_captures_before_nested_order() -> No
     assert normalize_body(canonical) is canonical
 
 
-def test_normalize_body_keeps_mma_in_its_reduction_loop() -> None:
-    """An Mma is loop-carried state even when its scalar operands are loop invariant."""
-
-    def make(axis: str) -> Body:
-        return Body(
-            (
-                Loop(
-                    axis=Axis(axis, 8),
-                    body=(
-                        Load(name="a", input="A", index=()),
-                        Load(name="b", input="B", index=()),
-                        Mma(c="state", a="a", b="b", atom=SCALAR_ATOM, axes=(axis,)),
-                    ),
-                ),
-                Write(output="O", index=(), value="state"),
-            )
-        )
-
-    canonical = normalize_body(make("k"))
-    assert canonical == normalize_body(make("renamed_k"))
-    assert isinstance(canonical[2], Loop)
-    assert isinstance(canonical[2].body[0], Mma)
-    assert canonical[2].body[0].axes == (canonical[2].axis.name,)
-
-
 def test_structural_key_equal_when_a_copy_alias_precedes_a_sibling_scope() -> None:
     def make(reuse_names: bool) -> Body:
         right_axis = "i" if reuse_names else "j"
@@ -812,7 +849,7 @@ def test_normalize_body_refines_large_asymmetric_sibling_partition() -> None:
     """Graph context splits a local-form tie before the exact ordering fallback."""
 
     def make(prefix: str, *, reverse: bool) -> Body:
-        constants = tuple(Const(name=f"{prefix}_source_{index}", value=index) for index in range(9))
+        constants = tuple(Let(name=f"{prefix}_source_{index}", value=index) for index in range(9))
         consumers = tuple(
             Cond(
                 cond=Literal(1, "int"),
@@ -866,8 +903,9 @@ def test_structural_key_distinguishes_reordered_noncommutative_arguments() -> No
     assert left_minus_right.structural_key(structural=False) != right_minus_left.structural_key(structural=False)
 
 
-def test_structural_key_distinguishes_repeated_computation() -> None:
-    """Canonical ordering retains duplicate instructions because they change kernel work."""
+def test_structural_key_folds_repeated_computation() -> None:
+    """A pure statement spelled twice over the same names is one value: normalization keeps the
+    first and aliases the second, so the two spellings are one kernel and one key."""
     axis = Axis("element", 4)
     load = Load(name="input", input="input_buffer", index=(Var("element"),))
     first = Assign(name="first", op="abs", args=("input",))
@@ -899,7 +937,7 @@ def test_structural_key_distinguishes_repeated_computation() -> None:
             ),
         )
     )
-    assert repeated.structural_key(structural=False) != shared.structural_key(structural=False)
+    assert repeated.structural_key(structural=False) == shared.structural_key(structural=False)
 
 
 def test_structural_key_preserves_effect_order() -> None:
@@ -919,7 +957,7 @@ def test_structural_key_preserves_effect_order() -> None:
 def test_structural_key_preserves_a_read_across_a_write_to_its_buffer() -> None:
     prefix = (
         Load(name="old", input="B", index=()),
-        Const(name="replacement", value=7),
+        Let(name="replacement", value=7),
         Write(output="P", index=(), value="old"),
     )
     write = Write(output="B", index=(), value="replacement")
@@ -952,8 +990,8 @@ def test_structural_key_preserves_when_accumulator_state_is_observed() -> None:
     """A state read remains after the update whose value it observes."""
     prefix = (
         Init(name="total", identity=0, dtype=F32),
-        Const(name="first", value=1),
-        Const(name="second", value=2),
+        Let(name="first", value=1),
+        Let(name="second", value=2),
         Accum(name="total", value="first"),
     )
     final_update = Accum(name="total", value="second")
@@ -1043,10 +1081,40 @@ def test_structural_key_clusters_collapse_noncommutative_to_commutative() -> Non
 
 
 def test_structural_key_idempotent() -> None:
-    """Identity normalization reaches a fixed canonical body."""
+    """Identity is a fixed point of normalization: the normal form keys as the body it came from."""
     body = _matmul_body("X", "Y", "O")
-    canonical = canonicalize_identity(normalize_body(body, hoist=False))
-    assert canonicalize_identity(canonical) == canonical
+    canonical = canonicalize_identity(body)
+    assert canonicalize_identity(normalize_body(body)) == canonical
+    assert set(canonical.arguments) == {"X", "Y", "O"}
+
+
+def test_identity_coordinate_order_survives_axis_rename() -> None:
+    """Renaming axes across lexical order must not re-key a saved kernel's measured evidence."""
+    keys = set()
+    for outer, inner in (("a9", "a10"), ("outer", "inner"), ("i", "j")):
+        index = BinaryExpr("+", BinaryExpr("*", Literal(128, "int"), Var(outer)), Var(inner))
+        body = Body(
+            (
+                Loop(
+                    Axis(outer, 40),
+                    (
+                        Loop(
+                            Axis(inner, 128),
+                            (
+                                Load(name="v", input="X", index=(index,)),
+                                Write(output="Y", index=(Var(outer), Var(inner)), value="v"),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+        canonical = canonicalize_identity(body)
+        assert canonicalize_identity(normalize_body(body)).key == canonical.key
+        normalized = normalize_body(body)
+        assert normalize_body(Body(tuple(normalized))) == normalized
+        keys.add(canonical.key)
+    assert len(keys) == 1
 
 
 def test_structural_key_is_string_and_hashable() -> None:

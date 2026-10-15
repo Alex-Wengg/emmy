@@ -9,8 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-import yaml
-
 from emmy.recipe.catalog import (
     HF_ID,
     create_recipe_stub,
@@ -20,6 +18,7 @@ from emmy.recipe.catalog import (
 )
 from emmy.recipe.lifecycle import (
     BEST_EFFORT_TAG,
+    LIFECYCLE_LOCKED_TAG,
     LIFECYCLE_TAGS,
     MAINTAINED_TAG,
     OBSOLETE_TAG,
@@ -31,6 +30,9 @@ MANIFEST_FIELDS = frozenset({"maintained_models", "best_effort_models", "obsolet
 DECISION_FIELDS = frozenset({"model_id", "rationale", "heat"})
 OBSOLETE_FIELDS = frozenset({"model_id", "replacement_model_id", "rationale", "heat"})
 ONBOARDING_FIELDS = frozenset({"model_id", "task", "rationale", "heat", "deployments"})
+# Every run scores every recipe afresh: the rationale is reworded and the heat drifts by a few points even when nothing
+# about the model changed. A recipe keeps its recorded rationale and heat until the heat moves at least this far.
+HEAT_HYSTERESIS = 10
 
 
 def _extract_object(text: str) -> dict:
@@ -76,6 +78,12 @@ def _resolve_existing_model_id(value: object, records: dict[str, dict]) -> objec
     checkpoint = value.rsplit("/", 1)[-1]
     matches = [model_id for model_id in records if model_id.rsplit("/", 1)[-1] == checkpoint]
     return matches[0] if len(matches) == 1 else value
+
+
+def _unlocked_catalog(workspace: Path) -> dict[str, dict]:
+    """The recipes this workflow classifies: a ``lifecycle-locked`` recipe is a person's decision, never touched here."""
+    records = recipe_catalog(workspace / "recipes")
+    return {model_id: record for model_id, record in records.items() if LIFECYCLE_LOCKED_TAG not in record["tags"]}
 
 
 def _model_decisions(
@@ -161,6 +169,19 @@ def _retain_best_effort(decision: dict, records: dict[str, dict]) -> dict:
     return {"model_id": model_id, "rationale": _existing_rationale(records[model_id]), "heat": decision["heat"]}
 
 
+def _settled(decision: dict, record: dict | None, lifecycle: str) -> dict:
+    """Keep a recipe's recorded rationale and heat unless its lifecycle changes or its heat moves materially."""
+    if record is None or lifecycle not in record["tags"]:
+        return decision
+    model = record["config"].get("model") or {}
+    heat = model.get("heat")
+    if not model.get("rationale") or not isinstance(heat, int) or abs(decision["heat"] - heat) >= HEAT_HYSTERESIS:
+        return decision
+    if decision.get("replacement_model_id", "") not in model["rationale"]:
+        return decision
+    return {**decision, "rationale": model["rationale"], "heat": heat}
+
+
 def _serving_capacity(config: dict) -> tuple[object, object]:
     llm = (config.get("engine") or {}).get("llm") or {}
     return llm.get("context_length"), llm.get("max_concurrent_requests")
@@ -169,7 +190,7 @@ def _serving_capacity(config: dict) -> tuple[object, object]:
 def validate_manifest(path: Path, workspace: Path) -> dict:
     """Validate one discovery manifest and return its normalized lifecycle decisions."""
     manifest = _extract_object(path.read_text())
-    records = recipe_catalog(workspace / "recipes")
+    records = _unlocked_catalog(workspace)
     maintained = _model_decisions(manifest.get("maintained_models"), "maintained_models", records)
     best_effort = _model_decisions(
         manifest.get("best_effort_models"),
@@ -185,6 +206,7 @@ def validate_manifest(path: Path, workspace: Path) -> dict:
         raise ValueError("onboarding_models must be a list")
     normalized_candidates = []
     candidate_ids: set[str] = set()
+    locked = set(recipe_catalog(workspace / "recipes")) - set(records)
     for candidate in candidates:
         if not isinstance(candidate, dict) or set(candidate) != ONBOARDING_FIELDS:
             raise ValueError(f"Each onboarding model must contain exactly: {', '.join(sorted(ONBOARDING_FIELDS))}")
@@ -193,6 +215,8 @@ def validate_manifest(path: Path, workspace: Path) -> dict:
             raise ValueError(f"Invalid onboarding Hugging Face model ID: {model_id!r}")
         if model_id in candidate_ids:
             raise ValueError(f"Duplicate onboarding model {model_id}")
+        if model_id in locked:  # the agent never saw it; the recipe is not this workflow's to change
+            continue
         if model_id in records and model_id not in existing_onboarding:
             raise ValueError(f"A complete recipe already exists for onboarding model {model_id}")
         if candidate["task"] not in ("generate", "embed"):
@@ -269,11 +293,15 @@ def validate_manifest(path: Path, workspace: Path) -> dict:
         accepted_obsolete.append(decision)
     obsolete_decisions = accepted_obsolete
 
+    lifecycles = (
+        ("maintained_models", maintained, MAINTAINED_TAG),
+        ("best_effort_models", best_effort, BEST_EFFORT_TAG),
+        ("obsolete_models", obsolete_decisions, OBSOLETE_TAG),
+        ("onboarding_models", normalized_candidates, ONBOARDING_TAG),
+    )
     return {
-        "maintained_models": maintained,
-        "best_effort_models": best_effort,
-        "obsolete_models": obsolete_decisions,
-        "onboarding_models": normalized_candidates,
+        field: [_settled(decision, records.get(decision["model_id"]), lifecycle) for decision in decisions]
+        for field, decisions, lifecycle in lifecycles
     }
 
 
@@ -329,25 +357,16 @@ def _replace_model_metadata(text: str, rationale: str, heat: int) -> str:
     return "".join(lines)
 
 
-def _replace_matrices(text: str, deployments: list[dict[str, object]]) -> str:
-    lines = text.splitlines(keepends=True)
-    start = next((index for index, line in enumerate(lines) if line.startswith("matrices:")), None)
-    if start is None:
-        raise ValueError("Onboarding shell is missing its matrices block")
-    end = start + 1
-    while end < len(lines) and (not lines[end].strip() or lines[end].startswith((" ", "\t", "-"))):
-        end += 1
-    lines[start:end] = [yaml.safe_dump({"matrices": deployments}, sort_keys=False, width=116)]
-    return "".join(lines)
-
-
-def _set_lifecycle(record: dict, lifecycle: str, rationale: str, heat: int, deployments: list | None = None) -> bool:
+def _set_lifecycle(record: dict, lifecycle: str, rationale: str, heat: int) -> bool:
     path = record["path"]
     before = path.read_text()
-    after = _replace_tag_block(before, _tags_with_lifecycle(record["tags"], lifecycle))
-    after = _replace_model_metadata(after, rationale, heat)
-    if deployments is not None:
-        after = _replace_matrices(after, deployments)
+    after = before
+    tags = _tags_with_lifecycle(record["tags"], lifecycle)
+    if tags != list(record["tags"]):
+        after = _replace_tag_block(after, tags)
+    model = record["config"].get("model") or {}
+    if (model.get("rationale"), model.get("heat")) != (rationale, heat):
+        after = _replace_model_metadata(after, rationale, heat)
     if before == after:
         return False
     path.write_text(after)
@@ -381,7 +400,7 @@ def _summary(manifest: dict) -> str:
     lines = [
         "## Automated model lifecycle update",
         "",
-        f"This rolling PR keeps {len(manifest['maintained_models'])} recipes in the maintained set.",
+        f"This update keeps {len(manifest['maintained_models'])} recipes in the maintained set.",
         "Best-effort recipes remain runnable but are not selected for periodic testing and optimization. Obsolete recipes",
         "remain in git but are disabled and excluded from package builds.",
         "",
@@ -418,7 +437,7 @@ def _summary(manifest: dict) -> str:
 
 def apply_manifest(manifest: dict, workspace: Path, summary_path: Path) -> dict:
     """Apply a validated manifest and return change/count outputs."""
-    records = recipe_catalog(workspace / "recipes")
+    records = _unlocked_catalog(workspace)
     changed = False
     for decision in manifest["maintained_models"]:
         changed = _set_lifecycle(records[decision["model_id"]], MAINTAINED_TAG, decision["rationale"], decision["heat"]) or changed
@@ -428,16 +447,7 @@ def apply_manifest(manifest: dict, workspace: Path, summary_path: Path) -> dict:
         changed = _set_lifecycle(records[decision["model_id"]], OBSOLETE_TAG, decision["rationale"], decision["heat"]) or changed
     for candidate in manifest["onboarding_models"]:
         if candidate["model_id"] in records:
-            changed = (
-                _set_lifecycle(
-                    records[candidate["model_id"]],
-                    ONBOARDING_TAG,
-                    candidate["rationale"],
-                    candidate["heat"],
-                    candidate["deployments"],
-                )
-                or changed
-            )
+            changed = _set_lifecycle(records[candidate["model_id"]], ONBOARDING_TAG, candidate["rationale"], candidate["heat"]) or changed
         else:
             create_recipe_stub(
                 workspace / "recipes",

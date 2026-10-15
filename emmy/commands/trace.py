@@ -1,11 +1,11 @@
-"""Trace a transformer layer or inline module to self-contained golden YAML."""
+"""Trace a transformer layer or inline module to a self-contained golden file."""
 
 import ast
 import logging
 import sys
 from pathlib import Path
 
-from emmy.compiler.pipeline.search.working_golden import (
+from emmy.compiler.pipeline.search.golden import (
     append_trace_inventory,
     preflight_trace_inventory,
     write_trace_inventories,
@@ -20,24 +20,16 @@ def register_trace_command(subparsers):
 
     parser = subparsers.add_parser(
         "trace",
-        help="Trace a model, debug IR, or inline torch module to golden YAML",
+        help="Trace a model, debug IR, or inline torch module to a golden file",
     )
     add_input_args(parser, include_dump_dir=False)
     add_quantize_arg(parser)
-    parser.add_argument("--output", "-o", help="Output golden YAML path (default: <trace-name>.golden.yaml)")
-    parser.add_argument(
-        "--loop-targets",
-        action="store_true",
-        help=(
-            "Persist every target as exact post-fusion Loop IR. Use for compiler-sensitive storage formats "
-            "whose fusion grouping is not a stable frontend-provenance selector."
-        ),
-    )
+    parser.add_argument("--output", "-o", help="Output golden file path (default: <trace-name>.golden.json)")
     parser.add_argument(
         "--append",
         action="store_true",
         help=(
-            "Add this trace's targets to an existing golden YAML instead of refusing to replace it. "
+            "Add this trace's targets to an existing golden file instead of refusing to replace it. "
             "Use to collect one model's separately traced paths -- each decoder-layer kind, the embedding, "
             "final normalization and output seams -- into one inventory. A kernel already covered is kept once."
         ),
@@ -62,7 +54,7 @@ def register_trace_command(subparsers):
         "--model-provenance",
         metavar="REPO@REVISION",
         help=(
-            "Record this exact model provenance in the working YAML instead of the input path. "
+            "Record this exact model provenance in the working golden file instead of the input path. "
             "Use the uploaded HF repo plus its 40-character checkpoint revision for release goldens."
         ),
     )
@@ -105,21 +97,18 @@ def handle_trace(args):
             logger.error("--serving-twins is incompatible with %s", ", ".join(conflicts))
             sys.exit(2)
         from emmy.serving.release import load_serving_config  # noqa: PLC0415
-        from emmy.serving.twins import capture_twin_graphs  # noqa: PLC0415
+        from emmy.serving.twins import capture_serving_twins  # noqa: PLC0415
 
         try:
             serving = load_serving_config(args.serving_config)
         except (OSError, ValueError) as exc:
             logger.error("invalid serving config: %s", exc)
             sys.exit(2)
-        # The release audit's graph set (``emmy eval golden``): the symbolic programs plus the
-        # config's static widths — a golden traced from fewer graphs leaves the audit with gaps.
-        if serving.static_only:
-            graphs = capture_twin_graphs(args.input, decode_bucket=1, prefill_bucket=0, symbolic=False, static_only=True)
-        else:
-            graphs = capture_twin_graphs(args.input, decode_bucket=0, prefill_bucket=0, extra_widths=serving.static_widths, symbolic=True)
+        # The release audit's graph set (``emmy eval golden``) — a golden traced from fewer graphs leaves the
+        # audit with gaps.
+        graphs = capture_serving_twins(args.input, serving)
         source_name = args.input.rstrip("/").rsplit("/", 1)[-1].partition("@")[0]
-        destination = args.output or f"{source_name}.serving-twins.golden.yaml"
+        destination = args.output or f"{source_name}.serving-twins.golden.json"
         try:
             preflight_trace_inventory(destination)
         except FileExistsError as e:
@@ -128,14 +117,16 @@ def handle_trace(args):
         if args.model_provenance and args.model_provenance != serving.model_provenance:
             logger.error("--model-provenance must match the serving config (%s)", serving.model_provenance)
             sys.exit(2)
+        from emmy.serving.twins import twin_realizations  # noqa: PLC0415
+
         result = write_trace_inventories(
             graphs,
             destination,
             model=serving.model_provenance,
-            realizations=[row.to_golden() for row in serving.realizations],
+            realizations={name: [row.to_golden() for row in twin_realizations(serving, name)] for name in graphs},
         )
         logger.info(
-            "Saved serving-twin golden YAML: %s (%d graph(s), %d distinct kernel(s))",
+            "Saved serving-twin golden file: %s (%d graph(s), %d distinct kernel(s))",
             result.path,
             len(graphs),
             result.target_count,
@@ -152,7 +143,7 @@ def handle_trace(args):
         from emmy.commands.compile import _quantize_traced  # noqa: PLC0415
 
         quantized_checkpoint = _quantize_traced(graph, bundle, args)
-    destination = args.output or f"{basename}.golden.yaml"
+    destination = args.output or f"{basename}.golden.json"
     if not args.append:
         try:
             preflight_trace_inventory(destination)
@@ -181,11 +172,10 @@ def handle_trace(args):
         graph,
         destination,
         model=model,
-        force_loop_targets=args.loop_targets,
         model_quant_digest=model_quant_digest,
     )
     verb = "Appended to" if writer is append_trace_inventory else "Saved"
-    logger.info("%s golden YAML: %s (%d new distinct kernel(s))", verb, result.path, result.target_count)
+    logger.info("%s golden file: %s (%d new distinct kernel(s))", verb, result.path, result.target_count)
 
 
 def graph_from_code(code: str, dynamic_shapes: dict | None = None):

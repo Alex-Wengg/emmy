@@ -11,9 +11,12 @@ skills and CloudRift inference endpoint.
 | Workflow | Trigger | Runner | Result |
 | --- | --- | --- | --- |
 | **Tests** | Pull request to `main` | GitHub-hosted + `ubuntu-runners` | Runs Ruff, the complete test suite, and a PyPI package dry run. |
+| **Nightly refresh** | Nightly schedule or manual dispatch | `ubuntu-runners` + `agent-runners` / `agents` | Refreshes CPU test durations and qualified schedule or placement priors directly on `main`, refreshes recipe lifecycle tags and onboarding shells on `main`, lists the compiler gaps, fills one hardware golden's missing measurements on a rented CloudRift card, and posts one summary to #emmy-robots. |
+| **Review pull requests** | Ready PR or new commit | GitHub-hosted | Posts a PR Agent review using the nightly CloudRift model. |
 | **Publish to PyPI** | Manual dispatch or published GitHub release | GitHub-hosted | Verifies the source and distribution, publishes to PyPI, and optionally creates the release. |
 | **Verify or onboard model** | Nightly schedule or manual dispatch | `agent-runners` / `agents` | Qualifies one available exact model/GPU deployment and updates the rolling lifecycle PR. |
-| **Discover model** | Nightly schedule or manual dispatch | `agent-runners` / `agents` | Refreshes recipe lifecycle tags and onboarding shells in one rolling PR without renting a VM. |
+| **Corpus timings** | Weekly schedule or manual dispatch | `agent-runners` / `agents` | Rents one CloudRift card and records its realization corpus timings on a rolling PR. |
+| **Review agent prompts** | Nightly schedule or manual dispatch | `agent-runners` / `agents` | Reads the last discovery and qualification run and corrects one agent prompt when its wording caused the failure. |
 
 There is no generic experiment workflow or GitHub dispatch input for `emmy bench`. Requested experiment runs start
 from a developer checkout through the tracked `.agents/skills/run-experiment` skill.
@@ -26,22 +29,86 @@ table, a diagram, a few lines of output — a horizontal rule, and then the rest
 the change. `Abstract` is the only fixed heading. The split exists so a reader can decide from the abstract
 alone whether the PR concerns them, which is why code references stay below the rule. The template also asks
 for two revision passes before posting, because the failure it guards against is a first draft that lists
-everything done instead of saying what the change is.
+everything done instead of saying what the change is. A test holds the tracked file to that shape — outside its
+instruction comments it is the `Abstract` heading and the rule — so a PR body written over the template fails the
+suite.
 
 The template stays reusable and never holds one PR's content. Agents draft the body in an untracked temporary file
 outside the repository, post that body to GitHub, and leave the tracked template unchanged.
 
 ## Pull-request checks
 
-**Tests** runs three parallel jobs and installs the CI dependency set on Python 3.13. A newer commit cancels the
+**Tests** runs four parallel jobs and installs the CI dependency set on Python 3.13. A newer commit cancels the
 previous run for the same pull request. The GitHub-hosted lint job runs Ruff check and format verification. The
 compiler-heavy job uses `ubuntu-runners` for `make test`, including `tests/github/` coverage for helpers under
 `.github/scripts/` and `.github/workflows/scripts/`. Hugging Face downloads used by tests are cached because anonymous
 shared-runner traffic is rate-limited. A separate GitHub-hosted bare-Python job runs `make pypi-dist`, the exact
-non-publishing build path used by the release workflow, and requires one wheel and one source distribution. This
-workflow has no write permission and does not use deployment credentials. The test step has a 38-minute execution cap
-and reuses the environment installed before that step; the outer 45-minute job allowance also covers dependency
+non-publishing build path used by the release workflow, then the release gate's own smoke test
+(`.github/actions/smoke-wheel`): one wheel and one source distribution, the wheel installed into a clean environment,
+its runtime extension imported, its recipe catalog read and its goldens discovered. This workflow has no write
+permission and does not use deployment credentials. The test step has a 60-minute execution cap
+and reuses the environment installed before that step; the outer 70-minute job allowance also covers dependency
 installation and cache setup.
+
+The native-runtime job runs Rustfmt, Clippy with warnings denied, and locked Cargo tests on a GitHub-hosted runner.
+These checks require no GPU. Native GPU parity and failure recovery run through `make test-native` on supplied hardware.
+
+**Nightly refresh** holds the nightly jobs: the duration, prior, gap and fill jobs on `ubuntu-runners`, and the
+discovery job on the agent runners (see Model discovery and onboarding). Only the fill job rents a GPU. Every job has
+three hours, and each long step a shorter limit of its own, so the summary steps after it still run and the message
+carries what a timed-out job finished. The jobs on `ubuntu-runners` set up through `.github/actions/setup-emmy`
+(Python, the Rust toolchain, `make setup-ci`) and commit through `.github/actions/push-to-main`. Every job runs the
+commit the run started from, so a manual dispatch from a branch tests the workflow on that branch; only a run on
+`main` commits anything to `main`. The durations job
+runs the CPU test lane with one xdist worker per available core. It rewrites only the CPU duration file, leaving GPU
+timings intact, records tests of 5 s or more, and keeps a recorded row while measurements stay within 50% of it. A
+successful run with changed timings commits and pushes directly to `main` with the repository's GitHub App token,
+through the `push_to_main` helper in `.github/workflows/scripts/bot_git.sh`, with the GitHub CLI as git's credential
+helper. The repository's pull-request ruleset grants that App a bypass; the separate rule still rejects force pushes.
+
+The prior job runs beside durations, with schedule and placement one at a time. Each run imports the repository
+goldens into its own DB, exports that space's dataset, and fits a CatBoost candidate without cross-validation. The
+comparison mode of `eval prior` scores both weights on the same dataset and skips the CLI's separate greedy
+reproduction walk. A candidate needs at least one GPU/tier/pool-size cell with 5% lower median golden rank, no cell
+with higher median rank, and unchanged scored-pool coverage. The matching space's reproduction tests run before a
+qualified candidate is committed. The shared push helper rebases and retries a push when `main` moved only in the
+other job's file, named by `TOLERATED_PATHS`; any other move of `main` stops the push, so stale measurements or weights
+cannot overwrite newer work. A job whose result depends on only part of the tree names that part in `GUARDED_PATHS`
+instead: discovery guards `recipes`, so a compiler change merged during its run is rebased over. Each prior leg
+writes its comparison line to the job output named after its space, which GitHub combines across the matrix for the
+notification job. Each leg also runs `eval prior --json` on the weights it leaves on `main` and appends how many pools
+the prior re-decides as their golden did and the regret of the picks a golden row measured (`prior_picks.jq`).
+
+The gap job runs `emmy golden list` over the repository goldens and the realization corpus and lists the corpus's
+expected-failure cases; `compiler_gaps.jq` turns them into one line: the rows behind `torch.compile` and the slowest
+three.
+
+The fill job measures what a hardware golden is missing on its own card. `emmy golden list --missing` names each
+proposal row and each target with no `torch.compile` time; `emmy vm available` says which of those cards CloudRift can
+rent now; `fill_choice.jq` takes the file with the most missing rows among them, and the job skips when nothing is
+missing or no card is free. `emmy bench` then runs `.github/golden-fill/recipe.yaml` on the rented card — one row per
+hardware golden, which `tests/github/test_golden_fill_recipe.py` keeps whole — recording each missing row with
+`run --record-greedy` (a proposal) or `run --record` (a `torch.compile` time) until its two-hour budget is spent. The
+job copies the returned file over the golden, holds it to `emmy golden check`, and pushes it to `main`, after a
+timed-out fill too, so a large file fills over several nights. The other jobs tolerate the hardware goldens moving on
+`main` while they run.
+
+The workflow ends with one GitHub-hosted notification job that waits for every other job and posts a single summary to
+#emmy-robots: each job's result, whether the durations changed, each prior's comparison and picks, the compiler gaps,
+the golden fill, and the discovery outcome described below; a discovery agent that stopped short reports how many tool
+calls and notes it finished (`discovery_partial.jq`). Because that job is independent of the self-hosted ones, it still
+reports a failure, cancellation, or timeout.
+
+**Review pull requests** runs the pinned PR Agent image when a PR is opened, reopened, marked ready, or updated. It
+reviews ready PRs from both repository branches and forks, including bot-authored PRs. The action reads the diff through
+the GitHub API without checking out PR code, and its token can read contents and write PR comments but cannot push.
+Only `/review` runs; PR descriptions and code suggestions are left to the author. New commits replace an in-progress
+review for the same PR. The model, endpoint, and credential are shared with the nightly agent workflows. PR Agent can
+use up to 128,000 tokens of model context. Recorded golden JSON is excluded from the review input; the repository's
+golden checks validate those files. A failed review gets one fresh attempt, and a second failure fails the job. A
+review with no actionable finding posts no empty review card. The check is advisory: completion does not establish
+that the model found every issue, and no comment is the expected result when it reports none. The patch includes ten
+unchanged lines before each change, the maximum PR Agent accepts, so it can check nearby imports and definitions.
 
 ## Package publication
 
@@ -52,12 +119,12 @@ installation and cache setup.
 - A manually published GitHub release must already have a tag matching `pyproject.toml`; the workflow validates and
   publishes that version without creating another release.
 
-Both paths accept only a commit already merged into `main` through a pull request with a successful **Tests** workflow.
-Those pull-request checks own lint, the complete suite, and the release-path package dry run; publication verifies the
-result through GitHub's read-only API rather than repeating it. `make pypi-dist` installs its minimal build
-dependencies, then uses `scripts/prepare_dist.py` to stage bundled recipes and rewrite repository-relative README
-links for PyPI before building the wheel and source distribution. The release gate requires exactly one of each,
-installs the wheel into a clean environment, checks its version, and reads its bundled recipe catalog. The build
+Both paths accept any commit already on `main`, including direct commits. Publication does not require a merged pull
+request or a successful **Tests** workflow. Pull-request checks own lint, the complete suite, and the release-path
+package dry run. `make pypi-dist` installs its minimal build dependencies, then uses `scripts/prepare_dist.py` to stage
+bundled recipes and rewrite repository-relative README links for PyPI before building the wheel and source distribution.
+The release gate runs the shared wheel smoke test
+(`.github/actions/smoke-wheel`, the one the pull-request dry run also runs) and checks the installed version. The build
 artifact moves between jobs through GitHub artifacts. PyPI uses trusted publishing through the `pypi` environment and
 an OIDC token, so the repository stores no PyPI password. The manual path creates its GitHub release only after a
 successful upload, preventing a failed publication from leaving a release behind.
@@ -72,53 +139,82 @@ receives a 0-100 heat score for current onboarding priority. Each promising new 
 an onboarding shell with one to three proposed deployment entries made only from `deploy.gpu` and
 `deploy.gpu_count`; there is no shell-count limit.
 
-An exact-SHA `emmy recipe query` reads the rolling `recipes/` root and expands its deployment rows. The workflow's
-tracked `discovery_task.jq` filter groups those rows into recipe records and bounded scoring batches. The skill's
-lifecycle and scoring prompts are attached from that same workflow commit, so the skill and GitHub Actions share one
-prompt source. Three source investigators collect independent demand evidence, then hidden scorer subagents score the
-deterministic batches without selecting lifecycle states. Hidden fit subagents size one onboarding model each, in
-parallel, reading that checkpoint's published configuration and the `emmy/gpu.py` capacity registry under the shared
+`emmy recipe query` reads the checkout's `recipes/` root and expands its deployment rows. The workflow's
+tracked `discovery_task.jq` filter groups those rows into recipe records and bounded scoring batches. The workflow
+adds the lines of each recipe's `DISCOVERY.md` to its task row; an empty array means the note is missing. The skill's
+lifecycle and scoring prompts are attached from the same workflow commit. Scorers see each recipe's previous research
+with its batch and preserve prior heat and rationale unless substantial new evidence or a factual correction changes
+the assessment. The maintained set follows the same rule.
+Three source investigators collect independent demand evidence, then hidden scorer subagents score the deterministic
+batches without selecting lifecycle states. Hidden fit subagents size one new candidate each, in parallel, reading
+that checkpoint's published configuration and the `emmy/gpu.py` capacity registry under the shared
 `prompts/model-fit.md` contract; the parent relays their deployments and authors no hardware itself. The parent
 returns only scores, maintained IDs, obsolete proposals, new onboarding models, and the sized deployments. The tracked
 `discovery_manifest.jq` filter validates exact score coverage, ignores already-inventoried IDs repeated as new
-candidates, and mechanically assembles the four-list manifest before the lifecycle validator applies policy. An
-exact-SHA recipe query against the rolling root enforces the maintained count after application.
+candidates, and mechanically assembles the four-list manifest before the lifecycle validator applies policy. A
+recipe query enforces the maintained count after application.
 
-The workflow checks that the agent did not modify the checkout, then validates and applies its lifecycle manifest. Its
-artifact worktree remains on the rolling lifecycle branch, while the catalog, workflow scripts, OpenCode agent and
-plugin directory, attached discovery skill, and prompt files come from the exact `github.sha` that started the run.
-This lets a manual dispatch test a workflow PR without copying its implementation commits into the rolling branch or
-silently using an older manifest contract. The manifest filter reads the last fenced or bare object carrying exactly
+A rejected selection is not a failed run on its own: the step resumes the same OpenCode session with the exact
+rejection and accepts a corrected selection, twice, before failing. A reply carrying no JSON object counts as a
+rejection too, since it matches nothing in the filter, which would otherwise succeed having written an empty manifest
+and fail the run two steps later on a parse error. The rejection names the offending IDs and the set to choose from,
+because the agent assembles its answer from subagent reports with the batch rows long out of context; for the same
+reason the task states the selectable set once as `maintainable_model_ids` rather than only as a per-row flag. The
+step prints one line per agent event: a run in progress is visible only through the job log, and a rejected decision
+has to stay readable afterwards. The task is indented JSON inside the checkout so the agent can read it again after
+the initial attachment: its read tool truncates a line at 2000 characters, and the compact form was one 33 KB line
+it could not read back, which cost a run its recipe IDs. The workflow removes the task before checking that discovery
+changed no repository file except recipe-local `DISCOVERY.md` notes.
+
+The workflow checks the agent's edit boundary, then validates and applies its lifecycle manifest. It commits recipes
+and any new or changed research notes to `main` through the shared push helper, as the duration and prior jobs do and
+under the same gate: only a run on `main` commits. A note-only change also causes a commit, and the other nightly jobs
+tolerate it while retrying their pushes. The checkout is the commit the run started from, so the catalog, workflow
+scripts, OpenCode agent and plugin directory, attached discovery skill, prompt files and the recipes they edit are
+one tree, and a dispatch from a branch tests that branch without committing. The validator's full lifecycle summary
+is the job's step summary. The manifest filter reads the last fenced or bare object carrying exactly
 the five expected selection fields, so reasoning before or after it is tolerated, and requires exactly the five
-expected selection fields before assembling the manifest. A sized deployment replaces an existing onboarding shell's
-matrix, so a shell's hardware is corrected as the fleet and the checkpoint's published form become better understood.
-An empty sized result drops a new candidate that nothing in the fleet can serve and leaves an existing shell's matrix
-untouched, which keeps one unreadable checkpoint from failing the run. The named discovery agent denies repository
-edits and permits only the tracked discovery skill, public-web tools, repository reads, read-only Git inspection, the
-three named read-only source subagents, the tool-free batch scorer, and the fit subagent. Parent work caps at 64
-agentic steps. The Reddit, Hugging Face, and OpenRouter/Arena investigators run as independent bounded sources; Reddit
-can surface a candidate before an exact Hugging Face identity is known. The last complete selection object in
-OpenCode's final completed text event is logged before deterministic assembly so a rejected decision remains
-inspectable; the repository validator remains the authoritative completion gate. The project provider configuration
-selects the configurable CloudRift model through an OpenAI-compatible Chat Completions endpoint and disables the
-model's chat-template thinking mode for the concise JSON result. Discovery never provisions hardware.
+expected selection fields before assembling the manifest. Only new candidates are sized: an existing onboarding
+shell keeps the matrix it was created with, because sizing it again every run only reshuffled its hardware. An empty
+result drops a new candidate that nothing in the fleet can serve. The named discovery agent may create only
+missing recipe-local `DISCOVERY.md` notes and edit existing ones only for factual correction or substantial new
+evidence. A new onboarding shell first gets a note in the next run, once the directory exists. Its other permissions
+cover only the tracked discovery skill, public-web tools, repository reads, read-only Git inspection, the three named
+read-only source subagents, the tool-free batch scorer, and the fit subagent. Parent work caps at 160 agentic steps to
+allow the first run to create notes for missing recipes. The Reddit, Hugging Face, and OpenRouter/Arena investigators run
+as independent bounded sources; Reddit can surface a candidate before an exact Hugging Face identity is known. The
+last complete selection object in OpenCode's final completed text event is logged before deterministic assembly so a
+rejected decision remains inspectable; the repository validator remains the authoritative completion gate. The project
+provider configuration selects the configurable CloudRift model through an OpenAI-compatible Chat Completions endpoint
+and disables the model's chat-template thinking mode for the concise JSON result. Discovery never provisions hardware.
 
-OpenCode is provisioned on the self-hosted runners rather than maintained inside Emmy. `opencode.json` owns the model
-provider alias, while `.opencode/agents/` owns the separate discovery and onboarding limits and permissions. The
-tracked `.agents/skills/` remain the canonical task definitions. Compatibility symlinks under `.claude/skills/`
-expose the same packages through OpenCode's native skill tool.
+OpenCode is provisioned on the self-hosted runners rather than maintained inside Emmy. `.opencode/opencode.json` owns
+the model provider alias and a 15-minute limit on one model request, so a request the server never answers fails
+instead of holding the job until its limit; `.opencode/agents/` owns the separate discovery and onboarding limits and
+permissions. Both live under `.opencode/` because the onboarding workflow points OpenCode's config directory at the
+exact workflow source, which loads after the rolling branch's config; a provider setting anywhere else would come from
+that branch. The tracked `.agents/skills/` remain the canonical task definitions. Compatibility symlinks under
+`.claude/skills/` expose the same packages through OpenCode's native skill tool.
 
 ### Nightly verification and direct onboarding
+
+Before its first GitHub CLI call, the onboarding workflow installs a pinned, checksum-verified CLI in the runner's
+temporary directory when `gh` is absent. A runner that already provides it keeps its existing installation.
 
 **Verify or onboard model** runs nightly and retains a manual exact model/GPU dispatch. Its selector uses the
 `emmy recipe query` command against the rolling branch's recipe root, with the command implementation loaded from the
 exact workflow SHA. Manual dispatch supplies one exact external candidate; scheduled dispatch queries declared
 deployments. A filtered-out manual candidate is an error, while no scheduled match is a successful no-op.
 The query's filters and sorts read CloudRift VM variant availability without filtering on public-IP supply and consider
-only declared deployments with an available exact CloudRift GPU count. Pending `onboarding`/`untested` recipes are the
-first priority, ordered by descending heat, then model ID and deployment declaration order. If none can run, the
-selector performs a second generic query for a `maintained` recipe whose committed `RESULTS.md` has the oldest
-last-change timestamp; a missing report is oldest. No eligible deployment is a successful no-op.
+only declared deployments with an available exact CloudRift GPU count. Nightly work excludes every recipe tagged
+`onboarding-failed`; an explicit manual dispatch can retry one after a fix. It tries five queries in order and takes
+the first match: `onboarding` shells with heat 70 or more; `maintained` or `best-effort` recipes with heat 70 or more,
+no Emmy serving variant (`emmy_serving`), and no recorded `emmy-blocked` tag; other shells; hot blocked recipes when
+Emmy Python, Rust, or serving-image files changed since their last report; and `maintained` recipes, oldest report
+first. The agent reads that Git diff and retries the exact failed gate only when a relevant change may have lifted it.
+A manual run can retry a blocked recipe after an external project changes; periodic verification remains available for
+maintained recipes. Ties fall to heat, then model ID and deployment declaration order. No eligible deployment is a
+successful no-op.
 
 The workflow requires the repository's `CLOUDRIFT_TEAM_ID` variable to contain the exact Robots team UUID. Before it
 checks capacity, it validates that `CLOUDRIFT_API_KEY` can act for that UUID through a team-scoped account request;
@@ -139,14 +235,20 @@ lifecycle tag. Both modes preserve discovery-managed `model.heat`. Before the ag
 small remote Python/rsync prerequisite set and
 requires `$HOME/.cache/emmy` to be durable storage with at least 8 GiB free. Compiler staging keeps its checkout,
 venv, cache, and build temporary files there rather than on a small `/tmp` tmpfs. The job has a 24-hour limit and gives
-the agent a 23.5-hour deadline so artifact validation and cleanup retain 30 minutes. For the selected recipe and GPU,
-the same nightly qualification validates the recipe-local golden schema, strictly decodes every stored row, and
-replays it on the exact card; pull-request tests do not load checked-in golden YAML. The shared serving experiment
-retains one LFS archive per exact GPU platform plus one cumulative `RESULTS.md`; each archive includes its system-only
-row records, and a run replaces only its platform snapshot. Ignored dated run directories, loose benchmark output,
-top-level row-record copies, and qualification summaries are not repository artifacts. An Emmy-tuned prebuilt image
-is produced only when every release gate passes.
-Nightly image publication is disabled unless
+the agent a 23.5-hour deadline so artifact validation and cleanup retain 30 minutes. The deadline is the agent's only
+budget. It has no step cap: a capped agent can only answer in text once it reaches the cap, so it never writes its
+summary. An agent that ends without a summary fails its step, and the failure notice says so. A failed run adds the
+`onboarding-failed` tag to its recipe (and nothing else there) and a dated failure entry to its `RESULTS.md`, and
+keeps any complete golden, corpus case, or bounded compiler fix; the workflow validates and commits those, then fails
+the job. Before validation of a failed run, the workflow restores tracked experiment and serving-image files, removes
+new files in those areas, and drops their paths from the summary. This keeps incomplete serving results from blocking
+the failure report. A successful run must remove the tag. For the selected
+recipe and GPU, the same nightly qualification validates the recipe-local golden file and replays it on the exact
+card; pull-request tests hold every golden to the fresh lowering of its programs and load nothing more of it. The shared serving
+experiment retains one LFS archive per exact GPU platform plus one cumulative `RESULTS.md`; each archive includes its
+system-only row records, and a run replaces only its platform snapshot. Ignored dated run directories, loose benchmark
+output, top-level row-record copies, and qualification summaries are not repository artifacts. An Emmy-tuned prebuilt
+image is produced only when every release gate passes. Nightly image publication is disabled unless
 `NIGHTLY_ONBOARD_PUBLISH_IMAGE` is `true`; manual dispatch retains an explicit input.
 
 The artifact worktree stays on the rolling lifecycle branch, while Python control code is loaded from the exact
@@ -154,7 +256,7 @@ The artifact worktree stays on the rolling lifecycle branch, while Python contro
 manual dispatch test a workflow PR without leaking that PR's implementation commits into the model-artifact branch.
 The selector runs the exact-SHA catalog logic against the rolling worktree's `recipes/` directory so lifecycle mode
 and priority always reflect the branch that the agent will update.
-The workflow also attaches the exact-SHA README related-project map, the `onboard-model`, `tune-kernels`, and
+The workflow also attaches the exact-SHA README related-project map, the `onboard-model` and
 `run-experiment` skills, and the `prompts/onboard-model/` qualification, benchmarking, and investigation prompts as
 authoritative agent inputs. It loads the OpenCode agent and plugin directory from that same commit; older copies on the
 rolling branch cannot silently override a proposed artifact contract. As in discovery, the workflow renders only a
@@ -169,7 +271,7 @@ implementation/test/architecture files and 500 changed lines, and any Python sou
 change. Broader changes fail artifact validation and remain follow-up work.
 
 The agent returns an atomic manifest. `.github/scripts/onboarding_artifacts.py` accepts only declared changes under the
-allowed recipe (including `golden/<gpu-slug>_<compute-cap>.yaml`), experiment, serving-image, and bounded
+allowed recipe (including `golden/<gpu-slug>_<compute-cap>.json`), experiment, serving-image, and bounded
 implementation/test paths. The validator requires the shared experiment recipe and report plus the exact
 `results_<gpu-short>x<gpu-count>.tar.gz` archive, and it opens that archive to require matching current-platform row
 records.
@@ -186,33 +288,64 @@ model, expected lifecycle tag, and compact deployment and measured-performance s
 lane. The workflow then commits those artifacts, rebases on the latest default branch, and updates or opens the
 rolling model lifecycle PR using renewable GitHub App credentials for the long-running push path.
 
-Both lifecycle workflows finish with a separate GitHub-hosted notification job. Discovery groups only recipe entries
-actually modified by the run under their resulting lifecycle, includes each current heat score, and links the run and
-rolling PR. Onboarding includes the selected model, target, operation mode, serving deployment, and measured
-performance from its validated atomic summary. A failed summary marks a regression only when a previously qualified
-behavior or measured lane cannot be restored by a bounded fix; the isolated notification job then sends a prominent
-red Discord notice with the credential-free gate and message. Because the notification job is independent of the
-self-hosted agent job, it still runs after a failure, cancellation, or timeout. Discord delivery retries three times,
-remains non-blocking, and disables all mentions; the workflow run, durable reports, and rolling PR retain the complete
-evidence.
+The nightly refresh and the onboarding workflow each finish with a separate GitHub-hosted notification job, built by
+one script, `.github/scripts/discord_notification.py`, so every message has the same shape: a titled embed colored by
+the result, linked to the run, with one field per fact. The nightly summary groups only recipe entries actually
+modified by discovery under their resulting lifecycle and includes each current heat score.
+Onboarding includes the selected model, target, operation mode, serving deployment, and measured performance from its
+validated atomic summary. A failed summary marks a regression only when a previously qualified behavior or measured
+lane cannot be restored by a bounded fix; the isolated notification job then sends a prominent red Discord notice with
+the credential-free gate and message. Because the notification job is independent of the self-hosted agent job, it
+still runs after a failure, cancellation, or timeout. Discord delivery retries three times, remains non-blocking, and
+disables all mentions; the workflow run, durable reports, and rolling PR retain the complete evidence.
 
-### Discovery lifecycle PR
+### Nightly prompt review
 
-**Discover model** runs nightly or by manual dispatch. Discovery and qualification share a static concurrency group
-and one rolling draft PR rather than opening one PR per model. Each workflow fails closed if more than one rolling PR
-exists. It also adopts one unpaired
-discovery branch left by an interrupted PR-creation step, while
-failing closed if multiple such branches would make ownership ambiguous. Before rendering inventory or running the
-agent, it rebases an existing rolling branch onto the latest default branch. The rebase push uses the exact original
-remote head as its force-with-lease expectation; a conflict, a stale checkout, or a concurrent branch update stops the
-run before any lifecycle changes are applied.
+The discovery and qualification agents are driven entirely by the Markdown under `prompts/` and `.agents/skills/`, so
+a failure that traces to a sentence there repeats every night until someone reads a log. **Review agent prompts** runs
+at 05:00 UTC, before both, and closes that loop: it takes the agent's job from the most recent completed run of each
+workflow (the nightly refresh's discovery job and the qualification job, named as `workflow/job` pairs), and stops
+without starting an agent unless that job failed or emitted a warning annotation. The other nightly jobs read no prompt,
+so their failures never wake the review. Annotations rather than whole logs are what make
+a quiet night nearly free, and they are also what catches a run that eventually succeeded after burning its correction
+budget.
+
+The review is deliberately hard to use. `prompts/review-agent-prompts.md` states a four-part bar — a real failure, a
+cause traceable to the prompt as written, a repeat on the next run, and one sentence that would prevent it — and names
+the cases that are never prompt defects: infrastructure faults, correct negative conclusions, one-off flakes, and
+anything whose real fix is code or a permission rule. Changing nothing is the expected nightly outcome. The workflow
+enforces the rest mechanically rather than trusting the verdict: the agent may only modify tracked files under
+`prompts/` and `.agents/skills/`, at most two files and fifteen lines, and a verdict that disagrees with the working
+tree in either direction fails the run. Loosening a boundary, authorization, or safety rule is forbidden outright,
+because an agent blocked by such a rule is usually the rule working.
+
+A correction lands as one commit on the rolling discovery branch with a comment on the PR, so it reaches the nightly
+agents only once a person merges it. That is the review's real safety property: it proposes, and a human still
+decides. `.github/workflows/scripts/bot_git.sh` holds the one copy of the bot's git operations: the rolling-branch
+lookup (`find_rolling_pr`, by branch prefix and labels, which corpus timings uses for its own rolling PR) and
+force-with-lease rebase the review and onboarding use, and the push to `main` every nightly job uses. Once
+the review has loaded the exact workflow source, it sources the helpers from there rather than from the rolling
+checkout, whose copy is as old as the branch.
+
+### Discovery lifecycle update
+
+Discovery is the `discover` job of **Nightly refresh**, so it runs nightly or by manual dispatch of that workflow, and
+its validated lifecycle changes land on `main` as one commit per night, the way the duration and prior jobs land
+theirs. Qualification keeps the rolling draft PR: a qualification run holds a rented GPU for up to a day and brings
+artifacts a person reviews before they merge, while a lifecycle update is tags, heat and rationale the validator
+already bounds. The onboarding workflow rebases its rolling branch onto `main` before each run, so it picks up
+discovery's shells and scores; a recipe both touched since that rebase is a genuine overlap, and the rebase stops the
+run before any artifact is applied. The onboarding workflow fails closed if more than one rolling PR exists, adopts
+one unpaired branch left by an interrupted PR-creation step, and fails closed if several would make ownership
+ambiguous. Its rebase push uses the exact original remote head as its force-with-lease expectation; a conflict, a
+stale checkout, or a concurrent branch update stops the run.
 
 The validated manifest tags the ten selected complete recipes `maintained`, keeps other useful recipes runnable as
 `best-effort`, and uses `obsolete` only when the rationale names the exact ID of an all-around better maintained or
-best-effort replacement for the same task at a comparable or lower practical VRAM footprint, or gives a technical
-reason the recipe should no longer be used. The manifest must classify and score every complete recipe exactly once.
-For decisions with a replacement, the validator demotes the proposal to `best-effort` unless the replacement is active
-and serves the same task. A replacement described as merely comparable, or whose recipe reduces configured context or
+best-effort replacement for the same task at a comparable or lower practical VRAM footprint, or gives a technical reason
+the recipe should no longer be used. The manifest must classify and score every complete recipe exactly once. For
+decisions with a replacement, the validator demotes the proposal to `best-effort` unless the replacement is active and
+serves the same task. A replacement described as merely comparable, or whose recipe reduces configured context or
 concurrency, also defaults to `best-effort` while retaining the supplied heat. No repository code estimates whether a
 checkpoint fits a platform: memory footprint depends on total parameters, quantization, and context, which the recipe
 does not record. `prompts/model-fit.md` is the shared contract where that reasoning happens, attached to both the
@@ -221,19 +354,20 @@ lower-priority model IDs cannot stand in for an omitted recipe because every rea
 checkpoint name is normalized across a missing or incorrect organization only when it uniquely identifies one existing
 recipe; ambiguous or unknown maintained IDs still fail validation because all ten selections must resolve exactly. The
 agent must use `best-effort` when the old model retains any material capability or operating advantage. Every complete
-recipe stores the current rationale and heat immediately after `model.huggingface`. Obsolete recipes remain in git but
-cannot be deployed, benchmarked, published, or bundled; a later reassessment may return one to the maintained or
-best-effort set.
+recipe stores its rationale and heat immediately after `model.huggingface`. Every run scores every recipe afresh,
+rewording the rationale and moving the heat a few points even when nothing changed, so a recipe keeps its recorded pair
+until its lifecycle changes or its heat moves by at least 10; rewriting both every run buried the real changes of each
+nightly commit. Obsolete recipes remain in git but cannot be deployed, benchmarked, published, or bundled; a later
+reassessment may return one to the maintained or best-effort set.
 
-The workflow creates every selected `onboarding`/`untested` shell through the same catalog library that backs
-`emmy recipe create`. Each shell stores its rationale and heat under `model` and a list of one to three candidate
-deployment entries under `matrices`; subsequent runs preserve the task and setups mechanically while refreshing heat
-and rationale. A shell does not claim qualification. The workflow commits lifecycle updates to the rolling branch and
-uses the API-only `make setup-agent` target for repository helpers plus `gh` for rolling-PR discovery and updates. It
-never rents a VM. Network operations use bounded retries, and discovery keeps source evidence, batched recipe context,
-retained history, and final output within the inference endpoint's context limit. The workflow filters perform only
-structural batching and manifest assembly; the lifecycle validator retains classification policy and manifest
-application.
+The workflow creates every selected `onboarding`/`untested` shell through the same catalog library that backs `emmy
+recipe create`. Each shell stores its rationale and heat under `model` and a list of one to three candidate deployment
+entries under `matrices`; subsequent runs preserve the task and setups mechanically and refresh heat and rationale under
+the same rule. A shell does not claim qualification. The workflow commits lifecycle updates to `main` and uses the `make
+setup-agent` target, built from the checkout. It never rents a VM. Network operations use bounded retries, and discovery
+keeps source evidence, batched recipe context, retained history, and final output within the inference endpoint's
+context limit. The workflow filters perform only structural batching and manifest assembly; the lifecycle validator
+retains classification policy and manifest application.
 
 ## Credentials, VM ownership, and cleanup
 
@@ -244,9 +378,12 @@ credentials.
 
 `emmy vm create gpu --lease` writes a run-owned lease as soon as CloudRift returns an instance ID. The lease binds the
 provider handle, exact request, workflow owner, and SSH target. Cleanup first deletes and audits that handle, then
-lists and terminates every still-active CloudRift VM carrying the complete run-unique tag set. The tag audit catches a
-VM created before the lease was durable without selecting another job's rentals. An `if: always()` step performs both
-paths after OpenCode exits and fails the job if either ownership audit leaves a VM active.
+lists and terminates every still-active CloudRift VM carrying the complete run-unique tag set (`emmy vm delete
+cloudrift --tag "$EMMY_RENTAL_TAGS"`, the one cleanup every renting workflow calls). The tag audit catches a VM
+created before the lease was durable without selecting another job's rentals. An `if: always()` step performs both
+paths after OpenCode exits and fails the job if either ownership audit leaves a VM active. A runner that dies mid-job
+runs no further step, so each onboarding run first terminates every VM carrying the workflow's tags other than the job
+tag: the concurrency group serializes runs, so such a VM belongs to a run that is already dead.
 
 GitHub App credentials are used for long-lived branch writes and PR operations. Private keys and temporary provider
 configuration live only under run-specific `/tmp/emmy-*` paths and are removed by unconditional cleanup steps.
@@ -255,15 +392,16 @@ configuration live only under run-specific `/tmp/emmy-*` paths and are removed b
 
 Agent workflows use these repository secrets as applicable:
 
-- `CLOUDRIFT_API_KEY` for model discovery, Robots-team resolution, availability, and CloudRift provisioning;
-- `DISCORD_EMMY_ROBOTS_WEBHOOK_URL` for non-pinging model discovery, verification, and onboarding summaries;
+- `CLOUDRIFT_API_KEY` for model discovery, PR review, Robots-team resolution, availability, and CloudRift provisioning;
+- `DISCORD_EMMY_ROBOTS_WEBHOOK_URL` for non-pinging nightly refresh, verification, and onboarding summaries;
 - `HF_TOKEN` for gated checkpoints;
 - `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` for an eligible verified prebuilt image.
 
-`ONBOARD_AGENT_MODEL` selects the discovery/onboarding model and defaults to `Qwen/Qwen3.6-35B-A3B-FP8`.
+`ONBOARD_AGENT_MODEL` selects the discovery, onboarding, and PR review model and defaults to
+`Qwen/Qwen3.8-27B-FP8`.
 `CLOUDRIFT_TEAM_ID` must be the exact Robots team UUID; the verification/onboarding workflow fails before capacity
 selection if the variable is absent, malformed, or inaccessible to `CLOUDRIFT_API_KEY`.
-`CLOUDRIFT_INFERENCE_URL` selects its OpenAI-compatible endpoint and defaults to
+`CLOUDRIFT_INFERENCE_URL` selects the agent workflows' OpenAI-compatible endpoint and defaults to
 `https://inference.cloudrift.ai/v1`.
 `NIGHTLY_ONBOARD_PUBLISH_IMAGE=true` authorizes a nightly qualification to publish an otherwise eligible image; it is
 false when unset.

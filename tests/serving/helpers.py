@@ -24,7 +24,37 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 
-GOLDEN = Path(__file__).parent / "goldens" / "serving.golden.yaml"
+GOLDENS = Path(__file__).parent / "goldens"
+
+
+def golden_path(compute_capability: tuple[int, int] | None = None) -> Path:
+    """The lane's golden for a compute capability (the live card's by default): ``serving_sm<NN>.golden.json``.
+
+    Rows are realized schedules, and a schedule one architecture offers another may not (a TMA stage on a card
+    with no TMA), so each capability the lane runs on keeps its own file, written by the regen on that card.
+    """
+    if compute_capability is None:
+        from emmy.compiler.context import Context
+
+        compute_capability = tuple(Context.probe().compute_capability)
+    major, minor = compute_capability
+    return GOLDENS / f"serving_sm{major}{minor}.golden.json"
+
+
+def per_expert(run_expert):
+    """``combine_routed_experts``'s batch callback from a per-expert ``run_expert(e, rows)``: each hit
+    expert runs on its own block of rows, and the outputs come back concatenated in the same order."""
+    import torch
+
+    def run(rows, counts):
+        outputs, start = [], 0
+        for e, count in enumerate(counts):
+            if count:
+                outputs.append(run_expert(e, rows[start : start + count]))
+            start += count
+        return torch.cat(outputs)
+
+    return run
 
 
 def qwen3_config(layers: int):
@@ -68,6 +98,35 @@ def qwen3_model(layers: int):
 
     torch.manual_seed(0)
     return transformers.Qwen3ForCausalLM(qwen3_config(layers)).eval()
+
+
+#: The tiny Qwen3.5 text geometry: a Gated DeltaNet layer beside a full-attention layer, with the
+#: family's partial rotary embedding and fused query/gate projection.
+QWEN3_5_TINY = dict(
+    vocab_size=64,
+    hidden_size=64,
+    intermediate_size=128,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=16,
+    linear_key_head_dim=16,
+    linear_value_head_dim=16,
+    linear_num_key_heads=2,
+    linear_num_value_heads=4,
+    linear_conv_kernel_dim=4,
+    max_position_embeddings=64,
+    layer_types=["linear_attention", "full_attention"],
+)
+
+
+def qwen3_5_model(**overrides):
+    import torch
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+    torch.manual_seed(0)
+    return Qwen3_5ForCausalLM(Qwen3_5TextConfig(**(QWEN3_5_TINY | overrides))).eval()
 
 
 #: The re-minted width of layer 1's experts in the mixed-shape model — EXL3's per-layer bit
@@ -126,6 +185,18 @@ def llama_model(layers: int = 1):
     ).eval()
 
 
+def qwen3_5_gdn_model(layers: int, *, dtype: str = "float32"):
+    """The lane's GDN model: a Qwen3.5 whose layers are all linear attention (gated DeltaNet), so a runner test
+    needs no attention stitch between its layer programs."""
+    import torch
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+    tiny = {**QWEN3_5_TINY, "num_hidden_layers": layers, "layer_types": ["linear_attention"] * layers}
+    torch.manual_seed(0)
+    return Qwen3_5ForCausalLM(Qwen3_5TextConfig(**tiny)).eval().to(getattr(torch, dtype))
+
+
 #: Every runner shape this lane builds: ``id -> (model factory, from_model kwargs)``. The golden
 #: covers exactly these, so a test asks for one by id rather than spelling a config of its own.
 RUNNERS: dict[str, tuple] = {
@@ -147,6 +218,14 @@ RUNNERS: dict[str, tuple] = {
     "olmoe.l1.rider": (
         lambda: olmoe_model(1, max_position_embeddings=128, flat_router=True),
         {"dtype_str": "float32", "decode_bucket": 16, "max_tokens": 512, "prefill_bucket": 512},
+    ),
+    "qwen3_5.gdn.l2": (
+        lambda: qwen3_5_gdn_model(2),
+        {"dtype_str": "float32", "decode_bucket": 4, "max_tokens": 64, "prefill_bucket": 16},
+    ),
+    "qwen3_5.gdn.l2.bf16": (
+        lambda: qwen3_5_gdn_model(2, dtype="bfloat16"),
+        {"dtype_str": "bfloat16", "decode_bucket": 4, "max_tokens": 64, "prefill_bucket": 16},
     ),
 }
 
@@ -223,25 +302,38 @@ def wrapper_graph(case_id: str):
     return trace_module(wrapper, tuple(args), dynamic_shapes=build_torch_dynamic_shapes(parse_position_specs(specs)))
 
 
-def golden_records() -> list:
-    """The golden's rows, each standing in as a measured row.
+def on_volta() -> bool:
+    """Whether the live card is a V100 (sm_70) — the condition of the lane's two V100-only skips."""
+    import torch
 
-    A golden authored by replay carries schedules, not measurements, and a proposal is no
-    evidence — so each row gets microseconds that only have to exist, never to rank: one document
-    is in scope, so there is nothing to rank against. Same reading as the realization corpus.
-    """
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (7, 0)
+
+
+def assert_same_schedule(actual, expected, context: str = "") -> None:
+    """Two runs of one schedule agree to a few units in the last place of their dtype. Not bit for bit: a
+    cross-CTA ``atomicAdd`` split (``g<n>a``, which the V100 golden picks on several of these shapes) adds its
+    partials in arrival order, and that order changes from run to run. A different schedule, or a wrong one,
+    differs by far more than 64 units in the last place."""
+    import numpy as np
+
+    expected = np.asarray(expected)
+    eps = np.finfo(expected.dtype).eps
+    np.testing.assert_allclose(np.asarray(actual), expected, rtol=64 * eps, atol=64 * eps, err_msg=context)
+
+
+def golden_document():
+    """The lane's golden as the compile's evidence: every row standing in as a measured one — these authored scalar
+    schedules carry no device measurements — and the file scoped to the live card, so strict replay can validate
+    them there whatever card traced them."""
     from dataclasses import replace
 
-    from emmy.compiler.pipeline.search.golden import load_golden_file, load_golden_records
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline.search.golden import GoldenFile, Measurements
 
-    if not GOLDEN.exists():
-        raise FileNotFoundError(f"{GOLDEN} is missing; regenerate with `python -m tests.serving.regen`")
-    return [
-        record
-        if record.measurements is not None
-        else replace(record, measurements={"emmy_us": 1.0, "reference_us": 1.0, "reference_backend": "serving-lane"})
-        for record in load_golden_records(load_golden_file(GOLDEN))
-    ]
+    document = GoldenFile.load(golden_path())
+    stand_in = Measurements(emmy_us=1.0, reference_us=1.0, reference_backend="serving-lane")
+    rows = [replace(row, measurements=row.measurements or stand_in) for row in document.rows]
+    return replace(document, compute_cap=tuple(Context.probe().compute_capability), gpu_name=None, rows=rows)
 
 
 def build(runner_id: str, *, model=None, plan_cache=None, **overrides):
@@ -263,6 +355,45 @@ def build(runner_id: str, *, model=None, plan_cache=None, **overrides):
 def evidence_scope():
     """The lane's golden as the compile's only evidence, strictly (:func:`golden.sole_evidence`)."""
     from emmy.compiler.pipeline.search.golden import sole_evidence
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
 
-    with sole_evidence(golden_records()):
+    document = golden_document()
+    with pinned_knobs(document.shared_regime()), sole_evidence([document]):
         yield
+
+
+def fp8_block_checkpoint(model, path, *, block: int = 32) -> None:
+    """Write ``model`` as a dynamic block-FP8 checkpoint — the form Qwen ships: e4m3 codes beside
+    one ``weight_scale_inv`` per block, no activation scale — and leave the model holding the
+    values the checkpoint stores, so it is the eager reference of what a coded program computes.
+    Every linear but the output head is quantized."""
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+
+    from emmy.compiler.loader.quant import decode_f8, dequantize
+    from emmy.compiler.loader.synthesize import _quantize_fp8_block
+
+    path = Path(path)
+    model.config.save_pretrained(path)
+    document = json.loads((path / "config.json").read_text())
+    document["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "weight_block_size": [block, block],
+    }
+    (path / "config.json").write_text(json.dumps(document, indent=1))
+    tensors = {}
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear) and name != "lm_head":
+            bits, scale = _quantize_fp8_block(module.weight.detach().float().numpy(), block)
+            tensors[f"{name}.weight"] = torch.from_numpy(bits).view(torch.float8_e4m3fn)
+            tensors[f"{name}.weight_scale_inv"] = torch.from_numpy(scale)
+            module.weight.data = torch.from_numpy(dequantize(decode_f8(bits, "f8e4m3"), scale)).to(module.weight.dtype)
+    for key, tensor in model.state_dict().items():
+        tensors.setdefault(key, tensor.contiguous())
+    if model.config.tie_word_embeddings:
+        del tensors["lm_head.weight"]  # one storage; safetensors refuses to write it twice
+    save_file(tensors, str(path / "model.safetensors"))

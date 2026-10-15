@@ -29,21 +29,9 @@ from vllm.model_executor.models.interfaces import IsAttentionFree
 from emmy import config
 from emmy.serving.packed import split_spans
 from emmy.serving.runner import EmmyForwardRunner
+from emmy.serving.trunk_dtype import _trunk_dtype_str
 
 logger = logging.getLogger(__name__)
-
-# vLLM's --dtype (mc.dtype, already resolved from `auto`) → the dtype the
-# emmy trunk computes at. Only fp16/fp32 are representable through the
-# runner's numpy weight carrier, so anything else (e.g. bf16) downcasts to fp16.
-_TRUNK_DTYPE = {torch.float16: "float16", torch.float32: "float32"}
-
-
-def _trunk_dtype_str(torch_dtype) -> str:
-    dtype_str = _TRUNK_DTYPE.get(torch_dtype)
-    if dtype_str is None:
-        logger.warning("[serving] --dtype %s unsupported by the emmy trunk; computing in float16", torch_dtype)
-        return "float16"
-    return dtype_str
 
 
 def pinned_model_id(model_config) -> str:
@@ -84,7 +72,7 @@ class EmmyEmbedModel(nn.Module, IsAttentionFree):
         self.runner = EmmyForwardRunner.create(
             model_id=pinned_model_id(mc),
             max_seq_len=mc.max_model_len,
-            dtype_str=_trunk_dtype_str(mc.dtype),
+            dtype_str=_trunk_dtype_str(mc.dtype, allow_bf16=False),
             batch=batch,
             static=static,
         )
@@ -92,7 +80,7 @@ class EmmyEmbedModel(nn.Module, IsAttentionFree):
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         # Packed (num_tokens_padded,) tensors: sequences flattened back-to-back,
         # positions 0-based per request. Everything stays on-device — each span's
-        # ids slice straight into the runner (torch→cupy zero-copy) and hidden
+        # ids slice straight into the runner (device-to-device, no host hop) and hidden
         # states come back as torch CUDA tensors. Only the span boundaries need a
         # host read of positions (a tiny (num_tokens,) int vector); garbage
         # dummy-run batches survive via the vocab clamp + split_spans' chunking.

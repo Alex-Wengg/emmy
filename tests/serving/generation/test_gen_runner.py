@@ -4,6 +4,7 @@ correctness are covered on GPU by ``test_gen_runner_gpu.py`` / ``test_vllm_plugi
 import numpy as np
 import pytest
 
+from emmy.compiler.dtype import F32
 from emmy.serving.gen_runner import EmmyGenRunner, _pad_rows, _program_config_sha, _static_decode_covers_capacity
 
 
@@ -179,10 +180,11 @@ def test_pipeline_runner_tracks_absolute_layers_and_boundary_ownership():
 
 @pytest.mark.parametrize(
     ("quant_method", "coded_trunk"),
-    [("exl3", True), ("awq", True), ("fp8", False), ("modelopt", True)],
+    [("exl3", True), ("awq", True), ("fp8", True), ("fp8-static", True), ("modelopt", True), ("bitsandbytes", False)],
 )
 def test_create_keeps_storage_coded_trunks_packed(tmp_path, monkeypatch, quant_method, coded_trunk):
-    """EXL3/AWQ/NVFP4 stay checkpoint-coded; FP8 preserves the decoded trunk lane.
+    """EXL3/AWQ/NVFP4 and FP8, static or dynamic, stay checkpoint-coded; a scheme with no coded
+    lane keeps the decoded one.
 
     NVFP4 (``modelopt``) sat in the decoded column while two defects made a coded trunk compute
     silently wrong numbers — a packed operand that dropped its split-K slice base, and a plan-keyed
@@ -197,6 +199,8 @@ def test_create_keeps_storage_coded_trunks_packed(tmp_path, monkeypatch, quant_m
     from emmy.serving.gen_runner import EmmyGenRunner
 
     quant_config = {"quant_method": quant_method}
+    if quant_method == "fp8-static":
+        quant_config = {"quant_method": "fp8", "activation_scheme": "static"}
     if quant_method == "modelopt":
         quant_config["quant_algo"] = "NVFP4"
     if quant_method == "awq":
@@ -209,7 +213,7 @@ def test_create_keeps_storage_coded_trunks_packed(tmp_path, monkeypatch, quant_m
     monkeypatch.setattr(safetensors, "warn_if_unpinned", lambda _model_id: None)
     monkeypatch.setattr(huggingface, "quantized_checkpoint_dir", lambda _model_id: tmp_path)
 
-    def fake_load(path, dtype, *, compress_trunk=False, layer_range=None, include_embed=True, include_norm=True, expert_range=None):
+    def fake_load(path, dtype, *, compress_trunk=False, layer_range=None, include_embed=True, include_norm=True, expert_slice=None):
         seen.update(
             path=path,
             dtype=dtype,
@@ -217,7 +221,7 @@ def test_create_keeps_storage_coded_trunks_packed(tmp_path, monkeypatch, quant_m
             layer_range=layer_range,
             include_embed=include_embed,
             include_norm=include_norm,
-            expert_range=expert_range,
+            expert_slice=expert_slice,
         )
         return fake_model, fake_store
 
@@ -279,12 +283,12 @@ def test_compile_split_spells_static_fp4_activations_for_a_marked_nvfp4_checkpoi
         def __init__(self, **_kwargs):
             pass
 
-        def compile(self, graph):
+        def compile(self, graph, *, ctx=None):
             raise _StampedGraph(graph)
 
     monkeypatch.setattr("emmy.compiler.backend.cuda.backend.CudaBackend", _CaptureBackend)
     with pytest.raises(_StampedGraph) as caught:
-        _compile_split(wrapper, list(example), None, np.dtype("float32"), ckpt=(str(ckpt), id_to_key))
+        _compile_split(wrapper, list(example), None, F32, ckpt=(str(ckpt), id_to_key))
     graph = caught.value.graph
 
     packed_weights = [n for n in graph.nodes.values() if n.output.dtype.name == "f4e2m1x2" and type(n.op).__name__ == "ConstantOp"]
@@ -328,14 +332,14 @@ def test_compile_split_spells_static_fp4_activations_on_a_symbolic_width_split(t
         def __init__(self, **_kwargs):
             pass
 
-        def compile(self, graph):
+        def compile(self, graph, *, ctx=None):
             raise _StampedGraph(graph)
 
     monkeypatch.setattr("emmy.compiler.backend.cuda.backend.CudaBackend", _CaptureBackend)
     with pytest.raises(_StampedGraph) as caught:
         # ``["x"]`` ties the forward arg's axis 0 to the shared symbolic ``num_tokens`` Dim, and
         # ``capacity`` sizes the build feed — exactly how the runner builds its ``*.sym`` tier.
-        _compile_split(wrapper, list(example), ["x"], np.dtype("float32"), capacity=64, ckpt=(str(ckpt), id_to_key))
+        _compile_split(wrapper, list(example), ["x"], F32, capacity=64, ckpt=(str(ckpt), id_to_key))
     graph = caught.value.graph
 
     assert not graph.buffer(graph.inputs[0]).shape[0].is_static, "the fixture traced static — not the symbolic tier"
@@ -352,9 +356,257 @@ def test_compile_split_spells_static_fp4_activations_on_a_symbolic_width_split(t
     )
 
 
-def test_create_passes_the_expert_shard_through_to_the_loader(tmp_path, monkeypatch):
-    """A tensor-parallel rank's expert shard must reach the checkpoint read, not just the routing:
-    holding every expert is what does not fit the card in the first place."""
+def _qwen3_5_full_attention_config():
+    """The tiny Qwen3.5 text config with every layer full attention: the runner has no path for a
+    linear-attention layer, and the full-attention layer is the one whose query projection also
+    carries the attention output gate."""
+    pytest.importorskip("transformers.models.qwen3_5")
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    from tests.serving.helpers import QWEN3_5_TINY
+
+    return Qwen3_5TextConfig(**(QWEN3_5_TINY | {"layer_types": ["full_attention", "full_attention"]}))
+
+
+def _traced_runner(monkeypatch, model, **kwargs):
+    """``EmmyGenRunner.from_model`` with every program traced but none compiled, so it runs on a CPU.
+
+    Returns the runner and its traced graphs as ``[(wrapper class name, token width or None for the
+    symbolic program, graph)]`` in build order."""
+    import types
+
+    import torch
+
+    from emmy.serving import gen_runner, roofline
+
+    traced = []
+
+    def trace_only(wrapper, example_args, argnames, *_args, **_kwargs):
+        graph = gen_runner.trace_split(wrapper, example_args, argnames)
+        traced.append((type(wrapper).__name__, None if argnames else example_args[0].shape[0], graph))
+        program = types.SimpleNamespace(buffer_view=lambda _name: torch.empty(0), alias_buffer=lambda *_a: None)
+        return gen_runner._Program(program, list(graph.inputs), list(graph.outputs)), None
+
+    monkeypatch.setenv("EMMY_GEN_M1_TIER", "1")  # every tier, the single-token twin included
+    monkeypatch.setattr(gen_runner, "_compile_split", trace_only)
+    monkeypatch.setattr(gen_runner.EmmyGenRunner, "_ensure_device", lambda self: None)
+    monkeypatch.setattr(roofline, "audit_boot_programs", lambda *_a, **_k: {})
+    return gen_runner.EmmyGenRunner.from_model(model, **kwargs), traced
+
+
+def _input_shapes(graph, rows):
+    return [tuple(rows if not d.is_static else d.value for d in graph.buffer(name).shape) for name in graph.inputs]
+
+
+@pytest.mark.parametrize("gated", [True, False])
+def test_runner_reads_true_head_count_and_feeds_post_the_output_gate(monkeypatch, gated):
+    """Qwen3.5's full-attention ``q_proj`` is twice its query width: the second half is a gate that
+    multiplies the attention output before ``o_proj``. The runner must count heads from the query
+    half (4, not 8) and give every ``post`` program the gate as a third input; with the width alone
+    corrected, ``post`` would trace and run without the gate, a wrong answer and no error. An
+    ungated model (tiny Qwen3, same head geometry) keeps its two ``post`` inputs."""
+    torch = pytest.importorskip("torch")
+    import transformers
+
+    from tests.serving.helpers import qwen3_model
+
+    if gated:
+        torch.manual_seed(0)
+        model = transformers.Qwen3_5ForCausalLM(_qwen3_5_full_attention_config()).eval()
+    else:
+        model = qwen3_model(2)
+    runner, traced = _traced_runner(monkeypatch, model, dtype_str="float32", decode_bucket=4, prefill_bucket=16)
+
+    assert [runner.layer_meta(i)[:3] for i in range(runner.num_layers)] == [(16, 4, 2)] * 2
+    assert runner._output_gates == (gated, gated)
+    posts = [(rows, graph) for kind, rows, graph in traced if kind == "Post"]
+    # Every tier: symbolic, the single-token twin, the decode bucket, the prefill bucket.
+    assert sorted({rows or 0 for rows, _graph in posts}) == [0, 1, 4, 16]
+    for rows, graph in posts:
+        expected = [(rows or "T", 64)] * (3 if gated else 2)
+        assert _input_shapes(graph, rows or "T") == expected
+
+
+def test_gated_runner_post_is_the_serving_twin(tmp_path, monkeypatch):
+    """Measured schedules reach serving only when its kernels are the ones the twin capture
+    recorded. For a gated layer the runner's ``post`` must therefore be the twin's graph at every
+    width, and lower to the same kernels."""
+    torch = pytest.importorskip("torch")
+    import transformers
+
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline.search.bench_record import kernel_row
+    from emmy.compiler.pipeline.search.golden.restamp import lift_targets
+    from emmy.serving.twins import capture_twin_graphs
+
+    config = _qwen3_5_full_attention_config()
+    config.save_pretrained(tmp_path)
+    torch.manual_seed(0)
+    model = transformers.Qwen3_5ForCausalLM(config).eval()
+    _runner, traced = _traced_runner(monkeypatch, model, dtype_str="float32", decode_bucket=4, prefill_bucket=16)
+    twins = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=16, extra_widths=(1,), dtype="float32")
+
+    ctx = Context.from_target((12, 0), gpu_name="NVIDIA GeForce RTX 5090")
+    posts = {rows: graph for kind, rows, graph in traced if kind == "Post"}  # layer 1 repeats layer 0
+    assert sorted(posts, key=lambda rows: rows or 0) == [None, 1, 4, 16]
+    for rows, graph in posts.items():
+        twin = twins["post-sym" if rows is None else f"post{rows}"]
+        assert graph.structural_key() == twin.structural_key()
+        if rows is not None:  # the symbolic program lowers per bound width; the static ones stand for it
+            identities = [{kernel_row(t, "k").exact_identity for t in lift_targets(g, ctx).values()} for g in (graph, twin)]
+            assert identities[0] and identities[0] == identities[1]
+
+
+@pytest.mark.parametrize("prefill_bucket", [0, 8])
+def test_lora_runner_programs_match_serving_twins(tmp_path, monkeypatch, prefill_bucket):
+    pytest.importorskip("torch")
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from emmy.serving.twins import capture_twin_graphs
+
+    config = LlamaConfig(
+        hidden_size=32, intermediate_size=64, num_attention_heads=4, num_key_value_heads=2, num_hidden_layers=1, vocab_size=64
+    )
+    config.save_pretrained(tmp_path)
+    runner, traced = _traced_runner(
+        monkeypatch,
+        LlamaForCausalLM(config).eval(),
+        dtype_str="float32",
+        decode_bucket=4,
+        prefill_bucket=prefill_bucket,
+        max_tokens=8,
+        lora_rank=2,
+    )
+    twins = capture_twin_graphs(
+        str(tmp_path), decode_bucket=4, prefill_bucket=prefill_bucket, extra_widths=(1,), dtype="float32", lora_rank=2
+    )
+    assert runner._lora_rank == 2
+    expected = {"pre1", "post1", "pre4", "post4", "pre-sym", "post-sym"}
+    if prefill_bucket:
+        expected |= {"pre8", "post8"}
+    assert set(twins) == expected
+    assert {f"{half.lower()}{'-sym' if rows is None else rows}" for half, rows, _ in traced} == expected
+    for half, rows, graph in traced:
+        name = f"{half.lower()}{'-sym' if rows is None else rows}"
+        assert graph.structural_key() == twins[name].structural_key()
+
+
+def test_lora_prefill_just_below_static_bucket_uses_static_programs():
+    torch = pytest.importorskip("torch")
+    from emmy.serving.gen_runner import EmmyGenRunner
+
+    class StaticProgram:
+        def __init__(self):
+            self.inputs = []
+
+        def run_device(self, inputs):
+            self.inputs.append(inputs)
+            return [inputs[0]]
+
+    class SymbolicProgram:
+        def run_device_sym(self, _inputs):
+            raise AssertionError("a nearly full LoRA chunk must use the static program")
+
+    runner = EmmyGenRunner.__new__(EmmyGenRunner)
+    pre, post = StaticProgram(), StaticProgram()
+    runner._lora_rank = 2
+    runner._decode_bucket = 2
+    runner._prefill_bucket = 4
+    runner._pre_m1 = runner._post_m1 = None
+    runner._pre_decode = runner._post_decode = None
+    runner._pre_prefill, runner._post_prefill = [pre], [post]
+    runner._pre, runner._post = [SymbolicProgram()], [SymbolicProgram()]
+    hidden = torch.zeros(3, 8)
+    mask = torch.ones(3, 1)
+    weight = torch.ones(2, 8)
+    runner.forward_layer_pre_device(0, hidden, lora=(mask, weight))
+    runner._route_post_device(0, hidden, hidden, lora=(mask, weight))
+    assert pre.inputs[0][2].shape == post.inputs[0][3].shape == (2, 8)
+
+
+def test_lora_prefill_multiple_chunks_preserves_masks_and_weights():
+    torch = pytest.importorskip("torch")
+    from emmy.serving.gen_runner import EmmyGenRunner
+
+    class StaticProgram:
+        def __init__(self):
+            self.inputs = []
+
+        def run_device(self, inputs, *, out):
+            self.inputs.append(inputs)
+            for target in out:
+                target.copy_(inputs[0])
+
+    class SymbolicProgram:
+        def run_device_sym(self, _inputs):
+            raise AssertionError("the nearly full tail should use the static program")
+
+    runner = EmmyGenRunner.__new__(EmmyGenRunner)
+    pre, post = StaticProgram(), StaticProgram()
+    runner._lora_rank = 2
+    runner._decode_bucket = 2
+    runner._prefill_bucket = 4
+    runner._pre_m1 = runner._post_m1 = None
+    runner._pre_decode = runner._post_decode = None
+    runner._pre_prefill, runner._post_prefill = [pre], [post]
+    runner._pre, runner._post = [SymbolicProgram()], [SymbolicProgram()]
+    runner._attn_meta = [(2, 4, 4, 1.0)]
+    runner._activation_dtype = torch.float32
+    hidden = torch.arange(56, dtype=torch.float32).reshape(7, 8)
+    mask = torch.arange(7, dtype=torch.float32).reshape(7, 1)
+    weight = torch.ones(2, 8)
+    assert runner.post_attn_backing(0, 7) is None
+    assert all(torch.equal(value, hidden) for value in runner.forward_layer_pre_device(0, hidden, lora=(mask, weight)))
+    assert torch.equal(runner._route_post_device(0, hidden, hidden, lora=(mask, weight))[0], hidden)
+    for program, mask_index in ((pre, 1), (post, 2)):
+        assert len(program.inputs) == 2
+        assert [part[mask_index].shape[0] for part in program.inputs] == [4, 3]
+        assert torch.equal(torch.cat([part[mask_index] for part in program.inputs]), mask)
+        assert all(part[mask_index + 1] is weight for part in program.inputs)
+
+
+def test_lora_prefill_above_static_bucket_keeps_weight_inputs_whole():
+    torch = pytest.importorskip("torch")
+    from emmy.serving.gen_runner import EmmyGenRunner
+
+    class StaticProgram:
+        def __init__(self):
+            self.inputs = []
+
+        def run_device(self, inputs, *, out):
+            self.inputs.append(inputs)
+            for target in out:
+                target.copy_(inputs[0])
+
+    class SymbolicProgram:
+        def run_device_sym(self, _inputs):
+            raise AssertionError("a two-row tail must use the decode program")
+
+    runner = EmmyGenRunner.__new__(EmmyGenRunner)
+    pre, post, pre_decode, post_decode = (StaticProgram() for _ in range(4))
+    runner._lora_rank = 2
+    runner._decode_bucket = 2
+    runner._prefill_bucket = 4
+    runner._pre_m1 = runner._post_m1 = None
+    runner._pre_decode, runner._post_decode = [pre_decode], [post_decode]
+    runner._pre_prefill, runner._post_prefill = [pre], [post]
+    runner._pre, runner._post = [SymbolicProgram()], [SymbolicProgram()]
+    runner._sym_decode_warned = set()
+    runner._attn_meta = [(2, 4, 4, 1.0)]
+    runner._activation_dtype = torch.float32
+    hidden = torch.zeros(6, 8)
+    mask = torch.ones(6, 1)
+    weight = torch.ones(2, 8)
+    runner.forward_layer_pre_device(0, hidden, lora=(mask, weight))
+    runner._route_post_device(0, hidden, hidden, lora=(mask, weight))
+    for program, rows, weight_index in ((pre, 4, 2), (pre_decode, 2, 2), (post, 4, 3), (post_decode, 2, 3)):
+        assert program.inputs[0][0].shape[0] == rows
+        assert program.inputs[0][weight_index] is weight
+
+
+def test_create_passes_the_expert_slice_through_to_the_loader(tmp_path, monkeypatch):
+    """A tensor-parallel rank's expert slice must reach the checkpoint read, not just the programs:
+    holding every whole expert is what does not fit the card in the first place."""
     import json
 
     from emmy.compiler.loader import safetensors
@@ -373,7 +625,67 @@ def test_create_passes_the_expert_shard_through_to_the_loader(tmp_path, monkeypa
     monkeypatch.setattr(huggingface, "load_quantized_split", fake_load)
     monkeypatch.setattr(EmmyGenRunner, "from_model", classmethod(lambda cls, model, **kwargs: kwargs))
 
-    built = EmmyGenRunner.create(model_id=str(tmp_path), expert_range=(64, 96))
+    built = EmmyGenRunner.create(model_id=str(tmp_path), expert_slice=(3, 8))
 
-    assert seen["expert_range"] == (64, 96), "the shard never reached the checkpoint read"
-    assert built["expert_range"] == (64, 96), "the shard never reached the runner"
+    assert seen["expert_slice"] == (3, 8), "the slice never reached the checkpoint read"
+    assert built["expert_slices"] == 8, "the slice never reached the pack key"
+
+
+def _offset_norm_pre(family):
+    """The ``pre`` wrapper of one layer whose norms scale by ``1 + weight``: Qwen3.5 full attention
+    or Gemma-3. The input norm's weight is random, so a zero or ``1`` buffer cannot pass for it."""
+    torch = pytest.importorskip("torch")
+    import transformers
+
+    from emmy.compiler.trace.huggingface import build_attention_split_wrapper
+    from tests.serving.helpers import _block
+
+    torch.manual_seed(0)
+    if family == "qwen3_5":
+        block = transformers.Qwen3_5ForCausalLM(_qwen3_5_full_attention_config()).eval().model.layers[0]
+    else:
+        _config, block = _block("gemma3")
+    with torch.no_grad():
+        block.input_layernorm.weight.normal_()
+    return build_attention_split_wrapper(block)[0]
+
+
+@pytest.mark.parametrize("family", ["qwen3_5", "gemma3"])
+def test_single_token_pre_plan_binds_every_constant(family):
+    """At one row the compiler folds the input norm's ``1 + weight`` into one constant computed
+    from the checkpoint weight. The serving runner binds constants from the execution plan alone,
+    so the plan must say how to rebuild that constant from the weight; when it could not, the
+    runner skipped it and ``pre`` read a zero buffer. Every constant the plan declares must bind,
+    and the folded one must hold ``1 + weight``. Lowering needs no GPU."""
+    torch = pytest.importorskip("torch")
+
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.plan import plan_from_graph
+    from emmy.compiler.context import Context
+    from emmy.serving.gen_runner import _bind_plan_constants, trace_split
+
+    pre = _offset_norm_pre(family)
+    graph = trace_split(pre, [torch.zeros(1, 64)], None)
+    plan = plan_from_graph(CudaBackend().compile(graph, ctx=Context.from_target((12, 0), gpu_name="NVIDIA GeForce RTX 5090")))
+    sources = {path: t.detach().numpy() for path, t in [*pre.named_parameters(), *pre.named_buffers()]}
+
+    bound = _bind_plan_constants(plan, sources, None)
+
+    assert set(bound) == set(plan.weights)
+    norm = [nid for nid, w in plan.weights.items() if w.source_path == "input_layernorm.weight"]
+    assert len(norm) == 1
+    expected = 1 + sources["input_layernorm.weight"]
+    np.testing.assert_array_equal(bound[norm[0]].reshape(expected.shape), expected)
+
+    # A pack stores the plan as JSON; the folded constant must rebind from that form too.
+    import dataclasses
+    import json
+
+    from emmy.compiler.backend.plan import WeightSpec, plan_from_dict, plan_to_dict
+
+    packed = plan_from_dict(json.loads(json.dumps(plan_to_dict(plan))))
+    np.testing.assert_array_equal(_bind_plan_constants(packed, sources, None)[norm[0]], bound[norm[0]])
+    # And a constant the plan cannot rebuild is an error, never a zero buffer.
+    unbindable = dataclasses.replace(plan, weights={**plan.weights, norm[0]: WeightSpec(source_path=None, load_ops=None)})
+    with pytest.raises(RuntimeError, match=f"plan constant '{norm[0]}' cannot bind"):
+        _bind_plan_constants(unbindable, sources, None)

@@ -24,11 +24,20 @@ only a log. An interrupted process may leave `running`, which is explicit incomp
 The record contains no serving metrics, benchmark values, workload output, rendered command, compose document,
 repeat aggregation, comparison, or conclusion. Those values remain only in raw artifacts.
 
+For a named LoRA adapter, `model.request_name` selects the API model in the client request. The client keeps the base
+checkpoint as its tokenizer source, so the adapter alias does not need a separate tokenizer repository.
+
 NVIDIA GPUs use a structured `nvidia-smi` query. PCI device identity supplies a vendor-neutral fallback, including
 AMD cards, while `amd-smi` or `rocm-smi` output is retained when available. Missing probes remain null; the runner does
 not substitute requested hardware for an unavailable live observation.
 
 ## Boundary
+
+For command-only groups, `--local` uses the current checkout and environment directly, without SSH or VM provisioning.
+Declared stage paths still supply the clean-source check and provenance; they do not create a frozen copy locally, so
+keep those paths unchanged throughout a measured run. Each row gets a separate work directory and normal result
+records. Local commands own a process group; timeout, cancellation, and command exit terminate their descendants.
+Other fixed-host and serving deployment paths retain their existing transport behavior.
 
 The orchestrator may:
 

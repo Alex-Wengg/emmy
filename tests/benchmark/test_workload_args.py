@@ -30,9 +30,28 @@ def test_hygiene_flags_emitted_when_set():
     assert "--num-warmups 8" in cmd
 
 
+def test_shared_prefix_is_a_client_flag_only_when_set():
+    assert "--random-prefix-len" not in build_bench_command(_recipe("generate"))
+    cmd = build_bench_command(_recipe("generate", random_prefix_len=1536, random_input_len=512))
+    assert "--random-prefix-len 1536" in cmd
+    assert "--random-input-len 512" in cmd
+
+
 def test_embedding_recipes_skip_generation_only_flags():
     cmd = build_bench_command(_recipe("embed", seed=7, temperature=0, ignore_eos=True, num_warmups=8))
     assert "--seed 7" in cmd
     assert "--num-warmups 8" in cmd
     assert "--temperature" not in cmd
     assert "--ignore-eos" not in cmd
+
+
+def test_named_adapter_uses_base_tokenizer_for_benchmark():
+    recipe = Recipe.from_dict(
+        {
+            "model": {"huggingface": "org/base", "request_name": "limo"},
+            "engine": {"llm": {"vllm": {}}},
+        }
+    )
+    cmd = build_bench_command(recipe)
+    assert "--model limo" in cmd
+    assert "--tokenizer org/base" in cmd

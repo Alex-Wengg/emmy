@@ -13,12 +13,14 @@ The classic schedule's typed move catalogs live with its model in
 :mod:`emmy.compiler.ir.schedule.catalog`; search consumes encoded rows but does not define the
 candidate schedules.
 
-Two groups:
+The main groups:
 
 - **Schedule codec knobs** (``WORK`` / ``REDUCE`` / ``TILE`` / ``STAGE`` / ``RASTER``) — the tile-lowering schedule
   fork points serialized by ``ClassicScheduleCodec``. The typed schedule is materialized in
   ``lowering/kernel/010_materialize``; its encoded row rides on ``TileOp.knobs`` so the online
   prior can featurize and tune the decision. ``off=""`` is the explicit direct leaf value.
+- **Kernel storage knobs** (``SHARED_CARRY``) — a later lowering choice retained in measured rows: global
+  storage and the padded shared layout offered as siblings.
 - **Kernel-lowering policy knobs** (``VECTORIZE_LOADS`` / ``INTERLEAVE_LOADS``) — boolean codegen
   policies recorded on the kernel op (idempotence + env override), on by default and not search
   dimensions (``hints=(True,)``).
@@ -32,13 +34,21 @@ from emmy.compiler.pipeline.knob import Knob, KnobType
 
 logger = logging.getLogger(__name__)
 
-# --- Schedule codec knobs ---------------------------------------------------
+# --- Structural and schedule knobs -----------------------------------------
 
 PLACE = Knob(
     "PLACE",
     KnobType.STR,
     hints=("fuse", "cut"),
     help="Stored Fold-edge placement (fuse into the consumer or cut to a fresh workspace kernel).",
+)
+
+LAYOUT = Knob(
+    "LAYOUT",
+    KnobType.STR,
+    hints=("folded", "source"),
+    help="Storage layout of a transposed constant read by a kernel (folded transpose or source storage).",
+    unfeatured=True,
 )
 
 # The reduce-axis partition codec. ``off=""`` = the scalar serial fold.
@@ -75,7 +85,8 @@ TILE = Knob(
 STAGE = Knob(
     "STAGE",
     KnobType.STR,
-    help="Operand-staging codec (d<depth>/smem|smem-async|smem-tma[/p<reg_depth>]; empty=no intermediate). "
+    help="Intermediate-storage codec (d1/reg; d<depth>/smem|smem-async|smem-tma[/p<reg_depth>]; "
+    "empty=no intermediate). "
     "Decided in the tile schedule, materialized in lowering/kernel/010_materialize.",
     off="",
 )
@@ -144,6 +155,15 @@ RASTER = Knob(
 )
 
 
+SHARED_CARRY = Knob(
+    "SHARED_CARRY",
+    KnobType.INT,
+    hints=(0, 1),
+    help="Carried-state storage: 0 global with one launch per ordered step, 1 two shared buffers padded by one column per row.",
+    off=0,
+)
+
+
 # --- Kernel-lowering policy knobs -------------------------------------------
 #
 # Boolean codegen policies recorded on the kernel op — on by default, not search dimensions
@@ -174,6 +194,14 @@ VECTORIZE_STORES = Knob(
     off=False,
 )
 
+GUARD_REDUCTIONS = Knob(
+    "GUARD_REDUCTIONS",
+    KnobType.BOOL,
+    hints=(True,),
+    help="Skip scalar reductions whose results are discarded by coordinate selects.",
+    off=False,
+)
+
 PAIR_LDMATRIX = Knob(
     "PAIR_LDMATRIX",
     KnobType.BOOL,
@@ -197,32 +225,36 @@ UNROLL = Knob(
 FAST_EXP = Knob(
     "FAST_EXP",
     KnobType.BOOL,
-    # Off by default and not a search dimension — a precision-trading knob (__expf ≈ 2 ulp vs
-    # correctly-rounded expf; numerically benign for the softmax family — the α rescale never
-    # amplifies and the carrier stays fp32 — but it must be a deliberate, pinnable choice, never
-    # a silent default). Enabled via EMMY_FAST_EXP=1 or the FAST_MATH umbrella.
+    # Pin-only precision policy; its effective default follows FAST_MATH. An explicit
+    # EMMY_FAST_EXP pin overrides the umbrella without changing the other precision gates.
     hints=(False,),
     help="Lower f32 exp through the SFU fast path (__expf: one FMUL + MUFU.EX2) instead of libm expf.",
     off=False,
 )
 
 
-# --- Precision-trading knobs (the FAST_MATH family) ---------------------------
+# --- The regime knobs: the precision-trading family (under the FAST_MATH umbrella) and the cache knob ------
 #
-# Knobs that trade numerical precision for throughput are NEVER silently on: each is off by
-# default and enabled by its own ``EMMY_<NAME>`` pin, or batch-enabled by the ``FAST_MATH``
-# umbrella (the ``-use_fast_math`` / ``-O3`` analogue). Precedence per knob: its own pin >
-# ``FAST_MATH`` > off (:func:`precision_pin`). The umbrella is a meta gate, not a kernel
-# property — the realized fork is already fully identified by what it enables (``FAST_EXP``'s
-# stamped BOOL, the ``TILE`` codec's bare atom token) — so it is ``unfeatured`` and never
-# stamped, enumerated, or featurized.
+# Precedence: an individual pin > FAST_MATH > True (precision_pin). The umbrella also
+# controls NVCC fast math and invariant reciprocal division. It is unfeatured: concrete
+# schedule choices retain their own identity, while effective compiler flags separate
+# the fast and precise measurement contexts. Golden input pins record the umbrella.
+
+COLD_CACHE = Knob(
+    "COLD_CACHE",
+    KnobType.BOOL,
+    hints=(False,),
+    help="Measure one kernel replay after L2 eviction; cold and hot timings are separate evidence regimes.",
+    unfeatured=True,
+)
+
 
 FAST_MATH = Knob(
     "FAST_MATH",
     KnobType.BOOL,
-    hints=(False,),
-    help="Umbrella pin for the precision-trading knobs (FAST_EXP, F16_MMA_F32_ACC, FP8_MMA): "
-    "EMMY_FAST_MATH=1 enables each one not individually pinned; individual pins win.",
+    hints=(True,),
+    help="Fast math is enabled by default: NVCC fast math, invariant reciprocal division, and the "
+    "precision-trading knobs (FAST_EXP, F16_MMA_F32_ACC, FP8_MMA). Pin 0 to disable; individual pins win.",
     unfeatured=True,  # a meta gate over other knobs — must never enter the feature vector
 )
 
@@ -252,17 +284,59 @@ FP8_MMA = Knob(
 )
 
 
-def precision_pin(knob: Knob) -> bool | None:
+#: The precision-trading family: the umbrella and the knobs that follow it (:func:`precision_pin`) — what sorts a
+#: row into the fast-math lane.
+PRECISION_KNOBS = (FAST_MATH, FAST_EXP, F16_MMA_F32_ACC, FP8_MMA)
+
+#: The regime knobs: the input pins a measured row is filed under beside the card and the kernel — the
+#: precision-trading family and the cache knob. Every reader of a regime iterates this tuple through
+#: :func:`regime_pins`; none names a knob of it on its own.
+REGIME_KNOBS = (*PRECISION_KNOBS, COLD_CACHE)
+
+
+def precision_pin(knob: Knob) -> bool:
     """The effective pin for a precision-trading BOOL ``knob``: its own ``EMMY_<NAME>`` pin when
-    set, else the ``FAST_MATH`` umbrella pin, else ``None`` (neither set — the caller applies its
-    conservative default, and may keep target gates that an *individual* pin overrides)."""
+    set, else the ``FAST_MATH`` umbrella pin, else its enabled default."""
     raw = knob.raw()
     if raw is not None:
         return knob.parse(raw)
     raw = FAST_MATH.raw()
     if raw is not None:
         return FAST_MATH.parse(raw)
-    return None
+    return FAST_MATH.hints[0]
+
+
+def regime_pin(knob: Knob) -> bool:
+    """The effective live pin of a regime BOOL ``knob``: a precision-trading knob's :func:`precision_pin`; any
+    other's own ``EMMY_<NAME>`` pin when set, else its default (its first hint)."""
+    if knob in PRECISION_KNOBS:
+        return precision_pin(knob)
+    raw = knob.raw()
+    return knob.parse(raw) if raw is not None else knob.hints[0]
+
+
+def cold_cache() -> bool:
+    """Whether this compile and its benchmark use the cold-cache evidence regime."""
+    return regime_pin(COLD_CACHE)
+
+
+def precision_pins(pins: dict | None = None) -> dict[str, bool]:
+    """Effective precision decisions: live when omitted, otherwise a recorded regime, independent of the environment —
+    a knob the record omits follows the recorded umbrella, which omitted means measured off."""
+    if pins is None:
+        return {knob.name: precision_pin(knob) for knob in PRECISION_KNOBS}
+    umbrella = bool(pins.get(FAST_MATH.name, False))
+    return {knob.name: bool(pins.get(knob.name, umbrella)) for knob in PRECISION_KNOBS}
+
+
+def regime_pins(pins: dict | None = None) -> dict[str, bool]:
+    """Every regime knob's effective decision: live when ``pins`` is omitted, otherwise the regime the recorded
+    ``pins`` spell, independent of the environment — the precision knobs as :func:`precision_pins` reads them, any
+    other regime knob its default when the record omits it. Two regimes are the same when these agree."""
+    if pins is None:
+        return {knob.name: regime_pin(knob) for knob in REGIME_KNOBS}
+    others = {knob.name: bool(pins.get(knob.name, knob.hints[0])) for knob in REGIME_KNOBS if knob not in PRECISION_KNOBS}
+    return {**precision_pins(pins), **others}
 
 
 LOOPIFY = Knob(

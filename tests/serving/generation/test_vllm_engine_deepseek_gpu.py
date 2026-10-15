@@ -4,7 +4,7 @@ The distributed gate of the plugin work: the same tiny checkpoint served by a si
 and by a TP2×PP2 engine must produce IDENTICAL greedy token ids. That exercises everything the
 in-process gates cannot: the engine-driven forward with real paged-attention metadata, the
 carrier-width pipeline transport between stages, per-stage weight loading, the tensor-parallel
-expert shards summed by the group all-reduce, and the head/sampler on the last rank.
+ranks' expert slices summed by the group all-reduce, and the head/sampler on the last rank.
 
 Needs four V100s in the pinned 1Cat image. Run it in its own pytest process: the engine spawns
 its own workers, and a process that already initialized single-rank groups (the other plugin
@@ -92,7 +92,6 @@ def test_tp2_pp2_greedy_token_ids_match_the_single_rank_engine(tmp_path, monkeyp
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     pytest.importorskip("vllm")
-    pytest.importorskip("cupy")
     # The DRIVER must stay off the CUDA driver (the fork-model import is NOT probed here on
     # purpose — it initializes CUDA), and the engine processes must spawn, not fork: a forked
     # EngineCore inherits a poisoned CUDA context and dies at init_device.

@@ -10,13 +10,14 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from emmy.compiler.dim import DYNAMIC_DIM_MAX, Dim
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Expr, FuncCallExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from emmy.compiler.ir.sigma import Sigma
 from emmy.compiler.structural import Structural
+from emmy.compiler.wire import Wire
 
 if TYPE_CHECKING:
     from emmy.compiler.ir.stmt.body import Body
@@ -41,6 +42,22 @@ INDENT = "    "
 # ---------------------------------------------------------------------------
 # RenderCtx — target-tuned tables + walk state for ``Stmt.render`` / ``Expr.render``
 # ---------------------------------------------------------------------------
+
+
+class Memory(Protocol):
+    """How a buffer's bytes are reached — the only thing a transport asks of one.
+
+    ``base`` is the pointer to address from and ``flat`` the index to use with it, so a
+    transport renders ``f"{base}[{flat}]"`` without knowing whether the buffer is one
+    allocation or many. ``vectorizable`` says whether consecutive elements are guaranteed
+    contiguous, which is what a vector access needs.
+    """
+
+    vectorizable: ClassVar[bool]
+
+    def base(self, index: tuple, ctx: RenderCtx) -> str: ...
+
+    def flat(self, index: tuple, ctx: RenderCtx) -> str: ...
 
 
 @dataclass
@@ -82,6 +99,10 @@ class RenderCtx:
     # alias into the pool instead of a stand-alone ``__shared__`` array
     # — the only way to exceed the 48 KB static-smem cap.
     smem_dynamic_offsets: dict[str, int] = field(default_factory=dict)
+    # How each buffer's bytes are reached, for the buffers that are not one allocation — see
+    # :class:`Memory`. Absent names are :class:`Flat`, so an empty map renders every buffer
+    # exactly as it always was.
+    memory: dict[str, Memory] = field(default_factory=dict)
     # Per-buffer canonical dtype tokens (``"f32"`` / ``"f16"``) for every
     # global-buffer name (kernel inputs + outputs). ``Load`` declares its
     # SSA-name local in the source buffer's C type so values flow at
@@ -109,18 +130,26 @@ class RenderCtx:
     # new C scope inherits the enclosing scope's decls but its own additions do
     # not leak back to the parent or across to siblings).
     scope_decls: set[str] = field(default_factory=set)
+    # The loop counters in scope whose every value is a multiple of a known stride — a static
+    # ``StridedLoop`` start and step — so an index built from one is provably aligned
+    # (``kernel.ir._multiple_of``). Scope-local like ``scope_decls``.
+    aligned: dict[str, int] = field(default_factory=dict)
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper. The mutable tables (``shapes``,
         ``ssa_dtypes``, …) stay shared by reference (SSA names are globally unique);
         ``scope_decls`` is COPIED — it tracks per-C-scope local declarations, which an
         inner scope inherits but must not leak back out of."""
-        return replace(self, indent=self.indent + 1, scope_decls=set(self.scope_decls))
+        return replace(self, indent=self.indent + 1, scope_decls=set(self.scope_decls), aligned=dict(self.aligned))
 
     # ---- Convenience wrappers over ``self.target``. These exist so the
     # render methods read ``ctx.type_name(dt)`` instead of pulling the
     # target out by hand; they also default ``None`` dtype to F32 so the
     # call sites don't repeat that boilerplate.
+
+    def memory_for(self, buf: str) -> Memory:
+        """How ``buf`` is reached. Every buffer is :class:`Flat` unless declared otherwise."""
+        return self.memory.get(buf) or Flat(buf)
 
     def type_name(self, dtype) -> str:
         """C type spelling for a local declaration. Accepts a
@@ -152,6 +181,7 @@ _INTEGER_ELEMENTWISE_OPS = frozenset(
     {
         "add",
         "subtract",
+        "negative",
         "multiply",
         "floor_divide",
         "remainder",
@@ -195,6 +225,12 @@ def dtype_promote(op_name: str, arg_dtypes: list[str]) -> str:
     if arg_dtypes and all(d == "f16" for d in arg_dtypes):
         return "f16"
     return "f32"
+
+
+def spell_literal(value: float) -> str:
+    """The one spelling of a literal: an integer without a point, anything else as Python repr."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() and abs(value) < 2**53 else repr(value)
 
 
 def _pad(n: int) -> str:
@@ -266,6 +302,8 @@ def op_to_expr(fn: str, inputs: list[Expr], *, dtype: str | None = None) -> Expr
         return FuncCallExpr("bitwise_count", tuple(inputs))
     if fn in _BINARY_OP:
         return BinaryExpr(_BINARY_OP[fn], inputs[0], inputs[1])
+    if fn == "divide_rn_f32":
+        return FuncCallExpr(fn, tuple(inputs))
     if fn == "maximum":
         return FuncCallExpr("fmax", tuple(inputs))
     if fn == "minimum":
@@ -304,7 +342,7 @@ def op_to_expr(fn: str, inputs: list[Expr], *, dtype: str | None = None) -> Expr
         neg_x = BinaryExpr("-", Literal(0.0, "float"), inputs[0])
         exp_neg = FuncCallExpr("exp", (neg_x,))
         return BinaryExpr("/", Literal(1.0, "float"), BinaryExpr("+", Literal(1.0, "float"), exp_neg))
-    if fn in ("exp", "exp_fast", "log", "rsqrt", "sin", "cos", "tanh", "sqrt", "erf"):
+    if fn in ("exp", "exp_fast", "log", "rsqrt", "sin", "cos", "tanh", "sqrt", "erf", "floor"):
         return FuncCallExpr(fn, tuple(inputs))
     if fn == "abs":
         return FuncCallExpr("fabs", tuple(inputs))
@@ -360,20 +398,12 @@ def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None =
     return out
 
 
-def select_to_ternary(s: Select) -> Expr:
-    """Build a chained ternary from a ``Select``'s branch list.
-
-    Each branch value is cast to ``float`` to match the ``float`` result
-    ``Select.render`` declares. Without it, a branch list mixing ``__half``
-    SSA values (a raw smem/gmem load) with ``float`` ones (a computed value)
-    makes the C++ conditional operator's common type ambiguous
-    (``cond ? float : __half`` — each converts to the other), which nvcc
-    rejects. The casts are no-ops when a value is already ``float``.
-    """
+def select_to_ternary(s: Select, dtype: str = "float") -> Expr:
+    """Cast branches to their common result type, avoiding ambiguous half/float C++ conditionals."""
     branches = list(s.branches)
-    result: Expr = CastExpr("float", Var(branches[-1].value))
+    result: Expr = CastExpr(dtype, Var(branches[-1].value))
     for b in reversed(branches[:-1]):
-        result = TernaryExpr(cond=b.select, if_true=CastExpr("float", Var(b.value)), if_false=result)
+        result = TernaryExpr(cond=b.select, if_true=CastExpr(dtype, Var(b.value)), if_false=result)
     return result
 
 
@@ -381,24 +411,65 @@ def select_to_ternary(s: Select) -> Expr:
 _INT_MAX = 2**31 - 1
 
 
-def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
+def render_index(buf: str, indices: tuple, ctx: RenderCtx, shape: tuple | None = None) -> str:
     """Row-major flatten ``buf[i0][i1]...`` to a single C/CUDA expression.
 
     Builds the row-major sum as an ``Expr`` and runs ``simplify`` on it so
     constant-zero indices (typical of size-1 outer dims) drop out via the
     standard ``0 * x → 0`` / ``0 + y → y`` folds rather than emitting
     ``0 * stride`` terms in the output.
+
+    ``shape`` overrides the buffer's declared shape — a paged read flattens over ONE page,
+    whose paged axis is the page size rather than the buffer's full extent. A single index is
+    already a flat address; any other index spells every dim of a known shape, ``0`` at a size-one dim.
     """
+    flat = _flat_index(buf, indices, ctx, shape)
+    return flat if isinstance(flat, str) else flat.render(ctx)
+
+
+def render_address(buf: str, indices: tuple, ctx: RenderCtx) -> str:
+    """``&buf[...]`` with the flat index's constant terms added to the pointer: ``&k[i] + 2056``.
+
+    CUDA 12's front end widens an ``int`` index sum to 64 bits before it folds the sum's
+    constant, so ``&k[i + 2048]`` and ``&k[i + 2056]`` become two live 64-bit pointers, where
+    ``&k[i] + 2048`` is one pointer and a load immediate. A register-carried tile's unrolled
+    fragment loads hold a hundred such offsets, and the extra pointers spill a kernel at the
+    register cap (the GDN chunk step: 255 registers and a spill on CUDA 12.9, 179 with this form).
+    """
+    flat = _flat_index(buf, indices, ctx)
+    if isinstance(flat, str):
+        return f"&{buf}[{flat}]"
+    index, offset = _split_offset(flat)
+    if not offset:
+        return f"&{buf}[{flat.render(ctx)}]"
+    return f"&{buf}[{(index or Literal(0, 'int')).render(ctx)}] + {offset}"
+
+
+def _split_offset(e: Expr) -> tuple[Expr | None, int]:
+    """``e`` as ``index + offset``, the constant taken through ``+`` and ``* literal``."""
+    if isinstance(e, Literal) and e.dtype == "int":
+        return None, int(e.value)
+    if isinstance(e, BinaryExpr) and e.op == "+":
+        (left, a), (right, b) = _split_offset(e.left), _split_offset(e.right)
+        return (left if right is None else right if left is None else BinaryExpr("+", left, right)), a + b
+    if isinstance(e, BinaryExpr) and e.op == "*":
+        for term, scale in ((e.left, e.right), (e.right, e.left)):
+            if isinstance(scale, Literal) and scale.dtype == "int":
+                index, offset = _split_offset(term)
+                return (None if index is None else BinaryExpr("*", index, scale)), offset * int(scale.value)
+    return e, 0
+
+
+def _flat_index(buf: str, indices: tuple, ctx: RenderCtx, shape: tuple | None = None) -> Expr | str:
+    """The row-major flat index of ``buf[indices]``: a simplified ``int`` Expr, or the rendered
+    ``long long`` sum when the buffer's extent exceeds ``int`` addressing."""
     if len(indices) == 0:
-        return "0"
+        return Literal(0, "int")
     if len(indices) == 1:
-        return indices[0].simplify(SimplifyCtx.empty()).render(ctx)
-    shape = ctx.shapes.get(buf)
+        return indices[0].simplify(SimplifyCtx.empty())
+    shape = ctx.shapes.get(buf) if shape is None else shape
     if shape is None or len(shape) != len(indices):
-        flat: Expr = indices[0]
-        for i in indices[1:]:
-            flat = BinaryExpr("+", flat, i)
-        return flat.simplify(SimplifyCtx.empty()).render(ctx)
+        raise ValueError(f"{buf}: {len(indices)} indices for a buffer of shape {shape} — an index spells every dim of its buffer")
     wide = _exceeds_int_range(shape)
     flat = None
     parts: list[str] = []
@@ -419,7 +490,64 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
     if wide:
         return "(" + " + ".join(parts) + ")"
     assert flat is not None
-    return flat.simplify(SimplifyCtx.empty()).render(ctx)
+    return flat.simplify(SimplifyCtx.empty())
+
+
+@dataclass(frozen=True)
+class Flat:
+    """One contiguous allocation — every buffer, unless it says otherwise."""
+
+    name: str
+    vectorizable: ClassVar[bool] = True
+
+    def base(self, index: tuple, ctx: RenderCtx) -> str:
+        del index, ctx
+        return self.name
+
+    def flat(self, index: tuple, ctx: RenderCtx) -> str:
+        return render_index(self.name, index, ctx)
+
+
+@dataclass(frozen=True)
+class Paged:
+    """A device table of equal-sized pages, each holding the buffer's shape with the paged axis
+    cut to ``page`` — the shape a KV cache has once it is allocated per request.
+
+    The paged index splits: its quotient picks the page (:meth:`base`), its remainder addresses
+    inside one (:meth:`flat`), and every other axis flattens row-major exactly as it does for a
+    flat buffer. Both halves fold through the ordinary index simplifier, so a loop tiled to a
+    multiple of the page size resolves the page once per tile rather than once per element.
+
+    ``start`` names the kernel-local ``int`` (a device scalar the preamble reads) that makes the
+    buffer's own coordinate absolute before the split, which is the whole of a cache write: the
+    kernel's output holds only the step's new rows and ``start`` decides which pages of the cache
+    they land in.
+
+    Not vectorizable: a vector access spans consecutive elements, which may cross a page.
+    """
+
+    name: str
+    axis: int
+    page: int
+    start: str | None = None
+    vectorizable: ClassVar[bool] = False
+
+    def base(self, index: tuple, ctx: RenderCtx) -> str:
+        page = BinaryExpr("//", self._position(index), Literal(self.page, "int"))
+        return f"{self.name}__pages[{page.simplify(SimplifyCtx.empty()).render(ctx)}]"
+
+    def flat(self, index: tuple, ctx: RenderCtx) -> str:
+        shape = ctx.shapes.get(self.name)
+        if shape is None or len(shape) != len(index):
+            raise ValueError(f"paged buffer {self.name!r} needs a declared shape matching its {len(index)} indices; got {shape}")
+        within = BinaryExpr("%", self._position(index), Literal(self.page, "int"))
+        inside = tuple(within if d == self.axis else idx for d, idx in enumerate(index))
+        return render_index(self.name, inside, ctx, shape=(*shape[: self.axis], self.page, *shape[self.axis + 1 :]))
+
+    def _position(self, index: tuple) -> Expr:
+        """The coordinate on the paged axis, shifted to the cache's own by ``start``."""
+        own = index[self.axis]
+        return own if self.start is None else BinaryExpr("+", Var(self.start), own)
 
 
 def _exceeds_int_range(shape) -> bool:
@@ -471,7 +599,7 @@ def _is_one(e: Expr) -> bool:
 # ---------------------------------------------------------------------------
 
 
-class Stmt(Structural):
+class Stmt(Structural, Wire):
     """Base class for IR body statements.
 
     Every concrete Stmt implements:
@@ -666,7 +794,7 @@ class Stmt(Structural):
         stmt run N times instead of M is observable, so it pins the
         enclosing iteration to its current scope.
 
-        Note: ``Accum`` / ``Mma`` / ``Init`` are *not* side-effecting in this
+        Note: ``Accum`` / ``Init`` are *not* side-effecting in this
         sense — they're scope-bound (their semantics depend on which
         Loop encloses them) but moving the *whole enclosing block* is
         safe. Hoisting passes that want to move a Loop containing an
@@ -818,7 +946,7 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
             ):
                 continue
             # The sole reader must render its operands through ``op_to_expr`` / ``Var.render`` (only
-            # ``Assign`` does) — folding into an ``Accum`` / ``Reassign`` / ``Write`` would drop the temp
+            # ``Assign`` does) — folding into an ``Accum`` / ``Write`` would drop the temp
             # without substituting it, leaving an undefined reference.
             ri = next((j for j, r in enumerate(stmts) if s.name in r.deps()), None)
             if ri is None or not isinstance(stmts[ri], Assign):

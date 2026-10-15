@@ -11,6 +11,9 @@ pool and reads the ranks off the scores, and the fit through :func:`rank_metrics
 cross-validated summary spans SEVERAL models and there is no one scorer to hand it. The two commands' numbers are
 therefore comparable by construction rather than by two paths agreeing.
 
+:func:`compare_golden_ranks` compares two summaries produced over the same pools. It checks coverage and each
+GPU/tier/pool-size cell before qualifying a candidate at the requested median-rank threshold.
+
 **Two questions, and they are not interchangeable.**
 
 - A MEASURED pool (:class:`~..data.group.MeasuredGroup`: freeze or tune-DB rows, every candidate benched) can
@@ -28,11 +31,11 @@ different reasons — the offline half decides what a cold sweep measures at all
 once trustworthy — and one unlabelled number would hide which. A fixed axis tuple would force the golden side's
 pool buckets onto measured summaries and guarantee empty rows, so each builder declares its own.
 
-**Every summary publishes what it was computed over.** ``groups`` is how many pools keyed into it and ``unscored``
-how many of those the model could not score at all. The measured metrics each add their OWN group count, because
-they have different minimums: regret needs a pool of at least two rows (a one-row pool is trivially perfect) and
-Spearman at least :data:`MIN_SPEARMAN_ROWS`. On the v3 freeze's 336 pools that is 297 and 216 — so an aggregate
-that quietly averaged the excluded pools in would be reporting mostly arithmetic. ``regret@10`` is the strictest:
+**Every summary publishes what it was computed over.** ``groups`` is how many pools keyed into it. The measured
+metrics each add their OWN group count, because they have different minimums: regret needs a pool of at least two
+rows (a one-row pool is trivially perfect) and Spearman at least :data:`MIN_SPEARMAN_ROWS`. On the v3 freeze's 336
+pools that is 297 and 216 — so an aggregate that quietly averaged the excluded pools in would be reporting mostly
+arithmetic. ``regret@10`` is the strictest:
 it needs eleven rows, which 90 pools have, so at the freeze's median pool size of seven it still excludes most of
 the corpus. The rank metrics have no minimum, so they carry no count of their own.
 
@@ -50,7 +53,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from emmy.compiler.pipeline.search.data.group import GoldenGroup, Group, MeasuredGroup
+from emmy.compiler.pipeline.search.dataset.group import GoldenGroup, Group, MeasuredGroup
 from emmy.compiler.pipeline.search.metrics import best_dual_rank, spearman, topk_regret
 
 # Minimum pool size a Spearman is reported over. Two rows make ``rho`` computable and meaningless: it is +1 or
@@ -77,7 +80,7 @@ TOP_KS = (1, 10, 25, 50, 100)
 POOL_BUCKETS: tuple[tuple[int | None, str], ...] = ((100, "<100"), (1_000, "<1k"), (10_000, "<10k"), (None, ">=10k"))
 
 # ``score(group) -> quality per row``, or ``None`` when this model cannot score the pool at all.
-Scorer = Callable[[Group], "np.ndarray | None"]
+Scorer = Callable[[Group], "np.ndarray"]
 
 
 def pool_bucket(total: int) -> str:
@@ -90,16 +93,15 @@ class Summary:
     """One row of the report: the axes it was keyed on, what it covered, and its metrics.
 
     ``metrics`` maps a metric name to that metric's own block. A block carries ``groups`` — the pools it was
-    actually computed over — only where that metric has a size minimum and so can differ from ``groups -
-    unscored``; a value of ``None`` was computable for nothing in the summary."""
+    actually computed over — only where that metric has a size minimum and so can differ from ``groups``; a value
+    of ``None`` was computable for nothing in the summary."""
 
     axes: dict[str, str]
     groups: int
-    unscored: int
     metrics: dict[str, dict]
 
     def to_json(self) -> dict:
-        return {"axes": dict(self.axes), "groups": self.groups, "unscored": self.unscored, "metrics": self.metrics}
+        return {"axes": dict(self.axes), "groups": self.groups, "metrics": self.metrics}
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,55 @@ class EvalReport:
         return {"header": self.header, "summaries": [c.to_json() for c in self.summaries]}
 
 
+def compare_golden_ranks(report: EvalReport, minimum: float) -> dict:
+    """Compare current and candidate weights over the same golden pools without losing scored pools."""
+    cells = {}
+    for summary in report.summaries:
+        half = summary.axes["half"]
+        key = tuple(sorted((name, value) for name, value in summary.axes.items() if name != "half"))
+        cells.setdefault(half, {})[key] = summary
+    current, candidate = cells.get("current", {}), cells.get("candidate", {})
+    if not current or current.keys() != candidate.keys():
+        raise ValueError("prior evaluations have different or empty GPU, tier, or pool-size cells")
+
+    improved = []
+    regressed = []
+    compared = 0
+    for key in sorted(current):
+        before, after = current[key], candidate[key]
+        if before.groups != after.groups:
+            raise ValueError(f"prior evaluation coverage changed for {key}")
+        baseline = before.metrics["rank"]["median"]
+        fitted = after.metrics["rank"]["median"]
+        if baseline is None or fitted is None:
+            if baseline != fitted:
+                raise ValueError(f"prior evaluation rank coverage changed for {key}")
+            continue
+        compared += 1
+        if fitted > baseline:
+            regressed.append(key)
+        elif baseline > 0 and fitted <= baseline * (1 - minimum):
+            improved.append((key, baseline, fitted))
+
+    if not compared:
+        raise ValueError("prior evaluation has no scored golden pools")
+    qualified = bool(improved) and not regressed
+    cells_word = "cell" if compared == 1 else "cells"
+    percent = f"{minimum * 100:g}%"
+    if regressed:
+        message = f"candidate rejected: median rank rose in {len(regressed)} of {compared} {cells_word}"
+    elif not improved:
+        message = f"candidate rejected: no median rank fell by at least {percent} across {compared} {cells_word}"
+    else:
+        key, baseline, fitted = max(improved, key=lambda row: (row[1] - row[2]) / row[1])
+        axes = dict(key)
+        message = (
+            f"candidate qualifies: {len(improved)} of {compared} {cells_word} improved by at least {percent}, none regressed; "
+            f"largest change {baseline:g} to {fitted:g} on {axes['gpu']}, {axes['tier']}, {axes['pool']}"
+        )
+    return {"qualified": qualified, "message": message, "compared": compared, "improved": len(improved), "regressed": len(regressed)}
+
+
 def _round(x: float | None, digits: int) -> float | None:
     """Round for a DIFF: a metrics file is compared with ``diff``, and float noise in the last places would
     make two runs of the same fit look like a change."""
@@ -128,32 +179,17 @@ def _median(vals: list[float], digits: int) -> float | None:
 
 
 def _summaries(groups: Sequence[Group], score: Scorer, axes_of, metrics_of, *, half: str) -> list[Summary]:
-    """Bucket ``groups`` by ``axes_of``, score each, and hand the survivors to ``metrics_of``.
-
-    The scoring pass is here rather than in each metric builder because ``None`` — this model cannot score this
-    pool — is a report fact, not a metric fact: a linear model that fitted no dynamic weight set answers
-    ``None`` for every symbolic-axis pool, and a summary that dropped those silently would show a healthy static
-    corpus and no sign that half the deploy surface is unscored."""
+    """Bucket ``groups`` by ``axes_of``, score each, and hand the buckets to ``metrics_of``."""
     buckets: dict[tuple, list] = {}
-    unscored: dict[tuple, int] = {}
     for g in groups:
-        axes = axes_of(g)
-        key = tuple(axes.items())
-        buckets.setdefault(key, [])
-        unscored.setdefault(key, 0)
-        scores = score(g)
-        if scores is None:
-            unscored[key] += 1
-        else:
-            buckets[key].append((g, np.asarray(scores, dtype=float)))
+        buckets.setdefault(tuple(axes_of(g).items()), []).append((g, np.asarray(score(g), dtype=float)))
     out = []
     for key in sorted(buckets):
         entries = buckets[key]
         out.append(
             Summary(
                 axes={"half": half, **dict(key)},
-                groups=len(entries) + unscored[key],
-                unscored=unscored[key],
+                groups=len(entries),
                 metrics=metrics_of(entries),
             )
         )
@@ -185,7 +221,7 @@ def _measured_metrics(entries: list[tuple[MeasuredGroup, np.ndarray]]) -> dict:
 
 
 def measured_summaries(half: str, groups: Sequence[MeasuredGroup], score: Scorer) -> list[Summary]:
-    """Cells over benched pools, keyed ``gpu`` x ``H_opt`` — the axes :func:`~..data.group.group_measured`
+    """Cells over benched pools, keyed ``gpu`` x ``H_opt`` — the axes :func:`~..db.export.measured_groups`
     already grouped on, minus the op identity that separates the pools within a summary."""
     return _summaries(groups, score, lambda g: {"gpu": g.gpu, "H_opt": f"O{g.h_opt:g}"}, _measured_metrics, half=half)
 
@@ -209,8 +245,8 @@ def rank_metrics(ranks: Sequence[tuple[int, int]]) -> dict:
     decide the number for a whole card."""
     pessimistic, optimistic = [r for r, _ in ranks], [o for _, o in ranks]
     # No per-metric ``groups`` here, unlike the measured side: no rank metric has a size minimum, so every
-    # block's count would be the summary's own scored total and the summary already publishes that. The top-k
-    # denominator is ``groups - unscored``.
+    # block's count would be the summary's own total and the summary already publishes that. The top-k
+    # denominator is ``groups``.
     out = {"rank": {"median": _median(pessimistic, 1), "median_optimistic": _median(optimistic, 1)}}
     for k in TOP_KS:
         out[f"top{k}"] = {"count": sum(r < k for r in pessimistic)}

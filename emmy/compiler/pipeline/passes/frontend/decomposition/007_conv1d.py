@@ -18,56 +18,30 @@ The two forms differ in what they do with those reads:
   the GEMM do ``C_in`` times the necessary work. It instead scales each of the ``K`` window
   reads by that tap's per-channel weight and sums them — pure elementwise, which also lets
   the chain fuse into its neighbours.
+
+An f16 or bf16 convolution forms its products at f32 and converts to its output dtype once, at the
+node that writes the result, the way ``torch.nn.functional.conv1d`` does. In the depthwise form the
+tap products and partial sums are f32, and the last add converts. In the dense form the matmul
+decomposition, a later pass, multiplies at f32 and writes its sum at the ``MatmulOp``'s dtype: without
+a bias that is the output dtype, a single conversion; with a bias the ``MatmulOp`` result is f32, so
+the bias add is the one conversion. Rounding each partial sum to 16 bits instead adds one rounding error per tap.
 """
 
 from emmy.compiler.dim import Dim
 from emmy.compiler.graph import Graph, Node, Tensor
-from emmy.compiler.ir.base import ConstantOp
-from emmy.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, placeholder
+from emmy.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from emmy.compiler.ir.frontend.ir import Conv1dOp, MatmulOp, ReshapeOp, TransposeOp
-from emmy.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 from emmy.compiler.pipeline import Match, Pattern
-from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import (
+    open_fragment,
+    opmath_dtype,
+    padded_read,
+    single_indexmap,
+    static_extent,
+)
 
 PATTERN = [Pattern("root", Conv1dOp)]
-
-
-def _static(extent) -> int:
-    """Unwrap a channel/tap extent to int. These axes are weight-derived and never symbolic."""
-    if isinstance(extent, Dim):
-        if not extent.is_static:
-            raise NotImplementedError(f"aten.conv1d requires static channel and tap extents, got {extent}")
-        return extent.as_static()
-    return int(extent)
-
-
-def _read(frag: Graph, x: Node, *, out_shape: tuple, channel: object, length: object, in_length: int, name: str) -> Node:
-    """Read ``x[n, channel, length]`` over ``out_shape``, yielding zero where ``length`` is padded off the end."""
-    coords = (placeholder(0), channel, length)
-    if isinstance(length, Literal) or in_length <= 0:
-        return single_indexmap(frag, x, out_shape=out_shape, coord_map=coords, name=name)
-
-    in_bounds = BinaryExpr("&&", BinaryExpr(">=", length, Literal(0, "int")), BinaryExpr("<", length, Literal(in_length, "int")))
-    # Clamp the off-domain coord so the post-fusion unconditional Load stays in range; the
-    # select is what actually discards the value.
-    clamped = TernaryExpr(cond=in_bounds, if_true=length, if_false=Literal(0, "int"))
-    zero_id = frag.add_node(
-        op=ConstantOp(name=f"{name}_zero", value=0.0),
-        inputs=[],
-        output=Tensor(f"{name}_zero", (1,), x.output.dtype),
-    )
-    nid = frag.add_node(
-        op=IndexMapOp(
-            out_shape=tuple(out_shape),
-            sources=(
-                IndexSource(input_idx=0, coord_map=(placeholder(0), channel, clamped), select=in_bounds),
-                IndexSource(input_idx=1, coord_map=(Literal(0, "int"),)),
-            ),
-        ),
-        inputs=[x, zero_id],
-        output=Tensor(name, tuple(out_shape), x.output.dtype),
-    )
-    return frag.nodes[nid]
 
 
 def _length_at(tap: object, *, stride: int, dilation: int, padding: int) -> object:
@@ -89,8 +63,8 @@ def rewrite(match: Match, root: Node, inp_x: Node, inp_w: Node, inp_bias: Node |
     op: Conv1dOp = root.op
     frag = open_fragment(graph, [inp_x, inp_w] + ([inp_bias] if inp_bias else []))
 
-    taps = _static(inp_w.output.shape[-1])
-    channels = _static(inp_x.output.shape[-2])
+    taps = static_extent(inp_w.output.shape[-1])
+    channels = static_extent(inp_x.output.shape[-2])
     # The input length is only needed to bound a padded read. Without padding every
     # coordinate is in range by construction of L_out, so a symbolic length is fine there.
     in_length = 0
@@ -98,8 +72,9 @@ def rewrite(match: Match, root: Node, inp_x: Node, inp_w: Node, inp_bias: Node |
         extent = inp_x.output.shape[-1]
         if isinstance(extent, Dim) and not extent.is_static:
             raise NotImplementedError(f"aten.conv1d with padding needs a static input length to bound the pad, got {extent}")
-        in_length = _static(extent)
+        in_length = static_extent(extent)
     out_shape = tuple(out.shape)
+    acc_dtype = opmath_dtype(out.dtype)
     geometry = {"stride": op.stride, "dilation": op.dilation, "padding": op.padding}
 
     if op.groups == 1:
@@ -107,7 +82,7 @@ def rewrite(match: Match, root: Node, inp_x: Node, inp_w: Node, inp_bias: Node |
         stacked = channels * taps
         stacked_coord = placeholder(1)
         tap_expr = BinaryExpr("/", stacked_coord, Literal(channels, "int"))
-        col = _read(
+        col = padded_read(
             frag,
             inp_x,
             out_shape=(out_shape[0], stacked, out_shape[-1]),
@@ -116,7 +91,7 @@ def rewrite(match: Match, root: Node, inp_x: Node, inp_w: Node, inp_bias: Node |
             in_length=in_length,
             name=f"{out.name}_im2col",
         )
-        w_shape = tuple(_static(d) for d in inp_w.output.shape)
+        w_shape = tuple(static_extent(d) for d in inp_w.output.shape)
         w_t = frag.add_node(
             op=TransposeOp(axes=(0, 2, 1)),
             inputs=[inp_w],
@@ -130,12 +105,12 @@ def rewrite(match: Match, root: Node, inp_x: Node, inp_w: Node, inp_bias: Node |
         acc: Node | str = frag.add_node(
             op=MatmulOp(),
             inputs=[flat_w, col],
-            output=Tensor(f"{out.name}_mm" if inp_bias else out.name, out_shape, out.dtype),
+            output=Tensor(f"{out.name}_mm", out_shape, acc_dtype) if inp_bias else Tensor(out.name, out_shape, out.dtype),
         )
     else:
         acc = None
         for tap in range(taps):
-            window = _read(
+            window = padded_read(
                 frag,
                 inp_x,
                 out_shape=out_shape,
@@ -155,7 +130,7 @@ def rewrite(match: Match, root: Node, inp_x: Node, inp_w: Node, inp_bias: Node |
             scaled = frag.add_node(
                 op=ElementwiseOp(op="multiply"),
                 inputs=[window, tap_w],
-                output=Tensor(f"{out.name}_scaled{tap}", out_shape, out.dtype),
+                output=Tensor(f"{out.name}_scaled{tap}", out_shape, out.dtype if taps == 1 and not inp_bias else acc_dtype),
             )
             if acc is None:
                 acc = scaled
@@ -164,7 +139,7 @@ def rewrite(match: Match, root: Node, inp_x: Node, inp_w: Node, inp_bias: Node |
             acc = frag.add_node(
                 op=ElementwiseOp(op="add"),
                 inputs=[acc, scaled],
-                output=Tensor(out.name if last else f"{out.name}_acc{tap}", out_shape, out.dtype),
+                output=Tensor(out.name, out_shape, out.dtype) if last else Tensor(f"{out.name}_acc{tap}", out_shape, acc_dtype),
             )
 
     if inp_bias:

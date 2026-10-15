@@ -1,0 +1,23 @@
+# Qwen3.8-27B at NVFP4 (W4A4) on one RTX 5090 (sm_120).
+#
+# Compiler-qualified and measured serving on one RTX 5090, including all 48 gated DeltaNet layers.
+# DISCOVERY.md records the serving setup and performance. The golden under golden/ holds measured rows for
+# the serving twins of serving-rtx5090.env (full attention at widths 16, 64 and any width; gated DeltaNet
+# at widths 1, 16 and 64). `emmy eval golden` deploys all nine twins from it alone, in both the standard and
+# the fast-math lane. The width-16 gated DeltaNet twin runs about twice as slow as on 2026-10-09: its conv
+# kernel recomputes the qkv projection for every conv tap.
+tags:
+  - maintained
+  - lifecycle-locked
+  - compiler-qualified
+
+model:
+  huggingface: Inferact/Qwen3.8-27B-NVFP4
+  rationale: "Qwen3.8 quant ecosystem strong on HF; low-VRAM serving value, moderate interest."
+  heat: 55
+  revision: 6128240ebaf4eaa7bad2b3d1c72c37d677c5f462
+  task: generate
+
+matrices:
+  deploy.gpu: NVIDIA GeForce RTX 5090
+  deploy.gpu_count: 1

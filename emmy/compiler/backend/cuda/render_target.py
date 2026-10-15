@@ -17,6 +17,7 @@ from __future__ import annotations
 _TYPE_NAME: dict[str, str] = {
     "f32": "float",
     "f16": "__half",
+    "bf16": "__nv_bfloat16",
     "f16x2": "__half2",
     "f8e4m3": "__nv_fp8_e4m3",
     "f8e5m2": "__nv_fp8_e5m2",
@@ -59,6 +60,7 @@ _F8_DTYPES = ("f8e4m3", "f8e5m2")
 # Intrinsic spellings — per dtype.  Keys are abstract op names emitted
 # by ``op_to_expr`` (``"exp"``, ``"fmax"``, ``"fabs"``, ...).
 _INTRINSIC_F32: dict[str, str] = {
+    "divide_rn_f32": "__fdiv_rn",
     "exp": "expf",
     "exp_fast": "__expf",
     "log": "logf",
@@ -72,9 +74,17 @@ _INTRINSIC_F32: dict[str, str] = {
     "pow": "powf",
     "sqrt": "sqrtf",
     "erf": "erff",
+    "floor": "floorf",
 }
 
+# The rounding binary ops spell ``_rn``: cuda_fp16.h's ``+`` / ``*`` are ``__hadd`` / ``__hmul``, which
+# nvcc may contract into one ``fma`` across statements, rounding a multiply-add once where the source
+# program rounded each op. RoPE's ``q*cos + rotate_half(q)*sin`` came out one f16 step off eager in
+# a sixth of its outputs that way. ``_rn`` rounds every op, as torch's per-op kernels do.
 _INTRINSIC_F16: dict[str, str] = {
+    "add": "__hadd_rn",
+    "subtract": "__hsub_rn",
+    "multiply": "__hmul_rn",
     "exp": "hexp",
     "exp_fast": "hexp",
     "log": "hlog",
@@ -90,6 +100,9 @@ _INTRINSIC_F16: dict[str, str] = {
 # ``h2`` / ``__h*2`` form. Used when an Init / Accum / Assign carries
 # dtype = F16x2 (paired by the ``070_pack_fp16_pairs`` pass).
 _INTRINSIC_F16x2: dict[str, str] = {
+    "add": "__hadd2_rn",
+    "subtract": "__hsub2_rn",
+    "multiply": "__hmul2_rn",
     "exp": "h2exp",
     "log": "h2log",
     "sqrt": "h2sqrt",
@@ -158,6 +171,8 @@ class CudaRenderTarget:
     def convert(self, value: str, src_dt: str, dst_dt: str) -> str:
         if src_dt == dst_dt:
             return value
+        if src_dt == "f8e4m3" and dst_dt in ("f32", "f16"):
+            return f"emmy_from_f8e4m3{'_f32' if dst_dt == 'f32' else ''}({value})"
         if src_dt in _F8_DTYPES and dst_dt in ("f32", "f16"):
             # fp8 decode — the ``from_f8*`` cast's device spelling. The functional
             # cast invokes ``<cuda_fp8.h>``'s explicit conversion operator, which
@@ -173,6 +188,12 @@ class CudaRenderTarget:
             return f"__float2half({value})"
         if dst_dt == "f32" and src_dt == "f16":
             return f"__half2float({value})"
+        # The kernel IR may compute a BF16 node through an F32 scalar. Keep
+        # the narrowing round explicit before its result is used again.
+        if dst_dt == "bf16" and src_dt == "f32":
+            return f"__float2bfloat16({value})"
+        if dst_dt == "f32" and src_dt == "bf16":
+            return f"__bfloat162float({value})"
         if dst_dt == "f16x2" and src_dt == "f16":
             # Broadcast scalar __half into both lanes of a __half2.
             return f"__half2half2({value})"

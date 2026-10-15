@@ -1,5 +1,5 @@
 """``_Program.run_device`` under an OUTER torch CUDA-graph capture (the vLLM whole-step
-decode-capture path). Needs CUDA + cupy (skips itself off-GPU).
+decode-capture path). Needs CUDA (skips itself off-GPU).
 
 Builds one tiny static program (the decode-bucket twin shape class), then captures a
 ``run_device`` call inside ``torch.cuda.graph`` — the capture-aware branch must issue the
@@ -9,15 +9,15 @@ tensor produce the matching output, i.e. the whole-step graph vLLM records is li
 baked snapshot of the capture-time values.
 """
 
-import numpy as np
 import pytest
+
+from emmy.compiler.dtype import F16
 
 # NOT perf-marked (correctness pin, must run under ``make test``; see tests/ARCHITECTURE.md).
 pytestmark = [pytest.mark.xdist_group("cuda")]
 
 
 def test_run_device_inside_outer_capture_replays_live():
-    pytest.importorskip("cupy")
     import torch
 
     if not torch.cuda.is_available():
@@ -27,7 +27,7 @@ def test_run_device_inside_outer_capture_replays_live():
 
     torch.manual_seed(0)
     wrapper = torch.nn.Linear(16, 16, bias=False).to(torch.float16).eval()
-    prog, _ = _compile_split(wrapper, [torch.zeros(4, 16, dtype=torch.float16)], None, np.dtype("float16"))
+    prog, _ = _compile_split(wrapper, [torch.zeros(4, 16, dtype=torch.float16)], None, F16)
 
     x = torch.randn(4, 16, dtype=torch.float16, device="cuda")
     ref0 = prog.run_device([x])[0].clone()  # uncaptured baseline (also warms the program)
@@ -56,7 +56,6 @@ def test_run_device_sym_inside_outer_capture_replays_live():
     the per-sym-key TMA descriptor overlay — descriptor encoding is an H2D copy and must
     never happen inside a capture), then captures at its exact width. Two sizes get two
     independent graphs over the same capacity buffers; each must replay LIVE."""
-    pytest.importorskip("cupy")
     import torch
 
     if not torch.cuda.is_available():
@@ -66,13 +65,13 @@ def test_run_device_sym_inside_outer_capture_replays_live():
 
     torch.manual_seed(0)
     wrapper = torch.nn.Linear(16, 16, bias=False).to(torch.float16).eval()
-    prog, _ = _compile_split(wrapper, [torch.zeros(4, 16, dtype=torch.float16)], ["input"], np.dtype("float16"), capacity=64)
+    prog, _ = _compile_split(wrapper, [torch.zeros(4, 16, dtype=torch.float16)], ["input"], F16, capacity=64)
 
     ref_mod = wrapper.cuda()
     graphs = {}
     ins = {}
     outs = {}
-    out_backing_ptr = prog.program.arrays[prog.output_names[0]].data.ptr
+    out_backing_ptr = prog.program.executor.buffer(prog.output_names[0])[0]
     for t in (24, 40):
         x = torch.randn(t, 16, dtype=torch.float16, device="cuda")
         warm = prog.run_device_sym([x])[0]  # uncaptured warmup at this exact width
@@ -97,7 +96,6 @@ def test_run_device_aliased_input_backing_replays_live():
     """The EMMY_GEN_ALIAS_ATTN path: the caller writes INTO the program's own input backing (a
     ``torch.from_dlpack`` view), so ``upload_prefix_device`` self-copy-skips — and the captured
     graph must still replay LIVE (new values written into the backing flow through)."""
-    pytest.importorskip("cupy")
     import torch
 
     if not torch.cuda.is_available():
@@ -107,10 +105,10 @@ def test_run_device_aliased_input_backing_replays_live():
 
     torch.manual_seed(0)
     wrapper = torch.nn.Linear(16, 16, bias=False).to(torch.float16).eval()
-    prog, _ = _compile_split(wrapper, [torch.zeros(4, 16, dtype=torch.float16)], None, np.dtype("float16"))
+    prog, _ = _compile_split(wrapper, [torch.zeros(4, 16, dtype=torch.float16)], None, F16)
 
     # The alias: a torch view of the program's OWN input buffer (the post twin's attn_out class).
-    x = torch.from_dlpack(prog.program.arrays[prog.input_names[0]])
+    x = prog.program.buffer_view(prog.input_names[0])
     assert x.shape[0] == 4
     x.copy_(torch.randn(4, 16, dtype=torch.float16, device="cuda"))
     ref0 = prog.run_device([x])[0].clone()  # upload self-copy-skips (pointer equality)
@@ -197,23 +195,29 @@ def test_rider_split_inside_outer_capture_replays_live(built):
         close(o, r)
 
 
-def test_moe_fixed_slot_decode_step_inside_outer_capture_replays_live(built):
+@pytest.mark.parametrize("rows", [1, 3, 16])
+def test_moe_fixed_slot_decode_step_inside_outer_capture_replays_live(built, monkeypatch, rows):
     """The fixed-slot MoE decode step (post_attn twin → router → index_select staging → k slot
     launches → score matmul) under an outer torch CUDA-graph capture — what vLLM's whole-step
-    FULL_DECODE_ONLY capture at size 1 records for an MoE model. Captured once, replayed twice:
-    new values in the same input tensors must flow through the ROUTING too (the top-k indices
-    and the staged expert weights are data-dependent VALUES inside the graph), checked against
-    the eager routed path on fresh inputs."""
+    FULL_DECODE_ONLY capture records for an MoE model: at size 1 always, and up to the decode
+    bucket where the ranks hold slices of every expert, the rows going through the one selector
+    and partials pair in turn. Captured once, replayed twice: new values in the same input
+    tensors must flow through the ROUTING too (the top-k indices and the staged expert weights
+    are data-dependent VALUES inside the graph, each row's its own), checked against the eager
+    routed path on fresh inputs."""
     import torch
 
     pair = built("olmoe.l2.b16")
     runner, config = pair.runner, pair.config
     assert runner.has_moe_fixed_slot
+    if rows > 1:
+        monkeypatch.setattr(runner, "_expert_slices", 8)  # the rule a sliced rank routes by; the experts stay whole
+    assert rows <= runner.moe_slot_width
 
     attn_width = runner.num_heads * runner.head_dim
     torch.manual_seed(1)
-    attn = torch.randn(1, attn_width, device="cuda")
-    residual = torch.randn(1, config.hidden_size, device="cuda")
+    attn = torch.randn(rows, attn_width, device="cuda")
+    residual = torch.randn(rows, config.hidden_size, device="cuda")
 
     def eager_ref(a, r):
         """The routed path on the same twin outputs — the parity oracle for the captured step."""
@@ -235,8 +239,8 @@ def test_moe_fixed_slot_decode_step_inside_outer_capture_replays_live(built):
     # Replay must be LIVE through the routing: new inputs select a different expert set.
     for seed in (2, 3):
         torch.manual_seed(seed)
-        a2 = torch.randn(1, attn_width, device="cuda")
-        r2 = torch.randn(1, config.hidden_size, device="cuda")
+        a2 = torch.randn(rows, attn_width, device="cuda")
+        r2 = torch.randn(rows, config.hidden_size, device="cuda")
         ref2 = eager_ref(a2, r2)
         attn.copy_(a2)
         residual.copy_(r2)
@@ -283,7 +287,6 @@ def test_run_device_sym_aliased_input_backing_replays_live():
     program's own input backing (what the previous layer's chained post output is, after A2),
     so ``upload_prefix_device`` self-copy-skips — and a captured graph over ``run_device_sym``
     must still replay LIVE through the aliased backing."""
-    pytest.importorskip("cupy")
     import torch
 
     if not torch.cuda.is_available():
@@ -293,12 +296,12 @@ def test_run_device_sym_aliased_input_backing_replays_live():
 
     torch.manual_seed(0)
     wrapper = torch.nn.Linear(16, 16, bias=False).to(torch.float16).eval()
-    prog, _ = _compile_split(wrapper, [torch.zeros(4, 16, dtype=torch.float16)], ["input"], np.dtype("float16"), capacity=64)
+    prog, _ = _compile_split(wrapper, [torch.zeros(4, 16, dtype=torch.float16)], ["input"], F16, capacity=64)
 
     ref_mod = wrapper.cuda()
     t = 24
     # The alias: a torch prefix view of the sym program's OWN capacity input buffer.
-    x = torch.from_dlpack(prog.program.arrays[prog.input_names[0]])[:t]
+    x = prog.program.buffer_view(prog.input_names[0])[:t]
     x.copy_(torch.randn(t, 16, dtype=torch.float16, device="cuda"))
     warm = prog.run_device_sym([x])[0]  # uncaptured warmup at this width (self-copy-skips)
     assert torch.allclose(warm, ref_mod(x), rtol=1e-2, atol=1e-2)

@@ -65,7 +65,9 @@ def test_staging_is_idempotent(fake_repo):
     assert [p.name for p in (fake_repo / "emmy" / "recipes").iterdir()] == ["kept"]
 
 
-def test_stages_only_runnable_recipes(fake_repo):
+def test_stages_only_runnable_recipes_and_their_goldens(fake_repo):
+    """An unbundled recipe's golden ships nowhere: discovery in a wheel reads the lifecycle tag off the recipe
+    file beside a golden, and a golden staged without its recipe file crashed every installed-wheel compile."""
     for name, tags in (
         ("maintained", ["maintained"]),
         ("best-effort", ["best-effort"]),
@@ -75,20 +77,37 @@ def test_stages_only_runnable_recipes(fake_repo):
         model = fake_repo / "recipes" / name
         model.mkdir(parents=True)
         (model / "recipe.yaml").write_text(f"tags: {tags!r}\nmodel:\n  huggingface: org/{name}\n")
-        golden = model / "golden" / "rtx5090_sm120.yaml"
+        golden = model / "golden" / "rtx5090_sm120.json"
         golden.parent.mkdir()
         golden.write_text("gpu_name: NVIDIA GeForce RTX 5090\n")
 
     assert prepare_dist.stage_recipes() == 2
     staged = fake_repo / "emmy" / "recipes"
-    assert sorted(p.name for p in staged.iterdir()) == ["best-effort", "maintained", "obsolete", "onboarding"]
-    assert (staged / "maintained" / "recipe.yaml").is_file()
-    assert (staged / "best-effort" / "recipe.yaml").is_file()
-    assert not (staged / "obsolete" / "recipe.yaml").exists()
-    assert not (staged / "onboarding" / "recipe.yaml").exists()
-    assert all(
-        (staged / name / "golden" / "rtx5090_sm120.yaml").is_file() for name in ("maintained", "best-effort", "obsolete", "onboarding")
-    )
+    assert sorted(p.name for p in staged.iterdir()) == ["best-effort", "maintained"]
+    assert all((staged / name / "recipe.yaml").is_file() for name in ("maintained", "best-effort"))
+    assert all((staged / name / "golden" / "rtx5090_sm120.json").is_file() for name in ("maintained", "best-effort"))
+
+
+def test_the_package_data_ships_everything_staged(fake_repo):
+    """Staging is only half of it: setuptools ships a staged file only if the package-data patterns match
+    it. The goldens became JSON in #912 and the recipe pattern still said YAML, so every wheel since
+    shipped the recipes and no model golden — a serving image warmed from one had no evidence at all."""
+    import fnmatch
+    import tomllib
+
+    model = fake_repo / "recipes" / "model"
+    (model / "golden").mkdir(parents=True)
+    (model / "recipe.yaml").write_text("tags: [maintained]\n")
+    (model / "golden" / "v100_sm70.json").write_text("{}\n")
+    prepare_dist.stage_recipes()
+    staged = [
+        path.relative_to(fake_repo / "emmy" / "recipes").as_posix()
+        for path in (fake_repo / "emmy" / "recipes").rglob("*")
+        if path.is_file()
+    ]
+    patterns = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())["tool"]["setuptools"]["package-data"]["emmy.recipes"]
+    assert sorted(staged) == ["model/golden/v100_sm70.json", "model/recipe.yaml"]
+    assert [path for path in staged if not any(fnmatch.fnmatch(path, pattern) for pattern in patterns)] == []
 
 
 def test_refuses_to_build_a_recipe_less_package(fake_repo):

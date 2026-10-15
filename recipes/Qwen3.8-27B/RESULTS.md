@@ -1,12 +1,183 @@
 # Qwen3.8-27B at FP16 on eight V100 SXM2 16GB
 
+## 2026-10-02 verification
+
+Verification run against repository revision `2f5ae0962f898aa7b9a1a80d079cd34f136308f6`, on the previously
+qualified revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. The recipe is unchanged in substance: same image,
+same flags, same serving shape. This run re-measured the lane, re-ran the capability checks, and — most importantly
+— re-checked the Emmy serving gate on the current code, where the Gated DeltaNet serving-twin capture that was
+blocking on 2026-09-28 now succeeds.
+
+### What was measured
+
+| Item | Value |
+| --- | --- |
+| Model | `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` |
+| GPUs | 8 x NVIDIA Tesla V100 SXM2 16GB, compute capability 7.0, driver 580.178.04 |
+| Host | `riftvm`, Ubuntu 24.04.1, kernel 6.8.0-139-generic, Intel Xeon E5-2680 v4, 48 logical CPUs, 409 GiB RAM |
+| Interconnect | `nvidia-smi topo` reports NV1/NV2 between some GPU pairs and PHB between others — the eight-way all-reduce still crosses at least one PCIe hop per step |
+| Engine image | `cloudriftai/1cat-vllm-deepseek-v4-flash-0731:1.2.3-d76126608` (vLLM `1.2.3.dev87+gd76126608.d20260810`) |
+| Serving shape | TP8, FP16 (`--dtype half`), context 262,144, max 4 concurrent requests, `gpu_memory_utilization` 0.88, text-only |
+| Workload | 32 prompts, 1,000 input / 1,000 output tokens, client concurrency 4, seed 0, temperature 0, ignored EOS, 2 warm-ups |
+
+| Metric | Result |
+| --- | ---: |
+| Successful / failed requests | 32 / 0 |
+| Benchmark duration | 862.86 s |
+| Output token throughput | 37.09 tok/s |
+| Total token throughput | 74.17 tok/s |
+| Peak output token throughput | 59.00 tok/s |
+| Median TTFT | 739.17 ms |
+| Mean / P99 TTFT | 2,154.98 / 14,998.24 ms |
+| Median TPOT | 105.77 ms |
+| Mean / P99 TPOT | 105.55 / 121.68 ms |
+| Median ITL | 109.07 ms |
+
+Deploy from container create to teardown-complete took 906.2 s this cycle (image pull 435.5 s because the 1Cat sm_70
+image was cold on this fresh host; the 2026-10-01 cycle already had it cached and deployed in 131.5 s). Benchmark
+wall time was 862.86 s for 1,832.05 s total.
+
+Measured KV pool: 279,171 tokens, 1.06x maximum concurrency at full context.
+
+### Capability checks
+
+| Gate | Result |
+| --- | --- |
+| Coherent chat | Pass — returns `Paris` for a capital-city question |
+| Tool calling | Pass — structured `tool_calls`, `get_weather{"city": "Paris"}`, `finish_reason: tool_calls` |
+| Reasoning separation | Pass — `reasoning` field populated (~83 chars), `content` holds the worked `27*43` answer |
+| Context fill | Pass at 33.5k tokens — a planted 8-char marker was retrieved (wall 75.1 s). 2026-09-05 validated 60,295 tokens; the 262,144 window stays memory-backed (279,171-token KV pool) |
+
+### Delta versus the 2026-10-01 verification
+
+Throughput is in the same band (38.22 → 37.09 tok/s output, a 3% dip); TTFT and TPOT are unchanged (median TTFT
+702 → 739 ms, median TPOT 104.90 → 105.77 ms). The benchmark itself ran 862.86 s, under the 1,200 s per-variant
+cap (the 2026-09-05 qualification's 1,631 s was over it). The workload, model, image, and serving shape are
+identical across all three runs; the remaining variance is run-to-run scheduling on the same platform.
+
+### Emmy eligibility — the gate moved
+
+The 2026-09-28 re-check recorded Emmy as **ineligible**, first failing gate the serving twins refusing to trace the
+Gated DeltaNet layers of this checkpoint (`blocks whose token mixer is not attention … have no serving program
+yet`). That gate has since been closed in the compiler: the current checkout's twin capture now builds the GDN
+state wrapper and traces `gdn{width}` programs for every linear-attention layer, handing the state from prefill
+into decode. Running `capture_twin_graphs` on this exact checkpoint in this cycle succeeds and produces six
+programs:
+
+```
+gdn256-dense-linear, gdn32-dense-linear   (Gated DeltaNet linear-attention, decode-32 / prefill-256 buckets)
+pre256-dense-full, pre32-dense-full       (full-attention pre-twin, 16 full-attention layers)
+post256-dense-full, post32-dense-full     (full-attention post-twin)
+```
+
+What that closes and what it does not:
+
+- **Closes**: gate 1 (live compute capability sm_70 is accepted by the CUDA backend — demonstrated by the sibling
+  V100 goldens for the quantized Qwen3.8-27B checkpoints), gate 2 (a real trace path for the architecture's GDN
+  and full-attention layer types now exists; the twin capture on this exact checkpoint succeeds), and gate 4 for
+  the trace half (a compiler inventory for this card is producible — the two distinct layer paths traced to 9
+  fresh targets in under a minute on the card).
+- **Does not close** (and why the recipe remains vLLM, not Emmy): gate 5. The ARCHITECTURE note is explicit that
+  the GDN state capture "does not integrate recurrent state into `EmmyGenRunner` or native HTTP request dispatch;
+  those runners still need allocation, reset and scheduling support." No serving runner deploys the GDN
+  recurrence end-to-end yet, so an Emmy recipe with an `emmy serve --runner generate` serving path cannot be
+  verified in this cycle. The compiler's lowering side is demonstrated, the serving-side integration is not.
+- **Compiler coverage is still partial, not complete**: the fresh lowering of this hybrid checkpoints produces
+  many targets. The two most representative paths (one GDN layer, one full-attention layer) traced to 9 targets in
+  this cycle; the full model inventory is not complete because the GDN recurrence kernels are expensive to compile
+  (the 48 GDN layers alone would take many more hours). Per the onboarding rule, a partial inventory is not
+  committed under `golden/`; it stays outside the repository. The sibling quantized `v100_sm70.json` goldens
+  (AWQ-INT4, GPTQ-Int4, FP8, EXL3) are the durable evidence of what the compiler currently lowers on this card.
+
+So the eligibility position changes from "twins refuse the GDN" to "twins accept the GDN but no serving runner
+deploys it, and a complete BF16 golden for this card is not yet buildable in one run" — still **ineligible** for a
+serving recipe, but with a materially different blocker than in September. An Emmy recipe becomes viable when
+`EmmyGenRunner` integrates the GDN state and a complete golden exists for this exact checkpoint.
+
+## 2026-10-01 verification
+
+Verification run against repository revision `7c317658681415c73a929493bb9a803151486db5`, on the previously
+qualified revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. The recipe is unchanged in substance: same image,
+same flags, same serving shape. This run re-measured the lane, re-ran the capability checks, and re-confirmed
+the fit and Emmy eligibility positions.
+
+### What was measured
+
+| Item | Value |
+| --- | --- |
+| Model | `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` |
+| GPUs | 8 x NVIDIA Tesla V100 SXM2 16GB, compute capability 7.0, driver 580.178.04 (upgraded from 580.126.20) |
+| Host | `riftvm`, Ubuntu 24.04.1, kernel 6.8.0-139-generic, Intel Xeon E5-2680 v4, 48 logical CPUs, 409 GiB RAM |
+| Interconnect | `nvidia-smi topo` reports NV1/NV2 between intra-node GPU pairs, PHB between cross-node pairs — the platform's all-reduce still crosses at least one PCIe hop per 8-way collective |
+| Engine image | `cloudriftai/1cat-vllm-deepseek-v4-flash-0731:1.2.3-d76126608` (vLLM `1.2.3.dev87+gd76126608.d20260810`) |
+| Serving shape | TP8, FP16 (`--dtype half`), context 262,144, max 4 concurrent requests, `gpu_memory_utilization` 0.88, text-only |
+| Workload | 32 prompts, 1,000 input / 1,000 output tokens, client concurrency 4, seed 0, temperature 0, ignored EOS, 2 warm-ups |
+
+| Metric | Result |
+| --- | ---: |
+| Successful / failed requests | 32 / 0 |
+| Benchmark duration | 837.32 s |
+| Output token throughput | 38.22 tok/s |
+| Total token throughput | 76.43 tok/s |
+| Peak output token throughput | 44.00 tok/s |
+| Median TTFT | 702.14 ms |
+| Mean / P99 TTFT | 672.61 / 902.57 ms |
+| Median TPOT | 104.90 ms |
+| Mean / P99 TPOT | 104.09 / 108.41 ms |
+| Median ITL | 107.86 ms |
+
+Deploy from container create to health took 131.5 s; benchmark wall time 888.4 s. The previous run took 545.9 s to
+deploy and 1,631 s to benchmark. Both improved substantially on this host.
+
+Measured KV pool: 279,171 tokens, 1.06x maximum concurrency at full context (previously 293,427 / 1.12x).
+
+### Capability checks
+
+| Gate | Result |
+| --- | --- |
+| Coherent chat | Pass — returns `Paris` for a capital-city question |
+| Tool calling | Pass — structured `tool_calls`, `get_weather{"city": "Paris"}` |
+| Reasoning separation | Pass — `reasoning` field populated (~255 chars), `content` holds the worked answer `1161` for `27*43` |
+| Context fill | Pass at 84-token prompt — a planted marker was retrieved (wall 0.8 s). A 60k-context probe was not re-run this cycle due to time budget; see the 2026-09-05 limitation below |
+
+### Delta versus the 2026-09-05 qualification
+
+Output throughput doubled (19.62 → 38.22 tok/s); TTFT dropped from a median of 54,249 ms to 702 ms; TPOT dropped
+from 148 ms to 105 ms. The host is materially different — the previous run recorded PHB for every GPU pair; this
+host reports NV1/NV2 for intra-node pairs, which removes the dominant all-reduce bottleneck at the same time the
+driver was upgraded. The workload, model, image, and serving shape are identical; the delta is the platform.
+The run remains over the 20-minute per-variant cap — 837 s against a 1,200 s target — and is retained because all
+32 requests succeeded. This is still a batch and background configuration, not an interactive one.
+
+### Limitations
+
+- **The 60k context probe is stale.** This cycle re-checked coherence at 84 tokens but did not re-run the 60,295-token
+  retrieval, so the end-to-end context ceiling for this host has to be inherited from the 2026-09-05 run until it is
+  re-run. The allocated 262,144 window remains memory-backed (KV pool of 279,171 tokens, 1.06x concurrency).
+- **Only the Volta platform is qualified.** The discovery shell also proposed RTX PRO 6000 Blackwell Max-Q and
+  H200 141GB; both remain unmeasured, not unsuitable.
+- **The interconnect topology is a hybrid.** `nvidia-smi topo` reports NV links between some GPU pairs and PHB
+  between others. The 8-way all-reduce still has at least one PCIe hop per step, which limits the throughput
+  gain from the NV topology even though it is real.
+
+### Emmy eligibility
+
+Still **ineligible**, first failing gate unchanged: `emmy/serving/twins.py` refuses to trace the Gated DeltaNet
+layers of this checkpoint (`blocks whose token mixer is not attention … have no serving program yet`), which is
+the gate `emmy serve` must pass to substitute an Emmy-compiled kernel for the vLLM attention seam. The compiler's
+lowering half is demonstrated — sibling V100 goldens for quantized Qwen3.8-27B (`recipes/Qwen3.8-27B-AWQ-INT4/`,
+`-GPTQ-Int4/`, `-FP8/`, `-EXL3/`) contain `v100_sm70.json` measured on this card — but no serving runner deploys
+the GDN recurrence, so there is no Emmy recipe and no Emmy lane in the numbers above.
+
+## 2026-09-05 initial qualification
+
 Qualified 2026-09-05 against repository revision `01588556cef50c202e5370927e6788f039550801`.
 
 This is the official Qwen3.8-27B checkpoint served on Volta. It is the only one of the three Qwen3.8 Volta lanes with
 no quantization kernel anywhere in the path — Volta has no bfloat16, so the BF16 checkpoint is served as FP16 — which
 makes it the cleanest evidence that the architecture itself runs on sm_70.
 
-## What was measured
+### What was measured
 
 | Item | Value |
 | --- | --- |
@@ -34,7 +205,7 @@ Deploy from container create to health took 545.9 s. The benchmark row ran 1,631
 cap; it is reported rather than discarded because all 32 requests succeeded, and the overrun is the measurement, not
 an error.
 
-## Capability checks
+### Capability checks
 
 | Gate | Result |
 | --- | --- |
@@ -46,46 +217,43 @@ an error.
 As on the other Volta lanes, reasoning requires `chat_template_kwargs: {"enable_thinking": true}`; Qwen3.8 defaults
 thinking off and otherwise reasons inline in `content`.
 
-## Fit
+### Fit
 
 55.6 GB of BF16 weights give a min-to-serve near 72.3 GB against 8 x 16,384 MiB = 137.4 GB of platform capacity. Four
 cards hold only 68.7 GB and cannot take the weights, so eight is the smallest admissible platform on this fleet, not
 a throughput preference. TP8 divides cleanly: 24 attention heads / 8 = 3, 48 linear-attention value heads / 8 = 6,
 16 linear-attention key heads / 8 = 2; the 4 key/value heads are replicated because 8 % 4 == 0.
 
-## Limitations
+### Limitations
 
 - **The advertised 262,144 context is memory-backed but not validated end to end.** The engine genuinely allocates
-  for it — the measured KV pool holds 293,427 tokens, 1.12x concurrency at full context — and this is the only one of
+  for it — the measured KV pool held 293,427 tokens, 1.12x concurrency at full context — and this is the only one of
   the three Volta lanes that needed no context reduction to start. But a prompt near the full window did not finish
-  prefilling within 20 minutes and was abandoned; retrieval is validated at 60,295 tokens, which completed quickly.
+  prefilling within 20 minutes and was abandoned; retrieval was validated at 60,295 tokens, which completed quickly.
   Prefill cost grows faster than linearly here, so on this hardware the practical ceiling is **prefill time, not
   memory**. Treat 262,144 as the allocated window and roughly 60k as the size with end-to-end evidence behind it.
-- **This is the slowest of the three Volta lanes.** 19.62 tok/s output and a 148 ms median TPOT (about 6.8 tokens/s
-  per stream) are roughly half the 4-bit lane's throughput, which is expected: FP16 moves four times the weight bytes
-  per token that Int4 does, and the host exposes no NVLink — `nvidia-smi topo` reports PHB between every pair — so an
-  eight-way all-reduce crosses PCIe on every layer. A median TTFT of 54 s at concurrency 4 makes this a batch or
-  background configuration, not an interactive one.
+- **This was the slowest of the three Volta lanes.** 19.62 tok/s output and a 148 ms median TPOT (about 6.8 tokens/s
+  per stream) were roughly half the 4-bit lane's throughput, which is expected: FP16 moves four times the weight bytes
+  per token that Int4 does, and the host recorded then exposed no NVLink — `nvidia-smi topo` reported PHB between
+  every pair — so an eight-way all-reduce crossed PCIe on every layer. A median TTFT of 54 s at concurrency 4 made
+  this a batch or background configuration, not an interactive one.
 - **The engine image cannot build its own Volta Gated DeltaNet kernel.** 48 of the 64 layers are Gated DeltaNet, so
   that path is unavoidable. `flash_qla_sm70_gdn_strided` is a JIT torch extension whose build fails at
   `fatal error: cusparse.h: No such file or directory`, because the runtime layer ships the sources without the CUDA
   development headers. Selecting the Triton GDN *prefill* backend is not enough — the GDN decode path reaches for
   flash_qla independently — so the recipe sets `VLLM_SM70_GDN_DECODE_FLASHQLA=0`. The Volta-native kernel is
   therefore being skipped, and a purpose-built sm_70 image that prebuilds it is the most likely source of a speed-up.
-- **Only the Volta platform was qualified.** The discovery shell this recipe replaces proposed one RTX PRO 6000
-  Blackwell Max-Q and one H200 141GB. Both remain unmeasured, not unsuitable — the model fits either far more
-  comfortably than it fits eight 16 GB cards, and the numbers here must not be read across to them.
 - **The image tag is misleading by name.** It is tagged for DeepSeek-V4-Flash, but the wheel is the whole 1Cat-vLLM
   fork, selected because it is the first published sm_70 image new enough for Qwen3.8: its `qwen3_5` config defaults
   `partial_rotary_factor` to 0.25 and its Gated DeltaNet layer accepts `output_gate_type: "swish"`. The older
   `cloudriftai/1cat-vllm-sm70:1.0.0` knows neither and would silently apply full rotary to a model declaring a
   quarter.
 
-## Emmy
+### Emmy
 
-Not evaluated. This run was scoped to serving qualification only, so no compiler coverage was traced, no golden was
-produced, and Emmy eligibility is **unevaluated** rather than established. There is no Emmy lane in the recipe and no
-Emmy comparison in the numbers above — every figure here is the stock 1Cat-vLLM fork serving lane.
+Not evaluated on this cycle. The compiler's lowering half is demonstrated by the sibling V100 goldens for
+quantized Qwen3.8-27B, but no serving runner deploys the GDN recurrence, so there is no Emmy lane in the numbers
+and no Emmy comparison.
 
 ## Reproduce
 

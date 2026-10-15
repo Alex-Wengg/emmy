@@ -10,14 +10,17 @@ import yaml
 from emmy import gpu as gpu_registry
 from emmy.recipe.lifecycle import ONBOARDING_TAG, UNTESTED_TAG, recipe_is_runnable, validate_recipe_tags
 from emmy.recipe.matrix import build_override, expand_matrix
-from emmy.recipe.recipe import deep_merge
+from emmy.recipe.recipe import deep_merge, validate_modality_input
+from emmy.recipe.types import LLMConfig
 
 HF_ID = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DEPLOYMENT_FIELDS = frozenset({"deploy.gpu", "deploy.gpu_count"})
 MAX_STUB_DEPLOYMENTS = 3
-CATALOG_SCHEMA_VERSION = 1
+CATALOG_SCHEMA_VERSION = 2
 MIN_MODEL_HEAT = 0
 MAX_MODEL_HEAT = 100
+#: The vLLM architecture overrides the Emmy serving plugin registers (``EmmyGenModel``, ``EmmyEmbedModel``).
+EMMY_ARCHITECTURE = re.compile(r"\bEmmy[A-Za-z]*Model\b")
 
 
 def validate_model_heat(value: object, model_id: str, *, required: bool = False) -> int | None:
@@ -78,31 +81,54 @@ def deployment_setups(config: dict) -> list[dict[str, object]]:
     return setups
 
 
-def _inventory_deployments(config: dict) -> list[dict[str, object]]:
-    """Return machine-readable hardware metadata after applying matrix overrides."""
+def _inventory_deployments(config: dict, model_id: str) -> list[dict[str, object]]:
+    """Return machine-readable hardware metadata after applying matrix overrides.
+
+    The input modalities travel with the deployment: a declared modality is a serving claim
+    about one resolved variant (its engine flags must keep that input path on), and a recipe's
+    entries may differ, a text-only lane beside one that keeps the vision tower.
+    """
     variants = _resolved_variants(config)
 
     deployments = []
     seen = set()
     for variant in variants:
+        try:
+            input_modalities = validate_modality_input(variant)
+        except ValueError as e:
+            raise ValueError(f"Recipe {model_id}: {e}") from e
         deploy = variant.get("deploy") or {}
+        llm = (variant.get("engine") or {}).get("llm") or {}
         gpu = deploy.get("gpu")
         gpu_count = deploy.get("gpu_count", 1)
+        fraction = llm.get("gpu_memory_utilization", LLMConfig.gpu_memory_utilization)
         valid_count = isinstance(gpu_count, int) and not isinstance(gpu_count, bool) and gpu_count >= 1
-        if not isinstance(gpu, str) or not valid_count or (gpu, gpu_count) in seen:
+        if not isinstance(gpu, str) or not valid_count or (gpu, gpu_count, fraction) in seen:
             continue
-        seen.add((gpu, gpu_count))
+        seen.add((gpu, gpu_count, fraction))
 
-        context_length = ((variant.get("engine") or {}).get("llm") or {}).get("context_length")
+        context_length = llm.get("context_length")
         valid_context = isinstance(context_length, int) and not isinstance(context_length, bool) and context_length >= 1
         deployments.append(
             {
                 "gpu": gpu,
                 "gpu_count": gpu_count,
+                "gpu_memory_utilization": fraction,
                 "context_length": context_length if valid_context else None,
+                "input_modalities": list(input_modalities),
             }
         )
     return deployments
+
+
+def _names_emmy_architecture(value: object) -> bool:
+    if isinstance(value, str):
+        return EMMY_ARCHITECTURE.search(value) is not None
+    if isinstance(value, dict):
+        return any(_names_emmy_architecture(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_names_emmy_architecture(item) for item in value)
+    return False
 
 
 def recipe_inventory(root: str | Path, tags: tuple[str, ...] = ()) -> list[dict]:
@@ -128,7 +154,9 @@ def recipe_inventory(root: str | Path, tags: tuple[str, ...] = ()) -> list[dict]
                 "tags": list(record["tags"]),
                 "task": task,
                 "runnable": recipe_is_runnable(config) and has_inference_engine and task in ("generate", "embed"),
-                "deployments": _inventory_deployments(config),
+                "deployments": _inventory_deployments(config, model_id),
+                # Some variant serves through the Emmy plugin rather than stock vLLM or SGLang.
+                "emmy_serving": any(_names_emmy_architecture(variant.get("engine")) for variant in _resolved_variants(config)),
                 "rationale": model.get("rationale"),
                 "heat": model.get("heat"),
             }

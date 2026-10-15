@@ -33,7 +33,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -123,30 +122,11 @@ def bench_pair(request):
     """
 
     def _run(case: Case) -> PerfRow | None:
-        if _tune_enabled():
-            # Tune-only path: populate the autotune DB, measure nothing. Run
-            # ``make bench-kernels-tuned`` afterwards to measure with the tuned knobs.
-            _tune_via_subprocess(case)
-            return None
         row = _bench_corpus_case(case, profile=_ncu_enabled())
         _collector(request.config).append(row)
         return row
 
     return _run
-
-
-def _tune_enabled() -> bool:
-    return os.environ.get("EMMY_TUNE", "") in ("1", "true", "True")
-
-
-def _tune_via_subprocess(case: Case) -> None:
-    """Search this case's kernel and record the winners into the autotune DB."""
-    subprocess.run(
-        [sys.executable, "-m", "emmy.emmy", "tune", "--golden", str(case.path), "--realization", case.record.name],
-        check=False,
-        env={**os.environ, "EMMY_TUNE": "1"},
-        timeout=3600,
-    )
 
 
 def _bench_corpus_case(case: Case, *, profile: bool) -> PerfRow:
@@ -158,7 +138,7 @@ def _bench_corpus_case(case: Case, *, profile: bool) -> PerfRow:
     """
     facts = helpers.describe(case)
     recorded = helpers.recorded_latency(case, helpers.live_hardware_id())
-    stored = float(recorded["emmy_us"]) if recorded else None
+    stored = float(recorded.emmy_us) if recorded else None
     with tempfile.TemporaryDirectory(prefix=f"emmy_perf_{case.path.stem}_") as tmp:
         record = None
         samples: list[float] = []

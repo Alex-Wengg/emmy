@@ -1,15 +1,14 @@
 # FP16 Llama 3.1 8B Instruct on one 32 GB Volta GPU. The public mirror's
 # config and all four model shards are byte-identical to Meta's gated release.
 tags:
-  - best-effort
+  - maintained
+  - lifecycle-locked
 
 model:
   huggingface: "NousResearch/Meta-Llama-3.1-8B-Instruct"
-  rationale: "Llama 3.1 aged out; succeeded by 3.3 and newer. Moderate HF presence but low current momentum."
-  heat: 35
+  rationale: "Stable utility downloads but zero trending or arena presence; cooling family."
+  heat: 25
   revision: d10aef7999a2b5ba950ab3974312feeedbfe0b77
-    FP16 fits one 32 GB V100 and avoids weight-only quantization. The pinned
-    public mirror is byte-identical to the official Meta model payload.
   task: generate
 
 engine:
@@ -20,17 +19,28 @@ engine:
     context_length: 65536
     max_concurrent_requests: 8
     vllm:
-      image: "cloudriftai/1cat-vllm-sm70@sha256:8405bb60d24610417d0d6da278a753e2c968bfd1e0d7ff7f79cd6601a038b2be"
+      image: "cloudriftai/1cat-vllm-sm70@sha256:6f34e0b247a78ca65f88f305b1f1cc52c9020ecb83a5ca21df0599676dc443d3"
+      extra_env:
+        VLLM_FLASH_V100_DISABLE_PAGED_PREFILL: "1"
       extra_args: >-
         --dtype half
-        --language-model-only
         --attention-backend FLASH_ATTN_V100
         --max-num-batched-tokens 4096
         --tokenizer hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4
         --tokenizer-revision db1f81ad4b8c7e39777509fac66c652eb0a52f91
         --enable-auto-tool-choice
         --tool-call-parser llama3_json
+        --no-enable-prefix-caching
 
 matrices:
-  deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"
-  deploy.gpu_count: 1
+  - deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"
+    deploy.gpu_count: 1
+
+  # Reduced-fraction entry so this model can share the 32 GB card with the AWQ-INT4 variant at 0.3.
+  # 0.65 x 32 GiB leaves ~4.5 GiB of KV after the ~15 GiB of FP16 weights and the engine's own
+  # overhead; at 128 KiB per token that holds two 16,384-token requests. Unverified until a record
+  # run on the card.
+  - deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"
+    deploy.gpu_count: 1
+    engine.llm.gpu_memory_utilization: 0.65
+    engine.llm.context_length: 16384

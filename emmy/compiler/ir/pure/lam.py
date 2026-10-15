@@ -12,9 +12,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from emmy.compiler.ir.elementwise import ElementwiseImpl
-from emmy.compiler.ir.stmt.base import pretty_body
-from emmy.compiler.ir.stmt.body import Body, _exposed_defines
-from emmy.compiler.ir.stmt.leaves import Assign, Load
+from emmy.compiler.ir.stmt.base import Stmt, pretty_body
+from emmy.compiler.ir.stmt.body import Body, _exposed_defines, free_names
+from emmy.compiler.ir.stmt.leaves import Affine, Assign, Load
+from emmy.compiler.wire import Wire
 
 
 def _canonical_body_order(body: Body) -> Body:
@@ -32,17 +33,8 @@ def _canonical_body_order(body: Body) -> Body:
             len(getattr(stmt, "args", ()) or ()),
         )
 
-    def reads(stmt) -> set[str]:
-        out = set(stmt.deps())
-        for nested in stmt.nested():
-            for child in nested:
-                out |= reads(child)
-        return out
-
-    definitions = [
-        set(stmt.defines()) | {name for nested in stmt.nested() for child in nested for name in child.defines()} for stmt in stmts
-    ]
-    dependencies = [reads(stmt) for stmt in stmts]
+    definitions = [_exposed_defines(stmt) for stmt in stmts]
+    dependencies = [free_names(stmt) for stmt in stmts]
     placed = []
     remaining = list(range(len(stmts)))
     while remaining:
@@ -58,17 +50,24 @@ def _canonical_body_order(body: Body) -> Body:
 
 def _normalize_body(body: Body) -> Body:
     """The construction canonicalization of a pure body — an idempotent transform, applied by
-    :meth:`Lambda.__post_init__`: a dependency-safe statement order and sorted commutative arguments,
-    the context-independent storage invariants a term's structural identity reads directly."""
+    :meth:`Lambda.__post_init__`: a dependency-safe statement order and sorted commutative arguments (an
+    ``Affine``'s terms among them), the context-independent storage invariants a term's structural identity reads
+    directly."""
     ordered = _canonical_body_order(body)
-    return Body(
-        replace(stmt, args=tuple(sorted(stmt.args))) if isinstance(stmt, Assign) and stmt.op.commutative and len(stmt.args) > 1 else stmt
-        for stmt in ordered
-    )
+
+    def sort(stmt: Stmt) -> Stmt:
+        if isinstance(stmt, Assign) and stmt.op.commutative and len(stmt.args) > 1:
+            return replace(stmt, args=tuple(sorted(stmt.args)))
+        if isinstance(stmt, Affine) and len(stmt.args) > 1:
+            terms = sorted(stmt.terms, key=lambda term: term[1])
+            return replace(stmt, args=tuple(arg for _, arg in terms), coefficients=tuple(c for c, _ in terms))
+        return stmt
+
+    return Body(sort(stmt) for stmt in ordered)
 
 
 @dataclass(frozen=True)
-class Lambda:
+class Lambda(Wire):
     """Explicit binders over the REUSED stmt vocabulary — the ONE binder kind, common to every IR
     level. Not a second expression language: ``body`` is a :class:`Body` of PURE stmts only
     (A-normal form ≙ a let-chain), ``params`` the binders, ``results`` the returned defs
@@ -78,9 +77,8 @@ class Lambda:
     :attr:`Stmt.pure` trait (declared on the interface, conservative ``False`` default —
     ``Load`` / ``Assign`` and the structural nodes opt in; ``Accum`` / ``Write`` / ``Init`` /
     ``Loop`` never do; no isinstance whitelist, so a new stmt kind is excluded until it declares
-    itself) and every result is defined. The CONTEXTUAL half — free names ⊆ params ∪ enclosing
-    iteration vars — is the consuming Fold's check, since a bare Lambda
-    cannot know its scope.
+    itself), every result is defined, and every value or coordinate read is bound. Scope-aware
+    ``free_names`` supplies both the construction check and canonical statement ordering.
 
     α-invariance is CANONICAL RENUMBERING (the existing rename machinery), not de Bruijn:
     :meth:`canonical` renumbers params (``_p0…``) and internal defs (``_v0…``) in walk order,
@@ -112,7 +110,7 @@ class Lambda:
         # are coordinates is the binder's knowledge (a ``Fold`` reads them as its free coordinates
         # past the operand binding); a bare lambda cannot tell. :meth:`closing` FORMS a closed
         # lambda; this only refuses.
-        free = self.body.ssa_uses - defined
+        free = set().union(*(free_names(stmt) for stmt in self.body)) - defined
         if free:
             raise ValueError(
                 f"Lambda body reads {sorted(free)} it does not bind. Pass them as params — "
@@ -141,7 +139,7 @@ class Lambda:
         # Reads the body does not define, plus any RESULT it does not define either: a write may
         # pass an enclosing value straight through (``o[j] = acc`` over an already-reduced
         # accumulator), and that result has no def to name, so it binds as a param like any read.
-        residual = set(body.ssa_uses)
+        residual = set().union(*(free_names(stmt) for stmt in body))
         residual |= set(results)
         return cls(params=(*params, *sorted(residual - bound)), body=body, results=tuple(results))
 

@@ -6,7 +6,6 @@ are explicit at each call site and test modules never import implementation from
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import functools
 from collections.abc import Mapping
@@ -117,25 +116,28 @@ def literal_classic_context(tile, target, *, kernel, nodes, edges, row=None, ord
 
 
 def case_target_tile(case: str):
-    """Lift the target of a realization corpus case, named by its path under ``realization/cases``.
+    """Lift the target of a realization corpus case, named by its path under ``realization/cases``: the one kernel
+    its traced program lowers to, as the cut pass is offered it."""
+    from dataclasses import replace
 
-    A case records one entry per kernel of the set it realizes and every entry decorates the same
-    target, so the first entry names it."""
-    from emmy.compiler.pipeline.search.golden import _lifted_target, load_golden_file, load_golden_records
+    from emmy.compiler.context import Context
+    from emmy.compiler.ir.tile import TileOp
+    from emmy.compiler.pipeline import Pipeline
+    from emmy.compiler.pipeline.search.golden import GoldenFile
 
-    path = Path(__file__).parent / "realization/cases" / case
-    record, *_ = load_golden_records(load_golden_file(path))
-    return _lifted_target(record)
+    document = GoldenFile.load(Path(__file__).parent / "realization/cases" / case)
+    [target] = document.targets()
+    lifted = Pipeline.build(["tile/lift"]).run(target.program({}), ctx=Context.from_target(tuple(document.compute_cap)), db=None)
+    [node] = [node for node in lifted.nodes.values() if isinstance(node.op, TileOp)]
+    tile = node.op.with_io(lifted, node)
+    return replace(tile, name=next(iter(tile.outputs)))  # addressed by its primary output, as a graph node is
 
 
 def has_cuda_gpu() -> bool:
-    """Check if cupy is importable and sees at least one CUDA device."""
-    try:
-        import cupy as cp
+    """Check that the runtime extension loads and sees a CUDA device."""
+    from emmy.compiler.backend.cuda.device import compute_capability
 
-        return cp.cuda.runtime.getDeviceCount() > 0
-    except Exception:
-        return False
+    return compute_capability() is not None
 
 
 def has_cuda_toolchain() -> bool:
@@ -149,19 +151,24 @@ def has_cuda_toolchain() -> bool:
 
 requires_cuda = pytest.mark.skipif(
     not has_cuda_toolchain(),
-    reason="CUDA not available (need cupy + GPU + nvcc)",
+    reason="CUDA not available (need the emmy.emmy_runtime extension + GPU + nvcc)",
 )
 
 
 @functools.cache
 def device_compute_capability() -> tuple[int, int] | None:
     """Return the live CUDA device compute capability, or ``None`` when no GPU is visible."""
-    if not has_cuda_gpu():
-        return None
-    import cupy as cp
+    from emmy.compiler.backend.cuda.device import compute_capability
 
-    cap = str(cp.cuda.Device().compute_capability)
-    return (int(cap[:-1]), int(cap[-1]))
+    return compute_capability()
+
+
+def requires_sm(major: int, minor: int = 0):
+    """Skip an instruction-specific CUDA test below its minimum compute capability."""
+    return pytest.mark.skipif(
+        (device_compute_capability() or (0, 0)) < (major, minor),
+        reason=f"requires sm_{major}{minor} or newer",
+    )
 
 
 # Skip the mma.sync warp-tier tests below sm_90. On sm_80-89 the pin-only path is currently non-functional because
@@ -209,7 +216,7 @@ def dtype_input_scale(dtype) -> float:
 def skip_if_no_cuda() -> None:
     """Skip the current test when Emmy cannot compile CUDA kernels."""
     if not has_cuda_toolchain():
-        pytest.skip("CUDA not available (need cupy + GPU + nvcc)")
+        pytest.skip("CUDA not available (need the emmy.emmy_runtime extension + GPU + nvcc)")
 
 
 def matmul_graph(m: int, k: int, n: int):
@@ -248,68 +255,6 @@ def inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.n
     return input_data
 
 
-def drain_tune(pipeline, graph, *, on=None, **kwargs):
-    """Synchronously collect :meth:`Pipeline.tune_async` terminals for tests."""
-
-    async def _collect():
-        out = []
-        try:
-            async for candidate in pipeline.tune_async(graph, **kwargs):
-                out.append(candidate)
-                if on is not None and on(candidate):
-                    break
-        finally:
-            backend = kwargs.get("backend")
-            if backend is not None and hasattr(backend, "aclose_async_worker"):
-                await backend.aclose_async_worker()
-        return out
-
-    return asyncio.run(_collect())
-
-
-def run_inner_reward(
-    fused_graph,
-    *,
-    ctx,
-    db,
-    backend=None,
-    backends=None,
-    patience,
-    ucb_c=None,
-    explore_eps=0.0,
-    seed=0,
-    progress=None,
-    prior=None,
-    run_id="",
-):
-    """Synchronously run the two-level strategy's separable terminal scoring for tests."""
-    from emmy.compiler.pipeline import TuningSearch
-    from emmy.compiler.pipeline.search.strategy import TwoLevelStrategy
-
-    if ucb_c is None:
-        ucb_c = TuningSearch.DEFAULT_UCB_C
-    strategy = TwoLevelStrategy(
-        db=db,
-        patience=patience,
-        backend=backend,
-        backends=backends,
-        ucb_c=ucb_c,
-        explore_eps=explore_eps,
-        progress=progress,
-        prior_seed=seed,
-        run_id=run_id,
-        prior=prior,
-    )
-    return asyncio.run(strategy._evaluate_terminal(fused_graph, ctx))
-
-
-def run_two_level(graph, *, ctx, **kwargs):
-    """Synchronously run :class:`two_level.TwoLevelStrategy` for tests."""
-    from emmy.compiler.pipeline.search.strategy import TwoLevelStrategy
-
-    return asyncio.run(TwoLevelStrategy(**kwargs).run(graph, ctx))
-
-
 def dyn_M(mode: str, M: int):
     """Return ``Dim('seq_len')`` for dynamic mode and the integer ``M`` otherwise."""
     if mode == "dynamic":
@@ -326,3 +271,38 @@ def from_pretrained_or_skip(loader, *args, **kwargs):
     except OSError as exc:
         model = args[0] if args else kwargs.get("pretrained_model_name_or_path", "?")
         pytest.skip(f"HuggingFace Hub unavailable for {model} (likely rate-limited): {exc}")
+
+
+def inventory_document(graph, compute_cap=(12, 0), gpu_name: str | None = None, **kwargs):
+    """The golden a trace inventory of ``graph`` writes for a card — every kernel it lowers to and an unmeasured row
+    per kernel — as a document, for tests that author rows onto it."""
+    from emmy.compiler.context import Context  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import inventory  # noqa: PLC0415
+
+    return inventory(graph.copy(), Context.from_target(tuple(compute_cap), gpu_name=gpu_name), **kwargs)
+
+
+QWEN3_EMBEDDING = "Qwen/Qwen3-Embedding-0.6B"
+
+
+def qwen3_embedding_config():
+    """The Qwen3-Embedding-0.6B config, trimmed to one layer.
+
+    Config only — no checkpoint — so the head geometry (16 query heads over 8 KV heads, head_dim 128) is
+    readable without downloading weights."""
+    from transformers import AutoConfig  # noqa: PLC0415
+
+    config = from_pretrained_or_skip(AutoConfig.from_pretrained, QWEN3_EMBEDDING)
+    config.num_hidden_layers = 1
+    return config
+
+
+def qwen3_embedding_model(config=None, auto_class=None):
+    """A random-weight fp32 model built from :func:`qwen3_embedding_config` — the shared trunk of the
+    dynamic-shape tests. Seeded, so two calls build the same weights. ``auto_class`` picks the head:
+    the bare trunk by default, or a causal LM for the whole-model trace."""
+    import torch  # noqa: PLC0415
+    from transformers import AutoModel  # noqa: PLC0415
+
+    torch.manual_seed(0)
+    return (auto_class or AutoModel).from_config(config if config is not None else qwen3_embedding_config()).float().eval()

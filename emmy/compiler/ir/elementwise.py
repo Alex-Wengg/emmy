@@ -24,6 +24,7 @@ from typing import NamedTuple
 import numpy as np
 
 from emmy.compiler.dtype import decode_f4, decode_f8, encode_f4, encode_f8
+from emmy.compiler.wire import Wire
 
 
 # Names whose callable isn't a plain ``getattr(np, name)`` — non-numpy
@@ -51,6 +52,7 @@ def _arange(x):
 
 _NAME_TO_FN: dict[str, object] = {
     "exp_fast": np.exp,  # the FAST_EXP-lowered exp — host semantics identical, CUDA renders __expf
+    "divide_rn_f32": np.divide,  # f32 reference division; CUDA keeps round-to-nearest under fast math
     "arange": _arange,
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "relu": lambda x: np.maximum(0.0, x),
@@ -61,6 +63,10 @@ _NAME_TO_FN: dict[str, object] = {
     "gelu": lambda x: 0.5 * x * (1.0 + _erf(x / np.sqrt(2.0))),
     "gelu_tanh": lambda x: 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3))),
     "copy": lambda x: x,
+    # The ACTION of a carried state's step: the state becomes what the step computed. A fold whose
+    # ⊕ is this folds the free monoid of step maps under composition, so it has no identity and no
+    # partition arm; every gate that asks ``has_identity`` refuses it by that alone.
+    "next": lambda x, y: y,
     # ``aten.pad`` reaches the generic elementwise spelling only when every pad width is zero.
     # The tracer rejects every non-empty pad before this point, so the stored unary op is an
     # identity (kept distinct from ``copy`` for frontend provenance).
@@ -112,10 +118,18 @@ _ALIASES: dict[str, str] = {
 _ARITY: dict[str, int] = {
     # ``np.where`` is a regular function rather than a ufunc, so it has no ``nin`` metadata.
     "where": 3,
+    "next": 2,
 }
 
 
-class ElementwiseImpl:
+def is_elementwise(name: str) -> bool:
+    """Whether ``name`` is an elementwise function: registered above, or a numpy ufunc. ``ElementwiseImpl``
+    also resolves a reduction's combine (``sum``, ``amax``) by any numpy name, and those are not."""
+    name = _ALIASES.get(name, name)
+    return name in _NAME_TO_FN or isinstance(getattr(np, name, None), np.ufunc)
+
+
+class ElementwiseImpl(Wire):
     """Named scalar op — name + numpy callable + arity + reducer metadata.
 
     Construction resolves the callable from ``_NAME_TO_FN`` (non-numpy
@@ -127,6 +141,17 @@ class ElementwiseImpl:
     gates (split-K, cooperative tree-combine) query instead of matching op
     names.
     """
+
+    wire_tag = "elementwise"
+
+    def to_wire(self) -> str:
+        return self.name
+
+    @classmethod
+    def from_wire(cls, value: object, where: str = "elementwise") -> ElementwiseImpl:
+        if not isinstance(value, str):
+            raise ValueError(f"{where} must be an op name")
+        return cls(value)
 
     # Commutative ops — binary combines where ``op(a, b) == op(b, a)``.
     _COMMUTATIVE: frozenset[str] = frozenset({"add", "multiply", "maximum", "minimum", "amax", "sum", "prod"})
@@ -258,7 +283,7 @@ class ElementwiseImpl:
 # ---------------------------------------------------------------------------
 
 # Reduce/scan op aliases → their canonical combine identity. The single map
-# behind ``ElementwiseImpl.reduce_canon`` and the lift-reduce tensor→loop
+# behind ``ElementwiseImpl.reduce_canon`` and the reduce lowering rule
 # alias; an unlisted name canonicalizes to itself.
 _REDUCE_CANON: dict[str, str] = {
     "add": "add",
@@ -345,16 +370,17 @@ def reduce_spelling(op) -> ReduceSpelling:
 # - **copy** (rep ``copy``) — passthrough; its own bucket so a no-op
 #   doesn't get collapsed with arithmetic.
 _OP_CLUSTERS: dict[str, str] = {
-    # fma
-    "add": "add",
-    "sum": "add",
-    "subtract": "add",
-    "sub": "add",
-    "negative": "add",
-    "multiply": "add",
-    "prod": "add",
-    "abs": "add",
-    "fma": "add",
+    # fma — the representative is the product: a sum would fold with its neighbours into one flat sum under
+    # normalization and lose the tree the exact body had, while a product of two values folds with nothing.
+    "add": "multiply",
+    "sum": "multiply",
+    "subtract": "multiply",
+    "sub": "multiply",
+    "negative": "multiply",
+    "multiply": "multiply",
+    "prod": "multiply",
+    "abs": "multiply",
+    "fma": "multiply",
     # compare
     "maximum": "maximum",
     "minimum": "maximum",
@@ -362,6 +388,7 @@ _OP_CLUSTERS: dict[str, str] = {
     "sign": "maximum",
     # sfu_div
     "divide": "divide",
+    "divide_rn_f32": "divide",
     "true_divide": "divide",
     "floor_divide": "divide",
     "remainder": "divide",

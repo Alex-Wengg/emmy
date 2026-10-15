@@ -7,13 +7,15 @@ Tile / Cond) live in ``blocks``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import cached_property
+from itertools import count
 
 from emmy.compiler.dtype import F32, DataType
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
-from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
+from emmy.compiler.ir.expr import BinaryExpr, Expr, FlatIndex, FuncCallExpr, Literal, Var, _float_lit
 from emmy.compiler.ir.stmt.base import (
     _INTEGER_DTYPES,
     RenderCtx,
@@ -23,7 +25,9 @@ from emmy.compiler.ir.stmt.base import (
     op_to_expr,
     render_index,
     select_to_ternary,
+    spell_literal,
 )
+from emmy.compiler.wire import Wire
 
 
 def _resolve_value(name: str, ctx: RenderCtx) -> str:
@@ -45,7 +49,6 @@ def _args_at_dtype(target, args: tuple[str, ...], arg_dtypes: list[str], dst_dt:
     target's conversion intrinsic (e.g. ``__half2float(name)``) by
     parsing ``target.convert``'s output back into a ``FuncCallExpr`` so
     it composes with the Expr renderer."""
-    from emmy.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
 
     out: list[Expr] = []
     for a, dt in zip(args, arg_dtypes, strict=True):
@@ -67,7 +70,6 @@ def _dtype_intrinsics(target, result_dt: str, expr: Expr) -> dict[str, str]:
     when resolving ``FuncCallExpr.name`` to a target spelling; we patch
     in the dtype-specific spellings while rendering the fp16-native
     path."""
-    from emmy.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
 
     overrides: dict[str, str] = {}
 
@@ -121,12 +123,22 @@ class Load(Stmt):
     matcher-populated ``KernelOp.inputs``/``outputs`` side channels.
     ``None`` keeps the legacy render-time inference path working for
     tests that construct Loads by hand without dtype.
+
+    ``carried`` marks the two halves of a staged copy that crosses the chunk loop's back edge. The
+    names and their packed vector are the ones an earlier Load of the same names DECLARED ahead of
+    the loop. ``"load"`` re-assigns only the packed vector, through the read-only (non-coherent)
+    path — the operand is one the kernel never writes — so the loaded chunk survives into the next
+    iteration as the few registers the vector holds. ``"unpack"`` re-assigns the names from that
+    vector and touches no memory; it sits right before the names' consumer. Measured on the V100:
+    unpacking at the load instead keeps every element live across the mma stream and ptxas then
+    serializes the loads behind it (a 128x128 partial 84 us against 67).
     """
 
     names: tuple[str, ...]
     input: str
     index: tuple[Expr, ...]
     dtype: DataType | None
+    carried: str = ""  # a default, so a Load that does not set it renders (and keys) as before
 
     pure = True  # a pure value binding — legal inside a stored ``Lambda`` body
 
@@ -138,6 +150,7 @@ class Load(Stmt):
         *,
         names: tuple[str, ...] | None = None,
         dtype: DataType | None = None,
+        carried: str = "",
     ) -> None:
         if names is None:
             if name is None:
@@ -155,6 +168,7 @@ class Load(Stmt):
         object.__setattr__(self, "input", input)
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "dtype", dtype)
+        object.__setattr__(self, "carried", carried)
 
     @property
     def name(self) -> str:
@@ -228,30 +242,31 @@ class Load(Stmt):
         # fall back to ``ctx.buffer_dtypes`` so handwritten test fixtures
         # without a stamped dtype still render correctly.
         src_dt = self.dtype.name if self.dtype is not None else ctx.buffer_dtypes.get(self.input, "f32")
+        mem = ctx.memory_for(self.input)
         if self.is_scalar:
             # Scalar path. Declare the local in the source buffer's
             # element type so downstream ``Assign``s can pick native ops
             # without an immediate promote.
-            flat = render_index(self.input, self.index, ctx)
             ctx.ssa_dtypes[self.names[0]] = src_dt
-            return [f"{pad}{ctx.type_name(src_dt)} {self.names[0]} = {self.input}[{flat}];"]
+            return [f"{pad}{ctx.type_name(src_dt)} {self.names[0]} = {mem.base(self.index, ctx)}[{mem.flat(self.index, ctx)}];"]
         # Vector path: one ``<vec_type>`` reinterpret-cast read + N
         # ``.x/.y/.z/.w`` (or indexed) unpacks.
         n = self.width
         vec_pair = ctx.target.vector_type(src_dt, n)
-        if vec_pair is None:
-            # Target doesn't support this width — fall back to scalar
+        if vec_pair is None or not mem.vectorizable:
+            # Target doesn't support this width, or the buffer does not guarantee consecutive
+            # elements are contiguous (a paged read may cross a page) — fall back to scalar
             # Loads. The vectorize pass should have avoided this, but
             # render's job is to always produce valid code.
             out: list[str] = []
             for k, nm in enumerate(self.names):
                 idx_k = tuple(self.index[:-1]) + (BinaryExpr("+", self.index[-1], Literal(k, "int")),)
-                flat = render_index(self.input, idx_k, ctx)
+                flat = f"{mem.base(idx_k, ctx)}[{mem.flat(idx_k, ctx)}]"
                 ctx.ssa_dtypes[nm] = src_dt
-                out.append(f"{pad}{ctx.type_name(src_dt)} {nm} = {self.input}[{flat}];")
+                out.append(f"{pad}{ctx.type_name(src_dt)} {nm} = {flat};")
             return out
         vec_type, elem_type = vec_pair
-        flat = render_index(self.input, self.index, ctx)
+        flat = render_index(self.input, self.index, ctx)  # vectorizable ⇒ Flat, so the plain index
         vname = f"_v_{self.names[0]}"
         # ``.x/.y/.z/.w`` accessors only work when ``vec_type``'s native
         # components match ``elem_type`` 1:1 (``float2``→``float``,
@@ -262,6 +277,12 @@ class Load(Stmt):
         # reinterpret-cast.
         native_n = {"float2": 2, "float4": 4, "__half2": 2}.get(vec_type)
         use_array_index = native_n != n
+        if self.carried == "load":  # re-assign the declared vector only (see the class doc)
+            return [f"{pad}{vname} = __ldg(reinterpret_cast<const {vec_type}*>(&{self.input}[{flat}]));"]
+        if self.carried == "unpack":
+            if use_array_index:
+                return [f"{pad}{nm} = {vname}_h[{k}];" for k, nm in enumerate(self.names)]
+            return [f"{pad}{nm} = {vname}.{c};" for nm, c in zip(self.names, ("x", "y", "z", "w"), strict=False)]
         out_lines = [f"{pad}{vec_type} {vname} = *reinterpret_cast<const {vec_type}*>(&{self.input}[{flat}]);"]
         if use_array_index:
             arr_name = f"{vname}_h"
@@ -273,81 +294,6 @@ class Load(Stmt):
         for nm in self.names:
             ctx.ssa_dtypes[nm] = src_dt
         return out_lines
-
-
-@dataclass(frozen=True)
-class Pack(Stmt):
-    """Pack two scalar values into one ``__half2`` (or future short-vec).
-
-    ``name`` is the new packed SSA local; ``low`` / ``high`` are the
-    two source SSA names. The pack emits ``__halves2half2(low, high)``
-    via the target's ``convert``; if ``low`` and ``high`` are already
-    fp16, no conversion happens — just the pair-bundle intrinsic. If
-    they are fp32, the target inserts ``__float2half`` first.
-
-    Used by the ``__half2``-packing pass to bundle the two scalar
-    operands of a paired ``Accum`` (one per lane of the F16x2 pair)
-    into a single SSA value the paired Accum can consume.
-    """
-
-    name: str
-    low: str
-    high: str
-    dtype: DataType = field(default_factory=lambda: F32)  # F16x2 in real use
-
-    def deps(self) -> tuple[str, ...]:
-        return (self.low, self.high)
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.name,)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}{self.dtype.name} {self.name} = pack({self.low}, {self.high})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        low_dt = ctx.ssa_dtypes.get(self.low, "f32")
-        high_dt = ctx.ssa_dtypes.get(self.high, "f32")
-        # ``__halves2half2`` takes two ``__half``; convert each arg if
-        # it isn't already fp16 (the target's convert handles f32→f16).
-        low_expr = ctx.target.convert(self.low, low_dt, "f16")
-        high_expr = ctx.target.convert(self.high, high_dt, "f16")
-        ctx.ssa_dtypes[self.name] = self.dtype.name
-        return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = __halves2half2({low_expr}, {high_expr});"]
-
-
-@dataclass(frozen=True)
-class Unpack(Stmt):
-    """Split one ``__half2`` SSA value into two scalar ``__half`` names.
-
-    Inverse of :class:`Pack`. Emits one decl line per lane via
-    ``__low2half`` / ``__high2half``. Used by the packing pass to
-    restore the scalar names that downstream stmts (e.g. WarpShuffle)
-    still reference.
-    """
-
-    low_name: str
-    high_name: str
-    value: str  # the f16x2 SSA name being split
-    lane_dtype: DataType = field(default_factory=lambda: F32)  # F16 in real use
-
-    def deps(self) -> tuple[str, ...]:
-        return (self.value,)
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.low_name, self.high_name)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}{self.lane_dtype.name} {self.low_name}, {self.high_name} = unpack({self.value})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        ty = ctx.type_name(self.lane_dtype)
-        ctx.ssa_dtypes[self.low_name] = self.lane_dtype.name
-        ctx.ssa_dtypes[self.high_name] = self.lane_dtype.name
-        pad = _pad(ctx.indent)
-        return [
-            f"{pad}{ty} {self.low_name} = __low2half({self.value});",
-            f"{pad}{ty} {self.high_name} = __high2half({self.value});",
-        ]
 
 
 @dataclass(frozen=True)
@@ -403,46 +349,165 @@ class Assign(Stmt):
         # dtype. Other cases promote to f32.
         # Explicit ``self.dtype`` overrides — the demote pass uses this
         # to force a narrower dtype on the result.
-        if self.dtype is not None:
-            result_dt = self.dtype.name
+        result_dt = self.dtype.name if self.dtype is not None else dtype_promote(op_name, arg_dtypes)
+
+        def build(operands: list[Expr], dtype: str) -> Expr:
+            expr = op_to_expr(op_name, operands, dtype=dtype)
+            if dtype != "f32" and isinstance(expr, BinaryExpr) and ctx.target.intrinsic(op_name, dtype) != op_name:
+                # A target that spells this operator as a call (CUDA's non-contracting f16 ``_rn`` ops).
+                expr = FuncCallExpr(op_name, tuple(operands))
+            return expr
+
+        return _render_promoted(ctx, self.name, op_name, self.args, arg_dtypes, result_dt, build)
+
+
+def _render_promoted(
+    ctx: RenderCtx,
+    name: str,
+    op_name: str,
+    args: tuple[str, ...],
+    arg_dtypes: list[str],
+    result_dt: str,
+    build: Callable[[list[Expr], str], Expr],
+) -> list[str]:
+    """``name = build(args)`` at ``result_dt``: natively when the target computes ``op_name`` at that dtype and every
+    argument is already there, else promoted to f32 and converted once."""
+    pad = _pad(ctx.indent)
+    all_args_at_result = bool(arg_dtypes) and all(d == result_dt for d in arg_dtypes)
+    integer_promotion = result_dt in _INTEGER_DTYPES and bool(arg_dtypes) and all(d in _INTEGER_DTYPES for d in arg_dtypes)
+    if result_dt != "f32" and ctx.target.has_native_op(op_name, result_dt) and (all_args_at_result or integer_promotion):
+        # Native non-f32 path: all args already at ``result_dt`` so no per-arg conversion is needed. Render with the
+        # target's dtype-specific intrinsics; ``Literal.render`` wraps embedded float literals via the target so
+        # they compose with the non-default-dtype operands. Mixed dtypes (an explicit demotion) fall through to
+        # the promote-then-demote path: computing in fp32 and converting once preserves precision better than
+        # converting each arg to fp16 first.
+        expr = build(_args_at_dtype(ctx.target, args, arg_dtypes, result_dt), result_dt)
+        saved_intr = ctx.intrinsics
+        saved_lit = ctx.literal_default_dtype
+        ctx.intrinsics = {**saved_intr, **_dtype_intrinsics(ctx.target, result_dt, expr)}
+        ctx.literal_default_dtype = result_dt
+        try:
+            body = expr.render(ctx)
+        finally:
+            ctx.intrinsics = saved_intr
+            ctx.literal_default_dtype = saved_lit
+        ctx.ssa_dtypes[name] = result_dt
+        return [f"{pad}{ctx.type_name(result_dt)} {name} = {body};"]
+
+    # f32 / no-native path: promote args to f32, render in f32, then convert the result back when narrower.
+    body_str = build(_args_at_dtype(ctx.target, args, arg_dtypes, "f32"), "f32").render(ctx)
+    if result_dt != "f32":
+        body_str = ctx.target.convert(body_str, "f32", result_dt)
+    ctx.ssa_dtypes[name] = result_dt
+    return [f"{pad}{ctx.type_name(result_dt)} {name} = {body_str};"]
+
+
+@dataclass(frozen=True)
+class Affine(Stmt):
+    """Pure SSA body statement: ``name = offset + Σ coefficient·arg``.
+
+    The one statement for a sum, a difference, a negation or a product with a literal: normalization folds every
+    such cone into one ``Affine`` (``fold_affine``), so ``x + x``, ``2 * x`` and ``x + 3 * x - x`` are one body.
+    It is n-ary, so identity lists its terms by value and there is no chain of binary operations whose shape
+    would need a canonical order. ``args`` are SSA names, one per term after normalization, no coefficient zero; a
+    literal operand is a coefficient or the ``offset``. A product of two values stays an ``Assign``.
+    """
+
+    name: str
+    args: tuple[str, ...]
+    coefficients: tuple[float, ...]
+    offset: float = 0.0
+    dtype: DataType | None = None
+
+    pure = True  # a pure value binding — legal inside a stored ``Lambda`` body
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "coefficients", tuple(float(c) for c in self.coefficients))
+        object.__setattr__(self, "offset", float(self.offset))
+        if len(self.args) != len(self.coefficients):
+            raise ValueError(f"Affine {self.name!r}: {len(self.args)} args and {len(self.coefficients)} coefficients")
+        if not self.args:
+            raise ValueError(f"Affine {self.name!r} has no term: a constant is a Let")
+        if any(c == 0 for c in self.coefficients):
+            raise ValueError(f"Affine {self.name!r} carries a zero coefficient: {self.coefficients}")
+
+    @property
+    def terms(self) -> tuple[tuple[float, str], ...]:
+        return tuple(zip(self.coefficients, self.args, strict=True))
+
+    def deps(self) -> tuple[str, ...]:
+        return self.args
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def spelled(self) -> str:
+        """``2*x - y + 1``: the expression in its own vocabulary."""
+        parts = [("-" if c < 0 else "+", arg if abs(c) == 1 else f"{spell_literal(abs(c))}*{arg}") for c, arg in self.terms]
+        if self.offset != 0 or not parts:
+            parts.append(("-" if self.offset < 0 else "+", spell_literal(abs(self.offset))))
+        text = parts[0][1] if parts[0][0] == "+" else f"-{parts[0][1]}"
+        return text + "".join(f" {sign} {term}" for sign, term in parts[1:])
+
+    def pretty(self, indent: str = "") -> list[str]:
+        prefix = f"{self.dtype.name} " if self.dtype is not None else ""
+        return [f"{indent}{prefix}{self.name} = {self.spelled()}"]
+
+    def as_assigns(self) -> list[Stmt]:
+        """The same value as binary ``Assign``s over ``Let``-bound literals, the last one named ``name``: for a
+        lowering that evaluates one operation at a time (Kernel IR, the fragment programs)."""
+        out: list[Stmt] = []
+        fresh = (f"{self.name}__t{index}" for index in count())
+
+        def bound(value: float) -> str:
+            out.append(Let(next(fresh), Literal(value), self.dtype))
+            return out[-1].name
+
+        def step(op: str, args: tuple[str, ...]) -> str:
+            out.append(Assign(next(fresh), op, args, self.dtype))
+            return out[-1].name
+
+        total: str | None = None
+        # A positive term leads when there is one, so the chain opens with a value rather than a negation.
+        terms = sorted(self.terms, key=lambda term: term[0] < 0)
+        for coefficient, arg in terms:
+            term = arg if abs(coefficient) == 1 else step("multiply", (arg, bound(abs(coefficient))))
+            if total is None:
+                total = term if coefficient > 0 else step("negative", (term,))
+            else:
+                total = step("add" if coefficient > 0 else "subtract", (total, term))
+        if self.offset != 0:
+            total = step("add" if self.offset > 0 else "subtract", (total, bound(abs(self.offset))))
+        if out and out[-1].name == total:
+            out[-1] = replace(out[-1], name=self.name)
         else:
-            result_dt = dtype_promote(op_name, arg_dtypes)
+            out.append(Assign(self.name, "copy", (total,), self.dtype))
+        return out
 
-        all_args_at_result = bool(arg_dtypes) and all(d == result_dt for d in arg_dtypes)
-        integer_promotion = result_dt in _INTEGER_DTYPES and bool(arg_dtypes) and all(d in _INTEGER_DTYPES for d in arg_dtypes)
-        if result_dt != "f32" and ctx.target.has_native_op(op_name, result_dt) and (all_args_at_result or integer_promotion):
-            # Native non-f32 path: all args already at ``result_dt`` so
-            # no per-arg conversion is needed. Render with the target's
-            # dtype-specific intrinsics. ``Literal.render`` wraps embedded
-            # float literals via the target so they compose with the
-            # non-default-dtype operands. When args are *not* all at
-            # ``result_dt`` (mixed dtypes from an explicit ``self.dtype``
-            # demotion), fall through to the promote-then-demote path
-            # below — computing in fp32 and converting once preserves
-            # precision better than converting each arg to fp16 first.
-            args = _args_at_dtype(ctx.target, self.args, arg_dtypes, result_dt)
-            expr = op_to_expr(op_name, args, dtype=result_dt)
-            saved_intr = ctx.intrinsics
-            saved_lit = ctx.literal_default_dtype
-            ctx.intrinsics = {**saved_intr, **_dtype_intrinsics(ctx.target, result_dt, expr)}
-            ctx.literal_default_dtype = result_dt
-            try:
-                body = expr.render(ctx)
-            finally:
-                ctx.intrinsics = saved_intr
-                ctx.literal_default_dtype = saved_lit
-            ctx.ssa_dtypes[self.name] = result_dt
-            return [f"{pad}{ctx.type_name(result_dt)} {self.name} = {body};"]
+    def render(self, ctx: RenderCtx) -> list[str]:
+        arg_dtypes = [ctx.ssa_dtypes.get(a, "f32") for a in self.args]
+        result_dt = self.dtype.name if self.dtype is not None else dtype_promote("add", arg_dtypes)
 
-        # f32 / no-native path: promote args to f32, render in f32, then
-        # convert the result back to ``result_dt`` when narrower.
-        promoted = _args_at_dtype(ctx.target, self.args, arg_dtypes, "f32")
-        expr = op_to_expr(op_name, promoted, dtype="f32")
-        body_str = expr.render(ctx)
-        if result_dt != "f32":
-            body_str = ctx.target.convert(body_str, "f32", result_dt)
-        ctx.ssa_dtypes[self.name] = result_dt
-        return [f"{pad}{ctx.type_name(result_dt)} {self.name} = {body_str};"]
+        def build(operands: list[Expr], dtype: str) -> Expr:
+            expr: Expr | None = None
+            for coefficient, operand in zip(self.coefficients, operands, strict=True):
+                term = operand if abs(coefficient) == 1 else BinaryExpr("*", Literal(abs(coefficient), "float"), operand)
+                if expr is None:
+                    expr = term if coefficient > 0 else BinaryExpr("-", Literal(0.0, "float"), term)
+                else:
+                    expr = BinaryExpr("+" if coefficient > 0 else "-", expr, term)
+            if self.offset != 0 or expr is None:
+                literal = Literal(abs(self.offset), "float")
+                expr = literal if expr is None else BinaryExpr("+" if self.offset > 0 else "-", expr, literal)
+            return expr
+
+        return _render_promoted(ctx, self.name, "add", self.args, arg_dtypes, result_dt, build)
+
+
+def binary(stmts) -> tuple[Stmt, ...]:  # noqa: ANN001 — any iterable of Stmt
+    """``stmts`` with every ``Affine`` spelled as its binary ``Assign``s, for a lowering that evaluates one
+    operation at a time; the other statements pass through."""
+    return tuple(part for stmt in stmts for part in (stmt.as_assigns() if isinstance(stmt, Affine) else (stmt,)))
 
 
 @dataclass(frozen=True)
@@ -566,102 +631,104 @@ class Accum(Stmt):
         return [f"{pad}{self.name} = {base} {spelling.infix} {rhs};"]
 
 
+#: The suffix of the slot a :class:`Carry` defines during a step.
+NEXT_STEP = "__next"
+
+
 @dataclass(frozen=True)
-class Mma(Stmt):
-    """Tensor-core multiply-accumulate over one atom cell — ``c += a @ b``.
+class Carry(Stmt):
+    """The next value of one cell of a CARRIED STATE: ``name[index] <- value``.
 
-    The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul
-    cell on the tensor-core path. Emitted by ``tile/enumeration/050_warp_build``
-    alongside its two operand ``Load``s — which stay **plain** (no tensor-core
-    tag): the ``Mma`` is the sole carrier of the cell's :class:`Atom` spec +
-    operand identity, naming its A/B operands by SSA value, so
-    ``kernel/005_lower_atom_tile`` reads the spec straight off the ``Mma`` and
-    recovers each operand Load's role from it. Carried through the staging
-    passes (it makes its reduce loop ``is_reduce`` just like an ``Accum``), and
-    lowered to a kernel-IR ``MmaSyncPtx``.
-
-    - ``c`` — the accumulator SSA name (declared + zero-init'd as the fp32 c
-      fragment at lowering); read-and-written, like ``Accum.name``.
-    - ``a`` / ``b`` — the SSA names of the two operand ``Load``s (A = M×K,
-      B = K×N); the lowering matches each Load by these names.
-    - ``atom`` — the ``Atom`` spec itself (cell shape + per-operand dtypes +
-      group size); a hashable frozen record, so it rides on this frozen ``Mma``
-      Stmt. NOTE: the tile-IR ``Atom`` type was demolished — the annotation is a
-      bare ``object`` placeholder pending the tile-IR rebuild.
-    - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
-      cooperative-K info the escape analysis reads). Threaded through
-      ``rewrite`` like ``Accum.axes``.
-    - ``b_trans`` — the B operand is stored N×K (K in its last dim), i.e. a
-      transposed-B ``Q @ K^T`` cell. This is the native ``mma.row.col`` B layout
-      (col-major K×N), so ``kernel/005_lower_atom_tile`` loads it via ``ldmatrix``
-      WITHOUT ``.trans`` (the default canonical B[k,n] uses ``.trans``). Set by
-      ``tile/enumeration/050_warp_build`` from the classified B Load's K position.
+    A recurrence's state, which a fold is not: its steps run in order, its step is any computation,
+    and it holds ``seed`` before the first. So it has no op — an op would declare an algebra (a
+    reorderable sum) the state does not have — and nothing else to declare either: the loop that
+    carries it is the nearest enclosing ``Loop`` whose axis ``index`` does not read
+    (:func:`~emmy.compiler.ir.stmt.blocks.carried_cells`), and its shape is those of the loops over
+    its cells, each entry of ``index`` a bare axis. The loop over the steps therefore sits OUTSIDE
+    the loops over the cells, which is what lets a step read OTHER cells of its own state (a delta
+    rule's ``k @ S``) through :class:`Pre`; a scalar ``Accum`` lives inside the cell loops and
+    cannot. One statement defines a state; a cell it skips keeps its value.
     """
 
-    c: str
-    a: str
-    b: str
-    atom: object
-    axes: tuple[str, ...] = ()
-    b_trans: bool = False
-    # Explicit masked-tile guards for a HAND-BUILT cell (the symbolic warp-chain flash),
-    # where ``kernel/005_lower_atom_tile`` can't derive them from a Write boundary ``Cond``
-    # (a fragment-output / fragment-A cell has no Write) or the operand tensor shape (the
-    # flash uses flat single-index Loads). Each is ``(base Expr, bound Expr)`` on the named
-    # axis; ``005`` routes them to the operand ``LdmatrixLoad``s — ``m_guard`` clamps the A
-    # rows (masked query), ``n_guard`` clamps the B cols (masked key, transposed-B), ``k_zero``
-    # zero-fills the B reduce rows past ``bound`` (masked-K P@V). ``None`` = the enumeration
-    # σ-split path, where ``005`` derives guards as before.
-    m_guard: tuple[Expr, Expr] | None = None
-    n_guard: tuple[Expr, Expr] | None = None
-    k_zero: tuple[Expr, Expr] | None = None
+    name: str
+    value: str
+    index: tuple[Expr, ...]
+    #: What the state holds before the first step: a constant, or the name of a buffer of the
+    #: state's shape read cell by cell — the tensor an unrolled loop started from.
+    seed: float | str
+    dtype: DataType | None = None
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.seed,) if isinstance(self.seed, str) else ()
+
+    def rename_buffers(self, rename):  # noqa: ANN001 — see ``Stmt.rename_buffers``
+        return replace(self, seed=rename.get(self.seed, self.seed)) if isinstance(self.seed, str) else self
+
+    @property
+    def cells(self) -> tuple[str, ...]:
+        """The axes of the cell this statement defines. An entry that is no axis is the ``0``
+        normalization leaves where a size-one axis stood."""
+        return tuple(e.name for e in self.index if isinstance(e, Var))
 
     def deps(self) -> tuple[str, ...]:
-        # Mirror ``Accum``: the accumulator read is implicit (loop-carried),
-        # so only the operands are listed — keeps sibling-def analyses (topo
-        # sort, reg-pipeline) from treating ``c`` as a same-scope read.
-        return (self.a, self.b)
+        return (self.value,)
 
     def defines(self) -> tuple[str, ...]:
-        return (self.c,)
+        return (self.name,)
 
     def carried_names(self) -> tuple[str, ...]:
-        return (self.c,)
+        return (self.name,)
 
-    def combine_operands(self) -> tuple[str, ...]:
-        return (f"{self.c}__o",)
-
-    def combine_partials(self) -> tuple[Assign, ...]:
-        """The fragment add of two partial accumulators: ``c = c + c__o`` — the
-        cross-CTA split-K combine, reified as a one-``Assign`` program (the
-        accumulation is additive, so the fold op is ``add`` regardless of the
-        original scalar cell)."""
-        return (Assign(name=self.c, op=ElementwiseImpl("add"), args=(self.c, f"{self.c}__o")),)
-
-    # The tensor-core accumulation ``c += a @ b`` is an additive fold —
-    # associative + commutative with identity 0. That is what tells
-    # reassociation gates split-K over the matmul's K axis is legal, exactly as
-    # for a scalar ``sum`` Accum (there is no scalar op to point at, so the
-    # traits are reported as constants).
-    @property
-    def associative(self) -> bool:
-        return True
-
-    @property
-    def commutative(self) -> bool:
-        return True
-
-    @property
-    def has_identity(self) -> bool:
-        return True
+    def exprs(self) -> tuple[Expr, ...]:
+        return self.index
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}{self.c} <- mma[{self.atom.name}]({self.a} @ {self.b})"]
+        seed = self.seed if isinstance(self.seed, str) else f"{self.seed:g}"
+        return [f"{indent}{self.name}[{', '.join(e.pretty() for e in self.index)}] <- {self.value}  (seed {seed})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        raise NotImplementedError(
-            f"Mma must be consumed by kernel/005_lower_atom_tile before render — reached render with atom={self.atom.name!r}"
-        )
+        # The carrying ``Loop`` declared this slot beside the one reads see, and commits it after
+        # every step.
+        dtype = (self.dtype or F32).name
+        value = ctx.target.convert(self.value, ctx.ssa_dtypes.get(self.value, "f32"), dtype)
+        return [f"{_pad(ctx.indent)}{self.name}{NEXT_STEP}[{render_index(self.name, self.index, ctx)}] = {value};"]
+
+
+@dataclass(frozen=True)
+class Pre(Stmt):
+    """A read of one cell of a carried state: ``name = carrier[index]``.
+
+    Inside the ``Loop`` that carries it, the value the PREVIOUS step left (the seed on the first
+    step) — no read of a step sees what that step defines; after that loop closes, the last
+    step's. ``index`` is any coordinate expression, so a step may read a cell other than the one
+    it defines — under a reduce over it, a contraction over the state. See :class:`Carry`.
+
+    A read like a ``Load``, so a term may hold one: a carrier read is a slab over one ``Pre``
+    (``Fold.carrier_read``), the way a gmem read is a slab over one ``Load``.
+    """
+
+    pure = True
+
+    name: str
+    carrier: str
+    index: tuple[Expr, ...]
+
+    def deps(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((self.carrier, *(v for e in self.index for v in e.free_vars()))))
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return self.index
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.name} = pre {self.carrier}[{', '.join(e.pretty() for e in self.index)}]"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        dtype = ctx.ssa_dtypes.get(self.carrier, "f32")
+        ctx.ssa_dtypes[self.name] = dtype
+        return [f"{_pad(ctx.indent)}{ctx.type_name(dtype)} {self.name} = {self.carrier}[{render_index(self.carrier, self.index, ctx)}];"]
 
 
 @dataclass(frozen=True)
@@ -706,34 +773,54 @@ class Init(Stmt):
 
 
 @dataclass(frozen=True)
-class Const(Stmt):
-    """A pure constant binding: ``<dtype> <name> = <value>;`` — one scalar literal as an SSA name.
+class Let(Stmt):
+    """A pure binding of one expression to an SSA name: ``<dtype> <name> = <value>;``.
 
-    The twisted carrier's injection needs it: online softmax folds each element as ``(score, 1)``,
-    and the denominator's ``1`` must be a def the lift can return, since a lambda's results are
-    names. Pure, so it is legal inside a stored ``Lambda`` body. ``dtype`` is stamped at kernel
-    lowering like an ``Assign``'s — f32 when nothing narrows it.
+    Three things reach a body this way — a scalar literal (the twisted carrier's injection binds
+    the ``1`` online softmax folds each element with, so the lift can return it by name), an
+    integer index precomputed once outside a nested hot loop, and a buffer coordinate's flattened
+    offset (:class:`~emmy.compiler.ir.expr.FlatIndex`) reused across a copy's trips. Pure, so it
+    is legal inside a stored ``Lambda`` body. A float literal's ``dtype`` is stamped at kernel
+    lowering like an ``Assign``'s (f32 when nothing narrows it); an untyped index renders as ``auto``
+    and takes its expression's type. A bare number coerces to a float ``Literal``.
     """
 
     pure = True
 
     name: str
-    value: float
+    value: Expr
     dtype: DataType | None = None
 
+    def __post_init__(self) -> None:
+        if isinstance(self.value, (int, float)):
+            object.__setattr__(self, "value", Literal(float(self.value)))
+
     def deps(self) -> tuple[str, ...]:
-        return ()
+        return tuple(dict.fromkeys(self.value.free_vars()))
 
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
 
+    def exprs(self) -> tuple[Expr, ...]:
+        return (self.value,)
+
+    def external_reads(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(e.buffer for e in self.value.subterms() if isinstance(e, FlatIndex)))
+
+    def rename_buffers(self, rename):  # noqa: ANN001 — see ``Stmt.rename_buffers``
+        value = self.value.rebuild(lambda e: replace(e, buffer=rename.get(e.buffer, e.buffer)) if isinstance(e, FlatIndex) else e)
+        return self if value == self.value else replace(self, value=value)
+
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}{self.name} = {self.value:g}"]
+        prefix = f"{self.dtype.name} " if self.dtype is not None else ""
+        return [f"{indent}{prefix}{self.name} = {self.value.pretty()}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        dtype = self.dtype or F32
-        ctx.ssa_dtypes[self.name] = dtype.name
-        return [f"{_pad(ctx.indent)}{ctx.type_name(dtype)} {self.name} = {ctx.identity_literal(self.value, dtype)};"]
+        if self.dtype is None:
+            return [f"{_pad(ctx.indent)}auto {self.name} = {self.value.render(ctx)};"]
+        ctx.ssa_dtypes[self.name] = self.dtype.name
+        value = ctx.identity_literal(self.value.value, self.dtype) if isinstance(self.value, Literal) else self.value.render(ctx)
+        return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = {value};"]
 
 
 # Map ``ElementwiseImpl`` op names to compound-assignment operator symbols
@@ -873,18 +960,19 @@ class Write(Stmt):
         # Prefer the stamped ``self.value_dtype`` (set by ``030_stamp_types``);
         # fall back to ``ctx.ssa_dtypes`` for legacy/handwritten paths.
         stamped_value_dt = self.value_dtype.name if self.value_dtype is not None else None
+        mem = ctx.memory_for(self.output)
         if self.is_scalar:
             # Scalar path. Convert at the store boundary only when the
             # value's SSA dtype disagrees with the destination buffer's
             # dtype — native chains write through with no conversion.
-            flat = self._swizzled(render_index(self.output, self.index, ctx), ctx)
+            flat = self._swizzled(mem.flat(self.index, ctx), ctx)
             value_dt = stamped_value_dt or ctx.ssa_dtypes.get(self.value, "f32")
             rhs = ctx.target.convert(_resolve_value(self.value, ctx), value_dt, out_dt)
             if self.atomic:
                 # Cross-CTA additive finalize: every contributing CTA accumulates into the
                 # same cell (the output is zero-init'd per launch — ``CudaOp.zero_outputs``).
-                return [f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});"]
-            return [f"{pad}{self.output}[{flat}] = {rhs};"]
+                return [f"{pad}atomicAdd(&{mem.base(self.index, ctx)}[{flat}], {rhs});"]
+            return [f"{pad}{mem.base(self.index, ctx)}[{flat}] = {rhs};"]
         # Vectorized path. Per-value dtype conversion: every SSA arg
         # must be at ``out_dt`` before packing.
         n = self.width
@@ -894,15 +982,16 @@ class Write(Stmt):
             resolved = _resolve_value(nm, ctx)
             converted.append(resolved if src_dt == out_dt else ctx.target.convert(resolved, src_dt, out_dt))
         vec_pair = ctx.target.vector_type(out_dt, n)
-        if vec_pair is None:
-            # Target doesn't support this width — fall back to scalar
+        if vec_pair is None or not mem.vectorizable:
+            # Target doesn't support this width, or the buffer does not guarantee consecutive
+            # elements are contiguous (a paged store may cross a page) — fall back to scalar
             # writes. The vectorize pass should have avoided this, but
             # render's job is to always produce valid code.
             lines: list[str] = []
             for k in range(n):
                 idx_k = tuple(self.index[:-1]) + (BinaryExpr("+", self.index[-1], Literal(k, "int")),)
-                flat = self._swizzled(render_index(self.output, idx_k, ctx), ctx, idx_k)
-                lines.append(f"{pad}{self.output}[{flat}] = {converted[k]};")
+                flat = self._swizzled(mem.flat(idx_k, ctx), ctx, idx_k)
+                lines.append(f"{pad}{mem.base(idx_k, ctx)}[{flat}] = {converted[k]};")
             return lines
         vec_type, _elem_type = vec_pair
         logical_flat = render_index(self.output, self.index, ctx)
@@ -967,7 +1056,7 @@ class Write(Stmt):
 
 
 @dataclass(frozen=True)
-class SelectBranch:
+class SelectBranch(Wire):
     """One branch of a ``Select`` body statement."""
 
     value: str  # SSA name when predicate holds
@@ -994,7 +1083,7 @@ class Select(Stmt):
             raise ValueError("Select.branches must be non-empty")
 
     def deps(self) -> tuple[str, ...]:
-        return tuple(b.value for b in self.branches)
+        return tuple(dict.fromkeys(name for b in self.branches for name in (b.value, *sorted(b.select.free_vars()))))
 
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
@@ -1010,8 +1099,11 @@ class Select(Stmt):
         return lines
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        expr = select_to_ternary(self)
-        return [f"{_pad(ctx.indent)}float {self.name} = {expr.render(ctx)};"]
+        dtype = dtype_promote("add", [ctx.ssa_dtypes.get(b.value, "f32") for b in self.branches])
+        ctx.ssa_dtypes[self.name] = dtype
+        ty = ctx.type_name(dtype)
+        expr = select_to_ternary(self, ty)
+        return [f"{_pad(ctx.indent)}{ty} {self.name} = {expr.render(ctx)};"]
 
 
 def mask_select_predicate(select: Select) -> Expr | None:
@@ -1044,9 +1136,11 @@ class ZeroPrologue(Stmt):
     costs a CUDA-graph MEMSET node per site. This stmt rides a kernel that launches strictly
     BEFORE the accumulator's kernel in the same stream (a dataflow predecessor — topological
     launch order guarantees it), so stream serialization makes the zero happen-before the
-    atomics and the MEMSET node disappears. CTA 0 alone writes; the zero is over raw 32-bit
-    words (``words = nbytes / 4`` — all-zero bytes are 0.0 in every buffer dtype, the same
-    argument the runtime memset makes), so the render never needs the buffer's dtype.
+    atomics and the MEMSET node disappears. Every thread of the grid writes a stride of it, ahead
+    of the kernel's own work: one CTA alone left the grid waiting on a serial tail (130 us for a
+    4 MB accumulator on the H100). The zero is over raw 32-bit words (``words = nbytes / 4`` —
+    all-zero bytes are 0.0 in every buffer dtype, the same argument the runtime memset makes), so
+    the render never needs the buffer's dtype.
 
     ``dst`` names the target buffer — it joins the carrying kernel's ``outputs`` (and thus its
     signature / ``arg_names``) WITHOUT a graph edge: an edge would be a cycle (the target is
@@ -1068,15 +1162,19 @@ class ZeroPrologue(Stmt):
         return True
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}zero {self.dst}[0:{self.words}w]  (delegated zero-init, CTA 0)"]
+        return [f"{indent}zero {self.dst}[0:{self.words}w]  (delegated zero-init)"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         p1 = _pad(ctx.indent + 1)
+        threads = "(int)(blockDim.x * blockDim.y * blockDim.z)"
+        grid = f"{threads} * (int)(gridDim.x * gridDim.y * gridDim.z)"
+        block = "(int)(blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z))"
+        thread = "(int)(threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z))"
         return [
-            f"{pad}if (blockIdx.x == 0) {{",
+            f"{pad}{{",
             f"{p1}int* _zp_{self.dst} = (int*){self.dst};",
-            f"{p1}for (int _zi = threadIdx.x; _zi < {self.words}; _zi += blockDim.x) _zp_{self.dst}[_zi] = 0;",
+            f"{p1}for (int _zi = {block} * {threads} + {thread}; _zi < {self.words}; _zi += {grid}) _zp_{self.dst}[_zi] = 0;",
             f"{pad}}}",
         ]
 

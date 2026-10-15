@@ -4,7 +4,7 @@ An NVFP4 weight constant stores two 4-bit codes per byte, so the loader spells i
 FLAT element offset divided by 2 and wrapped back into the packed row: ``((n·K + k) / 2) % (K/2)``.
 Read literally that expression carries ``n`` inside a division, which makes ``n`` unrecoverable to
 every consumer that asks "does this index still mention the row axis outside a div/mod" — the
-``loop/canonicalize`` axis re-fusion asks exactly that, and its refusal leaves a packed matmul
+free-axis re-fusion of the tile lift asks exactly that, and its refusal leaves a packed matmul
 without a contraction to bind.
 
 The value does separate: ``n·K`` is a multiple of the divisor, so the quotient is ``n·(K/2) + k/2``
@@ -34,6 +34,21 @@ def _ctx(k_hi: int = K - 1) -> SimplifyCtx:
 def _flat() -> BinaryExpr:
     """``n·K + k`` — the unpacked element offset the packed address is built from."""
     return BinaryExpr("+", BinaryExpr("*", Var("n"), _lit(K)), Var("k"))
+
+
+@pytest.mark.parametrize("ops", [("/", "/"), ("//", "/"), ("/", "//"), ("//", "//")])
+def test_constant_quotient_chains_have_one_normal_form(ops):
+    ctx = SimplifyCtx({"k": Interval(0, 16383)}, {})
+    nested = BinaryExpr(ops[1], BinaryExpr(ops[0], Var("k"), _lit(128)), _lit(2))
+    direct = BinaryExpr("/", Var("k"), _lit(256))
+    assert nested.simplify(ctx) == direct.simplify(ctx)
+    for k in (0, 127, 128, 255, 256, 257, 16383):
+        assert nested.eval({"k": k}) == direct.eval({"k": k})
+
+
+def test_quotient_chain_does_not_assume_unknown_operands_are_integer_indices():
+    nested = BinaryExpr("/", BinaryExpr("/", Var("value"), _lit(128)), _lit(2))
+    assert nested.simplify(SimplifyCtx.empty()) == nested
 
 
 def _same_value(a, b, ctx_desc: str) -> None:

@@ -48,10 +48,21 @@ the recipe should no longer be used. Low demand or age alone is not enough. Disc
 `onboarding` and `untested`; it contains the model ID, task, rationale, heat, and one to three proposed
 `deploy.gpu`/`deploy.gpu_count` matrix entries, but is not runnable until onboarding replaces it with a qualified
 `best-effort` recipe. Untagged recipes remain runnable for backward compatibility and are classified by the next
-discovery lifecycle run.
+discovery lifecycle run. `lifecycle-locked` is not a lifecycle tag: it sits beside one and marks the decision as a
+person's, so discovery never scores or reclassifies the recipe.
 
-Tag values are unique lowercase kebab-case strings. `onboarding` and `untested` must appear together. The runtime
-rejects direct use of disabled recipes, while bulk benchmark enumeration and package staging skip them.
+Tag values are unique lowercase kebab-case strings. `onboarding` and `untested` must appear together.
+`onboarding-failed` is not a lifecycle state: onboarding adds it when an attempt fails and removes it on success.
+Nightly selection skips such a recipe; an explicit manual dispatch can retry it after the failure is addressed. The
+`emmy-blocked` records a concrete unresolved Emmy serving blocker on every declared deployment of a valid recipe.
+Nightly Emmy qualification skips it until relevant repository code changes. Manual and periodic verification may also
+check whether Git history has lifted the blocker.
+The runtime rejects direct use of disabled recipes, while bulk benchmark enumeration and package staging skip them.
+
+Each repository recipe may retain `DISCOVERY.md` for the evidence behind heat and lifecycle, `RESULTS.md` for serving
+qualification, and a per-platform results archive. These files are not part of the runtime recipe or wheel catalog.
+The nightly discovery agent creates a missing note and changes an existing one only for a factual correction or
+substantial new information; the lifecycle validator alone writes `recipe.yaml`.
 
 `model.rationale` is descriptive lifecycle metadata. It records why the model currently belongs in the inventory and
 does not affect engine arguments, deployment, or benchmark behavior. `model.heat` is an optional integer from 0
@@ -60,9 +71,13 @@ onboarding work; it is not a benchmark score and does not affect serving behavio
 legacy recipes and sorts as null until the next discovery run.
 
 `recipe_catalog()` is the shared repository scan behind `emmy recipe list` and model-discovery validation. The
-versioned JSON document produced by `recipe_inventory_document()` adds the directory name, lifecycle-aware runnable
-state, and each matrix-expanded deployment's effective context length to the identity, tags, task, rationale, and
-heat.
+versioned JSON document produced by `recipe_inventory_document()` (schema version 2) adds the directory name,
+lifecycle-aware runnable state, whether any variant serves through Emmy, and one entry per matrix-expanded
+deployment — its GPU, GPU count, GPU memory fraction (`engine.llm.gpu_memory_utilization`, default 0.9) and
+effective context length — to the identity, tags, task, input modalities (`model.input_modalities`, `["text"]`
+unless declared), rationale, and heat. Deployments are unique per (GPU, count,
+fraction): a recipe that may share its GPU lists a reduced-fraction entry beside its whole-GPU one, each with its
+own qualified context length, and both appear.
 This is the machine interface used by other services: consumers reject unknown `schema_version` values, while Emmy
 may add fields without removing or redefining fields in the current version. Editable installs read the checkout's
 live top-level `recipes/` and wheel installs read their packaged runnable recipes. `recipe list` deliberately exposes
@@ -83,14 +98,15 @@ The row fields are grouped by ownership:
 | Fields | Meaning |
 |---|---|
 | `model_id`, `name`, `recipe_path`, `tags`, `lifecycle`, `task`, `runnable`, `rationale`, `heat` | Compact catalog metadata |
+| `emmy_serving` | Some matrix variant serves through the Emmy vLLM plugin (an `Emmy*Model` architecture override) |
 | `operation`, `expected_lifecycle` | Lifecycle-derived onboarding or verification action |
-| `deployment.index`, `deployment.gpu`, `deployment.gpu_count`, `deployment.context_length` | One declared or explicitly requested setup |
+| `deployment.index`, `deployment.gpu`, `deployment.gpu_count`, `deployment.gpu_memory_utilization`, `deployment.context_length` | One declared or explicitly requested setup |
 | `deployment.availability.cloudrift` | Exact-count capacity reported by CloudRift |
 | `results.path`, `results.last_run_at` | Sibling report path and its last committed change |
 | `provider.cloudrift.team_access` | Whether the configured key can act for the configured team UUID |
 
 The expression grammar is deliberately constrained rather than evaluated as Python. Predicates use a documented
-field, one of `==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `contains`, or `matches`, and a JSON value. Sorts use
+field, one of `==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `contains`, `not contains`, or `matches`, and a JSON value. Sorts use
 `FIELD asc|desc` with an optional `nulls-first|nulls-last`, or `FIELD order JSON_ARRAY`. Repeated filters are logical
 AND; repeated sort keys are applied in command order. The independent versioned JSON result contains `schema_version`
 and `rows`; an empty result is successful, leaving exact-candidate row-count policy to the caller.
@@ -247,6 +263,18 @@ repeat after the first skip most of its prefill. Lengths, concurrency and reques
 intelligent review may use the spread across repeats to assess run-to-run noise. Every client stanza remains in the
 raw benchmark artifact; the experiment record does not parse or aggregate those measurements.
 
+`benchmark.transcription_dataset` names a Hugging Face speech dataset the bench client reads (for example
+`openslr/librispeech_asr`, with `transcription_subset: clean` and `transcription_split: test`); its clips go to
+`/v1/audio/transcriptions` through the client's `openai-audio` backend instead of random text prompts. Each clip sets
+its own input and transcript length, so the random lengths and `ignore_eos` are not sent, and the backend takes no
+`temperature`.
+
+`benchmark.random_prefix_len` (default 0) prepends that many tokens to every prompt, so a request's input is the
+prefix plus `random_input_len` random tokens. The client draws the prefix once per run from its seed: every request
+of a repeat shares it, and each repeat has its own. It is the workload that shows what a prefix cache is worth. The
+client's warm-up sends its first prompt, so with warm-ups the prefix is already cached when measurement starts, and
+that first prompt is a full cache hit.
+
 The `benchmark` block describes workload generation only. Unknown fields are rejected rather than becoming implicit
 result validators. `emmy bench`, the experiment record, and the `run-experiment` skill preserve raw observations but
 do not interpret whether they support an experiment's claim.
@@ -278,6 +306,19 @@ engines, and deployment passes the same value to `hf download`. `--revision` is 
 ### Engine-Specific Nesting
 
 Engine-specific config (`image`, `extra_args`, `extra_env`) nests under `engine.llm.vllm` or `engine.llm.sglang`, while engine-agnostic config lives at `engine.llm`. `LLMConfig.engine_name` is determined by which sub-config is present (SGLang takes priority if both exist). The `image`, `extra_args`, and `extra_env` properties delegate to the active engine's config.
+
+### Pinned vLLM LoRA adapter
+
+`engine.llm.vllm.lora_adapter` names one adapter by API name, Hugging Face repository, immutable 40-character revision,
+and positive rank. Deployment downloads the exact adapter snapshot into the writable model cache. The generated vLLM
+command enables LoRA, sets its maximum rank, and points `--lora-modules` at that snapshot. Duplicate LoRA flags in
+`extra_args` are rejected. A baked image is rejected because this download path expects a regular image with a writable
+cache. The adapter must be compatible with the recipe's base model.
+
+`model.huggingface` stays the checkpoint downloaded and loaded by the engine. `model.request_name` selects the model
+name sent by the smoke test and benchmark; when omitted, it defaults to the adapter name if configured, otherwise the
+base name. A matrix row may override it to compare base and adapter requests on the same serving configuration. The
+benchmark client's tokenizer remains the base checkpoint when the request name is an adapter alias.
 
 ### Extra Environment Variables
 
@@ -313,6 +354,34 @@ model:
 Generative recipes use the semantic chat smoke test by default. A base checkpoint that is not instruction-tuned sets
 `model.smoke_test: completion`; deployment then sends `2 + 2 =` to `/v1/completions` and still requires the correct
 answer. The choice changes only the post-health correctness gate, not the benchmark endpoint or serving task.
+
+### Image and Audio Input (`model.input_modalities`)
+
+A multimodal checkpoint is served text-only unless the recipe says otherwise: `model.input_modalities` defaults to
+`[text]`; `image` declares that the engine accepts OpenAI-style `image_url` parts and `audio` that it accepts
+`input_audio` parts (and, for a speech model, `/v1/audio/transcriptions`). The field is a serving claim about one
+resolved variant, so `validate_modality_input()` rejects `image` or `audio` on an embedding task and on any
+configuration whose `extra_args` disable that path (`--language-model-only`, or `--limit-mm-per-prompt` with the
+modality at 0). A recipe's entries may differ: a lane qualified text-only beside one that keeps the encoders
+declares the modality on that matrix entry alone. A list in a matrix entry is an axis, so the entry's own list value
+is written as a one-element list of it, `model.input_modalities: [[text, image]]`. The catalog exports the list inside
+every `deployments[]` entry, next to the fraction and context Relay already reads per offering (Relay snapshots it on
+the offering and gates image parts with it; an entry without it is text). A standalone deploy follows the 2+2 chat
+probe with one inline red PNG the model must call red for an image variant, and one inline WAV tone that must get
+any answer for an audio variant (`deploy/orchestrate.py`): a tone has no words to check, so the audio probe proves
+the engine decodes a clip and runs the encoder. Bound an image variant's per-request cost in `extra_args` as well — a
+`--limit-mm-per-prompt` count and `--mm-processor-kwargs` `max_pixels` — since engines downscale large images rather
+than reject them and image tokens count toward the context length.
+
+```yaml
+model:
+  huggingface: "Qwen/Qwen3.6-27B-FP8"
+  input_modalities: [text, image]      # every entry serves images
+matrices:
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 1
+    model.input_modalities: [[text, image]]   # this entry alone, when the base is text-only
+```
 
 ### Command Recipes (Generic Workload)
 
@@ -370,9 +439,16 @@ engine:
 
 Each key-value pair is rendered as a top-level service key in the generated Docker Compose file, inserted after `ipc: host` and before `command:`. Values are serialized via `yaml.dump()` to handle nested structures (lists, dicts, scalars) correctly.
 
-Keys managed by the compose template (`image`, `container_name`, `entrypoint`, `deploy`, `devices`, `group_add`, `volumes`, `environment`, `ports`, `shm_size`, `ipc`, `command`, `healthcheck`, `restart`) are rejected at validation time via `validate_docker_options()`, following the same pattern as `validate_extra_args()`.
+Keys managed by the compose template (`image`, `container_name`, `entrypoint`, `deploy`, `devices`, `group_add`, `volumes`, `environment`, `ports`, `shm_size`, `ipc`, `command`, `healthcheck`, `restart`, `labels`) are rejected at validation time via `validate_docker_options()`, following the same pattern as `validate_extra_args()`.
 
 The compose template hard-codes `restart: unless-stopped` on every engine service (and the nginx load balancer in multi-instance deployments). Containers therefore come back automatically after a host reboot or after a process crash, but a manual `docker stop` / `docker compose down` is still honored — which is what the bench teardown path relies on.
+
+A restart policy acts only when the process exits, and an engine can fail without exiting: when vLLM's engine core dies,
+its API server stops listening but waits, with no timeout, for the open streams to close. The container stays up and
+fails its health check forever. So every engine service carries the label `autoheal=true`, and the compose file adds an
+`autoheal` service (`willfarrell/autoheal`, with the Docker socket mounted) that restarts a labelled container once
+Docker marks it unhealthy — after the health check's `start_period` and `retries`. It touches no unlabelled container on
+the host. The deploy starts it last, after every service has passed its first health check.
 
 Matrix overrides work naturally via deep merge:
 ```yaml
@@ -410,10 +486,13 @@ _load_raw_config(recipe_dir) -> raw dict
     +-- load_recipe(): strips matrices, calls _validate_and_build()
     |       -> base Recipe (for bench/cloud commands that don't need matrix resolution)
     |
-    +-- resolve_for_hardware(recipe_dir, gpu_name): expands full matrix,
-    |       finds best combo matching gpu_name, deep_merges with base,
-    |       calls _validate_and_build()
-    |       -> hardware-resolved Recipe (for deploy local/ssh commands)
+    +-- resolve_for_hardware(recipe_dir, gpu_name, gpu_count, gpu_memory_utilization):
+    |       expands full matrix, keeps the combos naming gpu_name, picks one:
+    |       with a fraction, the exact (count, fraction) entry and nothing else (a plan);
+    |       else the highest fraction among exact-count entries, else the largest
+    |       count dividing gpu_count (scale-out), else the first entry (no count);
+    |       deep_merges with base, calls _validate_and_build()
+    |       -> hardware-resolved Recipe (for the deploy commands)
     |
     +-- enumerate_tasks(): reads matrices, expands via cross/zip:
             |-- expand_matrix() -> list of combinations

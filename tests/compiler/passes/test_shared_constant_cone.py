@@ -15,20 +15,33 @@ sm_80, sm_89 and sm_120.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from importlib import import_module
 
 import pytest
 
 from emmy.compiler.context import Context
-from emmy.compiler.dtype import F16
+from emmy.compiler.dtype import F16, F32
 from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.expr import Literal
 from emmy.compiler.ir.frontend.ir import LinearOp, SliceOp
-from emmy.compiler.ir.stmt import Assign, Body, Load
+from emmy.compiler.ir.schedule import Placement, Raster, Reduce, Stage, Tile, Work, derive_inventory
+from emmy.compiler.ir.schedule.base import Schedule
+from emmy.compiler.ir.schedule.classic import (
+    ClassicMaterialization,
+    EdgeSchedule,
+    KernelSchedule,
+    ProjectionSchedule,
+    ReductionSchedule,
+)
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Let, Load
 from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.ir.tile import TileOp
 from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
 from emmy.compiler.target import set_target
+from tests.compiler.terms import projection, reduction, slab
 
 materialize = import_module("emmy.compiler.pipeline.passes.lowering.kernel.010_materialize")
 factor = import_module("emmy.compiler.pipeline.passes.lowering.kernel._factor")
@@ -72,6 +85,25 @@ def _gate_up_graph() -> Graph:
     return graph
 
 
+def _serial_tile(root, free: Axis, reduce_axis: Axis) -> TileOp:
+    """Stamp the all-OFF schedule used by the serial projection regressions below."""
+    tile = TileOp(op=root, place=Placement(free=(free,)), axes=(free, reduce_axis))
+    nodes = {
+        site: ProjectionSchedule(Tile()) if tile.views[site].axis is None else ReductionSchedule(Tile(), Reduce())
+        for site in tile.node_sites
+    }
+    work = derive_inventory((Tile(),), coop=1) or Work()
+    return replace(
+        tile,
+        schedule=Schedule(
+            KernelSchedule(work, Raster.parse("")),
+            nodes,
+            {edge: EdgeSchedule(Stage.direct()) for edge in tile.edge_sites},
+        ),
+        materialization=ClassicMaterialization({}, {}),
+    )
+
+
 @pytest.fixture
 def _scalar_tier(monkeypatch):
     """Pin the mma family off — the channels then fold serially in ONE loop body, the scope that clashes."""
@@ -95,7 +127,8 @@ def test_sibling_cones_share_one_declaration_of_a_broadcast_constant(_scalar_tie
     bindings = {source: re.findall(r"__half (\w+) = c\[0\];", source) for source in sources.values()}
     assert any(bindings.values())
     assert all(len(names) == 1 for names in bindings.values() if names)
-    uses = [source.count(f" - {names[0]};") for source, names in bindings.items() if names]
+    # A use is any read of the binding past its declaration, whatever spells the subtraction (``-`` or ``__hsub_rn``).
+    uses = [len(re.findall(rf"\b{names[0]}\b", source)) - 1 for source, names in bindings.items() if names]
     assert all(count >= 2 and count % 2 == 0 for count in uses), uses
 
 
@@ -123,6 +156,50 @@ def test_sibling_cones_share_one_declaration_of_a_derived_value() -> None:
     )
 
     assert [stmt.name for stmt in materialize._drop_repeated_declarations(body)] == ["in0", "v0"]
+
+
+@pytest.mark.parametrize("value", [3840.0, 1e-6, -0.0])
+def test_sibling_cones_share_one_typed_literal_declaration(value) -> None:
+    literal = Let("v0", Literal(value), dtype=F32)
+    body = Body((literal, Assign("first", "reciprocal", ("v0",)), literal, Assign("second", "reciprocal", ("v0",))))
+
+    assert list(materialize._drop_repeated_declarations(body)) == [body[0], body[1], body[3]]
+
+
+@pytest.mark.parametrize("other", [Let("v0", Literal(0.0), dtype=F32), Let("v0", Literal(-0.0), dtype=F16)])
+def test_a_literal_rebound_to_different_bits_or_dtype_remains_a_fault(other) -> None:
+    body = Body((Let("v0", Literal(-0.0), dtype=F32), other))
+
+    assert len(materialize._drop_repeated_declarations(body)) == 2
+
+
+def test_a_same_dtype_copy_of_the_bound_value_is_a_repeat() -> None:
+    """A placement cut on softmax's maximum binds ``v0`` to the workspace read in one cone and to a
+    same-dtype copy of a second read of it in the sibling: one value spelled twice (nvcc: already declared)."""
+    zero = (Literal(0, "int"),)
+    body = Body(
+        (
+            Load(name="v0", input="ws", index=zero),
+            Load(name="acc0", input="ws", index=zero),
+            Assign(name="v0", op="copy", args=("acc0",), dtype=F16),
+        )
+    )
+
+    assert [stmt.name for stmt in materialize._drop_repeated_declarations(body)] == ["v0", "acc0"]
+
+
+def test_a_converting_copy_under_a_bound_name_survives_as_the_fault_it_is() -> None:
+    """A copy that changes the dtype is a different value: the rebind must reach nvcc."""
+    zero = (Literal(0, "int"),)
+    body = Body(
+        (
+            Load(name="v0", input="ws", index=zero, dtype=F32),
+            Load(name="acc0", input="ws", index=zero, dtype=F32),
+            Assign(name="v0", op="copy", args=("acc0",), dtype=F16),
+        )
+    )
+
+    assert [stmt.name for stmt in materialize._drop_repeated_declarations(body)] == ["v0", "acc0", "v0"]
 
 
 def test_a_name_rebound_to_a_different_expression_survives_as_the_fault_it_is() -> None:
@@ -161,3 +238,98 @@ def test_two_cones_that_agree_keep_one_spelling() -> None:
     body = [Assign(name="v0", op="add", args=("a", "b"))] * 2
 
     assert [stmt.name for stmt in factor._one_value_per_name(body)] == ["v0", "v0"]
+
+
+def test_serial_nested_projections_re_spell_distinct_values_in_one_scope() -> None:
+    """A cut workspace and its fused twin may derive different values under one original SSA name."""
+    free, reduce_axis = Axis("m", 4), Axis("k", 8)
+    red = reduction(
+        reduce_axis,
+        (slab("x_e", "x", "m", "k"),),
+        (Assign(name="acc__v", op="copy", args=("x_e",)),),
+        ("acc",),
+    )
+    inner = projection(
+        (red, slab("ws", "cutbuf", "m"), slab("eps", "eps")),
+        (
+            Assign(name="v", op="add", args=("ws", "eps")),
+            Assign(name="inner_out", op="multiply", args=("acc", "v")),
+        ),
+        results=("inner_out",),
+    )
+    root = projection(
+        (inner, slab("base", "base", "m")),
+        (
+            Assign(name="v", op="add", args=("inner_out", "base")),
+            Assign(name="out", op="reciprocal", args=("v",)),
+        ),
+        results=("out",),
+    )
+    bound = factor.factorize(_serial_tile(root, free, reduce_axis), root=None)
+    additions = [stmt for stmt in bound.body if isinstance(stmt, Assign) and stmt.op.name == "add"]
+    reciprocal = next(stmt for stmt in bound.body if isinstance(stmt, Assign) and stmt.name == "out")
+
+    assert len(additions) == 2
+    assert additions[0].name != additions[1].name
+    assert reciprocal.args == (additions[1].name,)
+
+
+def test_serial_root_and_projection_tail_re_spell_distinct_values_in_one_scope() -> None:
+    """A serial fold's hoisted provider and its projection tail cannot redeclare one SSA name."""
+    free, reduce_axis = Axis("m", 4), Axis("k", 8)
+    provider = projection(
+        (slab("base", "base", "m"), slab("eps", "eps")),
+        (Assign(name="v", op="add", args=("base", "eps")),),
+        results=("v",),
+    )
+    red = reduction(
+        reduce_axis,
+        (slab("x_e", "x", "m", "k"), provider),
+        (Assign(name="acc__v", op="multiply", args=("x_e", "v")),),
+        ("acc",),
+    )
+    root = projection(
+        (red, slab("ws", "cutbuf", "m")),
+        (
+            Assign(name="v", op="add", args=("acc", "ws")),
+            Assign(name="out", op="reciprocal", args=("v",)),
+        ),
+        results=("out",),
+    )
+
+    bound = factor.factorize(_serial_tile(root, free, reduce_axis), root=None)
+    additions = [stmt for stmt in bound.body if isinstance(stmt, Assign) and stmt.op.name == "add"]
+    reciprocal = next(stmt for stmt in bound.body if isinstance(stmt, Assign) and stmt.name == "out")
+
+    assert len(additions) == 2
+    assert additions[0].name != additions[1].name
+    assert reciprocal.args == (additions[1].name,)
+
+
+@pytest.mark.parametrize("coop", [1, 32, 64])
+def test_projection_lowers_overlapping_carriers_together(coop) -> None:
+    free, reduce_axis = Axis("m", 4), Axis("k", 8)
+    shared = reduction(
+        reduce_axis,
+        (slab("x_e", "x", "m", "k"),),
+        tuple(Assign(name=f"{name}__v", op="multiply", args=("x_e", "x_e")) for name in ("a", "b", "c")),
+        ("a", "b", "c"),
+    )
+    left = projection((shared,), (Assign(name="left", op="add", args=("a", "b")),))
+    root = projection((shared, left), (Assign(name="out", op="multiply", args=("c", "left")),))
+
+    tile = _serial_tile(root, free, reduce_axis)
+    tile = replace(
+        tile,
+        schedule=replace(
+            tile.schedule,
+            kernel=KernelSchedule(derive_inventory((Tile(),), coop=coop) or Work(), Raster.parse("")),
+            nodes={
+                site: replace(choice, reduce=Reduce.of(coop=coop)) if isinstance(choice, ReductionSchedule) else choice
+                for site, choice in tile.schedule.nodes.items()
+            },
+        ),
+    )
+    bound = factor.factorize(tile, root=None)
+    accumulators = [stmt.name for stmt in bound.body.iter() if isinstance(stmt, Accum)]
+    assert len(accumulators) == len(set(accumulators))

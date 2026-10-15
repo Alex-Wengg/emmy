@@ -1,8 +1,8 @@
 ---
 sidebar_position: 8
 title: "8. Inside the Prior"
-description: The model that ranks schedules before they are measured — its features, its two halves, how it is trained, and the check that decides whether it is trusted.
-keywords: [Emmy, prior, features, CatBoost, calibration, quarantine, offline prior, online prior]
+description: The model that ranks schedules before they are measured — its features, how it is fitted on the golden configurations, and the limits that follow from that.
+keywords: [Emmy, prior, features, offline prior, fit, golden configurations]
 ---
 
 # 8. Inside the Prior
@@ -13,13 +13,13 @@ slower than the pages before it, because this is where the interesting failures 
 
 Two properties frame everything else.
 
-**There is one ranking path.** Whatever is choosing — a tuning search deciding where to explore, or a compile deciding
-what to deploy — asks the same object the same way. Forks carry no score of their own, and nothing builds a kernel in
-order to rank it. The knob values go straight into numbers the model consumes.
+**There is one ranking path.** Whatever is choosing asks the same object the same way. Forks carry no score of their
+own, and nothing builds a kernel in order to rank it. The knob values go straight into numbers the model consumes.
 
-**The prior has two halves.** The **offline prior** is fitted ahead of time and ships in the repository; it is what
-answers on a machine that has never measured anything. The **online prior** is trained from local measurements as
-tuning runs accumulate. A composite object holds both and decides which one answers.
+**The prior is fitted ahead of time and ships with the repository.** It is what answers on a machine that has never
+measured anything — and only there: a measured row of the same kernel outranks it at every fork, as [the hierarchy
+page](./06-deploy-evidence-hierarchy.md) explained. It is called the *offline* prior for that reason. Nothing on the
+machine trains it; `emmy fit` does, from the golden configurations, and writes the model into the repository.
 
 ## Features: what the model actually sees
 
@@ -29,151 +29,82 @@ a row of features, and the row has three groups.
 | Group | What it describes | Where it comes from |
 | --- | --- | --- |
 | Hardware and regime | which GPU, its memory, the optimization level this compile is running at | probed from the machine, or named with `--target` |
-| Structure of the operation | counts of the statements and operations in the kernel's body, the loop extents, the data types of the inputs | stamped onto the operation by the stamping pass, before any fork is reached |
+| Structure of the operation | counts of the statements and operations in the kernel's body, the loop extents, the data types of the inputs | computed from the kernel when the row is built; nothing stores them |
 | The candidate itself | its knob values, encoded by type; a named tensor core instruction expands into the properties of that instruction | the fork option |
 
-The offline half additionally computes hand-designed descriptions of a tile's geometry from those knob values — its
-area, its shape, how much shared memory it needs, how many groups of threads could be resident at once.
+The model additionally computes hand-designed descriptions of a tile's geometry from those knob values — its area, its
+shape, how much shared memory it needs, how many groups of threads could be resident at once.
 
 ### The subtlety that shapes the feature set
 
 The hardware group has the same value for every candidate competing at one fork. Every option is being compiled for
-the same GPU. **So no weight on a hardware feature can change the ranking within that set** — it shifts every
-candidate's score by the same amount and cancels out.
+the same GPU. **So a hardware feature on its own cannot change the ranking within that set** — it moves every
+candidate's score by the same amount.
 
-That has a counter-intuitive consequence: what tells GPU generations apart has to be a *per-candidate* feature, one
-that only takes a value where the hardware offers the thing it describes. Two families of feature exist for exactly
-this reason:
-
-- Features that mirror the tile's geometry onto candidates that stage their data through the newer hardware
-  transport. On a card that has it, those candidates get a distinguishable description; on a card that does not, they
-  never appear. One weight set can then score newer tiles differently from older ones.
-- Features that separate candidates with the same tile but a different arrangement of workers. Without them, two
-  genuinely different candidates produced identical feature rows, and no model could have told them apart.
+What it can do is change how *another* feature counts. The model is a set of decision trees, and a tree can split on
+the card first and on the candidate second: prefer accumulating in 16-bit floats on one generation and in 32-bit
+floats on another. A per-candidate feature still has to carry the difference — candidates with the same tile but a
+different arrangement of workers have their own features for that reason, because two genuinely different candidates
+with identical feature rows can never be told apart.
 
 If you take one thing from this page for future feature work: a feature that is constant across a fork's candidates
-cannot influence that fork.
+cannot influence that fork by itself.
 
-## The offline half
+## How it scores
 
-The offline prior scores a candidate with a linear formula over the geometry features, fitted ahead of time and stored
-in the repository as a small artifact carrying its own version and a record of where it came from. It never falls back
-on the order options were emitted in.
+The prior scores a candidate with a CatBoost ranker — a sum of small decision trees over the geometry features —
+fitted ahead of time and stored in the repository as one JSON file carrying its own version and a record of where it
+came from. The trees sit in that file in CatBoost's own JSON format. It never falls back on the order options were
+emitted in.
 
 **Loading it is strict.** A missing artifact, or one whose feature version does not match the running code, is a hard
 error — refit it, never silently continue with something else. (A compile treats the load as best-effort so a bad
 artifact does not abort a deployment; what it gets instead is the no-prior behaviour from [the hierarchy
-page](./06-deploy-evidence-hierarchy.md), where golden configurations still decide and the rest falls to the rule's first
+page](./06-deploy-evidence-hierarchy.md), where every fork the prior would have ranked falls to the rule's first
 option.)
 
-**It is fitted on the golden configurations**, by `emmy fit`. For each recorded golden, the fitter reconstructs the
-set of candidates that golden competed against — by tracing the shape's own small program and enumerating the fork —
-and trains the weights to rank the recorded configuration well inside that set. The loss has two parts:
+**It is fitted on the golden configurations**, by `emmy fit`, read from the dataset `emmy db export` writes out of
+the previous page's store (which `emmy db import` fills from the golden files named on its command line). For each
+kernel a golden row was measured on, the fitter enumerates the candidates that kernel offers — from the kernel's own
+definition, as the database holds it — and trains the trees so the recorded configuration comes first inside that set.
+The other candidates were never measured, so they are not known to be slow; the fit draws a sample of them as the
+configurations to rank below the recorded one.
 
-- an objective pushing each golden's rank up within its own candidate set, with the kinds of case weighted so that no
-  one kind dominates the fit;
-- a penalty on the weights, expressed in raw feature units.
+**A feature a candidate does not have is "missing", not zero.** A knob a candidate has not decided yet and a knob
+legitimately set to zero are different facts, and a tree can branch on the difference.
 
-**The penalty is there to make the fit well-determined, not to shrink the weights**, and the difference matters. The
-ranking objective barely moves when you scale a weight on a feature that hardly varies across the golden candidate
-sets. An unpenalized fit is therefore free to pick an arbitrarily large weight there, and nothing in the golden-rank
-metrics will show it. It becomes catastrophic at a fork, where a not-yet-decided knob makes that feature zero: the
-enormous weight now dominates the score of every candidate that has not yet decided it. The penalty has to be in raw
-units, because after rescaling the inflated weight looks like an ordinary one.
+**The score is turned into a stand-in for latency by an exponential curve**, so lower is better and the scores of
+several kernels can be summed when a structural choice compares kernel sets.
 
-**The score is turned into a stand-in for latency by an exponential curve**, and there is a rule about that curve
-which is easy to violate: it must never flatten out over the range of scores that actually occur. A curve that
-saturates inside the live range collapses good candidates onto one identical value; the choice among them then falls
-back to the order the options were emitted in, which is arbitrary. That is not hypothetical — it is how cold
-deployments once shipped kernels 12 to 29 times slower than the recorded configuration for the same shape, while the
-golden-rank metrics reported the model was choosing correctly. (Why the metrics were fooled is on [the next
-page](./09-storage-checks-and-limits.md).)
+## What it cannot know
 
-Two more details are worth knowing about the offline half. A separate weight set ranks kernels whose tiles are masked
-because an axis is symbolic, selected on the stamped structure. And two feature interactions sit outside the linear
-weights, expressing a preference for the tensor core path — they stop a kernel that could use the tensor cores from
-deploying a plain-arithmetic configuration instead.
+A fitted model is only as good as the pools it was fitted on, and three limits follow directly.
 
-## The online half
+**A kernel no golden covers is scored by extrapolation.** The model was fitted to rank recorded rows well inside
+their own pools; on a shape nothing recorded, the same model is applied and nothing checks it. That is why a
+compile that must not guess runs under `--strict-evidence`, and why the fix for a slow cold pick is a measurement,
+never a rule written into a pass.
 
-The online prior is a **CatBoost** model trained on the measurements a tuning run produces. There is exactly one of
-them across every kernel, every GPU and every compiler setting — hardware and structure are *features in every row*,
-not a key that partitions separate models.
+**Its absolute numbers are not calibrated.** The score is a ranking quantity turned into a stand-in for latency, and
+within one pool only the order matters. But a structural choice — keep two operations fused, or cut them apart —
+compares sums of per-kernel prices, and where a measured row prices one piece and the prior prices another, the
+prior's absolute error does not cancel. A recorded decision, priced from its pieces' measured rows, outranks any such
+sum, which is why the goldens page records kernel sets and not only schedules.
 
-**Why a tree model rather than a linear one.** The model's best guess must not run off to a degenerate extreme. A
-linear model moves in one direction with each knob, so its optimum always sits at a corner of the box of candidate
-values — the largest tile, the deepest staging — which shipped real blow-ups before the switch. Any tree ensemble is
-bounded: an untested extreme simply inherits the value of the nearest measured region, so it stays sane outside the
-data. Among the bounded models, CatBoost also generalized best to an operation that had never been tuned, which is
-the case that matters for a deployment.
-
-**How a partly decided option gets a label.** Real measurements exist only at complete configurations, but the model
-has to rank half-decided options at every level of the fork tree. So the label for any position in the search tree is
-the best measured latency anywhere below it. A branch is judged by the best thing reachable from it, which is exactly
-what a search wants to know when deciding where to descend.
-
-**The training data lives inside the checkpoint.** Rows stream in as kernels are tuned, into a bounded random sample
-capped at 100,000 rows that is maintained across runs. The model refits on a schedule that starts frequent and
-coarsens as the data grows, and checkpoints itself to a JSON file holding both the model and its data. That data is
-the **reservoir** — the same rows the [evidence hierarchy](./06-deploy-evidence-hierarchy.md) reads first. The
-checkpoint therefore carries deployment evidence, not just model state, which is why losing it costs more than a
-retrain.
-
-The model is deliberately **not** refit during a single kernel's own search. Within one run it is a fixed model, so
-the search is not chasing a moving target.
-
-## Calibration: the check that decides whether it is trusted
-
-A trained model is not automatically believed. After every fit, Emmy measures how well the model ranks **the very rows
-it trained on**: predictions against its own labels, as a rank correlation, computed per operation and taken as the
-median across operations. Groups with fewer than 8 rows are skipped.
-
-- A genuinely trained model scores around **+0.85**.
-- The failure this catches scores around **0** — the collapse where the model and its stored rows no longer share
-  feature names, so predictions are effectively constant and ranking is worse than chance.
-- Below **0.5** the model is **quarantined**: it keeps training and keeps checkpointing, but the deployment ranking,
-  the search's steering signal and the structural cost estimate all fall back to the offline half, and the verdict is
-  logged.
-
-Measured evidence from the reservoir stays live under quarantine. A measurement needs no trusted model to be true.
-
-Three things to understand about this gate:
-
-- **It is an alarm for measured failure, not a demand for proof of quality.** A calibration that could not be measured
-  at all — no operation group large enough, or the statistics library missing — passes.
-- **It is known to be lenient in one case.** A small tuning run needs only 50 rows to fit. If all its operation groups
-  stay under 8 rows, calibration cannot be computed, so it passes, and the model is trusted to own deployments and
-  structural decisions on very little data.
-- **It deliberately does not catch the subtler failures**: a model that fits the operation families that were tuned
-  and generalizes badly, or one that ranks well but is wrong about absolute times on operations it never saw — which
-  matters because the structural cost estimate compares sums of absolute predictions. Those are what the diagnostics
-  on the next page exist to surface.
-
-The gate exists because being fitted was once the only requirement, and a mis-calibrated model owned deployments
-silently.
-
-## How the two halves combine
-
-**When deploying, one half answers, never both.** If the online model is fitted and passes calibration, prediction
-calls go to it alone and the offline half is out of the deployment path entirely. Otherwise the offline half answers.
-There is no blending of predicted times, because a deployment's choice should not be a compromise between a trained
-model and a hand-fitted heuristic.
-
-**When steering a search, they blend.** The signal used to decide where to explore next is the online prediction
-multiplied by the offline score raised to a small power (0.3 by default, adjustable; zero gives a pure online search).
-The offline factor is clamped, only its ordering is meaningful, and its no-opinion value is exactly 1.0 — so a
-configuration the offline heuristic has no view on leaves the online prediction untouched.
-
-The point of the blend is to keep exploring regions the cold heuristic rates well but a data-poor online model has
-buried, while making sure the offline factor's arbitrary magnitude never touches the times a deployment sees.
+**It can rank an invalid tile first.** The prior knows geometry, not the card's limits, so its top pick can need more
+shared memory or more threads than the card has. An ordinary compile notices that at the end, blocks the tile, and
+resolves again — [the hierarchy page](./06-deploy-evidence-hierarchy.md) describes the retry.
 
 ## See it yourself
 
-Evaluate both halves against the golden configurations — where each recorded configuration ranks among the candidates
-it competed against. Both halves are reported side by side, labelled, because they fail for different reasons:
+Evaluate the prior against the golden configurations — where each recorded configuration ranks among the candidates
+it competed against. The report reads the dataset `emmy db export` writes, so fill the database from the hardware
+golden files and export it first; nothing fills it on its own:
 
 ```bash
-emmy eval prior --dataset golden
+emmy db import --db _data/dataset.db --fresh emmy/compiler/pipeline/search/golden/records/*.json
+emmy db export --db _data/dataset.db _data/dataset
+emmy eval prior _data/dataset
 ```
 
 A rank is only a screen. It says where a good configuration landed in the ordering, never what missing it costs — two
@@ -181,25 +112,21 @@ neighbouring ranks in a large pool can be a fraction of a percent apart or three
 cannot answer is asked over configurations that were actually measured, which is the next page's dataset:
 
 ```bash
-emmy eval prior --dataset nodes
+emmy db import --db _data/tune.db ~/.cache/emmy/autotune.db
+emmy db export --db _data/tune.db _data/tune
+emmy eval prior _data/tune --pools measured
 ```
 
 That one reports, per card and compile setting, how closely the model's ordering follows the hardware's and what its
 best guess costs against the fastest configuration measured.
 
-Print the feature row the model actually sees for each golden:
+And refit the prior from the golden configurations, with cross-validation, no GPU required:
 
 ```bash
-emmy eval prior --dataset golden --features
+emmy fit _data/dataset _tune/fits/offline.json
 ```
 
-And refit the offline half from the golden configurations, with cross-validation, no GPU required:
-
-```bash
-emmy fit
-```
-
-That writes a metrics file and a weights file to a fresh directory under `_tune/fits/`, so two fits can be compared by
-diffing their metrics rather than by argument.
+That writes the model to the path you named and a metrics file to a fresh directory under `_tune/fits/`, so two
+fits can be compared by diffing their metrics rather than by argument.
 
 Next: [9. Storage, checks and limits](./09-storage-checks-and-limits.md).

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from emmy.compiler.ir.schedule.base import Schedule
+from emmy.compiler.ir.schedule.catalog import coop_reduce_moves
 from emmy.compiler.ir.schedule.choices import Raster, Reduce, Stage, Tile, Work
 from emmy.compiler.ir.schedule.views import EdgeSite, NodeId
 
@@ -52,7 +53,7 @@ def _is_edge_site(edge: EdgeSite) -> bool:
     return isinstance(edge, tuple) and len(edge) == 2 and _is_node_id(edge[0]) and type(edge[1]) is int and edge[1] >= 0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class KernelSchedule:
     """Kernel-scoped choices."""
 
@@ -64,7 +65,7 @@ class KernelSchedule:
             raise TypeError("classic kernel choices must be Work and Raster values")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProjectionSchedule:
     """The choices of a projection node."""
 
@@ -75,7 +76,7 @@ class ProjectionSchedule:
             raise TypeError("classic projection TILE must be an unplaced Tile choice")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReductionSchedule:
     """The choices of a reduction node, including a contraction-capable reduction."""
 
@@ -92,7 +93,7 @@ class ReductionSchedule:
 NodeSchedule = ProjectionSchedule | ReductionSchedule
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EdgeSchedule:
     """The transport choice of one operand use."""
 
@@ -126,15 +127,37 @@ def classic_stage_key(sites, edge: EdgeSite) -> str:
     return "STAGE" if len(consumers) == 1 else f"STAGE@{sites.sites[edge[0]].path}"
 
 
-def no_site_claims_inventory(tile_op) -> bool:
-    """Whether this kernel has no node site that could fold out a worker inventory.
+def binds_root(choice: ProjectionSchedule | ReductionSchedule) -> bool:
+    """Whether the kernel binder builds around this node: an output tile, or a reduce that claims
+    a worker inventory. ``TILE`` and ``REDUCE`` both select the root the binder builds around, so
+    the offer and the binder read one predicate."""
+    return choice.tile.is_tiled or (isinstance(choice, ReductionSchedule) and (choice.reduce.coop > 1 or choice.reduce.reg > 1))
 
-    Only a tiled site or a cooperative reduction claims one, so a kernel with neither — a bare
-    elementwise map, the half a placement cut leaves behind a reduction — has a kernel work that no
-    node constrains. :class:`~emmy.compiler.ir.schedule.classic.sites.ClassicKernelSite` offers such a kernel the sweep
-    widths, and the two compatibility gates here let them through instead of filtering them back to
-    the direct per-cell form. Read off the tile rather than the projected domains, so validation
-    (which carries none) answers the same.
+
+#: Threads in a CTA that packs cells of a warp-wide cooperative reduce (``WORK=t<coop>x<cells>``).
+PACKED_CTA_THREADS = 128
+
+
+def packed_works(work: Work | None) -> frozenset[Work]:
+    """The inventory that packs several cells of a cooperative reduce into one CTA.
+
+    A cooperative reduce launches one CTA per output cell, ``coop`` threads each. When ``coop`` is
+    at most a warp, its combine is a lane butterfly that never leaves the cell's lanes, so the
+    launch can stack cells in one CTA (``t<coop>x<cells>``, ``PACKED_CTA_THREADS`` threads): the
+    flat thread decode already hands consecutive cells to consecutive lane groups. At a 128-wide
+    row the one-cell CTA is 32 or 64 threads, and the launch pays per CTA."""
+    if work is None or work.kind != "thread" or work.units[1] != 1 or not 1 < work.units[0] <= 32:
+        return frozenset()
+    return frozenset({Work(kind="thread", units=(work.units[0], PACKED_CTA_THREADS // work.units[0]))})
+
+
+def output_sweep_works(tile_op, claimed_work: Work | None) -> frozenset[Work]:
+    """The ``WORK`` values that may stripe every output sweep of a kernel whose nodes stay serial.
+
+    Each output must own a sweep, because a scalar sibling would be repeated by every lane. A tiled
+    or cooperative node choice that already claims an inventory must agree through the ordinary
+    compatibility relation instead.
     """
-    sites = tile_op.family_sites
-    return not sites["TILE"] and not sites["REDUCE"]
+    if claimed_work is not None or not tile_op.output_specs or not all(spec.sweep for spec in tile_op.output_specs):
+        return frozenset()
+    return frozenset(Work(kind="thread", units=(move.coop, 1)) for move in coop_reduce_moves() if move.coop > 1)

@@ -18,7 +18,7 @@ from emmy.compiler.context import Context
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.cuda import CudaOp
-from emmy.compiler.ir.loop import Accum, Assign, LoopOp, Write
+from emmy.compiler.ir.loop import Accum, Affine, Assign, LoopOp, Write
 from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp, ScanOp
 from emmy.compiler.ir.tile import TileOp
 from emmy.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, TILE_PASSES, Pipeline
@@ -60,6 +60,11 @@ def _elementwise_fns(body) -> list[str]:
     return [s.op.name for s in body.iter() if isinstance(s, Assign)]
 
 
+def _affine_shapes(body) -> list[tuple[tuple[float, ...], float]]:
+    """Every Affine's sorted coefficients and offset: the folded form a sum, difference or negation takes."""
+    return sorted((tuple(sorted(s.coefficients)), s.offset) for s in body.iter() if isinstance(s, Affine))
+
+
 def _has_update(body) -> bool:
     return any(isinstance(s, Accum) for s in body.iter())
 
@@ -83,7 +88,7 @@ def test_pointwise_add():
     result = _compile(g)
     launches = _loop_nodes(result)
     assert len(launches) == 1
-    assert "add" in _elementwise_fns(launches[0].op.body)
+    assert _affine_shapes(launches[0].op.body) == [((1.0, 1.0), 0.0)]
     assert _has_write(launches[0].op.body)
 
 
@@ -98,8 +103,8 @@ def test_chained_pointwise_fuses_into_one():
     result = _compile(g)
     launches = _loop_nodes(result)
     assert len(launches) == 1
-    fns = _elementwise_fns(launches[0].op.body)
-    assert "exp" in fns and "negative" in fns
+    assert "exp" in _elementwise_fns(launches[0].op.body)
+    assert _affine_shapes(launches[0].op.body) == [((-1.0,), 0.0)]
 
 
 def test_reduce_sum():
@@ -163,12 +168,13 @@ def test_scan_after_pointwise_keeps_the_write_inside_its_reduce_loop():
     tiled = Pipeline.build(TILE_PASSES).run(make_graph(), ctx=Context.from_target((8, 9)))
     scan_tile = next(node.op for node in tiled.nodes.values() if isinstance(node.op, TileOp) and node.id == "out")
     assert scan_tile.schedule is not None
-    assert family_value(scan_tile.knobs, "REDUCE") == "" and scan_tile.knobs["WORK"] == ""
+    assert family_value(scan_tile.knobs, "REDUCE") in ("", "coop")
 
     with pinned_knobs({"WORK": "t4", "REDUCE": "coop"}):
         pinned = Pipeline.build(TILE_PASSES).run(make_graph(), ctx=Context.from_target((8, 9)))
     pinned_scan = next(node.op for node in pinned.nodes.values() if isinstance(node.op, TileOp) and node.id == "out")
-    assert pinned_scan.schedule is None and not pinned_scan.place.is_mapped
+    assert pinned_scan.schedule is not None and pinned_scan.place.is_mapped
+    assert family_value(pinned_scan.knobs, "REDUCE") == "coop" and pinned_scan.knobs["WORK"] == "t4"
 
     lowered = Pipeline.build(CUDA_PASSES).run(make_graph(), ctx=Context.from_target((8, 9)))
     source = next(
@@ -178,7 +184,7 @@ def test_scan_after_pointwise_keeps_the_write_inside_its_reduce_loop():
     update = next(i for i, line in enumerate(lines) if "acc0 +=" in line)
     # The stored value is the observer's fresh name (``acc0__obs``), never the raw accumulator —
     # the boundary distinguishes a streamed store from a post-fold store by exactly that name.
-    write = next(i for i, line in enumerate(lines) if "out[a0 * 4 + a1] = acc0__obs;" in line)
+    write = next(i for i, line in enumerate(lines) if line.lstrip().startswith("out[") and " = acc0__obs;" in line)
     loop_open = max(i for i in range(update) if lines[i].lstrip().startswith("for ("))
     loop_indent = len(lines[loop_open]) - len(lines[loop_open].lstrip())
     loop_close = next(
@@ -220,7 +226,7 @@ def test_mul_fanout_fuses_into_one_multi_output_loop():
     assert len(launches) == 1
     assert {output.name for output in launches[0].outputs} == {"d", "n"}
     assert _has_update(launches[0].op.body)
-    assert "negative" in _elementwise_fns(launches[0].op.body)
+    assert ((-1.0,), 0.0) in _affine_shapes(launches[0].op.body)
 
 
 def test_matmul_op_decomposes_and_fuses():

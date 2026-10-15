@@ -2,6 +2,10 @@
 
 Three layers over a shared `Graph` container.
 
+`Context` identifies the target card, precision decisions, compiler flags and measurement cache mode. Hot and cold
+measurements have distinct structural and tune DB keys. The `COLD_CACHE` input pin selects the mode; it is replayed
+with a golden's precision pins and does not change lowering or become a prior feature.
+
 Reading a `--ir torch` / `--ir tensor` dump: [IR-PSEUDOCODE-TORCH.md](IR-PSEUDOCODE-TORCH.md).
 
 ```
@@ -11,16 +15,16 @@ PyTorch module
 Graph (frontend ops)                        ── Layer 1
    │  pipeline/passes/frontend/decomposition
    │  pipeline/passes/frontend/optimization
-   │  pipeline/passes/loop/lifting
+   │  pipeline/passes/loop/lowering
    │  pipeline/passes/loop/fusion
    ▼
 Graph[LoopOp]  (one LoopOp = one kernel)    ── Layer 2
-   │  pipeline/passes/lowering/tile         (Loop IR → Tile IR)
+   │  pipeline/passes/tile/{lift,cut,schedule}  (Loop IR → Tile IR)
    │  pipeline/passes/lowering/kernel       (Tile IR → Kernel IR)
    │  pipeline/passes/lowering/cuda         (Kernel IR → CUDA source)
    ▼
 Graph[CudaOp]                               ── Layer 3
-   │  backend/cuda                          (cupy.RawKernel via NVRTC)
+   │  backend/cuda                          (nvcc cubins, launched by the Rust runtime)
    ▼
 GPU
 ```
@@ -65,6 +69,14 @@ excluded (names, hints, ambient I/O) — the contract is "include only
 bits that affect codegen output or dataflow semantics" so the
 autotuning cache doesn't bust on cosmetic edits.
 
+`Context` binds the effective precision decisions when a compile starts. Its key includes those decisions beside
+the target, compiler flags and cache mode, so an independent `FAST_EXP`, `F16_MMA_F32_ACC` or `FP8_MMA` override
+cannot read another regime's timings. Reconstructed contexts take the recorded pins explicitly; later environment
+changes do not alter their keys. The bound decisions are the one carrier of the fast-math decision: the nvcc flag
+string names it only where a context is built from flags alone (`Context.from_target(compile_flags=…)`), and every
+reader — the context key, the `H_fast_math` feature, the tune DB's regime, the dataset's regime key — takes
+`Context.precision_pins()` or the row's `precision`, never the flag string.
+
 ## Module layout
 
 | Path                  | Role                                    | See                          |
@@ -74,10 +86,10 @@ autotuning cache doesn't bust on cosmetic edits.
 | `ir/`                 | Op-type definitions per dialect         | `ir/ARCHITECTURE.md`         |
 | `trace/`              | PyTorch/HuggingFace → Graph IR          | `trace/ARCHITECTURE.md`      |
 | `pipeline/`           | Rewrite engine, passes, dump hooks      | `pipeline/ARCHITECTURE.md`   |
-| `pipeline/passes/lowering/tile/` | LoopOp → TileOp; **purely algebraic moveset, no specializations** (dispatch on fold algebra) | `pipeline/passes/ARCHITECTURE.md` |
+| `pipeline/passes/tile/` | LoopOp → TileOp; **purely algebraic moveset, no specializations** (dispatch on fold algebra) | `pipeline/passes/ARCHITECTURE.md` |
 | `backend/`            | Execution (numpy / loop / cuda)         | `backend/ARCHITECTURE.md`    |
 | `loader/`             | Bind constants (safetensors / `nn.Module` → `input_data`) | —              |
-| `pipeline/search/`    | Autotune DB + MCTS tree (see below)     | `pipeline/ARCHITECTURE.md`   |
+| `pipeline/search/`    | Tune DB, evidence pick, prior           | `pipeline/ARCHITECTURE.md`   |
 | `structural.py`       | `Structural` protocol + `digest()` fold | —                            |
 | `provenance.py`       | Op provenance — map fused kernels back to original frontend ops | — (see below) |
 | `specialize.py`       | Bind named symbolic dimensions in persisted Torch/Loop programs before lowering | — |
@@ -111,7 +123,7 @@ autotuning cache doesn't bust on cosmetic edits.
   producer call sites need no change. An atomic symbolic `Dim` also carries a `hint` — its *expected*
   size (default `DEFAULT_SEQ_HINT=512`, set automatically so reconstruction can't lose it; an explicit
   `Dim(name, hint=...)` overrides). The hint is pure metadata (excluded from `==`/`hash`/structural keys),
-  read only by the tuner / partition planner to size tiles for a dynamic axis.
+  read only by the schedule enumeration / partition planner to size tiles for a dynamic axis.
   Graph JSON op fields use the same stable dimension wire mapping as Torch IR, so static, symbolic, and composite
   `Dim` values round-trip instead of depending on the scalar-only `Dim.value` compatibility property.
   Program specialization also binds the named string extents admitted by the `ReshapeOp.shape` and `SliceOp.shape`
@@ -122,7 +134,7 @@ autotuning cache doesn't bust on cosmetic edits.
   at any runtime `seq_len` — the grid (`ir/cuda/ir.py` `GridDimSpec` accepts an `Expr` factor, resolved via
   `Expr.eval` at launch) and the guard read the runtime value while the tile shape is tuned for the hint. The backend
   benches a symbolic graph at the hint when no real inputs are supplied (`Graph.symbolic_hints` /
-  `backend/cuda/program.py` `_resolve_symbolic`), so `tune` and `compile` agree on a hint-sized variant. (The masked
+  `backend/cuda/program.py` `_resolve_symbolic`), so a bench and a compile agree on a hint-sized variant. (The masked
   tensor-core / cooperative / split-K tiers for symbolic axes are part of the in-flight tile-IR rebuild — see
   `pipeline/passes/ARCHITECTURE.md` and the tile IR sources for current coverage.)
 - **`ElementwiseOp` inputs must already share the output shape.** The
@@ -167,6 +179,13 @@ working-golden inventory generation alone promotes the marked bits and scale val
 preserves the materialized W8A8 boundary. Native FP8 tensor-core enumeration remains explicitly gated by `FP8_MMA`,
 and a conservative compile can still execute the same graph algebra without selecting that hardware path.
 
+When the declaration specifies static activations instead, `loader.quant.spell_static_fp8_activations` spells the same
+encode, decode and scale round trip at the calibrated per-tensor scale each linear stores beside its weight
+(`activation_scale`, or `input_scale`). There is no amax: the encode saturates to the format's finite range, which is
+the clamp the calibrated scale relies on. Linears reading one activation through equal scales share one round trip,
+as a projection group calibrated together does. Nothing is marked to stay materialized: the codes are an interior
+value of the kernel, and a contraction that wants both multiplicands as FP8 bytes takes a cut at that seam.
+
 **Input-sourced fp8.** When the weights are forward-argument `InputOp`s instead of constants (the MoE serving seam's
 expert programs — one program per layer kind, per-expert 2-D slices fed per launch), the constant speller can never
 fire; `loader.quant.spell_quantized_inputs(graph, specs)` is the post-trace twin. Each named input keeps its node id
@@ -190,7 +209,7 @@ constant and the f32 per-tensor scale (`weight_scale_2`) fuse into one f16 scale
 values, one scale per 16 along the last axis. The 256×2 byte-to-value-pair table is a `ConstantOp` whose
 `source_graph` computes it at bind time; `from_f4e2m1` decodes the code halves inside that subgraph. Like every
 other constant it declares its dtype by NAME, which is what lets a spelled graph round-trip through
-`Graph.to_dict()` — the form the serving-twin capture writes and `emmy tune` reads back.
+`Graph.to_dict()` — the form the serving-twin trace writes and a golden replay reads back.
 
 A contraction (the matmul-shaped node) consuming that cone reads two ways, both fork siblings on the tensor-core
 tier. The general one is the computed-B reading every producer cone gets: loop fusion merges the decode into the
@@ -224,8 +243,9 @@ activations and stores per-linear `input_scale` tensors (modelopt's calibrated a
 calibration amax / (6 · 448)) marks its linears for W4A4. `loader.quant.spell_static_fp4_activations` runs after
 `spell_quantized_constants`, whose spelled weight cones are the marker it reads, and writes the quantize→dequantize
 round trip in front of each marked linear, in the same
-shared-vocabulary algebra: per 16-element K block, the e4m3 scale round trip (`to_f8e4m3(amax / (6·s2))`), ONE
-f32→f16 rounding of the fused scale (`fuse_nvfp4_scales` parity), the e2m1 encode over the rounded scale, the pair
+shared-vocabulary algebra: per 16-element K block, the e4m3 scale round trip (`to_f8e4m3((amax · 1/6) · 1/s2)`),
+the e2m1 encode over the fused f32 scale with round-to-nearest division even under fast math, the f32→f16 rounding
+of the scale during reconstruction (`fuse_nvfp4_scales` parity), the pair
 pack into an `f4e2m1x2` buffer, and the same pair-table-gather decode chain the weight side spells. Both matmul
 operands then read as one decode-chain shape, the graph's own meaning becomes Σ x̂·ŵ for the marked matmuls, and the
 numpy backend stays the parity oracle for every lowering of it. Two halves spell the round trip, and the split
@@ -251,6 +271,12 @@ are compute-FILLED when this matmul's own kernel produces them: loop fusion mate
 point, so an activation read by one kernel keeps its quantize inline, and the fill then evaluates that same cone once
 per slab cell instead of once per output element. Filled codes reach the cell but keep 16-bit traffic on that operand,
 since the fill still reads the unquantized activation to encode from.
+
+The copies run on cp.async or on TMA. A TMA box writes its rows unpadded, so its byte rows carry none of the cp.async
+row pad, and the drain's byte gathers conflict on shared-memory banks. On an RTX 5090, 2048-row prefill tiles run about
+25% slower on TMA than on cp.async, and 16-row decode tiles run even. Filled codes keep cp.async: a TMA copy completes
+by a byte count on its mbarrier, and a slab this kernel computes has no bytes for TMA to move, so the TMA stage needs
+every operand stored.
 
 That last move is why the native lowering carries a bounded gap rather than the exact oracle every other lowering
 answers to. The declared program applies `f16(block_scale x tensor_scale)` per element — the single fused rounding
@@ -323,10 +349,10 @@ origin is `len(pieces)` over the union of that origin's pieces across the whole 
 
 It rides on one chokepoint: `Graph.splice` calls `provenance.propagate` with a `mint_pieces` flag (set by
 `Candidate.apply` from the pass namespace — `True` only for `frontend/decomposition`). Decomposition *mints* each new
-fragment node as a fresh piece of the consumed origins; fusion / lifting / optimization folds *aggregate* the consumed
-piece sets onto the merged node (unioning the dissolved producers so a multi-output splice drops nothing). Lowering is
-in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched. Seeded once at
-`Pipeline.tune_async` / `Pipeline.run` entry (idempotent); pure metadata, excluded from structural / cache keys.
+fragment node as a fresh piece of the consumed origins. Loop lowering, fusion, and optimization passes *aggregate* the
+consumed piece sets onto the merged node (unioning the dissolved producers so a multi-output splice drops nothing).
+Later lowering uses in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched.
+It is seeded once at `Pipeline.run` entry (idempotent); pure metadata, excluded from structural / cache keys.
 Boundary sentinels (`InputOp`/`ConstantOp`) never carry prov: `put` refuses to stamp them and `propagate` scrubs splice
 outputs that land on one (the generic hint merge would otherwise copy prov onto e.g. the ConstantOp produced by the sm_90+
 weight-transpose fold, inflating `totals` so every kernel of that origin read partial coverage).
@@ -339,4 +365,4 @@ of fusion merge order — the attention kernel is `k_sdpa_linear_reduce`, its QK
 Layout/plumbing origins (`_WEAK_KINDS`: transpose / reshape / unsqueeze / cat / slice) label a kernel only when no
 strong op is present — RoPE plumbing fused into attention doesn't pollute the name, while a standalone copy kernel
 still reads `k_cat_…` instead of the node-id fallback. Compiler dumps retain provenance-selected frontend slices in
-memory for tune benchmarking; stable persistence of those programs belongs exclusively to golden YAML.
+memory for tune benchmarking; stable persistence of those programs belongs exclusively to golden files.

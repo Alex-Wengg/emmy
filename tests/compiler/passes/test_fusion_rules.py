@@ -1,6 +1,6 @@
-"""Tests for the fusion pass (lift-then-splice).
+"""Tests for lowering to loops followed by fusion.
 
-The fusion pass lifts each tensor op into a trivial ``LoopOp`` and then
+The lowering pass wraps each tensor op in a single-op ``LoopOp``. Fusion then
 splices maximal downstream regions through one multi-root, SSA-preserving
 worklist. Tests verify post-fixpoint structure, shared-producer reuse, and
 numeric correctness through ``NumpyBackend``. ``LoopOp.forward`` executes
@@ -8,13 +8,14 @@ multi-output fused kernels without a GPU.
 """
 
 import numpy as np
+import pytest
 
 from emmy.compiler.backend.numpy import NumpyBackend
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import ConstantOp, InputOp
 from emmy.compiler.ir.expr import Literal, placeholder
 from emmy.compiler.ir.frontend.ir import LinearOp, RmsNormOp
-from emmy.compiler.ir.loop import Accum, Assign, Load, LoopOp, Select, Write
+from emmy.compiler.ir.loop import Accum, Affine, Assign, Load, LoopOp, Select, Write
 from emmy.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp, ScanOp
 from emmy.compiler.pipeline import Pipeline
 
@@ -23,7 +24,7 @@ _backend = NumpyBackend()
 
 
 def _fuse(graph: Graph) -> Graph:
-    return Pipeline.build(["loop/lifting", "loop/fusion"]).run(graph)
+    return Pipeline.build(["loop/lowering", "loop/fusion"]).run(graph)
 
 
 def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -43,7 +44,7 @@ def _assert_correctness(make_graph, inputs):
 
     Exercises fusion rules for *semantic* equivalence on top of the
     structural checks in this file — ``LoopOp.forward`` executes the
-    lifted+merged kernels numerically against the original tensor-IR
+    lowered and merged kernels numerically against the original tensor-IR
     evaluation.
     """
     g_before = make_graph()
@@ -61,6 +62,11 @@ def _assign_fns(body) -> list[str]:
     return [s.op.name for s in body.iter() if isinstance(s, Assign)]
 
 
+def _affine_shapes(body) -> list[tuple[tuple[float, ...], float]]:
+    """Every Affine's sorted coefficients and offset: the folded form a sum, difference or negation takes."""
+    return sorted((tuple(sorted(s.coefficients)), s.offset) for s in body.iter() if isinstance(s, Affine))
+
+
 def _count_copies(body) -> int:
     """Count identity ``Assign(op=copy)`` statements in a LoopOp body."""
     return sum(1 for s in body.iter() if isinstance(s, Assign) and s.op.name == "copy")
@@ -74,11 +80,11 @@ def _local_combine_fns(locals_) -> set[str]:
     return {lb.op.name for lb in locals_ if lb.op is not None}
 
 
-def test_multisource_indexmap_lifts_unconditional_branch_as_bool():
+def test_multisource_indexmap_lowers_unconditional_branch_as_bool():
     """The fallback predicate remains boolean through rendering and Loop IR persistence."""
     import json
 
-    from emmy.compiler.loop_wire import loop_graph_from_wire, loop_graph_to_wire
+    from emmy.compiler.graph import Graph
 
     graph = Graph()
     graph.add_node(InputOp(), [], Tensor("left", (2, 2)), node_id="left")
@@ -104,13 +110,13 @@ def test_multisource_indexmap_lifts_unconditional_branch_as_bool():
         "left": np.array([[1, 2], [3, 4]], dtype=np.float32),
         "right": np.array([[5, 6], [7, 8]], dtype=np.float32),
     }
-    lifted = Pipeline.build(["loop/lifting"]).run(graph)
-    select = next(stmt for stmt in _kernel_nodes(lifted)[0].op.body.iter() if isinstance(stmt, Select))
+    lowered = Pipeline.build(["loop/lowering"]).run(graph)
+    select = next(stmt for stmt in _kernel_nodes(lowered)[0].op.body.iter() if isinstance(stmt, Select))
     assert select.branches[-1].select == Literal(True, "bool")
     assert select.branches[-1].select.render(None) == "1"
-    _assert_close(_run(graph, inputs), _run(lifted, inputs))
+    _assert_close(_run(graph, inputs), _run(lowered, inputs))
 
-    restored = loop_graph_from_wire(json.loads(json.dumps(loop_graph_to_wire(lifted))))
+    restored = Graph.from_wire(json.loads(json.dumps(lowered.to_wire())))
     restored_select = next(stmt for stmt in _kernel_nodes(restored)[0].op.body.iter() if isinstance(stmt, Select))
     assert restored_select.branches[-1].select == Literal(True, "bool")
 
@@ -144,9 +150,8 @@ def test_pointwise_chain_only_kernel_input_constant():
 def test_pointwise_chain_body_ops():
     result = _fuse(_make_pointwise_chain())
     kernel = _kernel_nodes(result)[0]
-    body_ops = _assign_fns(kernel.op.body)
-    assert "negative" in body_ops
-    assert "exp" in body_ops
+    assert "exp" in _assign_fns(kernel.op.body)
+    assert _affine_shapes(kernel.op.body) == [((-1.0,), 0.0)]
 
 
 def test_pointwise_chain_inputs_are_loads():
@@ -194,10 +199,9 @@ def test_reconvergent_dag_fuses_as_one_ssa_region():
     result = _fuse(_make_pointwise_diamond())
     kernels = _kernel_nodes(result)
     assert len(kernels) == 1
-    fns = _assign_fns(kernels[0].op.body)
-    assert fns.count("negative") == 1
-    assert fns.count("add") == 2
-    assert fns.count("multiply") == 1
+    assert _assign_fns(kernels[0].op.body).count("multiply") == 1
+    # The shared negation is read twice and stays; ``(shared + a) + right`` folds into one sum.
+    assert _affine_shapes(kernels[0].op.body) == [((-1.0,), 0.0), ((1.0, 1.0, 1.0), 0.0)]
 
 
 def test_reconvergent_dag_fusion_is_numerically_exact():
@@ -214,7 +218,7 @@ def test_non_reconvergent_fanout_becomes_one_mimo_kernel():
     result = _fuse(graph)
     (kernel,) = _kernel_nodes(result)
     assert len(kernel.outputs) == 2
-    assert _assign_fns(kernel.op.body).count("negative") == 1
+    assert _affine_shapes(kernel.op.body).count(((-1.0,), 0.0)) == 1
     assert len(result.outputs) == 2
 
 
@@ -226,12 +230,12 @@ def test_non_reconvergent_mimo_fusion_is_numerically_exact():
     _assert_close(_run(graph, inputs), _run(_fuse(graph), inputs))
 
 
-def _make_indexmap_diamond():
+def _make_indexmap_diamond(*, scalar_dtype="f32"):
     from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (2, 4)), node_id="x")
-    shared = const_bc(g, name="one", value=1.0, target_shape=(2, 4), dtype="f32")
+    shared = const_bc(g, name="one", value=1.0, target_shape=(2, 4), dtype=scalar_dtype)
     g.add_node(ElementwiseOp("add"), ["x", shared], Tensor("left", (2, 4)), node_id="left")
     g.add_node(ElementwiseOp("multiply"), ["x", shared], Tensor("right", (2, 4)), node_id="right")
     g.add_node(ElementwiseOp("add"), ["left", "right"], Tensor("out", (2, 4)), node_id="out")
@@ -240,7 +244,8 @@ def _make_indexmap_diamond():
 
 
 def test_reconvergent_indexmap_is_owned_by_shared_region_merge():
-    result = _fuse(_make_indexmap_diamond())
+    # FP16 retains a device buffer, so this still checks shared-load ownership.
+    result = _fuse(_make_indexmap_diamond(scalar_dtype="f16"))
     (kernel,) = _kernel_nodes(result)
     assert sum(isinstance(stmt, Load) and stmt.input == "one" for stmt in kernel.op.body.iter()) == 1
 
@@ -279,7 +284,7 @@ def _make_activation_linear(activation: str):
 
 
 def _decompose_and_fuse(graph: Graph) -> Graph:
-    return Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lifting", "loop/fusion"]).run(graph)
+    return Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lowering", "loop/fusion"]).run(graph)
 
 
 def test_transcendental_is_not_duplicated_across_contraction_columns():
@@ -467,7 +472,7 @@ def test_contraction_epilogue_fuses_to_one_kernel():
 def test_contraction_epilogue_body_has_add():
     result = _fuse(_make_contraction_with_epilogue())
     kernel = _kernel_nodes(result)[0]
-    assert "add" in _assign_fns(kernel.op.body)
+    assert _affine_shapes(kernel.op.body) == [((1.0, 1.0), 0.0)]
 
 
 # ===================================================================
@@ -531,15 +536,13 @@ def test_softmax_only_kernel_input_constant():
 def test_softmax_body_covers_all_ops():
     result = _fuse(_make_softmax())
     all_fns = set()
+    shapes = []
     for k in _kernel_nodes(result):
         all_fns |= set(_assign_fns(k.op.body))
         all_fns |= _local_combine_fns(k.op.body.accums)
-    # Expect elementwise sub/exp and reduce combine add/max from the
-    # max and sum accumulators. ``divide(x, acc_sum)`` is split by
-    # ``split_invariant_divides`` (in ``ir/stmt/normalize.py``) into
-    # ``reciprocal(acc_sum) + multiply(x, recip)`` so the rcp can hoist
-    # out of the inner reduce — divide no longer appears as a body op.
-    assert {"subtract", "exp", "reciprocal", "multiply"} <= all_fns
+        shapes += _affine_shapes(k.op.body)
+    assert {"exp", "divide"} <= all_fns
+    assert ((-1.0, 1.0), 0.0) in shapes, shapes  # the shift ``x - max``
     assert {"add", "maximum"} <= all_fns
 
 
@@ -574,8 +577,8 @@ def test_ssa_invariants_hold():
         from emmy.compiler.ir.loop import Accum, Load
 
         for s in k.op:
-            if isinstance(s, Assign):
-                for arg in s.args:
+            if isinstance(s, (Assign, Affine)):
+                for arg in s.deps():
                     assert arg in defined, f"arg {arg!r} not defined before use in {s.name}"
                 defined.add(s.name)
             elif isinstance(s, (Load, Accum)):
@@ -703,7 +706,7 @@ def test_softmax_has_both_accumulators():
 
 
 def _is_pure_indexmap(op: LoopOp) -> bool:
-    return not any(isinstance(s, (Assign, Accum)) for s in op.body.iter())
+    return not any(isinstance(s, (Affine, Assign, Accum)) for s in op.body.iter())
 
 
 def _pure_indexmap_kernels(graph: Graph) -> list:
@@ -714,7 +717,7 @@ def _loads_from(op: LoopOp) -> set[str]:
     return {ld.input for ld in op.body.loads}
 
 
-def _make_shared_const_broadcast():
+def _make_shared_const_broadcast(*, scalar_dtype="f32"):
     """A scalar ``const_bc(1.0)`` broadcast feeding two elementwise consumers —
     the headline case: torch.export folds attention-mask / RoPE scaffolding to
     scalar broadcasts that fan out (Qwen3 GQA query + key paths)."""
@@ -723,7 +726,7 @@ def _make_shared_const_broadcast():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
     g.add_node(InputOp(), [], Tensor("y", (4, 8)), node_id="y")
-    bc = const_bc(g, name="one", value=1.0, target_shape=(4, 8), dtype="f32")
+    bc = const_bc(g, name="one", value=1.0, target_shape=(4, 8), dtype=scalar_dtype)
     g.add_node(ElementwiseOp("multiply"), ["x", bc.id], Tensor("c1", (4, 8)), node_id="c1")
     g.add_node(ElementwiseOp("add"), ["y", bc.id], Tensor("c2", (4, 8)), node_id="c2")
     g.inputs, g.outputs = ["x", "y"], ["c1", "c2"]
@@ -738,16 +741,18 @@ def test_shared_const_broadcast_no_pure_indexmap_remains():
 
 def test_shared_const_broadcast_consumers_load_constant_directly():
     """The MIMO kernel loads the constant directly and shares the broadcast."""
-    result = _fuse(_make_shared_const_broadcast())
+    # FP16 retains a device buffer; a fixed FP32 scalar is bound before fusion.
+    result = _fuse(_make_shared_const_broadcast(scalar_dtype="f16"))
     (kernel,) = _kernel_nodes(result)
     assert len(kernel.outputs) == 2
     assert "one" in _loads_from(kernel.op)
 
 
-def test_shared_const_broadcast_correctness():
+@pytest.mark.parametrize("scalar_dtype", ["f16", "f32"])
+def test_shared_const_broadcast_correctness(scalar_dtype):
     x = rng.standard_normal((4, 8)).astype(np.float32)
     y = rng.standard_normal((4, 8)).astype(np.float32)
-    _assert_correctness(_make_shared_const_broadcast, {"x": x, "y": y})
+    _assert_correctness(lambda: _make_shared_const_broadcast(scalar_dtype=scalar_dtype), {"x": x, "y": y})
 
 
 def test_shared_const_broadcast_lowers_as_one_mimo_cuda_kernel():
@@ -758,7 +763,7 @@ def test_shared_const_broadcast_lowers_as_one_mimo_cuda_kernel():
     (kernel,) = [node for node in result.nodes.values() if isinstance(node.op, CudaOp)]
     assert kernel.buffer_names() == ("c1", "c2")
     assert kernel.op.arg_order[-2:] == ("c1", "c2")
-    assert "float* c1" in kernel.op.kernel_source and "float* c2" in kernel.op.kernel_source
+    assert "float* __restrict__ c1" in kernel.op.kernel_source and "float* __restrict__ c2" in kernel.op.kernel_source
 
 
 def _make_shared_transpose():
@@ -914,8 +919,8 @@ def _make_shared_broadcast_chain():
     a downstream multiply — mirrors the full-model RoPE/mask shape:
     ``scalar -> [1,1,4,8] (shared) -> {[1,3,4,8], [1,2,4,8]} -> multiply``.
 
-    The intermediate broadcasts are the regression trigger: lifting gives each a
-    node id (``lift_<id>``) that differs from its output Tensor name, so when the
+    The intermediate broadcasts are the regression trigger: lowering gives each a
+    node id (``loop_<id>``) that differs from its output Tensor name, so when the
     split rule peels one onto a private copy it MUST rename the new node's
     ``Write.output`` to its new id. Forgetting that leaves the node writing the
     old buf — ``splice_graph`` (which assumes Write.output == node id) then can't
@@ -926,7 +931,7 @@ def _make_shared_broadcast_chain():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("mq", (1, 3, 4, 8)), node_id="mq")
     g.add_node(InputOp(), [], Tensor("mk", (1, 2, 4, 8)), node_id="mk")
-    shared = const_bc(g, name="zero", value=0.0, target_shape=(1, 1, 4, 8), dtype="f32")
+    shared = const_bc(g, name="half", value=0.5, target_shape=(1, 1, 4, 8), dtype="f32")
     bq = broadcast_to(g, shared.id, (1, 3, 4, 8))
     bk = broadcast_to(g, shared.id, (1, 2, 4, 8))
     g.add_node(ElementwiseOp("multiply"), ["mq", bq.id], Tensor("fq", (1, 3, 4, 8)), node_id="fq")
@@ -948,11 +953,15 @@ def test_shared_broadcast_chain_correctness():
     _assert_correctness(_make_shared_broadcast_chain, {"mq": mq, "mk": mk})
 
 
-def test_output_reshape_folds_into_reduce_producer():
+@pytest.mark.parametrize("rows", [4, "num_tokens"])
+def test_output_reshape_folds_into_reduce_producer(rows):
     """A graph-output flat-address identity joins its producer's output equivalence cluster.
 
     The splicer retargets the producer's ``Write`` to the output shape with clean affine indices
-    instead of reconstructing its reduction at the flatten's div/mod-indexed loads.
+    instead of reconstructing its reduction at the flatten's div/mod-indexed loads. A symbolic
+    leading dimension — a serving twin's token axis — rides through as itself: the layout the
+    proof is about is the static rest, and declining it left every per-head statistic of a
+    projection inlined once per output column.
     """
     from emmy.compiler.dim import Dim
     from emmy.compiler.ir.axis import Axis
@@ -988,7 +997,7 @@ def test_output_reshape_folds_into_reduce_producer():
             body=Body(
                 (
                     Loop(
-                        axis=Axis(name="a0", extent=Dim(4)),
+                        axis=Axis(name="a0", extent=Dim(rows)),
                         body=Body((Loop(axis=Axis(name="a1", extent=Dim(H)), body=Body((red, sweep))),)),
                     ),
                 )
@@ -1000,7 +1009,7 @@ def test_output_reshape_folds_into_reduce_producer():
             body=Body(
                 (
                     Loop(
-                        axis=Axis(name="b0", extent=Dim(4)),
+                        axis=Axis(name="b0", extent=Dim(rows)),
                         body=Body(
                             (
                                 Loop(
@@ -1023,9 +1032,9 @@ def test_output_reshape_folds_into_reduce_producer():
             )
         )
         g = Graph()
-        g.add_node(InputOp(), [], Tensor("x", (4, H, D)), node_id="x")
-        g.add_node(producer, ["x"], Tensor("y", (4, H, D)), node_id="y")
-        g.add_node(copy, ["y"], Tensor("out", (4, H * D)), node_id="out")
+        g.add_node(InputOp(), [], Tensor("x", (rows, H, D)), node_id="x")
+        g.add_node(producer, ["x"], Tensor("y", (rows, H, D)), node_id="y")
+        g.add_node(copy, ["y"], Tensor("out", (rows, H * D)), node_id="out")
         g.inputs, g.outputs = ["x"], ["out"]
         return g
 
@@ -1037,7 +1046,12 @@ def test_output_reshape_folds_into_reduce_producer():
     idx = writes[0].index
     assert len(idx) == 2, "the retargeted Write indexes the flat output shape"
     assert "/" not in idx[1].pretty() and "%" not in idx[1].pretty(), f"clean affine index expected: {idx[1].pretty()}"
+    # The producer's loops carry the kernel: no loop over the flat width, under which the reduce
+    # would run once per output column.
+    assert not any(loop.axis.extent == Dim(H * D) for loop in kernels[0].op.body.loops), "the reduce runs per column"
 
+    if rows == "num_tokens":
+        return  # the loop runner binds no symbolic extent; the static row exercises the values
     x = rng.standard_normal((4, H, D)).astype(np.float32)
     before = _run(make_graph(), {"x": x})
     after = _run(fused, {"x": x})

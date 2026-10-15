@@ -53,6 +53,12 @@ PLAN_FORMAT_INDIRECT = 2
 # launches.  Older runtimes reject the plan and safely fall back to a full compile.
 PLAN_FORMAT_GENERATED = 3
 
+# Paged buffers: a plan whose ``paged`` declaration is non-empty passes a page table where its
+# launches name ``<buffer>__pages``, an operand the plan never declares as a buffer. Format 4 is
+# a superset of the formats before it; a runtime that did not know the table would fail to bind
+# it, so the gate refuses the plan up front and the pack loader falls back to a full compile.
+PLAN_FORMAT_PAGED = 4
+
 # Binary ops the on-disk expression grammar admits. Everything a ``Dim`` shape, a ceil-div grid
 # factor, or a runtime-constant expr can contain; anything else fails serialization loudly.
 _EXPR_OPS = ("+", "-", "*", "/", "//", "%")
@@ -92,6 +98,8 @@ class LaunchSpec:
     zero_prologues: tuple[str, ...] = ()
     tma_descriptors: tuple[TmaDescMeta, ...] = ()
     runtime_args: tuple[str, ...] = ()
+    # Serial launch axes ``(name, extent)`` — see ``CudaOp.serial``.
+    serial: tuple[tuple[str, int], ...] = ()
     # Buffer names this launch produces (the node's output buffers, slot order).
     # Empty on plans stored before the field existed — readers fall back to
     # ``(node_id,)``. ``node_id`` itself stays for naming / diagnostics.
@@ -115,6 +123,15 @@ class KernelSpec:
     # Whether this kernel must compile for the arch-SUFFIXED target (``sm_120a``). TMA needs it,
     # and so does the block-scaled fp4 mma, which ptxas refuses on the plain target.
     arch_specific: bool = False
+    # Whether the kernel waits on the grid ahead of it (``griddepcontrol.wait``) before its first
+    # memory access, which lets the runtime launch it as a programmatic dependent launch. A kernel
+    # that does not wait, or a plan stored before the renderer emitted the wait, launches serialized.
+    dependent_launch: bool = False
+
+    @classmethod
+    def from_op(cls, op) -> KernelSpec:
+        source = op.kernel_source
+        return cls(source=source, arch_specific=_needs_arch_isa(op), dependent_launch="griddepcontrol.wait" in (source or ""))
 
 
 @dataclass
@@ -163,6 +180,10 @@ class ExecutionPlan:
     launches: list[LaunchSpec]
     kernels: dict[str, KernelSpec]
     weights: dict[str, WeightSpec] = field(default_factory=dict)
+    # Buffers that are a table of equal-sized pages rather than one allocation:
+    # ``name -> (axis, page_size)``. The runtime reaches them through the page table bound
+    # under ``<name>__pages``. Empty for every ordinary program.
+    paged: dict[str, tuple[int, int]] = field(default_factory=dict)
     symbolic_bindings: dict[str, tuple[str, int]] = field(default_factory=dict)
     symbolic_hints: dict[str, int] = field(default_factory=dict)
     symbolic_caps: dict[str, int] = field(default_factory=dict)
@@ -216,7 +237,7 @@ def plan_from_graph(graph: Graph) -> ExecutionPlan:
             raise TypeError(f"plan_from_graph: node {nid!r} has non-CudaOp {type(op).__name__!r}; lowering must produce Graph[CudaOp].")
         spec = kernels.get(op.kernel_name)
         if spec is None:
-            kernels[op.kernel_name] = KernelSpec(source=op.kernel_source, arch_specific=_needs_arch_isa(op))
+            kernels[op.kernel_name] = KernelSpec.from_op(op)
         elif spec.source != op.kernel_source:
             # Longstanding runtime semantics: launches resolve kernels by NAME and the first
             # source wins (repeated helper names like ``__partial`` ride the first-compiled
@@ -234,6 +255,7 @@ def plan_from_graph(graph: Graph) -> ExecutionPlan:
                 zero_prologues=tuple(getattr(op, "zero_prologues", ())),
                 tma_descriptors=tuple(op.tma_descriptors),
                 runtime_args=tuple(getattr(op, "runtime_args", ())),
+                serial=tuple(getattr(op, "serial", ())),
                 writes=node.buffer_names(),
                 indirect_args=tuple(getattr(op, "indirect_args", ())),
             )
@@ -243,10 +265,11 @@ def plan_from_graph(graph: Graph) -> ExecutionPlan:
     for nid, op in graph.loadable_constants():
         load_ops = _encode_load_ops(op.load_ops)
         generated = None
+        source_path = op.source_path
         if op.source_graph is not None:
             # A source-free deterministic record is a generated constant: evaluate it once on
-            # CPU and carry its compact bytes in the plan. Records with checkpoint/input leaves
-            # still require sources the plan grammar cannot express and remain unbindable.
+            # CPU and carry its compact bytes in the plan. A record with one checkpoint leaf binds
+            # from that leaf (below); any other record stays unbindable from the plan.
             from emmy.compiler.loader.binder import evaluate_source_graph  # noqa: PLC0415
 
             try:
@@ -256,12 +279,16 @@ def plan_from_graph(graph: Graph) -> ExecutionPlan:
             if value is not None:
                 value = np.ascontiguousarray(value)
                 generated = (value.dtype.str, tuple(int(d) for d in value.shape), value.tobytes())
+            elif (record := _encode_source_record(op.source_graph)) is not None and load_ops is not None:
+                # A record computed from ONE checkpoint tensor (a norm's folded ``1 + weight``) binds
+                # from that tensor, replaying the record as the first load op.
+                source_path, load_ops = record[0], (record[1], *load_ops)
             else:
-                logger.warning("plan: constant %r rides a bind record with unresolved leaves; weight will not rebind from a pack", nid)
+                logger.warning("plan: constant %r rides a bind record the plan cannot replay; it cannot bind from the plan", nid)
                 load_ops = None
         node = graph.nodes.get(nid)
         weights[nid] = WeightSpec(
-            source_path=op.source_path,
+            source_path=source_path,
             load_ops=load_ops,
             source_parts=tuple((p, tuple(int(d) for d in s)) for p, s in op.source_parts),
             generated=generated,
@@ -278,6 +305,9 @@ def plan_from_graph(graph: Graph) -> ExecutionPlan:
         launches=launches,
         kernels=kernels,
         weights=weights,
+        # The paging declaration rides the plan so the runtime knows which buffers have no
+        # slab; lowering already renamed their launch args to the table.
+        paged={n: (axis, page) for n, axis, page, _ in graph.hints.get("cuda.paged_buffers", ())},
         symbolic_bindings=graph.symbolic_bindings(),
         symbolic_hints=graph.symbolic_hints(),
         symbolic_caps={},
@@ -349,13 +379,43 @@ def _encode_index_map(op) -> tuple | None:
     return ("slice", tuple(spans))
 
 
+#: The name the one checkpoint leaf of a ``("record", …)`` load op is bound under. The record never
+#: carries the leaf's real path: that is the ``WeightSpec``'s own ``source_path``, which the plan
+#: template cache and the checkpoint loaders already rewrite per layer.
+_RECORD_SOURCE = "__record_source__"
+
+
+def _encode_source_record(record: Graph) -> tuple[str, tuple] | None:
+    """``(leaf path, ("record", (wire,)))`` for a ``ConstantOp.source_graph`` bind record with
+    exactly one checkpoint leaf, a single ``source_path`` read of a non-f8 value; ``None``
+    otherwise. Replaying the op evaluates the record with the assembled source as that leaf
+    (:func:`apply_weight_loads`). An f8 leaf is left out because the plan's loaders decide raw
+    bits or decoded values from the weight's ``graph_dtype``, the record output's dtype, not the
+    leaf's."""
+    import json  # noqa: PLC0415
+    from dataclasses import replace  # noqa: PLC0415
+
+    leaves = list(record.loadable_constants())
+    if len(leaves) != 1:
+        return None
+    nid, leaf = leaves[0]
+    if leaf.source_path is None or leaf.source_parts or leaf.source_graph is not None:
+        return None
+    if record.nodes[nid].output.dtype.name in ("f8e4m3", "f8e5m2"):
+        return None
+    slotted = type(record).from_wire(record.to_wire())
+    slotted.nodes[nid].op = replace(slotted.nodes[nid].op, source_path=_RECORD_SOURCE)
+    return leaf.source_path, ("record", (json.dumps(slotted.to_wire(), sort_keys=True),))
+
+
 def _encode_load_ops(load_ops: tuple) -> tuple[tuple, ...] | None:
     """Encode a ``ConstantOp.load_ops`` chain into the plan's vocabulary
-    (``("transpose", axes)`` / ``("reshape", shape)`` / ``("slice", spans)``), or ``None`` when a
+    (``("transpose", axes)`` / ``("reshape", shape)`` / ``("slice", spans)`` /
+    ``("reciprocal", ())``), or ``None`` when a
     chain member isn't expressible — the plan still runs (binding came from the live module), it
     just can't rebind that weight from a pack."""
     from emmy.compiler.ir.frontend.ir import ReshapeOp, TransposeOp  # noqa: PLC0415
-    from emmy.compiler.ir.tensor.ir import IndexMapOp  # noqa: PLC0415
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp  # noqa: PLC0415
 
     out: list[tuple] = []
     for op in load_ops:
@@ -365,6 +425,8 @@ def _encode_load_ops(load_ops: tuple) -> tuple[tuple, ...] | None:
             out.append(("reshape", tuple(op.shape)))
         elif isinstance(op, IndexMapOp) and (enc := _encode_index_map(op)) is not None:
             out.append(enc)
+        elif isinstance(op, ElementwiseOp) and op.name == "reciprocal":
+            out.append(("reciprocal", ()))
         else:
             logger.warning("plan: load op %r not expressible in the pack vocabulary; weight will not rebind from a pack", op)
             return None
@@ -384,6 +446,15 @@ def apply_weight_loads(source: np.ndarray, load_ops: tuple[tuple, ...]) -> np.nd
         elif kind == "slice":
             spans = [tuple(arg[i : i + 3]) for i in range(0, len(arg), 3)]
             a = a[tuple(slice(start, start + step * extent, step) for start, step, extent in spans)]
+        elif kind == "reciprocal" and not arg:
+            a = np.reciprocal(a)
+        elif kind == "record" and len(arg) == 1:
+            import json  # noqa: PLC0415
+
+            from emmy.compiler.graph import Graph  # noqa: PLC0415
+            from emmy.compiler.loader.binder import evaluate_source_graph  # noqa: PLC0415
+
+            a = evaluate_source_graph(Graph.from_wire(json.loads(arg[0])), {_RECORD_SOURCE: a})
         else:
             raise ValueError(f"apply_weight_loads: unknown load op kind {kind!r}")
     return np.ascontiguousarray(a)
@@ -458,11 +529,18 @@ def _dim_from_json(v) -> Dim:
 # ---------------------------------------------------------------------------
 
 
+def _paged_to_json(paged: dict[str, tuple[int, int]]) -> dict:
+    """Serialize the paging declaration: which axis a buffer is cut along and the page size."""
+    return {n: {"axis": axis, "page": page} for n, (axis, page) in paged.items()}
+
+
 def plan_to_dict(plan: ExecutionPlan) -> dict:
     has_generated = any(w.generated is not None for w in plan.weights.values())
     return {
         "format": (
-            PLAN_FORMAT_GENERATED
+            PLAN_FORMAT_PAGED
+            if plan.paged
+            else PLAN_FORMAT_GENERATED
             if has_generated
             else PLAN_FORMAT_INDIRECT
             if any(lc.indirect_args for lc in plan.launches)
@@ -489,6 +567,7 @@ def plan_to_dict(plan: ExecutionPlan) -> dict:
                 **({"writes": list(lc.writes)} if lc.writes else {}),
                 **({"indirect": [[a, t, s, sl] for a, t, s, sl in lc.indirect_args]} if lc.indirect_args else {}),
                 "runtime_args": list(lc.runtime_args),
+                **({"serial": [[name, extent] for name, extent in lc.serial]} if lc.serial else {}),
                 "cuda": {
                     "tma": [
                         {"name": t.name, "src_buf": t.src_buf, "box_extents": list(t.box_extents), "swizzle": t.swizzle}
@@ -503,9 +582,11 @@ def plan_to_dict(plan: ExecutionPlan) -> dict:
                 **({"source": spec.source} if spec.source is not None else {}),
                 **({"binary_key": spec.binary_key} if spec.binary_key is not None else {}),
                 "arch_specific": spec.arch_specific,
+                **({"dependent_launch": True} if spec.dependent_launch else {}),
             }
             for name, spec in plan.kernels.items()
         },
+        **({"paged": _paged_to_json(plan.paged)} if plan.paged else {}),
         "weights": {
             nid: {
                 **({"path": w.source_path} if w.source_path is not None else {}),
@@ -536,12 +617,12 @@ def plan_to_dict(plan: ExecutionPlan) -> dict:
 
 def plan_from_dict(d: dict) -> ExecutionPlan:
     fmt = d.get("format")
-    if fmt not in (PLAN_FORMAT_VERSION, PLAN_FORMAT_INDIRECT, PLAN_FORMAT_GENERATED):
-        raise ValueError(
-            f"plan format {fmt!r} unsupported (runtime speaks {PLAN_FORMAT_VERSION}, {PLAN_FORMAT_INDIRECT}, and {PLAN_FORMAT_GENERATED})"
-        )
+    if fmt not in (PLAN_FORMAT_VERSION, PLAN_FORMAT_INDIRECT, PLAN_FORMAT_GENERATED, PLAN_FORMAT_PAGED):
+        raise ValueError(f"plan format {fmt!r} unsupported (runtime speaks {PLAN_FORMAT_VERSION} through {PLAN_FORMAT_PAGED})")
     symbols = d.get("symbols", {})
+    paged = {n: (p["axis"], p["page"]) for n, p in d.get("paged", {}).items()}
     return ExecutionPlan(
+        paged=paged,
         backend=d["backend"],
         inputs=list(d["inputs"]),
         outputs=list(d["outputs"]),
@@ -573,6 +654,7 @@ def plan_from_dict(d: dict) -> ExecutionPlan:
                     for t in lc.get("cuda", {}).get("tma", ())
                 ),
                 runtime_args=tuple(lc.get("runtime_args", ())),
+                serial=tuple((name, int(extent)) for name, extent in lc.get("serial", ())),
             )
             for lc in d["launches"]
         ],
@@ -582,6 +664,7 @@ def plan_from_dict(d: dict) -> ExecutionPlan:
                 binary_key=spec.get("binary_key"),
                 # ``uses_tma`` is the key packs baked before the fp4 atom wrote; same meaning, narrower name.
                 arch_specific=bool(spec.get("arch_specific", spec.get("uses_tma", False))),
+                dependent_launch=bool(spec.get("dependent_launch", False)),
             )
             for name, spec in d.get("kernels", {}).items()
         },

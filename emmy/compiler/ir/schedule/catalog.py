@@ -44,8 +44,10 @@ as it is for the curated grids.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from emmy.compiler.ir.atom import ATOM_REGISTRY
 
@@ -211,6 +213,13 @@ def scalar_tile_moves() -> list[Tile]:
     return moves
 
 
+def map_tile_moves() -> list[Tile]:
+    """Return the finite pointwise-map tile domain: the per-cell form and the register strips that
+    hand one thread ``reg_n`` contiguous inner-axis elements. The strip runs one step past the
+    scalar-contraction ladder — a map holds no accumulator, so ``f8`` is a width its registers carry."""
+    return [Tile(), *(Tile(regs=(1, reg_n)) for reg_n in (2, 3, 4, 8))]
+
+
 # ``fn`` runs past ``fm``'s widest point because a register row is what covers an output axis a
 # single warp column has to span whole: attention's expectation tiles the value's head dim on N, and
 # at head_dim 256 the score's seam allows exactly one warp column there, so the 32 atoms are the only
@@ -220,9 +229,9 @@ _WARP_TILE_SPACE = Space(
     dims=(
         Dimension("wm", (1, 2, 4, 8, 16)),
         Dimension("wn", (1, 2, 4, 8, 16)),
-        Dimension("fm", (1, 2, 4, 8)),
+        Dimension("fm", (1, 2, 3, 4, 8)),
         Dimension("fn", (1, 2, 4, 8, 16, 32)),
-        Dimension("bk", (1, 2, 4, 8)),
+        Dimension("bk", (1, 2, 4, 8, 16, 32)),
     ),
     bounds=(
         Bound(("wm", "wn"), limit=MAX_BLOCK_THREADS, coeff=WARP_LANES),
@@ -245,8 +254,21 @@ def warp_tile_moves(atom_names: tuple[str, ...]) -> list[Tile]:
             )
             for point in _WARP_TILE_SPACE
             if point["fm"] * point["fn"] * atom.accumulator_registers_per_lane <= MAX_FRAGMENT_REGISTERS
+            and _chunk_in_catalog(atom, point["bk"])
         )
     return moves
+
+
+#: The widest K chunk a stage carries, in elements: what the 16-deep atoms reach at ``bk`` 8. A shallower atom (Volta's
+#: m8n8k4) takes more steps per chunk to reach it — at ``bk`` 8 its chunk is 32 elements, 64 B of an fp16 row, too
+#: short for the K-contiguous rows of a skinny GEMM to stream at DRAM rate.
+MAX_CHUNK_ELEMS = 128
+
+
+def _chunk_in_catalog(atom, bk: int) -> bool:
+    """Whether ``bk`` steps of ``atom`` make a chunk of the catalog: ``bk`` up to 8 for every atom, and deeper only while
+    the chunk stays within :data:`MAX_CHUNK_ELEMS`."""
+    return bk <= 8 or atom.atom_k * bk <= MAX_CHUNK_ELEMS
 
 
 def warp_tile_in_catalog(plan: Tile) -> bool:
@@ -256,6 +278,7 @@ def warp_tile_in_catalog(plan: Tile) -> bool:
     return (
         _WARP_TILE_SPACE.contains(point)
         and plan.regs[0] * plan.regs[1] * plan.atom.accumulator_registers_per_lane <= MAX_FRAGMENT_REGISTERS
+        and _chunk_in_catalog(plan.atom, plan.bk)
     )
 
 
@@ -263,25 +286,32 @@ def warp_tile_in_catalog(plan: Tile) -> bool:
 #: ``depth`` how many chunks that hop keeps in flight, ``reg_depth`` the smem→register
 #: double-buffer beneath it. Independent knobs over one pipeline, so the domain is their PRODUCT.
 STAGE_TRANSPORTS = ("smem", "smem-async", "smem-tma")
-STAGE_DEPTHS = (1, 2, 3, 4)
+STAGE_DEPTHS = (1, 2, 3, 4, 8)
 STAGE_REG_DEPTHS = (1, 2)
 
 
-def stage_moves(*, warp: bool, ctx=None) -> list[Stage]:
+def stage_moves(*, warp: bool, ctx) -> tuple[Stage, ...]:
     """Return the finite staging domain — every combination the hardware allows.
 
     Nothing here picks which pairings are worth trying: :meth:`Stage.available_on` drops the
     transports the card cannot issue, the resolvers cap what a shape cannot size (the smem budget,
     and a split blocking copy's one-chunk register ring), and measured evidence ranks what survives.
     ``reg_depth >= 2`` is the fragment ping-pong under the mma drain, so it is warp-tier only."""
+    return _available_stage_moves(warp, ctx.has_cp_async, ctx.has_tma)
+
+
+@functools.cache
+def _available_stage_moves(warp: bool, has_cp_async: bool, has_tma: bool) -> tuple[Stage, ...]:
+    """The catalog a card with these copy families issues — asked once per support, so kept."""
+    card = SimpleNamespace(has_cp_async=has_cp_async, has_tma=has_tma)
     reg_depths = STAGE_REG_DEPTHS if warp else (1,)
-    moves = [
+    moves = (
         Stage(depth=depth, transport=transport, reg_depth=reg_depth)
         for transport in STAGE_TRANSPORTS
         for depth in STAGE_DEPTHS
         for reg_depth in reg_depths
-    ]
-    return moves if ctx is None else [move for move in moves if move.available_on(ctx)]
+    )
+    return tuple(move for move in moves if move.available_on(card))
 
 
 def raster_moves() -> tuple[str, ...]:
@@ -296,17 +326,37 @@ def producer_band_moves() -> tuple[int, ...]:
 
 SPLITK_WIDTHS: tuple[int, ...] = (2, 4, 8, 16, 32, 64)
 
+#: The adjacent output columns a ``coop-t`` lane may own: 1, then the runs whose f16 weights read as one
+#: 4-, 8- or 16-byte vector load.
+COOP_T_COLUMNS: tuple[int, ...] = (1, 2, 4, 8)
+
+#: The adjacent reduce elements a ``coop`` lane may read per step (``coop/v<n>``): the runs whose f16
+#: operands read as one 4-, 8- or 16-byte vector load. Never offered by the catalog itself: the prior has
+#: no feature that tells a run from its plain band, so a run is taken only where a row or a pin names it.
+COOP_RUNS: tuple[int, ...] = (2, 4, 8)
+
+
+def coop_run_allowed(reduction: Reduce, catalog) -> bool:
+    """Whether ``reduction`` is a ``coop/v<n>`` band whose plain band ``catalog`` offers."""
+    plain = Reduce.of(coop=reduction.coop)
+    return not reduction.coop_transposed and reduction.reg == 1 and reduction.coop_columns in COOP_RUNS and plain in catalog
+
 
 def splitk_moves() -> list[Reduce]:
     """Return cross-CTA split choices for both supported finalization modes."""
     return [Reduce.of(cta=width, finalize=finalize) for width in SPLITK_WIDTHS for finalize in ("kernel", "atomic")]
 
 
-def coop_reduce_moves() -> list[Reduce]:
+def coop_reduce_moves(*, transposed_lanes: tuple[int, ...] = (32,)) -> list[Reduce]:
     """Return the finite cooperative and register reduction domain."""
     return [
         *(Reduce.of(coop=coop, reg=reg) for coop in (1, 4, 8, 16, 32, 64, 128, 256, 512) for reg in (1, 2, 4) if coop > 1 or reg > 1),
-        *(Reduce.of(coop=width, coop_transposed=True) for width in (32, 64, 128, 256)),
+        *(
+            Reduce.of(coop=width, coop_transposed=True, columns=columns, output_lanes=lanes)
+            for width in (32, 64, 128, 256, 512)
+            for lanes in transposed_lanes
+            for columns in COOP_T_COLUMNS
+        ),
     ]
 
 
@@ -322,6 +372,7 @@ __all__ = [
     "Space",
     "WARP_LANES",
     "coop_reduce_moves",
+    "coop_run_allowed",
     "producer_band_moves",
     "raster_moves",
     "scalar_tile_moves",

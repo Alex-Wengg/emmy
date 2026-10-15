@@ -20,26 +20,28 @@ pulled from the FX meta and fed into the op's `infer_output_shape` to
 stamp the output tensor.
 
 Tensor constructors whose receiver supplies only dtype/device metadata (`new_zeros`, `new_full`) lower from a scalar
-constant plus an explicit broadcast; the receiver's unrelated shape and values never become operands. Exported
-`copy_` is treated functionally as a destination-shaped broadcast/cast of its source. A static, unit-step slice/select
-chain rooted at a locally computed tensor additionally reassembles the updated base as a two-source `IndexMapOp`: the
-copied value supplies the written region and the previous base supplies the remainder. Rebinding the root's FX name
-versions sequential overlapping writes and later aliases built from that name; an empty write leaves that version
-unchanged. The written-region predicate starts from a boolean literal, so coordinate ternaries and the source select
-retain a boolean condition in vectorized reference evaluation and after Loop IR lifting. A write through an
-input/parameter, a dynamic or strided view, a used `copy_` return, or a view created
-before the write still fails closed; those forms need general alias versioning rather than this local functional
-update. `masked_fill` lowers to ternary `where(mask, fill, self)` so an unselected infinity is preserved
-instead of becoming NaN through arithmetic selection. `triu` and `tril` lower to two-source `IndexMapOp` regions over
-the last two axes: the selected triangular region reads the input and the complement reads a scalar zero. The
-diagonal must be a static integer; tensor-valued or symbolic diagonals fail closed instead of becoming broadcast
-elementwise operands.
+constant plus an explicit broadcast; the receiver's unrelated shape and values never become operands. `masked_fill`
+lowers to ternary `where(mask, fill, self)` so an unselected infinity is preserved instead of becoming NaN through
+arithmetic selection. `triu` and `tril` lower to two-source `IndexMapOp` regions over the last two axes: the selected
+triangular region reads the input and the complement reads a scalar zero. The diagonal must be a static integer;
+tensor-valued or symbolic diagonals fail closed instead of becoming broadcast elementwise operands.
 
-A static one-dimension `roll` and rank-reducing `select` lower directly to affine `IndexMapOp` regions. An exported
-`fill_` is functional through its returned value. If a later live read observes the written storage, a static unit-step
-slice/select chain rooted at a local value can also reassemble that base with the filled rectangle. Multidimensional
-roll, dynamic or strided views, input/parameter mutation, used mutation returns, and aliases created before the write
-fail closed.
+A static one-dimension `roll` and rank-reducing `select` lower directly to affine `IndexMapOp` regions.
+Multidimensional roll fails closed.
+
+The walker never sees an in-place op. Every export runs `run_decompositions({})`, one form whether or not the module
+writes anything: each write is functionalized, so later reads see the new value, a view made before the write
+included, and the empty table decomposes nothing but the view aliases (`chunk` arrives as `split`, `narrow` as
+`slice`, `reshape` and `flatten` as `view`, `expand_as` as `expand`, `to` as `_to_copy`) while inference `dropout`
+disappears; `linear`, `rms_norm`, `scaled_dot_product_attention`, `einsum` and `silu` keep their names. `chunk`,
+`split` and `split_with_sizes` share one handler driven by the FX output metadata. A write
+through a static unit-step slice or select arrives as `slice_scatter` / `select_scatter`, a two-source `IndexMapOp`
+whose region reads the source and whose remainder reads the base; functional `copy` is a broadcast and cast of its
+source, and `fill` a fill constructor. Other scatters (`index_put`, `scatter`, strided or diagonal views) fail. A
+graph has no write-back, so `trace_module` refuses a module that writes an input, parameter or buffer, read again or
+not. `trace_module_functional` traces one for a caller that writes the results back: each input's new value becomes a
+graph output after the module's own, and the second return value maps those outputs to their inputs. A write to a
+parameter or buffer is refused there too, as the caller cannot reach it.
 
 Static integer `arange` lowers to the zero-input tensor `RangeOp`, so constant-source replay evaluates one sequence
 instead of applying NumPy `arange` elementwise to a broadcast stop. Dynamic and non-integer ranges fail closed.
@@ -49,9 +51,10 @@ diagonal and a typed scalar zero everywhere else. Square and rectangular dimensi
 the exported tensor metadata. Dynamic dimensions, non-strided layouts, pinned memory, and unsupported overloads or
 constructor options fail closed rather than being stored as an elementwise operation without coordinate semantics.
 
-An explicit all-zero `aten.pad` width tuple stays as a unary `ElementwiseOp("pad")` identity so a working golden
-retains the frontend provenance and exact dtype. Any nonzero, symbolic, or otherwise unrepresented padding fails
-closed: the elementwise form has no coordinate, mode, or fill-value fields and cannot describe a changed tensor.
+Constant zero-fill `aten.pad` lowers to a two-source `IndexMapOp`: shifted input coordinates inside the original
+extent and a typed zero outside. Inactive input coordinates are clamped before selection because reference
+backends may evaluate both sources. Negative widths crop through the same map; an empty input uses only the zero
+source. All-zero widths alias the input. Symbolic widths, other modes and nonzero fill values fail explicitly.
 
 The default `aten.cumsum` overload with a static integer axis lowers to an additive `ScanOp`, preserving the input
 shape and dtype. Dynamic axes, dtype overrides, and unsupported overloads or keyword arguments fail closed.
@@ -74,6 +77,11 @@ by both reference backends and the decomposition's scale constant. Gemma-nano (E
 the scaling — so dropping the kwarg re-scaled every logit by `1/sqrt(d)` and redistributed the whole softmax.
 
 ### `huggingface.py` — trace-friendly wrapper
+
+`build_gdn_state_wrapper` exposes a linear-attention block as `(x, state, history) -> (y, next_state, next_history)`.
+The recurrent matrix is FP32 and history uses the projected activation dtype. Zero states start or reset a request;
+batch rows are independent. History is cloned before the installed Hugging Face forward can update it in place,
+so callers retain both inputs. Static prefill and decode programs share this explicit state contract.
 
 HuggingFace `CausalLM` models build their causal attention mask
 dynamically at forward time (`arange` → `cumsum` → `triu` → `eq` …),
@@ -104,6 +112,8 @@ an `AutoModel` trunk yields hidden states instead of logits (the serving plugin'
   concrete `(cos, sin)` kwargs — those specialise rotary to the trace seq_len, which is exactly what dynamic mode must
   avoid. Forward arg is named `x`, so the CLI spec is `--dynamic seq_len@x:1`
   (`tests/compiler/ir/test_dynamic_shapes.py::test_qwen_layer_dynamic_compiles_and_matches_eager`).
+  An attention whose `forward` takes `position_ids` (Ministral 3 scales its queries by position) gets them the same
+  way: a position buffer sliced by `x.shape[1]`, as the static trace passes them as a concrete kwarg.
   Gemma-nano PLE blocks (those exposing `hidden_size_per_layer_input`) additionally get a seeded synthetic
   `per_layer_input` (`build_synthetic_ple`) — the dynamic wrapper registers it as a buffer sliced in-graph like
   cos/sin, and the static single-layer trace (`commands/compile.py`) passes the same buffer as a concrete kwarg
@@ -178,7 +188,13 @@ an `AutoModel` trunk yields hidden states instead of logits (the serving plugin'
   above, up clamped on both sides, then SwiGLU and the down projection); OLMoE has no limit and is unchanged.
   Config-only selected-layer tracing replaces routing with one representative routed expert before materialization.
   DeepSeek V4 requires that replacement to be confirmed and preserves the same clamp. Missing the replacement fails
-  closed.
+  closed. A shared expert keeps its per-token sigmoid gate (`shared_expert_gate`, the Qwen-MoE form).
+
+  The decoder stack a selected layer indexes is the module that owns `layers`, `rotary_emb` and `config`
+  (`find_text_decoder`). A vision-language wrapper nests its text decoder, so the deepest one is taken. A model that
+  holds several stacks, neither inside the other, is refused: Qwen3-Omni carries a thinker, a talker, a code predictor
+  and a codec transformer. `emmy trace --decoder PATH` names one by its dotted module path (`talker.model`). A wrapper
+  Transformers registers only as a multimodal LM builds from its config like an image-text-to-text one.
 
   A DeepSeek V4 block (`hyper_connection_seam(block)` is not `None`: it carries `attn_hc` / `ffn_hc`) takes the
   **attention-sublayer seam** instead of the q/k/v one, because the 1Cat vLLM fork's paged MLA attention owns the
@@ -199,14 +215,19 @@ an `AutoModel` trunk yields hidden states instead of logits (the serving plugin'
 
 - `load_quantized_split(model_dir, dtype) → (model, expert_store)` is the shard-streamed serving load of a
   quantized MoE checkpoint. The twin builds from config on the meta device (weights never read at trace; the
-  experts' would-be initialization never materializes), while the dense trunk streams per shard as real values and
-  attaches via `load_state_dict(assign=True)`. Expert tensors collect into a per-layer store keyed by the expert
+  experts' would-be initialization never materializes), while the dense trunk streams per shard as real values in the
+  requested dtype (a router's `e_score_correction_bias` stays float32, as `from_pretrained` keeps it) and attaches via
+  `load_state_dict(assign=True)`. Expert tensors collect into a per-layer store keyed by the expert
   program's input names: FP8 weights remain raw bits with f32 scales, and native-MXFP4 gpt-oss weights remain uint8
   blocks with uint8 E8M0 scales; biases stay in the requested value dtype. An NVFP4 dense-trunk weight streams as
   values: the loader dequantizes each packed trio (`<key>` + `<key>_scale` + `<key>_scale_2`) on read and consumes the
-  scale siblings. A packed NVFP4 EXPERT weight raises `NotImplementedError` — the expert lane has no packed-trio
-  decode. `expert_range=(lo, hi)` narrows the read to one tensor-parallel rank's expert shard, re-indexed
-  rank-locally, so a rank never reads bytes it does not own.
+  scale siblings. A packed int4 dense-trunk weight (AWQ, GPTQ, compressed-tensors `pack-quantized`) streams the same
+  way, dequantized from its packed codes, zero points and scales under the sibling names its own layout spells
+  (`qweight` / `qzeros` / `scales`, or `weight_packed` / `weight_zero_point` / `weight_scale`); a bfloat16 scale
+  is widened to float32 for the decode. A packed NVFP4 EXPERT weight raises `NotImplementedError` — the expert lane
+  has no packed-trio decode. `expert_slice=(rank, world)` keeps one tensor-parallel rank's slice of every per-expert
+  tensor along the intermediate axis (gate/up rows, down block columns) and re-declares the twin's experts at the sliced
+  shapes (`slice_routed_experts`), so the store, the twin and the serving-twin capture agree.
   The twin's config must resolve to Transformers' OWN class for the architecture: a hosting process can re-register
   the model type onto its own minimal config class (vLLM's config parser does, process-wide), which drops every field
   the real `__init__` derives — DeepSeek V4 loses `layer_types` — so when a same-named native class exists, the
@@ -224,6 +245,12 @@ an `AutoModel` trunk yields hidden states instead of logits (the serving plugin'
   upstream's own `rename_source_key`, rather than hand-writing one family's rule. Pre-existing loads are unchanged not
   because unmapped families exist but because the mappings they do carry — four legacy `LayerNorm.gamma`/`weight_g`
   renames attach to every model — match no modern checkpoint key.
+  The reverse direction, which re-addresses a traced constant to its checkpoint key, runs the inverse renamings in
+  reverse order. Upstream applies every matching renaming in turn, so a key can pass through a chain (Mistral 3:
+  `language_model.model.` → `language_model.` → `model.language_model.`), and inverses applied in forward order stop
+  halfway: every weight then misses its checkpoint key and silently stays unquantized. A family Transformers
+  registers only as image-text-to-text (Mistral 3) is built as that whole model; its decoder is found as in a causal
+  LM.
 
   The NATIVE translation runs first, since the family one matches on module-namespace names. A checkpoint published in
   its own namespace is translated by `_native_checkpoint_renamer`, which reuses the renaming Transformers itself
@@ -285,12 +312,12 @@ an `AutoModel` trunk yields hidden states instead of logits (the serving plugin'
   outside the band and both reference backends (`SdpaOp.forward`, `backend/torch_ref.py`) compute the band.
   `commands/compile.py` calls it after every model/layer `trace_module`.
 
-`torch.py` converts only FX nodes observable through the exported value output. FX's stock dead-code elimination
-deliberately retains every mutating ATen schema as impure, including mutations of local tensors whose values never
-escape the function. Reverse reachability removes those local branches; ATen schema aliases additionally retain a
-write through a view of a returned tensor. An unsupported operation on an observable path remains live and fails
-loudly, so the filter is not an operator-support fallback. Retaining a write does not itself functionalize storage:
-`copy_` and `fill_` handle the bounded local view forms above and separately reject aliases that cannot be versioned.
+`torch.py` converts only FX nodes observable through the exported value output, by reverse reachability; once every
+write is functionalized, no node reaches the output except through its values. An unsupported operation on an
+observable path remains live and fails loudly, so the filter is not an operator-support fallback. An ATen operation
+with no handler becomes an `ElementwiseOp` of the same name only when that name is an elementwise function (one
+registered in `ir/elementwise.py`, or a numpy ufunc); any other name fails at trace time, so a whole-array numpy
+function such as `flip` never reaches a reference backend as an elementwise op.
 
 `SliceOp` nodes record `dim`/`start` as **op fields** at trace time (`torch.py`'s slice handler reads the raw FX
 args): the legacy constant-input convention can't represent a `None` start (`x[:, :s]`) or a SymInt end —
@@ -311,14 +338,13 @@ shared with CausalLM traces.
 
 ## Entry points
 
-- CLI model/IR/code loading: `commands.compile.load_or_trace` is shared by `trace`, `compile`, `run`, and `tune`, so
+- CLI model/IR/code loading: `commands.compile.load_or_trace` is shared by `trace`, `compile` and `run`, so
   adapters, dynamic shapes, quantized checkpoint reconstruction, and the guarded remote-code fallback cannot drift.
 - Working-golden inventory generation is downstream compiler/search behavior, not frontend capture behavior:
-  `compiler.pipeline.search.working_golden.write_trace_inventory` lowers the captured graph through fusion, enumerates
-  every fold-aware kernel occurrence, and embeds the complete stable Torch IR program once in the golden YAML. Each
-  target is selected by unique frontend origins when possible; an empty or ambiguous selector stores the standalone
-  post-fusion Loop IR slice instead. The smaller provenance tuning reproducer is derived in memory when the working
-  file is loaded. Quantized model traces also embed the digest of their exact checkpoint declaration. Frontend nodes
+  `compiler.pipeline.search.golden.write_trace_inventory` lowers the captured graph through fusion, enumerates
+  every fold-aware kernel occurrence, and embeds the complete stable Torch IR program once in the golden file. Each
+  target stores its kernel's standalone post-fusion Loop IR, with the frontend origins it computes whole as
+  provenance. Quantized model traces also embed the digest of their exact checkpoint declaration. Frontend nodes
   carrying the generic `trace.materialize` hint become auxiliary outputs only in the inventory copy. Maximal fusion
   retains that storage value as a live output in one frontend target; placement then enumerates its materialized cut
   without changing an ordinary model call.
@@ -326,6 +352,7 @@ shared with CausalLM traces.
 - Whole-model trace: `trace_module(build_full_model_wrapper(model, …), (input_ids,))`.
 - Single-layer trace: `trace_module(model.model.layers[N], (x,), kwargs={…})` (static); with `--dynamic`,
   `trace_module(build_layer_wrapper(block, …), (x,), dynamic_shapes={"x": {1: Dim("seq_len")}})`.
+- `torch.compile(model, backend="emmy", dynamic=False)` (`emmy/dynamo.py`): `trace_module_functional` on each graph.
 - Inline expression: `graph_from_code("torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))")` (used by every compiler CLI).
 - DiT block: `trace_dit_model("facebook/DiT-XL-2-256", 0)` (fixed FP16 block workload).
 

@@ -2,7 +2,8 @@
 
 import json
 import pickle
-from dataclasses import FrozenInstanceError
+import random
+from dataclasses import FrozenInstanceError, replace
 from itertools import permutations
 
 import pytest
@@ -49,8 +50,8 @@ from emmy.compiler.ir.schedule.classic.sites import _select
 from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
 from emmy.compiler.ir.tile import OutputSpec, TileOp
 from emmy.compiler.pipeline.fork import DeferredFork, iter_leaves, schedule_forks
-from emmy.compiler.pipeline.passes.lowering.tile._fromloop import fold_from_loop
-from tests.compiler.helpers import classic_cartesian_schedules, enumerate_classic_reference, literal_classic_context
+from emmy.compiler.pipeline.passes.tile._fromloop import fold_from_loop
+from tests.compiler.helpers import case_target_tile, classic_cartesian_schedules, enumerate_classic_reference, literal_classic_context
 from tests.compiler.terms import contraction, projection
 
 _K = Axis("k", 8)
@@ -97,6 +98,99 @@ def _direct(context: ClassicScheduleContext) -> ClassicSchedule:
 
 def _reduce_sites(tile: TileOp) -> tuple[int, ...]:
     return tuple(site for site, view in enumerate(tile.views) if view.axis is not None)
+
+
+@pytest.mark.parametrize("free_order", list(permutations(("head", "row", "channel"))))
+def test_contraction_tiles_the_contiguous_output_axis_across_grid_orders(free_order):
+    from emmy.compiler.ir.schedule.classic.materialize import materialize_classic
+    from emmy.compiler.ir.tile.ops import sched_of
+
+    axes = {name: Axis(name, extent) for name, extent in (("head", 4), ("row", 64), ("channel", 256))}
+    root = contraction(
+        _K,
+        Load("a", "a", (Var("row"), Var("k"))),
+        (Load("b", "b", (Var("head"), Var("channel"), Var("k"))), "acc"),
+    )
+    tile = TileOp(
+        op=root,
+        place=Placement(free=tuple(axes[name] for name in free_order), grid=tuple(axes[name] for name in free_order), mapped=True),
+        axes=(*axes.values(), _K),
+        output_specs=(OutputSpec(Write("out", (Var("head"), Var("row"), Var("channel")), "acc")),),
+        outputs={"out": Tensor("out", (4, 64, 256))},
+    )
+    assert {axis.name for axis in sched_of(tile)._mn_for(tile.op)} == {"row", "channel"}
+    target = Context.from_target((7, 0))
+    context = ClassicScheduleContext(tile, target)
+    direct = _direct(context)
+    site = context.tile_op.node_sites[0]
+    schedule = Schedule(
+        KernelSchedule(Work.parse("t8x8"), Raster()),
+        {**direct.nodes, site: ReductionSchedule(Tile(units=(8, 8)), Reduce())},
+        direct.edges,
+    )
+    result = materialize_classic(
+        tile, name="layout", knobs=ClassicScheduleCodec(context).encode(schedule), target=target, schedule=schedule
+    )
+    assert result.outputs == tile.outputs
+    assert {axis.name for axis in result.materialization.tiles[site].axes} == {"row", "channel"}
+    graph = Graph()
+    graph.add_node(InputOp(), [], Tensor("a", (64, 8)), node_id="a")
+    graph.add_node(InputOp(), [], Tensor("b", (4, 256, 8)), node_id="b")
+    graph.add_node(result, ["a", "b"], tile.outputs["out"], node_id="out")
+    restored = Graph.from_dict(json.loads(json.dumps(graph.to_dict(), default=str))).nodes["out"].op
+    assert restored.outputs == result.outputs
+    assert restored.materialization == result.materialization
+
+
+@pytest.mark.parametrize("free_order", list(permutations(range(3))))
+@pytest.mark.parametrize("projected", [False, True])
+def test_attention_score_tiles_its_consumers_row_across_grid_orders(free_order, projected):
+    from emmy.compiler.ir.kernel.ir import MmaSyncPtx
+    from emmy.compiler.ir.schedule.classic.materialize import materialize_classic
+    from emmy.compiler.ir.tile.ops import sched_of
+    from emmy.compiler.pipeline.passes.lowering.kernel._factor import factorize
+
+    tile = case_target_tile("attention/sdpa-hd128-softmax-v-mma.json")
+    if projected:
+        tile = replace(
+            tile,
+            op=projection((tile.op,), (Assign("projected", "copy", tile.op.exposes, dtype="f16"),)),
+            output_specs=tuple(replace(spec, write=Write(spec.write.output, spec.write.index, "projected")) for spec in tile.output_specs),
+        )
+    _, row, channel = tile.place.free
+    free = tuple(tile.place.free[index] for index in free_order)
+    tile = replace(tile, place=Placement(free=free, grid=free, mapped=True))
+    carrier = next(site.node for site in tile.sites if site.node.chunked())
+    score = carrier.operands[0]
+    geometry = sched_of(tile)
+    assert geometry._mn_for(carrier) == (row, channel)
+    assert geometry._mn_for(score) == (row, tile.axis_of(carrier.axis))
+
+    target = Context.from_target((12, 0))
+    context = ClassicScheduleContext(tile, target)
+    assert "mma_m16n8k16_f16_f32" in ClassicProblem(tile, target).atoms_of(tile.node_id(carrier))
+    codec = ClassicScheduleCodec(context)
+    knobs = codec.encode(_direct(context))
+    knobs["WORK"] = "w4x1"
+    for node, fragment in ((carrier, "f1x16"), (score, "f1x8")):
+        path = geometry.site_of(node).path
+        knobs[f"TILE@{path}"] = f"mma_m16n8k16_f16_f32/{fragment}/k4"
+        knobs[f"STAGE@{path}"] = "d2/smem-async"
+    schedule = codec.decode(knobs)
+    scheduled = materialize_classic(tile, name=tile.name, knobs=knobs, target=target, schedule=schedule)
+    body = Body((factorize(scheduled, None),))
+    assert list(body.iter_of_type(MmaSyncPtx))
+
+
+def test_attention_statistic_projection_has_no_expectation_fragment() -> None:
+    tile = case_target_tile("attention/sdpa-hd128-softmax-v-mma.json")
+    carrier = next(site.node for site in tile.sites if site.node.chunked())
+    tile = replace(
+        tile,
+        op=projection((carrier,), (Assign("statistic", "copy", (carrier.exposes[1],), dtype="f16"),)),
+        output_specs=tuple(replace(spec, write=Write(spec.write.output, spec.write.index, "statistic")) for spec in tile.output_specs),
+    )
+    assert not ClassicProblem(tile, Context.from_target((12, 0))).atoms_of(tile.node_id(carrier))
 
 
 def test_shared_node_has_one_site_and_each_use_has_an_edge() -> None:
@@ -251,6 +345,79 @@ def test_site_factors_do_not_depend_on_the_prefix() -> None:
     assert advanced.problem.node_site(last).nodes == before
 
 
+def test_a_draw_derives_the_supports_it_touches_and_never_a_site() -> None:
+    """A random descent costs the picks it tries: the step draws a node choice among those the site admits
+    under the prefix's relation, then a transport among that choice's supports, so supports are derived for the
+    choices the draw touched and for no other. The walk reads the same per-choice supports, so the two agree."""
+    problem = _problem(_contraction())
+    offers = ClassicProblem(*problem)
+    site = max(offers.node_sites, key=lambda candidate: len(candidate.nodes))
+    order = (site.id, *(other for other in offers.tile.node_sites if other != site.id))
+    context = ClassicScheduleContext(*problem, offers, order=order)
+    assert len(site.choices) > 4
+
+    stepped = context.random_step(random.Random(0))
+
+    assert stepped is not None and stepped.schedule.nodes[site.id] in site.node_set
+    pick = Schedule(None, {site.id: stepped.schedule.nodes[site.id]}, dict(stepped.schedule.edges))
+    derived = [choice for choice in site.choices if "supports" in choice.__dict__]
+    assert 0 < len(derived) < len(site.choices)
+    walked = {_schedule_signature(extension) for extension in context.extensions()}
+    assert _schedule_signature(pick) in walked
+    assert all("supports" in choice.__dict__ for choice in site.compatible(context._site_relation(site.id)))
+
+
+def test_a_composed_draw_is_the_extended_pick() -> None:
+    """``random_step`` composes a drawn node support without ``extend``'s re-check, so every step it takes must be
+    one ``extend`` accepts and composes to the same context, down to a complete schedule."""
+    problem = _problem(_contraction())
+    offers = ClassicProblem(*problem)
+    for seed in range(8):
+        rng = random.Random(seed)
+        context = ClassicScheduleContext(*problem, offers)
+        while context is not None and context.schedule.kernel is None:
+            stepped = context.random_step(rng)
+            if stepped is not None and stepped.schedule.kernel is None:
+                site = context.next_site
+                edges = {edge: stepped.schedule.edges[edge] for edge in context.incident_edges(site)}
+                extended = context.extend(Schedule(None, {site: stepped.schedule.nodes[site]}, edges))
+                assert stepped.schedule == extended.schedule
+                assert (stepped.position, stepped._relation) == (extended.position, extended._relation)
+            context = stepped
+
+
+def test_a_choice_claims_only_what_every_support_of_it_claims() -> None:
+    """The tile-level filter is sound. A choice's inventory and axis claims are each of its supports' own, and its
+    seam claims are a subset of each support's — a support adds its transport's K slab at an ordinary seam and
+    nothing else — so a choice the relation refuses has no support the relation admits, and the lazy frontier at a
+    site under a prefix is the brute-force filter of every support through the full rule. Checked on attention,
+    whose carrier's chunk need and score's offer are the seam claims that matter."""
+    tile = case_target_tile("attention/sdpa-hd128-causal-mask-mma.json")
+    target = Context.from_target((12, 0))
+    offers = ClassicProblem(tile, target)
+    seams = 0
+    for site in offers.node_sites:
+        for choice in site.choices[::7]:
+            seams += bool(choice.fragments)
+            for support in choice.supports:
+                assert (support.work, support.axes) == (choice.work, choice.axes)
+                assert set(choice.fragments) <= set(support.fragments)
+    assert seams
+
+    for seed in range(16):  # a prefix that claimed an inventory, with a site still to decide
+        advanced = ClassicScheduleContext(tile, target, offers)
+        while advanced.work is None and not advanced.nodes_complete:
+            advanced = advanced.random_step(random.Random(seed))
+        if advanced.work is not None and not advanced.nodes_complete:
+            break
+    site = offers.node_site(advanced.next_site)
+    relation = advanced._site_relation(site.id)
+    sampled = site.choices[::4]
+    brute = {id(support) for choice in sampled for support in choice.supports if site.refusal(support, relation) is None}
+    nodes = {choice.node for choice in sampled}
+    assert {id(support) for support in site.frontier(relation) if support.node in nodes} == brute
+
+
 def test_context_indexes_finite_domain_membership(monkeypatch) -> None:
     problem = _problem(_contraction())
     factors = _finite_factors(problem)
@@ -283,7 +450,7 @@ def test_reference_is_the_compatible_cartesian_subset() -> None:
     assert {_schedule_signature(schedule) for schedule, verdict in schedules if verdict} == {
         _schedule_signature(schedule) for schedule in enumerate_classic_reference(context)
     }
-    assert len(schedules) == context.problem.bounds[0] == 24
+    assert len(schedules) == context.problem.bound == 24
 
 
 def test_every_lazy_traversal_equals_the_cartesian_reference() -> None:
@@ -330,10 +497,12 @@ def test_context_rejects_incomplete_or_duplicate_composition_orders() -> None:
         ClassicScheduleContext(*problem, order=(site, site))
 
 
-def test_an_authored_tile_bypasses_enumeration_precision_policy() -> None:
+def test_a_hand_pinned_tile_bypasses_the_precision_policy_and_a_followed_row_does_not() -> None:
     """The precision policy filters the CATALOG: with f16 accumulation disallowed the site offers no
-    f16-accumulate atom. A row naming such a tile is an authored, legal independent choice and the
-    site offers exactly it — the policy is a property of unpinned enumeration, never of a parse."""
+    f16-accumulate atom. A hand pin naming such a tile is an authored choice and the site offers exactly
+    it. A row the compile FOLLOWS — measured evidence, a golden row's replay — is not: the standard lane
+    of the Gemma 4 serving golden carried FP16-accumulate rows, and a strict boot deployed them as if
+    the user had pinned the fast-math tile."""
     root = _contraction()
     m, n = Axis("m", 8), Axis("n", 8)
     source = TileOp(
@@ -346,24 +515,61 @@ def test_an_authored_tile_bypasses_enumeration_precision_policy() -> None:
     target = Context.from_target((12, 0))
     site = source.node_sites[0]
     tile = Tile(atom=ATOM_REGISTRY["mma_m16n8k16_f16_f16"], units=(1, 4), regs=(2, 2))
+    row = {"WORK": "w1x4", "TILE": tile.spell()}
 
     policy_only = ClassicProblem(source, target, allow_f16_accumulate=False)
     offered = policy_only.node_site(site).nodes
     assert offered and all(not (choice.tile.is_warp and choice.tile.atom.operand_dtype("c").nbytes == 2) for choice in offered)
 
-    authored = policy_only.with_row({"WORK": "w1x4", "TILE": tile.spell()}, strict=True)
-    assert [choice.tile for choice in authored.node_site(site).nodes] == [tile]
-    schedule = next(iter(_enumerate_context(ClassicScheduleContext(source, target, authored))))
+    pinned = ClassicProblem(source, target, row=row, allow_f16_accumulate=False)
+    assert [choice.tile for choice in pinned.node_site(site).nodes] == [tile]
+    schedule = next(iter(_enumerate_context(ClassicScheduleContext(source, target, pinned))))
     assert schedule.nodes[site].tile == tile
+
+    assert policy_only.with_row(row, strict=True).node_site(site).nodes == ()
+    assert all(choice.tile != tile for choice in policy_only.with_row(row).node_site(site).nodes)
+
+
+def test_a_row_narrows_within_a_pin_and_never_lifts_it() -> None:
+    """An evidence descent installs a recorded row over the problem the environment pinned. The pin is a
+    restriction the row narrows within: where the two disagree the site keeps the pin's value, so no leaf
+    equals the record and the caller re-decides. It used to take the record's — measured while
+    hand-recording a fast-math row beside a standard receipt of the same kernel, where ``EMMY_KNOBS`` named
+    the f16-accumulate tile and the compile deployed the receipt's f32-accumulate one."""
+    root = _contraction()
+    m, n = Axis("m", 8), Axis("n", 8)
+    source = TileOp(
+        op=root,
+        place=Placement(free=(m, n)),
+        axes=(m, n, Axis("k", 16)),
+        inputs={"a": Tensor("a", (8, 16), "f16"), "b": Tensor("b", (16, 8), "f16")},
+        outputs={"out": Tensor("out", (8, 8), "f16")},
+    )
+    target = Context.from_target((12, 0))
+    site = source.node_sites[0]
+    pinned = Tile(atom=ATOM_REGISTRY["mma_m16n8k16_f16_f16"], units=(1, 4), regs=(2, 2))
+    recorded = Tile(atom=ATOM_REGISTRY["mma_m16n8k16_f16_f32"], units=(1, 4), regs=(2, 2))
+
+    problem = ClassicProblem(source, target, row={"WORK": "w1x4", "TILE": pinned.spell()}, allow_f16_accumulate=True)
+    narrowed = problem.with_row({"WORK": "w1x4", "TILE": recorded.spell()})
+    assert [choice.tile for choice in narrowed.node_site(site).nodes] == [pinned]
 
 
 def test_strict_row_does_not_make_inherited_peer_pins_strict() -> None:
     problem = ClassicProblem(*_problem(_contraction()), validate_pins=False)
     tolerated = problem.with_row({"WORK": "not-a-work"})
 
-    assert tolerated.kernel_site.options
-    assert not problem.with_row({"WORK": "not-a-work"}, strict=True).kernel_site.options
-    assert tolerated.with_row({"RASTER": ""}, strict=True).kernel_site.options
+    assert tolerated.kernel_site.kernels
+    assert not problem.with_row({"WORK": "not-a-work"}, strict=True).kernel_site.kernels
+    assert tolerated.with_row({"RASTER": ""}, strict=True).kernel_site.kernels
+
+
+def test_narrowing_row_cannot_override_existing_hand_pins() -> None:
+    problem = ClassicProblem(*_problem(_contraction()), row={"WORK": "t16x8", "RASTER": ""})
+
+    narrowed = problem.with_row({"WORK": "t32x8", "RASTER": "gn2", "TILE": "f4x6"})
+
+    assert narrowed.row == {"WORK": "t16x8", "RASTER": "", "TILE": "f4x6"}
 
 
 def test_exact_row_rejects_before_walking_a_catalog() -> None:
@@ -466,7 +672,9 @@ def test_codec_rejects_a_noncanonical_value_spelling() -> None:
 
 
 def test_context_enforces_kernel_resource_and_producer_band_invariants() -> None:
-    context = ClassicScheduleContext(*_problem(_contraction()))
+    tile, target = _problem(_contraction())
+    tile = replace(tile, inputs={name: Tensor(name, (8, 8), "f16") for name in ("a", "b")})
+    context = ClassicScheduleContext(tile, target)
     direct = _direct(context)
     site = context.tile_op.node_sites[0]
     atom = ATOM_REGISTRY["mma_m16n8k16_f16_f32"]
@@ -559,7 +767,7 @@ def test_generic_fork_adapter_drives_a_schedule_context_lazily() -> None:
     )
 
     assert forks and not accepted
-    assert forks[0].pool_bound == 1 and forks[0].pool_descent_bound == 2  # the bounds read off the problem, lazily
+    assert forks[0].pool_bound == 1  # the bound read off the problem, lazily
     assert tuple(iter_leaves(forks))
     assert accepted
 

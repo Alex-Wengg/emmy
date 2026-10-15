@@ -2,30 +2,37 @@
 
 from dataclasses import replace as dc_replace
 from importlib import import_module
+from types import SimpleNamespace
+
+import pytest
 
 from emmy.compiler.context import Context
+from emmy.compiler.dtype import F16, F32
 from emmy.compiler.graph import Tensor
 from emmy.compiler.ir.axis import Axis, Window
+from emmy.compiler.ir.elementwise import ElementwiseImpl
 from emmy.compiler.ir.expr import Var
 from emmy.compiler.ir.schedule import Reduce, ScheduleContext, ScheduleRefused, Stage, Tile, Work
 from emmy.compiler.ir.schedule import schedule as advance_schedule
 from emmy.compiler.ir.schedule.catalog import coop_reduce_moves, scalar_tile_moves
 from emmy.compiler.ir.schedule.classic import (
+    ClassicKernelSite,
     ClassicProblem,
     ClassicScheduleCodec,
     ClassicScheduleContext,
     ReductionSchedule,
 )
 from emmy.compiler.ir.schedule.classic import refusals as classic
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop
-from emmy.compiler.ir.tile import Placement, TileOp
+from emmy.compiler.ir.schedule.classic.schedule import output_sweep_works, packed_works
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
+from emmy.compiler.ir.tile import OutputSpec, Placement, TileOp
 from emmy.compiler.ir.tile.ops import carries_partition
 from emmy.compiler.pipeline.fork import iter_leaves
-from emmy.compiler.pipeline.passes.lowering.tile._fromloop import fold_from_loop
-from tests.compiler.helpers import enumerate_classic_reference
-from tests.compiler.terms import contraction, projection
+from emmy.compiler.pipeline.passes.tile._fromloop import fold_from_loop
+from tests.compiler.helpers import enumerate_classic_reference, requires_cuda
+from tests.compiler.terms import contraction, projection, reduction, slab
 
-classic_forks = import_module("emmy.compiler.pipeline.passes.lowering.tile.040_schedule").classic_forks
+classic_forks = import_module("emmy.compiler.pipeline.passes.tile.schedule.040_schedule").classic_forks
 
 
 def _signature(codec, schedule) -> tuple[tuple[str, str], ...]:
@@ -86,6 +93,33 @@ def _pointwise() -> TileOp:
     return TileOp(op=root, place=Placement(free=(n,)), axes=(n,))
 
 
+def _sweep_tile(*sweeps: tuple[Axis, ...]):
+    specs = tuple(OutputSpec(Write(output=f"out{i}", index=(), value=f"v{i}"), sweep=sweep) for i, sweep in enumerate(sweeps))
+    return SimpleNamespace(family_sites={"TILE": (), "REDUCE": (0,)}, output_specs=specs)
+
+
+def _sweep_work(*sweeps: tuple[Axis, ...]) -> set[str]:
+    """Kernel-level WORK offers for serial reductions with the given output sweeps."""
+    tile = _sweep_tile(*sweeps)
+    return {work.spell() for work in ClassicKernelSite(SimpleNamespace(tile=tile))._sweep_widths()}
+
+
+def test_disjoint_output_sweeps_offer_worker_widths() -> None:
+    """Sibling output loops can share one lane width without sharing an axis."""
+    assert "t128" in _sweep_work((Axis("n", 16),), (Axis("p", 32),))
+
+
+def test_a_scalar_output_suppresses_sweep_worker_widths() -> None:
+    """A scalar sibling would be repeated by lanes, so mixed outputs stay serial."""
+    assert _sweep_work((Axis("n", 16),), ()) == set()
+
+
+def test_a_node_owned_inventory_suppresses_sweep_worker_widths() -> None:
+    """A cooperating node's inventory must compose through the ordinary equality relation."""
+    tile = _sweep_tile((Axis("n", 16),), (Axis("p", 32),))
+    assert not output_sweep_works(tile, Work.parse("t128"))
+
+
 def _row_sum(k: Axis, n: Axis) -> TileOp:
     """``acc[n] = Σ_k x[k]`` — one reduction site over the kernel's ``k``."""
     root = fold_from_loop(
@@ -101,6 +135,161 @@ def _matmul(m: Axis, n: Axis, k: Axis, a=None, **fields) -> TileOp:
     return TileOp(op=root, place=Placement(free=(m, n)), axes=(m, n, k), **fields)
 
 
+def test_eight_output_lanes_are_offered_on_volta_and_lower_with_their_own_grid() -> None:
+    from emmy.compiler.ir.kernel.ir import TreeHalve  # noqa: PLC0415
+    from emmy.compiler.ir.schedule.classic import materialize_classic  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.kernel._factor import factorize  # noqa: PLC0415
+
+    target = Context.from_target((7, 0))
+    for spec, work, extent, expected in (
+        ("coop-t/n8", "t512", 1024, (128, 64, 8)),
+        ("coop-t/n8/v2", "t256", 512, (32, 32, 8)),
+        ("coop-t", "t512", 1024, (32, 16, 32)),
+    ):
+        tile = _matmul(Axis("m", 1), Axis("n", extent), Axis("k", 2048))
+        row = {"WORK": work, "REDUCE": spec}
+        problem = ClassicProblem(tile, target, row=row, validate_pins=True)
+        choices = list(advance_schedule(ClassicScheduleContext(tile, target, problem)))
+        assert len(choices) == 1, (spec, choices)
+        realized = materialize_classic(tile, name="matmul", knobs=row, target=target, schedule=choices[0])
+        bound = factorize(realized, root=None)
+        assert tuple(axis.extent.as_static() for axis in bound.axes[1:]) == expected
+        (tree,) = [stmt for stmt in bound.body.iter() if isinstance(stmt, TreeHalve)]
+        assert tree.inner == ("n_ln", expected[-1])
+
+    tile = _matmul(Axis("m", 1), Axis("n", 1024), Axis("k", 2048))
+    for cap in ((8, 0), (12, 0)):
+        assert not any(choice.coop_output_lanes == 8 for choice in classic._reduction_domain(tile, tile.op, Context.from_target(cap)))
+    assert any(choice.coop_output_lanes == 8 for choice in classic._reduction_domain(tile, tile.op, target))
+
+
+def _deferred_softmax_merge(count: int) -> TileOp:
+    """Finished workspace states, including a ragged partition count, with one rounded output."""
+    from emmy.compiler.ir.expr import Literal
+    from emmy.compiler.ir.pure import Fold, Lambda
+    from emmy.compiler.ir.pure.twist import SOFTMAX, Twist
+
+    n = Axis("n", 8)
+    k = Axis("k", count, window=Window(parent=Axis("split", count), partition=True))
+    values = ("pm", "pd", "po")
+    fold = Fold(
+        operands=tuple(slab(value, "x", Literal(i, "int"), "k", "n") for i, value in enumerate(values)),
+        lift=Lambda(("k", *values), Body(), values),
+        init=(ElementwiseImpl("maximum").identity, 0.0, 0.0),
+        base=Lambda.componentwise(SOFTMAX.base, ("m", "d", "o")),
+        twist=Twist(SOFTMAX, ()),
+    )
+    root = projection((fold,), (Assign("out", "divide", ("o", "d")),), ("out",))
+    return TileOp(
+        op=root,
+        place=Placement(free=(n,)),
+        axes=(n, k),
+        inputs={"x": Tensor("x", (3, count, 8), F32)},
+        outputs={"y": Tensor("y", (8,), F16)},
+        output_specs=(OutputSpec(Write("y", (Var("n"),), "out")),),
+    )
+
+
+def _deferred_merge_graph(tile):
+    from emmy.compiler.graph import Graph
+    from emmy.compiler.ir.base import InputOp
+
+    graph = Graph()
+    graph.add_node(InputOp(), [], tile.inputs["x"], node_id="x")
+    graph.add_node(tile, ["x"], tile.outputs["y"], node_id="y")
+    graph.inputs, graph.outputs = ["x"], ["y"]
+    return graph
+
+
+def _partial_states():
+    import numpy as np
+
+    states = np.random.default_rng(4).normal(size=(3, 5, 8)).astype(np.float32)
+    states[1] = np.abs(states[1]) + 1
+    states[0, :, :2] = -np.inf
+    states[1:, :, :2] = 0
+    states[:, 0, 1] = (0, 1, 1.25)  # only one nonempty partition; several register chains stay empty
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pivot = np.maximum(states[0].max(axis=0), ElementwiseImpl("maximum").identity)
+        weights = np.exp(states[0] - pivot)
+        expected = (states[2] * weights).sum(axis=0) / (states[1] * weights).sum(axis=0)
+    return states, expected
+
+
+@pytest.mark.parametrize("count", [5, 16])
+@pytest.mark.parametrize(("reduce", "work"), [("", ""), ("r2", ""), ("r4", ""), ("coop-t", "t128")])
+def test_deferred_states_offer_and_lower_the_requested_reduction(count, reduce, work):
+    from emmy.compiler.ir.cuda import CudaOp
+    from emmy.compiler.ir.tile.ops import merges_partition
+    from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    tile = _deferred_softmax_merge(count)
+    assert merges_partition(tile)
+    graph = _deferred_merge_graph(tile)
+    row = {"WORK": work, "REDUCE": reduce, "RASTER": "", "PLACE": "fuse", "LOOPIFY": "0"}
+    with pinned_knobs(row):
+        compiled = Pipeline.build(CUDA_PASSES).run(graph, ctx=Context.from_target((8, 0)), db=None)
+    (kernel,) = [node.op for node in compiled.nodes.values() if isinstance(node.op, CudaOp)]
+    assert kernel.knobs["REDUCE"] == reduce and kernel.knobs["WORK"] == work
+    assert kernel.kernel_source.count("__float2half(") == 1
+    assert "const float*" in kernel.kernel_source
+
+
+@pytest.mark.parametrize("reduce", ["r2", "r4"])
+def test_deferred_register_partials_preserve_empty_states_and_the_uneven_tail(reduce):
+    import numpy as np
+
+    from emmy.compiler.ir.kernel import KernelOp
+    from emmy.compiler.ir.loop.runner import execute_loop_op_cpp
+    from emmy.compiler.ir.schedule.classic import materialize_classic
+    from emmy.compiler.pipeline.passes.lowering.kernel._factor import factorize
+
+    tile = _deferred_softmax_merge(5)
+    target = Context.from_target((8, 0))
+    row = {"WORK": "", "REDUCE": reduce}
+    problem = ClassicProblem(tile, target, row=row, validate_pins=True)
+    (choice,) = advance_schedule(ClassicScheduleContext(tile, target, problem))
+    realized = materialize_classic(tile, name="merge", knobs=row, target=target, schedule=choice)
+    bound = factorize(realized, root=None)
+    assert bound.axes == tile.place.free
+    # This serial Kernel IR uses only the shared scalar statements. Execute its actual strided
+    # body through the host renderer; the CUDA source assertion above checks the storage conversion.
+    kernel = KernelOp(body=Body((Loop(bound.axes[0], bound.body),)), inputs=tile.inputs, outputs=tile.outputs)
+    states, expected = _partial_states()
+    actual = execute_loop_op_cpp(kernel, {"x": states}, {"y": (8,)})
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6, equal_nan=True)
+
+
+@requires_cuda
+@pytest.mark.parametrize(("reduce", "work"), [("r2", ""), ("r4", ""), ("coop-t", "t128")])
+def test_deferred_reduction_cuda_preserves_empty_states_and_the_uneven_tail(reduce, work):
+    import numpy as np
+
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda import CudaOp
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    backend = CudaBackend()
+    row = {
+        "PLACE": "fuse",
+        "WORK": work,
+        "REDUCE": reduce,
+        "FAST_MATH": False,
+        "FAST_EXP": False,
+        "F16_MMA_F32_ACC": False,
+        "FP8_MMA": False,
+    }
+    with pinned_knobs(row):
+        compiled = backend.compile(_deferred_merge_graph(_deferred_softmax_merge(5)))
+    (kernel,) = [node.op for node in compiled.nodes.values() if isinstance(node.op, CudaOp)]
+    assert kernel.knobs["REDUCE"] == reduce and kernel.knobs["WORK"] == work
+    states, expected = _partial_states()
+    actual = backend.run(compiled, input_data={"x": states})[0].outputs["y"]
+    assert actual.dtype == np.float16
+    np.testing.assert_allclose(actual, expected.astype(np.float16), rtol=1e-3, atol=1e-3, equal_nan=True)
+
+
 def test_production_enumeration_is_the_compatible_independent_product() -> None:
     tile = _pointwise()
     target = Context.from_target((12, 0))
@@ -111,7 +300,10 @@ def test_production_enumeration_is_the_compatible_independent_product() -> None:
     leaves = _schedule_leaves(tile, "pointwise", target)
 
     assert {_signature(codec, leaf.schedule) for leaf in leaves} == reference
-    assert len(reference) == offers.bounds[0] == 3
+    # The per-cell form and every register strip dividing the 8-wide axis, ``f8`` included: a map's
+    # strip ladder runs past the scalar-contraction one.
+    assert {dict(row)["TILE"] for row in reference} == {"", "f2", "f4", "f8"}
+    assert len(reference) == offers.bound == 4
     (materialized,) = leaves[0].expand()
     assert materialized.schedule == leaves[0].schedule
     assert materialized.place == tile.place.on_grid()
@@ -137,6 +329,28 @@ def test_a_complete_row_proves_its_singleton_by_selection_alone() -> None:
     assert tuple(enumerate_classic_reference(c)) == (wanted,)
 
 
+def test_a_swept_map_row_decodes_exactly_with_its_strip_bare() -> None:
+    """A map whose store sweeps an axis offers the kernel-level worker widths beside its register
+    strips, and its rows spell both (``WORK=t256,TILE=f2``). The strip never carries that inventory
+    — it is the sweep's — so the exact decode of a complete row must parse the strip bare, as the
+    catalog spells it; folding the WORK into it made every such row equal no enumerated leaf,
+    which failed the release audit of the Gemma 4 golden on four QK-norm pieces."""
+    m, n = Axis("m", 8), Axis("n", 256)
+    root = projection((), (Load(name="x", input="x", index=(Var("m"), Var("n"))), Assign("y", "add", ("x", "x"))), ("y",))
+    spec = OutputSpec(Write(output="out", index=(Var("m"), Var("n")), value="y"), sweep=(n,))
+    tile = TileOp(op=root, place=Placement(free=(m,)), axes=(m, n), output_specs=(spec,))
+    target = Context.from_target((12, 0))
+    context = _plain(tile, target)
+    codec = ClassicScheduleCodec(context)
+    rows = {}
+    for wanted in enumerate_classic_reference(context):
+        row = codec.encode(wanted)
+        rows[(row["WORK"], row["TILE"])] = wanted
+        complete = {key: row.get(key, "") for key in codec.keys()}
+        assert ClassicScheduleCodec(context.narrowed(complete, strict=True)).decode(complete) == wanted, row
+    assert ("t256", "f2") in rows and len(rows) == 36
+
+
 def test_reduction_enumeration_filters_the_independent_product_by_compatibility() -> None:
     tile = _row_sum(Axis("k", 2048), Axis("n", 512))
     target = Context.from_target((12, 0))
@@ -151,8 +365,10 @@ def test_reduction_enumeration_filters_the_independent_product_by_compatibility(
     codec = ClassicScheduleCodec(_context(tile, target))
 
     assert {_signature(codec, leaf.schedule) for leaf in leaves} == {_signature(codec, schedule) for schedule in reference}
-    assert len(reference) == len(expected_reductions)
-    assert offers.bounds[0] > len(reference)
+    # A warp-wide cooperative fold is offered once more on its packed inventory (several cells per CTA).
+    packed = sum(len(packed_works(Work(kind="thread", units=(plan.coop, 1)))) for plan in coop_reduce_moves() if not plan.coop_transposed)
+    assert len(reference) == len(expected_reductions) + packed
+    assert offers.bound > len(reference)
 
 
 def test_scalar_contraction_enumeration_is_the_compatible_independent_product(monkeypatch) -> None:
@@ -176,7 +392,7 @@ def test_scalar_contraction_enumeration_is_the_compatible_independent_product(mo
     leaves = _schedule_leaves(tile, "matmul", target)
     codec = ClassicScheduleCodec(_context(tile, target))
     assert {_signature(codec, leaf.schedule) for leaf in leaves} == {_signature(codec, schedule) for schedule in reference}
-    assert offers.bounds[0] > len(reference)
+    assert offers.bound > len(reference)
     assert {choice.raster.spell() for choice in offers.kernel_site.kernels} == {"", "gm8"}
     assert all(schedule.kernel.raster.is_direct for schedule in reference if not schedule.nodes[site].tile.is_tiled)
 
@@ -189,7 +405,7 @@ def test_overwide_reduction_is_in_the_domain_before_c_restricts_it(monkeypatch) 
     tile = _row_sum(Axis("k", 8), Axis("n", 8))
     target = Context.from_target((12, 0))
     overwide = Reduce.of(coop=128)
-    monkeypatch.setattr(classic, "coop_reduce_moves", lambda: [overwide])
+    monkeypatch.setattr(classic, "coop_reduce_moves", lambda **_: [overwide])
     offers = _offers(tile, target)
     c = _context(
         tile,
@@ -206,7 +422,7 @@ def test_overwide_reduction_is_in_the_domain_before_c_restricts_it(monkeypatch) 
     assert len(tuple(_enumerate_context(c))) == 1
 
 
-def test_multi_channel_contraction_domain_contains_per_cell_and_warp_compute_fill() -> None:
+def test_multi_channel_contraction_domain_is_per_cell_direct_and_warp_staged() -> None:
     m, n, k = Axis("m", 16), Axis("n", 16), Axis("k", 16)
     root = contraction(
         k,
@@ -236,10 +452,88 @@ def test_multi_channel_contraction_domain_contains_per_cell_and_warp_compute_fil
     per_cell = [child for child in compatible if not child.schedule.nodes[0].tile.is_tiled]
     warp = [child for child in compatible if child.schedule.nodes[0].tile.is_warp]
     assert per_cell and all(choice.stage.is_direct for child in per_cell for choice in child.schedule.edges.values())
-    assert warp and all(choice.stage.transport == "smem" for child in warp for choice in child.schedule.edges.values())
+    # The gmem-direct mma leaf folds ONE B out of registers, so no warp choice of a multi-channel
+    # node is direct. Staged it is ordinary, and the compute fill stays among its transports beside
+    # whatever copy transports the card offers.
+    warp_transports = {choice.stage.transport for child in warp for choice in child.schedule.edges.values()}
+    assert warp and not any(choice.stage.is_direct for child in warp for choice in child.schedule.edges.values())
+    assert "smem" in warp_transports
+
+
+@pytest.mark.parametrize("n,work,fragment,legal", [(48, "w1x4", "f3x4", False), (48, "w1x2", "f3x1", True), (128, "w1x4", "f3x4", True)])
+def test_materialized_multi_channel_fill_requires_complete_copied_n_chunks(n, work, fragment, legal) -> None:
+    """A shared A and two copied B slabs obey the compute fill's vector-copy cover rule too."""
+    m_axis, n_axis, k_axis = Axis("m", 64), Axis("n", n), Axis("k", 64)
+    root = contraction(
+        k_axis,
+        slab("a_e", "a", "m", "k"),
+        (slab("b0_e", "b0", "k", "n"), "acc0"),
+        (slab("b1_e", "b1", "k", "n"), "acc1"),
+    )
+    tile = TileOp(
+        op=root,
+        place=Placement(free=(m_axis, n_axis)),
+        axes=(m_axis, n_axis, k_axis),
+        inputs={name: Tensor(name, shape, "bf16") for name, shape in (("a", (64, 64)), ("b0", (64, n)), ("b1", (64, n)))},
+        outputs={"out": Tensor("out", (64, n), "f32")},
+    )
+    row = {"WORK": work, "TILE": f"mma_m16n8k16_bf16_f32/{fragment}/k4", "STAGE": "d2/smem", "REDUCE": "", "RASTER": ""}
+    pins = {key: ((key, value),) for key, value in row.items()}
+    context = _context(tile, Context.from_target((12, 0)), pins=pins)
+    if legal:
+        assert tuple(_enumerate_context(context))
+    else:
+        with pytest.raises(ValueError, match="STAGE pin .* does not resolve"):
+            tuple(_enumerate_context(context))
+
+
+def test_materialized_multi_channel_fill_clamps_transposed_b_rows() -> None:
+    """K-contiguous B copies clamp whole N rows, even when N is narrower than a Volta tile."""
+    m, n, k = Axis("m", 16), Axis("n", 8), Axis("k", 64)
+    root = contraction(
+        k,
+        slab("a_e", "a", "m", "k"),
+        *((slab(f"b{i}_e", f"b{i}", "n", "k"), f"acc{i}") for i in range(3)),
+    )
+    tile = TileOp(
+        op=root,
+        place=Placement(free=(m, n)),
+        axes=(m, n, k),
+        inputs={"a": Tensor("a", (16, 64), "f16"), **{f"b{i}": Tensor(f"b{i}", (8, 64), "f16") for i in range(3)}},
+        outputs={f"out{i}": Tensor(f"out{i}", (16, 8), "f32") for i in range(3)},
+    )
+    row = {"WORK": "w1x1", "TILE": "mma_m8n8k4_f16_f32/f1x1/k8", "STAGE": "d2/smem", "REDUCE": "", "RASTER": ""}
+    context = _context(tile, Context.from_target((7, 0)), pins={key: ((key, value),) for key, value in row.items()})
+    assert tuple(_enumerate_context(context))
+
+
+def test_a_packed_gate_up_edge_offers_a_scalar_register_tile() -> None:
+    """Two channels streamed from ONE operand edge — a packed gate/up weight decoded by one lift —
+    fold like two B edges. The scalar register tier reads both channels per register column,
+    sharing A while retaining each product's independent accumulator."""
+    m, n, k = Axis("m", 16), Axis("n", 16), Axis("k", 16)
+    loads = (Load(name="gate", input="b0", index=(Var("k"), Var("n"))), Load(name="up", input="b1", index=(Var("k"), Var("n"))))
+    packed = projection((), loads, ("gate", "up"))
+    a = slab("a_e", "a", "m", "k")
+    products = tuple(
+        Assign(name=f"{acc}__v", op=ElementwiseImpl("multiply"), args=("a_e", b)) for acc, b in (("acc0", "gate"), ("acc1", "up"))
+    )
+    root = reduction(k, (a, packed), products, ("acc0", "acc1"))
+    assert len(root.operands) == 2 and len(root.bilinear_channels()) == 2
+    tile = TileOp(
+        op=root,
+        place=Placement(free=(m, n)),
+        axes=(m, n, k),
+        inputs={name: Tensor(name, (16, 16), "f16") for name in ("a", "b0", "b1")},
+        outputs={"out": Tensor("out", (16, 16), "f16")},
+    )
+    nodes = _offers(tile, Context.from_target((7, 0))).node_site(0).nodes
+    assert any(choice.tile.is_tiled and not choice.tile.is_warp for choice in nodes)
+    assert any(not choice.tile.is_tiled for choice in nodes)
 
 
 def test_tensor_core_enumeration_is_the_compatible_independent_product(monkeypatch) -> None:
+    monkeypatch.setenv("EMMY_FAST_MATH", "0")
     m, n, k = Axis("m", 128), Axis("n", 128), Axis("k", 132)
     tile = _matmul(
         m,
@@ -265,7 +559,7 @@ def test_tensor_core_enumeration_is_the_compatible_independent_product(monkeypat
     leaves = _schedule_leaves(tile, "matmul", target)
     codec = ClassicScheduleCodec(_context(tile, target))
     assert {_signature(codec, leaf.schedule) for leaf in leaves} == {_signature(codec, schedule) for schedule in reference}
-    assert offers.bounds[0] > len(reference)
+    assert offers.bound > len(reference)
     assert {choice.raster.spell() for choice in offers.kernel_site.kernels} == {"", "gm8"}
     assert all(schedule.kernel.raster.is_direct for schedule in reference if not schedule.nodes[site].tile.is_tiled)
 
@@ -386,6 +680,30 @@ def test_bare_kernel_parameter_applies_when_scoped_pin_targets_another_kernel() 
     assert tuple(enumerate_classic_reference(c)) == ()
 
 
+@pytest.mark.parametrize(
+    "family,value,target",
+    [
+        ("REDUCE", "coop-t/n8/v2", (7, 0)),
+        ("TILE", "wgmma_m64n64k16_f16_f32/f1x8/k4", (9, 0)),
+    ],
+)
+def test_kernel_pin_without_work_keeps_the_matching_catalog_rows(monkeypatch, family, value, target) -> None:
+    tile = _matmul(
+        Axis("m", 64),
+        Axis("n", 64),
+        Axis("k", 64),
+        name="k_matmul__place_ab12",
+        inputs={name: Tensor(name, (64, 64), "f16") for name in ("a", "b")},
+        outputs={"out": Tensor("out", (64, 64), "f16")},
+    )
+    monkeypatch.setenv(f"EMMY_{family}@place_ab12", value)
+    forks = classic_forks(tile, tile.name, {}, Context.from_target(target), kernel_set=True)
+    leaf = next(iter_leaves(forks), None)
+    assert leaf is not None, "a partial kernel pin must find WORK in the catalog"
+    assert leaf.row[family] == value
+    assert leaf.row["WORK"]
+
+
 def test_union_parameter_ignores_a_global_value_unsupported_by_this_kernel() -> None:
     """A graph-wide pin may target a sibling kernel in a union compile."""
     tile = _pointwise()
@@ -396,6 +714,27 @@ def test_union_parameter_ignores_a_global_value_unsupported_by_this_kernel() -> 
     c = _context(tile, target, pins=pins)
 
     assert tuple(enumerate_classic_reference(c))
+
+
+def test_a_cut_piece_keeps_its_catalog_when_published_pins_leave_it_no_row(monkeypatch) -> None:
+    """A pin published to every piece of a cut takes where it fits. ``STAGE=d1/smem`` fits this piece's edge
+    alone yet composes with none of its rows; the piece keeps its catalog instead of running unscheduled,
+    while a kernel pin naming it still holds. A GEMM sweep's pins left two GDN pieces of a Qwen3.8 layer
+    unscheduled this way on every row, and the recorded golden carried them as loops."""
+    k = Axis("k", 64)
+    root = contraction(
+        k, Load(name="a_e", input="a", index=(Var("m"), Var("k"))), (Load(name="b_e", input="b", index=(Var("k"), Var("n"))), "acc")
+    )
+    tile = TileOp(op=root, place=Placement(free=(Axis("m", 64), Axis("n", 64))), axes=(Axis("m", 64), Axis("n", 64), k))
+    target = Context.from_target((7, 0))
+    monkeypatch.setenv("EMMY_STAGE", "d1/smem")
+    assert tuple(iter_leaves(classic_forks(tile, "k__place_ab12", {}, target, kernel_set=True, published=True)))
+    with pytest.raises(ValueError, match="does not resolve"):  # a kernel of its own is held to the pin, loudly
+        tuple(iter_leaves(classic_forks(tile, "k", {}, target)))
+
+    monkeypatch.setenv("EMMY_WORK@place_ab12", "t16x16")
+    leaves = tuple(iter_leaves(classic_forks(tile, "k__place_ab12", {}, target, kernel_set=True, node="out__place_ab12_0")))
+    assert leaves and {leaf.schedule.kernel.work.spell() for leaf in leaves} == {"t16x16"}
 
 
 def test_schedule_restriction_snapshots_parameter_values() -> None:
@@ -448,7 +787,7 @@ def test_staged_edges_are_independent_product_factors(monkeypatch) -> None:
     leaves = _schedule_leaves(tile, "matmul", target)
     codec = ClassicScheduleCodec(_context(tile, target))
     assert {_signature(codec, leaf.schedule) for leaf in leaves} == {_signature(codec, schedule) for schedule in reference}
-    assert offers.bounds[0] > len(reference)
+    assert offers.bound > len(reference)
     assert all(len({choice.stage for choice in schedule.edges.values()}) == 1 for schedule in reference)
 
     staged = next(leaf for leaf in leaves if all(not choice.stage.is_direct for choice in leaf.schedule.edges.values()))
@@ -458,6 +797,7 @@ def test_staged_edges_are_independent_product_factors(monkeypatch) -> None:
 
 
 def test_compute_fill_edges_remain_independent_product_factors(monkeypatch) -> None:
+    monkeypatch.setenv("EMMY_FAST_MATH", "0")
     m, n, k = Axis("m", 64), Axis("n", 64), Axis("k", 64)
     computed_a = projection(
         (), (Load(name="score", input="scores", index=(Var("m"), Var("k"))), Assign(name="prob", op="exp", args=("score",)))
@@ -478,15 +818,53 @@ def test_compute_fill_edges_remain_independent_product_factors(monkeypatch) -> N
     context = _plain(tile, target)
     site = context.tile_op.node_sites[0]
 
-    assert all({choice.stage.spell() for choice in site.edges} == {"", "d1/smem", "d2/smem"} for site in offers.node_sites if site.edges)
+    # The computed A keeps the compute fill; on a TMA target its stored B may also ride box copies.
+    fill = {"", "d1/smem", "d2/smem", "d1/smem-tma", "d1/smem-tma/p2", "d2/smem-tma", "d2/smem-tma/p2"}
+    assert all({choice.stage.spell() for choice in site.edges} == fill for site in offers.node_sites if site.edges)
+    # A card without TMA keeps the fill's cp.async ring only.
+    no_tma = _offers(tile, Context.from_target((8, 0)))
+    assert all({choice.stage.spell() for choice in site.edges} == {"", "d1/smem", "d2/smem"} for site in no_tma.node_sites if site.edges)
     reference = tuple(_reference(tile, target))
     leaves = _schedule_leaves(tile, "computed_a", target)
     codec = ClassicScheduleCodec(_context(tile, target))
     assert {_signature(codec, leaf.schedule) for leaf in leaves} == {_signature(codec, schedule) for schedule in reference}
-    assert offers.bounds[0] > len(reference)
+    assert offers.bound > len(reference)
     warp_schedules = tuple(schedule for schedule in reference if schedule.nodes[site].tile.is_warp)
     assert warp_schedules
-    assert all({edge.stage.transport for edge in schedule.edges.values()} == {"smem"} for schedule in warp_schedules)
+    assert {edge.stage.transport for schedule in warp_schedules for edge in schedule.edges.values()} == {"smem", "smem-tma"}
+    # Beside a compute fill the box copies run as one group of the uniform K loop, so no producer
+    # band is ever composed with them, although the kernel catalog offers bands.
+    assert any(choice.work.producer for choice in offers.kernel_site.kernels)
+    assert not any(schedule.kernel.work.producer for schedule in reference)
+
+
+def test_computed_f16_tma_needs_a_stored_slab_to_copy(monkeypatch) -> None:
+    """With both operands computed, every slab is the compute fill's and a TMA stage has nothing to
+    copy: the catalog names it and the resolver declines it. So does the fill's ring, which has no
+    copied slab to prefetch either, leaving the single-buffer fill."""
+    monkeypatch.setenv("EMMY_FAST_MATH", "0")
+    m, n, k = Axis("m", 64), Axis("n", 64), Axis("k", 64)
+
+    def exp_of(name: str, *index: str):
+        return projection(
+            (), (Load(name=f"{name}_v", input=name, index=tuple(Var(i) for i in index)), Assign(f"{name}_e", "exp", (f"{name}_v",)))
+        )
+
+    tile = TileOp(
+        op=contraction(k, exp_of("scores", "m", "k"), (exp_of("weights", "k", "n"), "acc")),
+        place=Placement(free=(m, n)),
+        axes=(m, n, k),
+        inputs={"scores": Tensor("scores", (64, 64), "f16"), "weights": Tensor("weights", (64, 64), "f16")},
+        outputs={"out": Tensor("out", (64, 64), "f16")},
+    )
+    target = Context.from_target((12, 0))
+    warp = Tile.parse("mma_m16n8k16_f16_f32/f1x1", Work.parse("w1x1"))
+    monkeypatch.setattr(classic, "scalar_tile_moves", lambda: [Tile()])
+    monkeypatch.setattr(classic, "warp_tile_moves", lambda atoms: [warp] if warp.atom.name in atoms else [])
+    reference = tuple(_reference(tile, target))
+    warp_schedules = [schedule for schedule in reference if any(node.tile.is_warp for node in schedule.nodes.values())]
+    assert warp_schedules
+    assert {edge.stage.spell() for schedule in warp_schedules for edge in schedule.edges.values()} == {"d1/smem"}
 
 
 def _two_root_projection(m: Axis, n: Axis, body, results: tuple[str, ...], outputs: dict, specs: tuple) -> TileOp:
@@ -522,11 +900,38 @@ def _tiled_root_sets(tile: TileOp, target, monkeypatch) -> set[tuple[int, ...]]:
     return {tuple(site for site in roots if leaf.schedule.nodes[site].tile.is_tiled) for leaf in leaves}
 
 
-def test_shared_output_projection_offers_at_most_one_output_tiled_root(monkeypatch) -> None:
-    """One output reads BOTH accumulators, so the projection does not partition by root and the
-    kernel binder binds at most one output-tiled root (the other reduce lowers serially inside
-    the projection). The offer applies the binder's rule: no row tiles both roots — that row was
-    offered and then refused at materialize — while each root still reaches the tile tier alone."""
+def _cooperative_root_sets(tile: TileOp, target, monkeypatch) -> set[tuple[int, ...]]:
+    """Which root sites each enumerated row partitions, over one cooperative reduction."""
+    cooperative = Reduce.of(coop=4)
+    monkeypatch.setattr(classic, "scalar_tile_moves", lambda: [Tile()])
+    monkeypatch.setattr(classic, "warp_tile_moves", lambda atoms: [])
+    monkeypatch.setattr(classic, "coop_reduce_moves", lambda **_: [cooperative])
+    roots = tuple(tile.node_id(edge) for edge in tile.op.operands)
+    leaves = _schedule_leaves(tile, "gate_up", target)
+    assert leaves
+    return {tuple(site for site in roots if leaf.schedule.nodes[site].reduce == cooperative) for leaf in leaves}
+
+
+def test_shared_output_projection_refuses_fragment_atoms(monkeypatch) -> None:
+    """One output reads both roots, so either fragment would have a serial reduction in its epilogue."""
+    from emmy.compiler.ir.stmt import Write
+    from emmy.compiler.ir.tile import OutputSpec
+
+    m, n = Axis("m", 128), Axis("n", 128)
+    tile = _two_root_projection(
+        m,
+        n,
+        (Assign("v", "multiply", ("acc0", "acc1")),),
+        ("v",),
+        {"out": Tensor("out", (128, 128), "f16")},
+        (OutputSpec(Write(output="out", index=(Var("m"), Var("n")), value="v")),),
+    )
+    assert _tiled_root_sets(tile, Context.from_target((12, 0)), monkeypatch) == {()}
+
+
+def test_shared_output_projection_offers_at_most_one_cooperative_root(monkeypatch) -> None:
+    """A cooperative reduction selects the same kernel root as an output tile, so a projection
+    that does not partition by root may not offer cooperative plans for two roots at once."""
     from emmy.compiler.ir.stmt import Write
     from emmy.compiler.ir.tile import OutputSpec
 
@@ -540,7 +945,7 @@ def test_shared_output_projection_offers_at_most_one_output_tiled_root(monkeypat
         (OutputSpec(Write(output="out", index=(Var("m"), Var("n")), value="v")),),
     )
     roots = tuple(tile.node_id(edge) for edge in tile.op.operands)
-    assert _tiled_root_sets(tile, Context.from_target((12, 0)), monkeypatch) == {(), (roots[0],), (roots[1],)}
+    assert _cooperative_root_sets(tile, Context.from_target((12, 0)), monkeypatch) == {(), (roots[0],), (roots[1],)}
 
 
 def test_partitioned_projection_still_offers_both_roots_output_tiled(monkeypatch) -> None:
@@ -563,3 +968,56 @@ def test_partitioned_projection_still_offers_both_roots_output_tiled(monkeypatch
     )
     roots = tuple(tile.node_id(edge) for edge in tile.op.operands)
     assert roots in _tiled_root_sets(tile, Context.from_target((12, 0)), monkeypatch)
+    assert roots in _cooperative_root_sets(tile, Context.from_target((12, 0)), monkeypatch)
+
+
+def test_fragment_domain_includes_the_reduction_in_a_sibling_projection():
+    """A matmul result normalized by another reduction is not a straight-line fragment epilogue."""
+    from tests.compiler.terms import reduction
+
+    m, n, k, r = Axis("m", 32), Axis("n", 32), Axis("k", 64), Axis("r", 32)
+    matmul = contraction(
+        k,
+        Load(name="av", input="a", index=(Var("m"), Var("k"))),
+        (Load(name="bv", input="b", index=(Var("k"), Var("n"))), "acc"),
+    )
+    statistic = reduction(
+        r,
+        (Load(name="xv", input="x", index=(Var("m"), Var("r"))),),
+        (Assign("sum__v", "multiply", ("xv", "xv")),),
+        ("sum",),
+    )
+    scale = projection((statistic,), (Assign("scale", "rsqrt", ("sum",)),), ("scale",))
+    root = projection((matmul, scale), (Assign("y", "multiply", ("acc", "scale")),), ("y",))
+    tile = TileOp(
+        op=root,
+        place=Placement(free=(m, n)),
+        axes=(m, n, k, r),
+        inputs={name: Tensor(name, shape, "f16") for name, shape in {"a": (32, 64), "b": (64, 32), "x": (32, 32)}.items()},
+        outputs={"out": Tensor("out", (32, 32), "f16")},
+        output_specs=(OutputSpec(Write(output="out", index=(Var("m"), Var("n")), value="y")),),
+    )
+    assert not classic._warp_atoms(tile, Context.from_target((8, 9)), matmul)
+
+
+@pytest.mark.parametrize("heads", [1, 16])
+def test_grouped_matvec_does_not_tile_two_axes_of_one_operand(heads):
+    """A vector times per-head weights tiles a unit row and channels, never heads and channels."""
+    head, channel, k = Axis("head", heads), Axis("channel", 128), Axis("k", 64)
+    root = contraction(
+        k,
+        Load(name="xv", input="x", index=(Var("k"),)),
+        (Load(name="wv", input="w", index=(Var("head"), Var("channel"), Var("k"))), "acc"),
+    )
+    tile = TileOp(
+        op=root,
+        place=Placement(free=(head, channel)),
+        axes=(head, channel, k),
+        inputs={"x": Tensor("x", (64,), "f16"), "w": Tensor("w", (heads, 128, 64), "f16")},
+        outputs={"out": Tensor("out", (heads, 128), "f32")},
+        output_specs=(OutputSpec(Write(output="out", index=(Var("head"), Var("channel")), value="acc")),),
+    )
+    assert tile.contractions and tile.family_sites["TILE"]
+    row, column = tile.grid_sched._mn_for(tile.op)
+    assert row.extent.as_static() == 1 and column.name == "channel"
+    assert heads == 1 or row.name != "head"

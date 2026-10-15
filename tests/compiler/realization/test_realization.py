@@ -4,15 +4,15 @@ A case is a checked-in minimized reproducer of one failure class: a schedule tha
 realizable is not. Its expectation is its filename (see ``ARCHITECTURE.md``); there is no manifest.
 A case holds one entry per kernel of the set its target compiles to.
 
-Every case is asked four questions in order, one test node each, so an ``_xfail_<stage>`` suffix
-lands on exactly the stage it names rather than on a walker that could have failed anywhere.
-``offered`` asks the pinned enumeration; the other three ask the compile with the case as its
-only evidence and no hand pin — the schedule reaches them the way it reaches a deploy.
+Every case is asked three questions in order, one test node each, so an ``_xfail_<stage>`` suffix
+lands on exactly the stage it names rather than on a walker that could have failed anywhere. Each
+asks the compile with the case as its only evidence and no hand pin — the schedule reaches them the
+way it reaches a deploy.
 
-``offered`` and ``realized`` are GPU-free and run at the case's DECLARED capability, so an sm_70
-lockout is exercised on any box. ``built`` and ``correct`` need the card itself and run only when
-the live capability equals the declared one — a pinned schedule is a claim about one capability,
-never about a merely newer card.
+``realized`` is GPU-free and runs at the case's DECLARED capability, so an sm_70 lockout is exercised
+on any box. ``built`` and ``correct`` need the card itself and run only when the live capability
+equals the declared one — a pinned schedule is a claim about one capability, never about a merely
+newer card.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _parameters():
             # its own context, which is the OOM-and-cascade the serial chain exists to prevent.
             marks = [requires_cuda] if stage in ("built", "correct") else []
             if case.xfail_stage == stage:
-                marks.append(pytest.mark.xfail(strict=True, reason=f"known gap — {helpers.evidence_line(path)}"))
+                marks.append(pytest.mark.xfail(strict=True, reason=f"known gap — {helpers.evidence_line(case.document)}"))
             elif case.xfail_stage is not None and STAGES.index(stage) > STAGES.index(case.xfail_stage):
                 # The schedule never realizes, so the stages past the gap have nothing to run.
                 marks.append(pytest.mark.skip(reason=f"open case: the gap at {case.xfail_stage} blocks {stage}"))
@@ -61,9 +61,6 @@ def test_realization(case, stage):
     """Assert one stage of one case."""
     if stage == "unusable":
         raise AssertionError(case)
-    if stage == "offered":
-        assert (reason := helpers.offered(case)) is None, reason
-        return
     if stage == "realized":
         assert (reason := helpers.realized(case)) is None, reason
         return
@@ -84,18 +81,32 @@ def _spell(cap: tuple[int, int]) -> str:
 # --- staleness --------------------------------------------------------------------------------
 #
 # Detection is a test, not a command: the check is GPU-free and roughly 0.1 s per case, so codec
-# and kernel-identity drift is caught on the pull request that causes it rather than weeks later
+# and lowering drift is caught on the pull request that causes it rather than weeks later
 # on a GPU box. ``make test-corpus-regen`` only APPLIES the fix — the same split as
-# ``ruff format --check`` / ``make format`` and the session-end durations gate.
+# ``ruff format --check`` / ``make format``.
 
 
 @pytest.mark.parametrize("path", helpers.case_files(), ids=lambda path: path.relative_to(helpers.CASES_DIR).as_posix())
 def test_case_derived_half_is_current(path):
-    """The stored program wire, target, realization name, identity and canonical knobs still equal
-    what this compiler derives from the case's own program."""
+    """The stored kernels' bodies and the canonical knobs still equal what this compiler derives from the case's
+    own program: the restamp every golden gets is a no-op on the case."""
     case = helpers.load_case(path)
     assert helpers.regenerate(case.document) == case.document, (
-        f"{path.name} is stale — a kernel identity or a schedule codec moved under it. "
+        f"{path.name} is stale — the lowering or a schedule codec moved under it. "
         "Run `make test-corpus-regen` to restamp it; that command refuses to write when a case's "
         "verdict also changed, which is a review conversation rather than a mechanical step."
     )
+
+
+def test_volta_compute_fill_offers_no_prefetch_ring():
+    """The Volta mma atom's compute fill stages at depth 1 only. Its depth-2 B prefetch ring copies
+    with blocking copies (sm_70 has no cp.async) and returned silently wrong answers on a V100, so
+    the enumeration must never offer it — asked on the one program known to offer the fill: as the
+    case's only evidence, the depth-1 row realizes and the depth-2 row is a fork no row decides."""
+    from dataclasses import replace
+
+    case = helpers.load_case(helpers.CASES_DIR / "matmul" / "volta-gptq-cone-d1smem.json")
+    assert helpers.realized(case) is None, "the depth-1 fill is realized"
+    (row,) = case.rows
+    ringed = replace(case.document, rows=[replace(row, knobs={**row.knobs, "STAGE": "d2/smem"})])
+    assert helpers.realized(replace(case, document=ringed)) is not None, "the depth-2 ring is not"

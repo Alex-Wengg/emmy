@@ -30,6 +30,7 @@ from emmy.compiler.ir.schedule import Stage, Tile, Work
 from emmy.compiler.ir.schedule.classic import ClassicProblem, ClassicScheduleContext, ReductionSchedule
 from emmy.compiler.ir.schedule.classic import refusals as classic
 from emmy.compiler.ir.schedule.classic.refusals import _wgmma_refusal
+from emmy.compiler.ir.schedule.classic.sites import _stage_candidates
 from emmy.compiler.ir.stmt import Load
 from emmy.compiler.ir.stmt.leaves import Assign
 from emmy.compiler.ir.tile import Placement, TileOp
@@ -152,6 +153,22 @@ def test_domain_offers_only_group_aligned_wgmma_rows_and_stages_them(monkeypatch
     assert not set(WGMMA) & direct and "mma_m16n8k16_bf16_f32" in direct
 
 
+def test_a_row_past_the_register_envelope_is_not_offered(monkeypatch) -> None:
+    """Sixteen warps leave each lane 128 registers: an m64n128 row's 64 accumulators fit, a 128-accumulator
+    row does not (ptxas refuses such a kernel outright rather than spilling)."""
+    moves = classic.warp_tile_moves
+    monkeypatch.setattr(classic, "scalar_tile_moves", lambda: [Tile()])
+    monkeypatch.setattr(
+        classic, "warp_tile_moves", lambda atoms: [plan for plan in moves(atoms) if plan.units == (16, 1) and plan.atom.is_wgmma]
+    )
+    monkeypatch.setattr(classic, "stage_moves", lambda *, warp, ctx=None: [Stage(depth=2, transport="smem-tma")])
+    tile, target = _matmul(), Context.from_target((9, 0))
+    site = tile.node_sites[0]
+    rows = [choice.tile for choice in ClassicProblem(tile, target).node_site(site).nodes if isinstance(choice, ReductionSchedule)]
+    widths = {plan.reg_n for plan in rows if plan.is_warp}
+    assert 16 in widths and 32 not in widths
+
+
 @pytest.mark.parametrize(
     ("pins", "message"),
     [
@@ -182,6 +199,7 @@ def _graph(m: int, n: int, k: int) -> Graph:
 def test_env_pins_reach_the_wgmma_rules_and_a_legal_row_schedules(monkeypatch) -> None:
     monkeypatch.setenv("EMMY_TILE", f"{N128}/f1x16/k4")
     monkeypatch.setenv("EMMY_STAGE", "d2/smem-tma")
+    monkeypatch.setenv("EMMY_REDUCE", "")
     monkeypatch.setenv("EMMY_WORK", "w2x4")
     with pytest.raises(ValueError, match="w<4k>x1 warp grid"):
         Pipeline.build(TILE_PASSES).run(_graph(128, 256, 256), ctx=Context.from_target((9, 0)))
@@ -263,3 +281,45 @@ def test_a_computed_n_contiguous_b_fills_atom_major() -> None:
     stmts, _ = b_op.value(_lit(0), _lit(70), _lit(3))
     read = next(s for s in stmts if isinstance(s, Load) and s.input == "w")
     assert (_at(read.index[0]), _at(read.index[1], n_b=2)) == (6, 2 * 128 + 64 + 3)
+
+
+def test_a_choice_is_fed_only_by_the_transports_it_offers(monkeypatch) -> None:
+    """A site's edge catalog is the union over its node choices, so a row can name any of them, but a choice's
+    supports pair it with its own candidates only. The 8-deep ring is wgmma's alone; paired with an mma tile it
+    made a leaf the draw could reach and no narrowed descent could rebuild (``leaf_for`` found nothing for the
+    drawn row)."""
+    moves = classic.warp_tile_moves
+    monkeypatch.setattr(classic, "scalar_tile_moves", lambda: [Tile()])
+    monkeypatch.setattr(classic, "warp_tile_moves", lambda atoms: [plan for plan in moves(atoms) if plan.units in ((1, 1), (4, 1))])
+    tile, target = _matmul(True), Context.from_target((9, 0))
+    site = ClassicProblem(tile, target).node_site(next(iter(tile.contractions)))
+    deep = {edge.stage for edge in site.edges if edge.stage.depth >= 8}
+    assert deep, "the union catalog carries wgmma's 8-deep ring"
+    mma = [choice for choice in site.choices if choice.node.tile.is_warp and not choice.node.tile.atom.is_wgmma]
+    assert mma
+    for choice in site.choices:
+        fed = {edge.stage for support in choice.supports for edge in support.edges.values()}
+        assert fed <= set(_stage_candidates(tile, target, site.node, choice.node))
+        if choice in mma:
+            assert not fed & deep
+
+
+def test_a_paged_operand_is_never_fed_by_tma(monkeypatch) -> None:
+    """A paged buffer has no fixed base address: a TMA descriptor encodes one on the host, so the catalog keeps
+    TMA off a choice that reads one; a buffer of several pages resolves a page per element, so cp.async's
+    per-thread addresses cannot feed it either. Paging the output changes nothing — nothing stages a write."""
+    moves = classic.warp_tile_moves
+    monkeypatch.setattr(classic, "scalar_tile_moves", lambda: [Tile()])
+    monkeypatch.setattr(classic, "warp_tile_moves", lambda atoms: [plan for plan in moves(atoms) if plan.units == (4, 1)])
+    tile, target = _matmul(True), Context.from_target((9, 0))
+    site = next(iter(tile.contractions))
+
+    def transports(paged):
+        node_site = ClassicProblem(tile, target, paged=paged).node_site(site)
+        return {edge.stage.transport for choice in node_site.choices for support in choice.supports for edge in support.edges.values()}
+
+    assert {"smem-tma", "smem-async"} <= transports({})
+    one_page = transports({"b": (0, N, None)})
+    assert "smem-tma" not in one_page and "smem-async" in one_page
+    assert not {"smem-tma", "smem-async"} & transports({"b": (0, 16, None)})
+    assert "smem-tma" in transports({"out": (0, M, None)})

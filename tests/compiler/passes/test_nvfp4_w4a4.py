@@ -13,6 +13,8 @@ program applies the two levels fused (see the tolerance the device tests below d
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 
@@ -21,7 +23,7 @@ from emmy.compiler.ir.base import ConstantOp, InputOp
 from emmy.compiler.ir.frontend.ir import LinearOp
 from emmy.compiler.loader.quant import spell_quantized_constants, spell_static_fp4_activations
 from emmy.compiler.tensor import Tensor
-from tests.compiler.helpers import requires_cuda
+from tests.compiler.helpers import device_compute_capability, requires_cuda, requires_sm
 from tests.compiler.loader.test_quant import _w4a4_checkpoint
 
 pytest.importorskip("torch")
@@ -45,13 +47,14 @@ def _w4a4_linear(tmp_path, *, m, n, k, dtype="f16", input_scale=0.02):
     return g
 
 
-def test_the_spelled_w4a4_program_lowers_whole(tmp_path):
+def test_the_spelled_w4a4_program_lowers_whole(tmp_path, monkeypatch):
     """The full CUDA pass list consumes the spelled chain — quantize, pack, decode and matmul all
     land in kernels, with the e2m1 encode reaching the emitted source. Structure only; which
     kernel carries which piece is the scheduler's call and not pinned here."""
     from emmy.compiler.context import Context
     from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
 
+    monkeypatch.setenv("EMMY_FAST_MATH", "1")
     g = _w4a4_linear(tmp_path, m=32, n=128, k=128)
     lowered = Pipeline.build(CUDA_PASSES).run(g, ctx=Context.from_target((12, 0)))
     sources = [s for node in lowered.nodes.values() if (s := getattr(node.op, "kernel_source", None))]
@@ -59,6 +62,7 @@ def test_the_spelled_w4a4_program_lowers_whole(tmp_path):
     leftovers = [nid for nid, n in lowered.nodes.items() if type(n.op).__name__ not in ("CudaOp", "ConstantOp", "InputOp")]
     assert not leftovers, f"lowering left tensor ops behind: {leftovers}"
     assert any("emmy_to_f4e2m1" in s for s in sources), "the activation encode never reached a kernel"
+    assert any("__fdiv_rn" in s for s in sources), "fast math lost the precise quotient before the FP4 encode"
 
 
 @requires_cuda
@@ -108,24 +112,43 @@ def test_a_shared_quantized_activation_behind_a_norm_compiles_and_holds_flip_bou
 
 
 @requires_cuda
-@pytest.mark.parametrize(("m", "n", "k"), [(32, 128, 128), (16, 512, 2048), (256, 512, 2048)])
+@pytest.mark.parametrize(
+    ("m", "n", "k", "schedule"),
+    [
+        (32, 128, 128, {"WORK": "t4", "TILE": "", "REDUCE": "coop", "STAGE": ""}),
+        (16, 512, 2048, {"WORK": "t512", "TILE": "", "REDUCE": "coop-t", "STAGE": ""}),
+        pytest.param(
+            256,
+            512,
+            2048,
+            {"WORK": "w1x8", "TILE": "mma_m16n8k64_e2m1_f32/f1x1/k8", "REDUCE": "", "STAGE": "d3/smem-tma"},
+            marks=requires_sm(12),
+        ),
+    ],
+)
 @pytest.mark.xdist_group("cuda")
-def test_the_spelled_w4a4_program_matches_numpy_on_device(tmp_path, m, n, k):
+def test_the_spelled_w4a4_program_matches_numpy_on_device(tmp_path, m, n, k, schedule):
     """numpy-vs-CUDA parity on the declared W4A4 program. numpy evaluates the same graph the CUDA
     backend compiles, so any gap is a lowering defect. The deep-K decode shape and a prefill-wide
     M ride along — split-K and the wider schedules are where the packed lane has been bitten
-    before. Bound is roughly 3x the measured error on an RTX 5090 (4.8e-4 – 6.3e-4)."""
+    before. Bound is roughly 3x the measured error on an RTX 5090 (4.8e-4 – 6.3e-4).
+
+    Each shape's schedule is pinned, so the subject is the lowering and not the prior's pick, and
+    fast math is off through the run: its approximate division moves a quotient that sits one ulp
+    above an e2m1 midpoint onto it, and that code flip alone is a 2-3% gap to the oracle."""
     from emmy.compiler.backend.cuda.backend import CudaBackend
     from emmy.compiler.backend.numpy import NumpyBackend
     from emmy.compiler.loader.safetensors import load_constants_from_safetensors
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
 
     g = _w4a4_linear(tmp_path, m=m, n=n, k=k)
     x = (np.random.default_rng(3).standard_normal((m, k)) * 0.05).astype(np.float16)
     data = load_constants_from_safetensors(g, str(tmp_path))
     ref, _ = NumpyBackend().run(g, input_data={**data, "x": x})
     backend = CudaBackend()
-    compiled = backend.compile(g)
-    got, _ = backend.run(compiled, input_data={**data, "x": x})
+    with pinned_knobs({"PLACE": "fuse", **schedule, "FAST_MATH": "False"}):
+        compiled = backend.compile(g)
+        got, _ = backend.run(compiled, input_data={**data, "x": x})
     r = ref.outputs["y"].astype(np.float32)
     c = np.asarray(got.outputs["y"]).reshape(m, n).astype(np.float32)
     denom = max(float(np.abs(r).max()), 1e-9)
@@ -207,7 +230,7 @@ def _bound_contractions(tmp_path):
 
     g = _w4a4_shared_linears(tmp_path, ("q", "kp", "v"), m=16, n=128, k=128)
     looped = Pipeline.build(LOOP_PASSES).run(g)
-    tiled = Pipeline.build(["lowering/tile"], select={"lift"}).run(looped, ctx=Context.from_target((12, 0)))
+    tiled = Pipeline.build(["tile/lift"], select={"lift"}).run(looped, ctx=Context.from_target((12, 0)))
     tiles = [node.op for node in tiled.nodes.values() if isinstance(node.op, TileOp)]
     return [(tile, t) for tile in tiles for t in _folds(tile.op) if t.as_contraction() is not None]
 
@@ -255,14 +278,16 @@ def test_the_marked_matmul_binds_its_activation_edge_as_a_packed_decode_chain(tm
 
 @requires_cuda
 @pytest.mark.xdist_group("cuda")
+@pytest.mark.skipif((device_compute_capability() or (0, 0))[0] != 12, reason="block-scaled FP4 mma requires sm_12x")
 def test_the_block_scaled_cell_runs_and_holds_its_declared_tolerance(tmp_path):
     """The native fp4 path end to end: both operands packed, the block-scaled cell spelled, and
     the result within the gap PR decision 18 accepts.
 
-    The cell is PINNED rather than elected. This lane gives every test an empty online prior, so an
-    unpinned compile decides the cell's fork by the prior's cold-start order — which arm that names
-    is not this test's subject, and it moved with the catalog. The pin makes the subject the cell
-    itself: that it reaches the kernel with its own scale operands and holds its declared tolerance.
+    The cell's whole schedule is PINNED rather than elected: an unpinned fork follows the prior,
+    which arm that names is not this test's subject, and it moves whenever the prior is refit. The
+    pin makes the subject the cell itself: that it reaches the kernel with its own scale operands
+    and holds its declared tolerance. Fast math stays off through the run, since its approximate
+    division flips activation codes at e2m1 midpoints, a gap no fused-scale rounding explains.
 
     That gap is not rounding noise, so this is a tolerance and not the exact oracle every other
     lowering answers to. The declared program applies ``f16(block_scale x tensor_scale)`` per
@@ -285,15 +310,15 @@ def test_the_block_scaled_cell_runs_and_holds_its_declared_tolerance(tmp_path):
     data = load_constants_from_safetensors(g, str(tmp_path))
     ref, _ = NumpyBackend().run(g, input_data={**data, **feed})
     backend = CudaBackend()
-    with pinned_knobs({"TILE": "mma_m16n8k64_e2m1_f32/f1x2/k4"}):
+    with pinned_knobs(_fp4_tma_pins("d1/smem-async")):
         compiled = backend.compile(g)
+        got, _ = backend.run(compiled, input_data={**data, **feed})
     sources = [s for node in compiled.nodes.values() if (s := getattr(node.op, "kernel_source", None))]
     assert any("emmy_mma_m16n8k64_e2m1_f32(" in s for s in sources), "the pinned block-scaled cell never reached a kernel"
     native = next(s for s in sources if "emmy_mma_m16n8k64_e2m1_f32(" in s)
     assert "emmy_mma_load_sfa_f4" in native and "emmy_mma_load_sfb_f4" in native, "the cell ran without its scale operands"
     assert "EMMY_F4_LUT" not in native, "a native cell must not decode either operand through the value table"
 
-    got, _ = backend.run(compiled, input_data={**data, **feed})
     for out in g.outputs:
         r = ref.outputs[out].astype(np.float32).reshape(-1)
         c = np.asarray(got.outputs[out]).astype(np.float32).reshape(-1)
@@ -373,22 +398,207 @@ def _w4a4_gate_up_down(tmp_path, *, m, k):
     return g
 
 
+def _w4a4_gate_times_up(tmp_path, *, m, n, k):
+    """Two marked linears over one quantized activation, multiplied — the gate/up half of the
+    serving MLP with the product left in 16 bits. Fusion puts both projections in one kernel
+    through the shared consumer, and that kernel is what the two-channel questions below ask."""
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+
+    _w4a4_checkpoint(tmp_path, {"gate": (n, 0.02), "up": (n, 0.02)}, k=k)
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (m, k), "f16"), node_id="x")
+    for name in ("gate", "up"):
+        w = g.add_node(
+            op=ConstantOp(name=name, source_path=f"{name}.weight", source_shape=(n, k), source_dtype="f16"),
+            inputs=[],
+            output=Tensor(f"{name}_w", (n, k), "f16"),
+            node_id=f"{name}_w",
+        )
+        g.add_node(op=LinearOp(), inputs=["x", w], output=Tensor(name, (m, n), "f16"), node_id=name)
+    g.add_node(op=ElementwiseOp(op="multiply"), inputs=["gate", "up"], output=Tensor("act", (m, n), "f16"), node_id="act")
+    g.inputs, g.outputs = ["x"], ["act"]
+    assert spell_quantized_constants(g, str(tmp_path)) == 2
+    assert spell_static_fp4_activations(g, str(tmp_path)) == 2
+    return g
+
+
+def _two_channel_pair(tmp_path, *, m=16, n=128, k=256):
+    """The gate/up kernel's one two-channel contraction after the tile LIFT, with its pair reading."""
+    from emmy.compiler.context import Context
+    from emmy.compiler.ir.schedule.packing import match_packed_pair_node
+    from emmy.compiler.ir.tile import TileOp
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+
+    looped = Pipeline.build(LOOP_PASSES).run(_w4a4_gate_times_up(tmp_path, m=m, n=n, k=k))
+    tiled = Pipeline.build(["tile/lift"], select={"lift"}).run(looped, ctx=Context.from_target((12, 0)))
+    tiles = [node.op for node in tiled.nodes.values() if isinstance(node.op, TileOp)]
+    # A shared cone is one object reached through several operand edges; key on identity.
+    two_channel = {
+        id(t): (tile, t) for tile in tiles for t in _folds(tile.op) if t.as_contraction() is not None and len(t.combine.results) == 2
+    }
+    assert len(two_channel) == 1, "gate and up must lower to exactly one two-channel contraction"
+    ((tile, con),) = two_channel.values()
+    return tile, con, match_packed_pair_node(con, tile.inputs)
+
+
+def test_gate_and_up_over_one_quantized_activation_bind_as_one_two_channel_contraction(tmp_path):
+    """Gate and up read one quantized activation through the same byte-packed index. Fusion puts
+    both projections in one kernel, and the loop normalizer unifies their K axes although the axis
+    reaches the activation's index through div and mod, so the two reductions become ONE
+    contraction with two channels — the shape the block-scaled pair reading accepts with any
+    channel count. Left as two reductions feeding one projection, the kernel has no warp-tier
+    schedule at all."""
+    _tile, _con, pair = _two_channel_pair(tmp_path)
+    assert pair is not None, "the two-channel contraction must read as a block-scaled pair"
+    assert len(pair.b) == 2
+
+
+def test_the_two_channel_pair_is_offered_the_block_scaled_cell_with_its_copy_transports(tmp_path):
+    """The cell's transports are the copy ones, one codes and one scale slab per channel, so the
+    pair reading keeps them at any channel count. The one-slab-per-fold rule that sends a
+    multi-channel node to the compute fill is about the other transports."""
+    from emmy.compiler.context import Context
+    from emmy.compiler.ir.schedule.classic import refusals as sched
+    from emmy.compiler.ir.schedule.classic.schedule import ProjectionSchedule
+
+    tile, con, _pair = _two_channel_pair(tmp_path)
+    ctx = Context.from_target((12, 0))
+    atoms = sched._warp_atoms(tile, ctx, con)
+    assert "mma_m16n8k64_e2m1_f32" in atoms, atoms
+    plan = next(p for p in sched.warp_tile_moves(atoms) if p.atom.name == "mma_m16n8k64_e2m1_f32" and p.bk == 4)
+    assert not sched._needs_fill(tile, con, plan)
+    transports = {stage.transport for stage in sched._stage_candidates(tile, ctx, con, ProjectionSchedule(tile=plan))}
+    assert transports == {"smem-async", "smem-tma"}, transports
+
+
+@requires_cuda
+@pytest.mark.xdist_group("cuda")
+@pytest.mark.skipif((device_compute_capability() or (0, 0))[0] != 12, reason="block-scaled FP4 mma requires sm_12x")
+def test_the_two_channel_block_scaled_cell_runs_and_holds_the_declared_tolerance(tmp_path):
+    """The native fp4 cell over the fused gate/up pair: one A pair shared by two weight channels,
+    each with its own codes and scale slabs, to the tolerance the single-channel cell declares."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.loader.safetensors import load_constants_from_safetensors
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    m, n, k = 16, 128, 256
+    g = _w4a4_gate_times_up(tmp_path, m=m, n=n, k=k)
+    feed = {"x": (np.random.default_rng(3).standard_normal((m, k)) * 0.05).astype(np.float16)}
+    data = load_constants_from_safetensors(g, str(tmp_path))
+    ref, _ = NumpyBackend().run(g, input_data={**data, **feed})
+    backend = CudaBackend()
+    with pinned_knobs(_fp4_tma_pins("d1/smem-async")):
+        compiled = backend.compile(g)
+        got, _ = backend.run(compiled, input_data={**data, **feed})
+    sources = [s for node in compiled.nodes.values() if (s := getattr(node.op, "kernel_source", None))]
+    native = [s for s in sources if "emmy_mma_m16n8k64_e2m1_f32(" in s]
+    assert len(native) == 1, "the pinned block-scaled cell never reached the gate/up kernel"
+    assert "_b1_smem" in native[0] and "_b1s_smem" in native[0], "the second channel has no slabs of its own"
+
+    r = ref.outputs["act"].astype(np.float32).reshape(-1)
+    c = np.asarray(got.outputs["act"]).astype(np.float32).reshape(-1)
+    rel = np.abs(c - r) / max(float(np.abs(r).max()), 1e-9)
+    assert float(np.median(rel)) < 1e-4, "a systematic shift, not the fused-scale rounding"
+    assert float(rel.max()) < 2e-3, "past one fused-scale rounding per side"
+
+
+def _fp4_tma_program(tmp_path, channels, *, m, k):
+    """Stored activation codes under the block-scaled cell: two linears reading one quantized
+    activation, each its own single-channel contraction, or the fused gate/up pair's two channels.
+    Both keep the activation encode in a kernel of its own, so every operand of the cell is a
+    stored buffer."""
+    if channels == 1:
+        return _w4a4_shared_linears(tmp_path, ("q", "kp"), m=m, n=128, k=k, norm=False), 0.5
+    return _w4a4_gate_times_up(tmp_path, m=m, n=128, k=k), 0.02
+
+
+def _fp4_tma_pins(stage: str) -> dict:
+    return {"TILE": "mma_m16n8k64_e2m1_f32/f1x2/k4", "WORK": "w1x2", "STAGE": stage, "PLACE": "fuse", "REDUCE": "", "FAST_MATH": "False"}
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+def test_fp4_tma_copies_each_stored_buffer_by_box_ahead_of_the_mma(tmp_path, channels):
+    """The TMA form of the cell: one descriptor per stored buffer (the activation's codes and scales,
+    and each weight's), no cp.async left for them, and under a two-slot ring the next chunk's box
+    copies issue before this chunk's wait and its native mma."""
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    g, _ = _fp4_tma_program(tmp_path, channels, m=16, k=1024)
+    with pinned_knobs(_fp4_tma_pins("d2/smem-tma")):
+        lowered = Pipeline.build(CUDA_PASSES).run(g, ctx=Context.from_target((12, 0)))
+    sources = [s for node in lowered.nodes.values() if (s := getattr(node.op, "kernel_source", None))]
+    native = [s for s in sources if "emmy_mma_m16n8k64_e2m1_f32(" in s]
+    assert native, "the pinned block-scaled cell never reached a kernel"
+    for src in native:
+        assert len(set(re.findall(r"CUtensorMap\* __restrict__ (_desc_\w+)", src))) == 2 + 2 * channels
+        assert "emmy_cp_async_cg" not in src
+        assert "unsigned long long _mbar[2]" in src
+        body = src[src.index("for (int _ks") :]
+        assert body.index("cp_async_bulk_tensor") < body.index("mbarrier_wait_parity") < body.index("emmy_mma_m16n8k64_e2m1_f32(")
+
+
+@requires_cuda
+@pytest.mark.xdist_group("cuda")
+@pytest.mark.skipif((device_compute_capability() or (0, 0))[0] != 12, reason="block-scaled FP4 mma requires sm_12x")
+@pytest.mark.parametrize("channels", [1, 2])
+@pytest.mark.parametrize(("ring", "k"), [("d1", 4096), ("d2/p2", 4096), ("d3", 4096), ("d4/p2", 4096), ("d2", 256)])
+def test_fp4_tma_matches_cp_async_bit_for_bit(tmp_path, channels, ring, k):
+    """Only the copy mechanism differs between the two transports, so on the same buffers, tile,
+    ring depth and register buffering the outputs agree to the bit, launch after launch. Sixteen
+    chunks wrap every ring and flip each slot's barrier parity more than once; a single chunk never
+    reaches the ring's steady state. 24 rows leave the second M tile partial, where the box
+    zero-fills the rows cp.async clamps. Separately, the output stays within the cell's declared gap
+    to the numpy reference."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.loader.safetensors import load_constants_from_safetensors
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    m = 24
+    g, amplitude = _fp4_tma_program(tmp_path, channels, m=m, k=k)
+    feed = {"x": (np.random.default_rng(5).standard_normal((m, k)) * amplitude).astype(np.float16)}
+    data = load_constants_from_safetensors(g, str(tmp_path))
+    ref, _ = NumpyBackend().run(g, input_data={**data, **feed})
+    depth, *register = ring.split("/")
+    outputs = {}
+    for transport in ("smem-async", "smem-tma"):
+        backend = CudaBackend()
+        with pinned_knobs(_fp4_tma_pins("/".join((depth, transport, *register)))):
+            compiled = backend.compile(g)
+            native = [
+                s for node in compiled.nodes.values() if "emmy_mma_m16n8k64_e2m1_f32(" in (s := getattr(node.op, "kernel_source", "") or "")
+            ]
+            assert native and all(("cp_async_bulk_tensor" in s) == (transport == "smem-tma") for s in native)
+            runs = [backend.run(compiled, input_data={**data, **feed})[0] for _ in range(2)]
+        outputs[transport] = [np.asarray(run.outputs[out]) for run in runs for out in g.outputs]
+    async_out, tma_out = outputs["smem-async"], outputs["smem-tma"]
+    assert all(np.array_equal(a, t) for a, t in zip(async_out, tma_out, strict=True)), "TMA and cp.async disagree"
+    assert all(np.array_equal(a, async_out[i % len(g.outputs)]) for i, a in enumerate(tma_out)), "a repeated launch changed"
+    for i, out in enumerate(g.outputs):
+        r = ref.outputs[out].astype(np.float32).reshape(-1)
+        rel = np.abs(tma_out[i].astype(np.float32).reshape(-1) - r) / max(float(np.abs(r).max()), 1e-9)
+        assert float(np.median(rel)) < 1e-4 and float(rel.max()) < 2e-3, out
+
+
 def _seams_of(g):
     """Every kernel's cuttable placement seams after the tile LIFT, as ``(tile, seams)``."""
     from emmy.compiler.context import Context
     from emmy.compiler.ir.tile import TileOp
     from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
-    from emmy.compiler.pipeline.passes.lowering.tile._cut import cuttable_seams
+    from emmy.compiler.pipeline.passes.tile._cut import cuttable_seams
 
     looped = Pipeline.build(LOOP_PASSES).run(g)
-    tiled = Pipeline.build(["lowering/tile"], select={"lift"}).run(looped, ctx=Context.from_target((12, 0)))
+    tiled = Pipeline.build(["tile/lift"], select={"lift"}).run(looped, ctx=Context.from_target((12, 0)))
     tiles = [node.op for node in tiled.nodes.values() if isinstance(node.op, TileOp)]
     return [(tile, cuttable_seams(tile)) for tile in tiles]
 
 
 def test_a_block_scaled_operand_cone_is_not_a_placement_seam(tmp_path):
-    """A contraction whose operands read as a block-scaled packed pair offers its OWN seam and
-    none of its operand cones.
+    """A contraction whose operands read as a block-scaled packed pair is covered by a seam,
+    and none of its operand cones is offered.
 
     Cutting a contraction lifts it into a kernel whose grid supplies the output-axis pair a
     fragment needs, which is how the cell reaches this shape at all. Cutting one of its operand
@@ -399,26 +609,26 @@ def test_a_block_scaled_operand_cone_is_not_a_placement_seam(tmp_path):
     for tile, seams in _seams_of(_w4a4_gate_up_down(tmp_path, m=16, k=128)):
         pairs = [t for t in _folds(tile.op) if t.as_contraction() is not None and _edge_readings(tile, t)[0] is not None]
         offered = {id(seam.node) for seam in seams}
+        covered = offered | {
+            id(sibling)
+            for seam in seams
+            for sibling in (
+                *(entry[0] for entry in seam.siblings),
+                *(entry[0] for entry in seam.indexed_siblings),
+            )
+        }
         for con in pairs:
             seen += 1
             assert not [edge for edge in con.operands if id(edge) in offered], "a block-scaled operand cone was offered as a seam"
             # A kernel's ROOT term is not a seam of its own kernel — there is no consumer left to
             # read the workspace — so only a nested contraction is asked for its own seam.
-            assert con is tile.op or id(con) in offered, "a block-scaled contraction lost its own seam"
+            assert con is tile.op or id(con) in covered, "a block-scaled contraction lost its cuttable seam"
     assert seen, "the fixture offered no block-scaled contraction to ask about"
 
 
-def test_a_block_scaled_operand_workspace_would_re_encode_the_values_it_stores(tmp_path):
-    """What the refusal above avoids, stated in the dtype rule's own terms.
-
-    A contraction-operand seam materializes at the dtype the consuming contraction's output is
-    STORED at, which stands in for the element a fused slab would have held. On a kernel whose
-    store is an encode — this shape re-encodes its product, at packed codes over the feature axis
-    and one e4m3 block scale per 16 of them — that stand-in names a bits carrier rather than the
-    decoded values the cone computes. A workspace typed that way holds neither what the producer
-    wrote nor what the consumer would decode, so the cone is not a seam and the question of
-    storing into it never arises."""
-    from emmy.compiler.pipeline.passes.lowering.tile._cut import _dtype_table, _workspace_dtypes
+def test_a_block_scaled_operand_workspace_keeps_its_producers_value_type(tmp_path):
+    """A later packed-code or FP8 scale store cannot retype the decoded operand value."""
+    from emmy.compiler.pipeline.passes.tile._cut import _dtype_table, _workspace_dtypes
 
     asked = 0
     for tile, _ in _seams_of(_w4a4_gate_up_down(tmp_path, m=16, k=128)):
@@ -427,13 +637,11 @@ def test_a_block_scaled_operand_workspace_would_re_encode_the_values_it_stores(t
         table = _dtype_table(tile)
         for con in (t for t in _folds(tile.op) if t.as_contraction() is not None and _edge_readings(tile, t)[0] is not None):
             for edge in con.operands:
-                dtypes = _workspace_dtypes(edge, tile, con, table)
-                if dtypes is None:
-                    continue  # the contraction feeds several stores; the stand-in has no answer
+                dtypes = _workspace_dtypes(edge, table)
                 asked += 1
-                assert all(dtype.nbytes == 1 for dtype in dtypes), "the stand-in named a value dtype on a re-encoding store"
-                assert set(dtypes) != set(table.get(id(edge), ())), "the stand-in agreed with the cone's own dtypes"
-    assert asked, "the fixture never reached the operand workspace rule this refusal exists for"
+                assert dtypes == table[id(edge)]
+                assert all(dtype.nbytes > 1 for dtype in dtypes), "a decoded value was typed as the consumer's encoded bytes"
+    assert asked, "the fixture never reached a decoded operand of a re-encoding kernel"
 
 
 def _pair_terms(tmp_path):
@@ -451,10 +659,9 @@ def _pair_terms(tmp_path):
 def _pair_refusal(tile, ctx, con, pair):
     """Why static node facts rule out every tensor-core atom, asked with ``pair`` as the reading."""
     from emmy.compiler.ir.schedule.classic import refusals as sched
-    from emmy.compiler.ir.tile.ops import projection_tail
 
-    tail = projection_tail(tile)
-    return sched._node_refusal(tile, ctx, con, sched._fragment_epilogue_ok(tail, sched._fold_states(tile.op)), (None, pair))
+    tail, states = sched._fragment_projection(tile)
+    return sched._node_refusal(tile, ctx, con, sched._fragment_epilogue_ok(tail, states), (None, pair))
 
 
 def test_the_block_scaled_cell_says_why_it_declines_a_pair_it_cannot_bind(tmp_path):

@@ -22,7 +22,6 @@ from emmy.compiler.ir.expr import Var
 from emmy.compiler.ir.schedule import Tile, Work
 from emmy.compiler.ir.schedule.views import cone_seam
 from emmy.compiler.ir.stmt import Body, Load, Loop, Write
-from emmy.compiler.ir.stmt.body import dedup_recomputes
 from emmy.compiler.ir.stmt.leaves import Assign
 from emmy.compiler.pipeline.passes.lowering.kernel._atom import _hoist_k_invariant, reduce_codegen, store_sink
 from emmy.compiler.pipeline.passes.lowering.kernel._tiling import atomize, grid_tile, register_tile, unit_tile
@@ -61,11 +60,36 @@ def test_the_seam_lowers_a_twice_read_fold_once() -> None:
     assert {"inv", "out"} <= Body(cell).ssa_defs
 
 
+def test_the_prologue_lowers_a_shared_statistic_once() -> None:
+    """Two row-invariant edges over one row statistic bridge two values but fold the statistic once."""
+    stat = reduction(J, (slab("xj", "x", "m", "j"),), (Assign(name="sq", op=ElementwiseImpl("multiply"), args=("xj", "xj")),), ("acc0",))
+    scale = projection(operands=(stat,), body=(Assign(name="r1", op=ElementwiseImpl("rsqrt"), args=("acc0",)),), results=("r1",))
+    shift = projection(operands=(stat,), body=(Assign(name="r2", op=ElementwiseImpl("multiply"), args=("acc0", "acc0")),), results=("r2",))
+    cone = projection(
+        operands=(scale, shift, slab("xk", "x", "m", "k")),
+        body=(
+            Assign(name="t", op=ElementwiseImpl("multiply"), args=("r1", "xk")),
+            Assign(name="a", op=ElementwiseImpl("multiply"), args=("t", "r2")),
+        ),
+        results=("a",),
+    )
+    pro, cell, stats, chunk = cone_seam(cone, K.name, axes=(M, N, K, J))
+    assert stats == ("r1", "r2") and chunk == ()
+    assert [stmt for stmt in pro if isinstance(stmt, Loop)] == [stmt for stmt in pro if isinstance(stmt, Loop)][:1]
+    defined = [name for stmt in pro for name in stmt.defines()]
+    assert len(defined) == len(set(defined)), defined
+    assert {"acc0", "r1", "r2"} <= Body(pro).ssa_defs
+    assert "acc0" not in Body(cell).ssa_defs
+
+
 def test_dedup_keeps_a_repeated_effect_and_the_first_definition() -> None:
-    fold = tuple(_pv().lower(axes=(S,)))
-    twice = (*fold, *fold)
-    assert dedup_recomputes(twice) == fold
-    assert dedup_recomputes(fold) == fold
+    fold = _pv().lower(axes=(S,))
+    assert (fold + fold).coalesce() == fold
+    assert fold.coalesce() == fold
+    write = Write(output="out", index=(Var("m"), Var("k")), value="acc", atomic=True)
+    assert Body((*fold, *fold, write, write)).coalesce() == (*fold, write, write)
+    effectful = Loop(axis=S, body=(*fold, write))
+    assert Body((effectful, effectful)).coalesce() == (effectful, effectful)
 
 
 def _norm_linear() -> tuple:
@@ -78,6 +102,19 @@ def _norm_linear() -> tuple:
         results=("a",),
     )
     return cone, contraction(K, cone, (slab("w", "w", "n", "k"), "acc"))
+
+
+def test_the_seam_does_not_bridge_a_statistic_the_cell_defines() -> None:
+    """A shared row statistic can also be computed inside a varying operand's cone."""
+    inner, _ = _norm_linear()
+    cone = projection(
+        operands=(inner.operands[0], inner),
+        body=(Assign(name="out", op=ElementwiseImpl("multiply"), args=("acc0", "a")),),
+        results=("out",),
+    )
+    pro, cell, stats, chunk = cone_seam(cone, K.name, axes=(M, N, K, J))
+    assert "acc0" in Body(cell).ssa_defs
+    assert pro == stats == chunk == ()
 
 
 def _register_tiled(spelling: str) -> Body:

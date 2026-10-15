@@ -32,8 +32,8 @@ from emmy.compiler.ir.schedule import Stage, Tile, Work
 from emmy.compiler.ir.schedule.staging import resolve_warp_stage
 from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop
 from emmy.compiler.ir.tile import Placement, TileOp
-from emmy.compiler.pipeline.passes.lowering.tile._fromloop import _stamp_axes, fold_from_loop
-from tests.compiler.helpers import requires_cuda
+from emmy.compiler.pipeline.passes.tile._fromloop import _stamp_axes, fold_from_loop
+from tests.compiler.helpers import requires_cuda, requires_sm
 from tests.compiler.terms import contraction, projection
 
 # ===================================================================
@@ -173,10 +173,15 @@ def test_non_decode_computed_b_preserves_cone_instead_of_positional_misbind():
     assert any(isinstance(s, Assign) and s.op.name == "exp" for s in con.operands[1].lift.body)
 
 
-def test_m_dependent_b_cone_declines_instead_of_crossing_operand_roles():
-    """A B producer that reads the output-row axis is not a separable (k,n) operand — the tree
-    keeps its PLANAR reading; nothing is positionally misbound."""
-    assert _bind(_dequant_loop(scale_index=(Var("m"), Var("k")))) is None
+def test_m_dependent_b_cone_binds_as_a_batched_matvec():
+    """A row-varying scale stays in the complete B cone for each independent m batch."""
+    bound = _bind(_dequant_loop(scale_index=(Var("m"), Var("k"))))
+    assert bound is not None
+    con, epi = bound
+    assert con.as_contraction().shared_axes == {"m"}
+    assert con.operands[1].as_slab() is None
+    assert {stmt.input for stmt in _statements(con.operands[1]) if isinstance(stmt, Load)} == {"w_scale", "w_bits"}
+    assert not epi
 
 
 def test_bare_decode_binds_raw_load_without_epilogue():
@@ -287,6 +292,7 @@ def _fp8_linear_graph(m=32, n=512, k=512):
 
 @requires_cuda
 @pytest.mark.xdist_group("cuda")
+@requires_sm(8)
 def test_fp8_b_matmul_reaches_warp_tier_cuda():
     """The fragment-convert path (M2b priority 3): under a warp ``TILE`` pin the fp8-B linear
     lands on the mma tier — the gmem-direct B fragment load converts fp8 bytes to f16 per element

@@ -14,16 +14,28 @@ the step into an ``Accum`` per carried component.
 
 from __future__ import annotations
 
+import pytest
+
 from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import F16, F32, I32
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.elementwise import ElementwiseImpl
-from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.expr import Literal, Var
 from emmy.compiler.ir.pure import Fold
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Let, Load, Loop
+from emmy.compiler.ir.tile.ops import cone_stat_dtypes, edge_dtypes
 from tests.compiler.terms import contraction, projection, reduction, slab
 
 M_AXIS, N_AXIS, K_AXIS = Axis("m", Dim(256)), Axis("n", Dim(256)), Axis("k", Dim(256))
 SCOPE = (M_AXIS, N_AXIS, K_AXIS)
+
+
+@pytest.mark.parametrize("dtype", [F16, F32, I32, None])
+def test_typed_literal_bindings_keep_their_edge_and_cone_statistic_dtypes(dtype):
+    body = (Let("constant", Literal(2.0), dtype=dtype), Assign("product", "multiply", ("constant", "constant")))
+    edge = projection((), body, ("product",))
+    assert edge_dtypes(edge, {}) == (dtype,)
+    assert cone_stat_dtypes(body, ("constant", "product"), {}) == ({} if dtype is None else {"constant": dtype, "product": dtype})
 
 
 def _matmul() -> Fold:
@@ -167,7 +179,7 @@ def test_every_buffer_the_term_touches_reaches_the_lowered_body() -> None:
 
 def test_iteration_variables_are_not_captures() -> None:
     """The dominant names in any cone are induction variables, bound by the enclosing nest."""
-    from emmy.compiler.pipeline.passes.lowering.tile._cut import _closed_at
+    from emmy.compiler.pipeline.passes.tile._cut import _closed_at
 
     cone = projection(
         (slab("e", "x", "m", "k"), slab("s", "w", "k")),
@@ -181,9 +193,48 @@ def test_iteration_variables_are_not_captures() -> None:
 def test_the_closure_predicate_reads_the_declaration() -> None:
     """``_external_reads`` is :attr:`Fold.free_axes` — asked of the term, not derived by lowering
     it and scanning the result."""
-    from emmy.compiler.pipeline.passes.lowering.tile._cut import _external_reads
+    from emmy.compiler.pipeline.passes.tile._cut import _external_reads
 
     assert _external_reads(_matmul()) == {"m", "n"}  # ``k`` is bound by the fold — not free above it
+
+
+def test_a_sweep_drops_pure_members_not_read_by_its_stores() -> None:
+    from emmy.compiler.ir.loop import LoopOp
+    from emmy.compiler.ir.stmt import Write
+    from emmy.compiler.ir.tile.ir import loaded_buffers
+    from emmy.compiler.pipeline.passes.tile._fromloop import lift_loop_op
+
+    first = Loop(
+        axis=N_AXIS,
+        body=Body(
+            (
+                Load(name="first", input="x", index=(Var("n"),)),
+                Write(output="a", index=(Var("n"),), value="first"),
+            )
+        ),
+    )
+    second = Loop(
+        axis=M_AXIS,
+        body=Body(
+            (
+                Load(name="unused", input="dead", index=(Var("m"),)),
+                Loop(
+                    axis=K_AXIS,
+                    body=Body(
+                        (
+                            Load(name="value", input="y", index=(Var("m"), Var("k"))),
+                            Accum(name="sum", value="value", op="add", axes=("k",)),
+                        )
+                    ),
+                ),
+                Write(output="b", index=(Var("m"),), value="sum"),
+            )
+        ),
+    )
+    tile = lift_loop_op(LoopOp(body=(first, second)))
+    assert {load.input for load in loaded_buffers(tile.op)} == {"x", "y"}
+    assert sorted((spec.write.output, len(spec.sweep)) for spec in tile.output_specs) == [("a", 1), ("b", 1)]
+    assert tile.output_specs[0].sweep != tile.output_specs[1].sweep
 
 
 def test_a_sweep_with_a_projection_beside_a_nested_sweep_lifts() -> None:
@@ -193,7 +244,7 @@ def test_a_sweep_with_a_projection_beside_a_nested_sweep_lifts() -> None:
     statement of the retained cell, and the boundary records its store under the axis path."""
     from emmy.compiler.ir.loop import LoopOp
     from emmy.compiler.ir.stmt import Write
-    from emmy.compiler.pipeline.passes.lowering.tile._fromloop import lift_loop_op
+    from emmy.compiler.pipeline.passes.tile._fromloop import lift_loop_op
 
     add = ElementwiseImpl("add")
     gate_total = Loop(
@@ -247,7 +298,7 @@ def test_a_reduce_under_an_output_sweep_lifts_to_an_operand_and_lowers_back_unde
     rather than a peeled free axis."""
     from emmy.compiler.ir.loop import LoopOp
     from emmy.compiler.ir.stmt import Write
-    from emmy.compiler.pipeline.passes.lowering.tile._fromloop import lift_loop_op
+    from emmy.compiler.pipeline.passes.tile._fromloop import lift_loop_op
 
     add = ElementwiseImpl("add")
     total = Loop(

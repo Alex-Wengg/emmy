@@ -70,6 +70,7 @@ def test_validate_summary_accepts_exact_manifest(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -100,6 +101,51 @@ def test_validate_summary_accepts_exact_manifest(tmp_path):
     assert artifacts == [Path(path) for path in paths]
 
 
+@pytest.mark.parametrize(
+    ("emmy", "tags", "error"),
+    [
+        ({"eligible": False, "blocked": True}, "[best-effort, emmy-blocked]", None),
+        ({"eligible": False, "blocked": True}, "[best-effort]", "tag must match"),
+        ({"eligible": False, "blocked": False}, "[best-effort, emmy-blocked]", "tag must match"),
+        ({"eligible": True, "blocked": True}, "[best-effort, emmy-blocked]", "cannot be blocked"),
+    ],
+)
+def test_emmy_blocker_tag_matches_summary(tmp_path, emmy, tags, error):
+    paths = _write_artifacts(tmp_path)
+    (tmp_path / paths[0]).write_text(f"tags: {tags}\nmodel:\n  huggingface: org/Model\n  heat: 77\n")
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "emmy": emmy,
+                "mode": "onboarding",
+                "model_id": "org/Model",
+                "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
+                "deployment_summary": "vLLM 0.22.1, 32K context, concurrency 8",
+                "performance_summary": "100 requests, 2,400 output tok/s, p50 TTFT 42 ms, 0 failures",
+                "recipe": paths[0],
+                "report": paths[1],
+                "experiment": paths[2],
+                "experiment_artifacts": paths[2:],
+                "artifacts": paths,
+                "cleanup": {"workloads": "complete", "docker_logout": True},
+            }
+        )
+    )
+
+    def call():
+        return onboarding_artifacts.validate_summary(
+            summary_path, tmp_path, "org/Model", "NVIDIA H200 141GB", 1, "user@host", "onboarding", "best-effort"
+        )
+
+    if error:
+        with pytest.raises(ValueError, match=error):
+            call()
+    else:
+        call()
+
+
 def test_validate_summary_includes_separately_declared_artifacts(tmp_path):
     paths = _write_artifacts(tmp_path)
     summary_path = tmp_path / "summary.json"
@@ -107,6 +153,7 @@ def test_validate_summary_includes_separately_declared_artifacts(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -143,6 +190,7 @@ def test_validate_summary_requires_exact_platform_archive(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -184,6 +232,7 @@ def test_validate_summary_requires_platform_record_inside_archive(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -222,6 +271,7 @@ def test_validate_summary_rejects_top_level_experiment_record(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -260,6 +310,7 @@ def test_validate_summary_rejects_other_platform_archive(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -298,6 +349,7 @@ def test_validate_summary_rejects_experiment_result(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -336,6 +388,7 @@ def test_validate_summary_rejects_recipe_run_result(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -374,6 +427,7 @@ def test_validate_summary_rejects_report_outside_final_recipe_dir(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -409,6 +463,7 @@ def test_validate_summary_rejects_mode_mismatch(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -444,6 +499,7 @@ def test_validate_summary_rejects_lifecycle_change(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "verification",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -469,6 +525,130 @@ def test_validate_summary_rejects_lifecycle_change(tmp_path):
             "user@host",
             "verification",
             "maintained",
+        )
+
+
+def _failed_run(workspace, tags="[best-effort, onboarding-failed]"):
+    _write_artifacts(workspace)
+    _init_repo(workspace)
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=workspace, check=True)
+    (workspace / "recipes/Model/recipe.yaml").write_text(f"tags: {tags}\nmodel:\n  huggingface: org/Model\n  heat: 77\n")
+
+
+def _failure_summary(tmp_path, artifacts):
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "mode": "onboarding",
+                "model_id": "org/Model",
+                "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
+                "failure": {"gate": "engine-support", "message": "No engine loads the checkpoint.", "regression": False},
+                "report": "recipes/Model/RESULTS.md",
+                "artifacts": artifacts,
+                "cleanup": {"workloads": "complete", "docker_logout": True},
+            }
+        )
+    )
+    return onboarding_artifacts.validate_summary(
+        summary_path, tmp_path, "org/Model", "NVIDIA H200 141GB", 1, "user@host", "onboarding", "best-effort"
+    )
+
+
+def test_failed_run_tags_its_recipe_and_keeps_its_report_and_golden(tmp_path):
+    _failed_run(tmp_path)
+    golden = tmp_path / "recipes/Model/golden/h200_90.json"
+    golden.parent.mkdir()
+    golden.write_text("{}\n")
+
+    _, artifacts = _failure_summary(tmp_path, ["recipes/Model/golden/h200_90.json"])
+
+    assert artifacts == [
+        Path("recipes/Model/recipe.yaml"),
+        Path("recipes/Model/RESULTS.md"),
+        Path("recipes/Model/golden/h200_90.json"),
+    ]
+
+
+@pytest.mark.parametrize("tags", ["[best-effort]", "[maintained, onboarding-failed]"])
+def test_failed_run_changes_only_the_failure_tag(tmp_path, tags):
+    _failed_run(tmp_path, tags)
+
+    with pytest.raises(ValueError, match="add only the 'onboarding-failed' tag"):
+        _failure_summary(tmp_path, [])
+
+
+def test_failed_run_rejects_a_deleted_golden(tmp_path):
+    golden = tmp_path / "recipes/Model/golden/h200_90.json"
+    golden.parent.mkdir(parents=True)
+    golden.write_text("{}\n")
+    _failed_run(tmp_path)
+    golden.unlink()
+
+    with pytest.raises(ValueError, match="only its report, golden, and compiler work"):
+        _failure_summary(tmp_path, ["recipes/Model/golden/h200_90.json"])
+
+
+def test_failed_run_requires_a_failure_object(tmp_path):
+    _failed_run(tmp_path)
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "mode": "onboarding",
+                "model_id": "org/Model",
+                "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
+                "failure": None,
+                "report": "recipes/Model/RESULTS.md",
+                "artifacts": [],
+                "cleanup": {"workloads": "complete", "docker_logout": True},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="failure object"):
+        onboarding_artifacts.validate_summary(
+            summary_path, tmp_path, "org/Model", "NVIDIA H200 141GB", 1, "user@host", "onboarding", "best-effort"
+        )
+
+
+def test_failed_run_rejects_serving_artifacts(tmp_path):
+    _failed_run(tmp_path)
+
+    with pytest.raises(ValueError, match="only its report, golden, and compiler work"):
+        _failure_summary(tmp_path, ["experiments/Model/serving/RESULTS.md"])
+
+
+def test_successful_run_removes_the_failure_tag(tmp_path):
+    paths = _write_artifacts(tmp_path)
+    (tmp_path / paths[0]).write_text("tags: [best-effort, onboarding-failed]\nmodel:\n  huggingface: org/Model\n")
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
+                "mode": "onboarding",
+                "model_id": "org/Model",
+                "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
+                "deployment_summary": "vLLM 0.22.1, 32K context, concurrency 8",
+                "performance_summary": "100 requests, 2,400 output tok/s, p50 TTFT 42 ms, 0 failures",
+                "recipe": paths[0],
+                "report": paths[1],
+                "experiment": paths[2],
+                "experiment_artifacts": paths[2:],
+                "artifacts": paths,
+                "cleanup": {"workloads": "complete", "docker_logout": True},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="must remove the 'onboarding-failed' tag"):
+        onboarding_artifacts.validate_summary(
+            summary_path, tmp_path, "org/Model", "NVIDIA H200 141GB", 1, "user@host", "onboarding", "best-effort"
         )
 
 
@@ -635,6 +815,7 @@ def test_platform_update_preserves_other_platform_snapshot(tmp_path):
         json.dumps(
             {
                 "status": "success",
+                "emmy": {"eligible": False, "blocked": False},
                 "mode": "onboarding",
                 "model_id": "org/Model",
                 "target": {"gpu": "NVIDIA H200 141GB", "gpu_count": 1, "ssh": "user@host"},
@@ -685,25 +866,25 @@ def test_platform_update_preserves_other_platform_snapshot(tmp_path):
 def _corpus_case(workspace, name):
     path = workspace / onboarding_artifacts.CORPUS_CASE_DIR / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("compute_cap: [12, 0]\n")
+    path.write_text('{"compute_cap": [12, 0]}\n')
     return path.relative_to(workspace)
 
 
 def test_corpus_case_is_an_allowed_artifact(tmp_path):
-    """A ``.yaml`` under the corpus is allowed even though ``tests/`` otherwise takes only Python."""
-    _corpus_case(tmp_path, "matmul/f16-warp-splitk.yaml")
+    """A ``.json`` case under the corpus is allowed even though ``tests/`` otherwise takes only Python."""
+    _corpus_case(tmp_path, "matmul/f16-warp-splitk.json")
 
-    resolved = onboarding_artifacts._relative_artifact(tmp_path, "tests/compiler/realization/cases/matmul/f16-warp-splitk.yaml")
+    resolved = onboarding_artifacts._relative_artifact(tmp_path, "tests/compiler/realization/cases/matmul/f16-warp-splitk.json")
 
-    assert resolved == Path("tests/compiler/realization/cases/matmul/f16-warp-splitk.yaml")
+    assert resolved == Path("tests/compiler/realization/cases/matmul/f16-warp-splitk.json")
 
 
 def test_corpus_case_rejects_an_unknown_expected_failure_stage(tmp_path):
     """The filename is semantic, so a typo must not quietly become a closed case."""
-    _corpus_case(tmp_path, "matmul/lockout_xfail_offerd.yaml")
+    _corpus_case(tmp_path, "matmul/lockout_xfail_offerd.json")
 
     with pytest.raises(ValueError, match="unknown expected-failure stage"):
-        onboarding_artifacts._relative_artifact(tmp_path, "tests/compiler/realization/cases/matmul/lockout_xfail_offerd.yaml")
+        onboarding_artifacts._relative_artifact(tmp_path, "tests/compiler/realization/cases/matmul/lockout_xfail_offerd.json")
 
 
 def test_non_corpus_yaml_under_tests_is_still_rejected(tmp_path):
@@ -724,7 +905,7 @@ def test_corpus_cases_are_the_focused_test_for_a_compiler_fix(tmp_path):
     subprocess.run(["git", "add", "emmy/compatibility.py"], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
     implementation.write_text("VALUE = 'after'\n")
-    case = _corpus_case(tmp_path, "matmul/lockout.yaml")
+    case = _corpus_case(tmp_path, "matmul/lockout.json")
 
     onboarding_artifacts.stage_artifacts(tmp_path, [Path("emmy/compatibility.py"), case])
 
@@ -736,6 +917,6 @@ def test_corpus_cases_do_not_consume_the_small_fix_budget(tmp_path):
     baseline.write_text("baseline\n")
     subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
-    cases = [_corpus_case(tmp_path, f"matmul/case_{index}.yaml") for index in range(onboarding_artifacts.MAX_IMPLEMENTATION_FILES + 3)]
+    cases = [_corpus_case(tmp_path, f"matmul/case_{index}.json") for index in range(onboarding_artifacts.MAX_IMPLEMENTATION_FILES + 3)]
 
     onboarding_artifacts.stage_artifacts(tmp_path, cases)

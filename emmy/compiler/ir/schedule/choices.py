@@ -49,6 +49,7 @@ import enum
 import re
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
+from functools import cached_property
 
 from emmy.compiler.ir.atom import SCALAR_ATOM, Atom, AtomKind, atom_for
 from emmy.compiler.ir.axis import Axis
@@ -106,7 +107,7 @@ class FoldMove(enum.Enum):
     KERNEL = "kernel"  # cross-CTA workspace + deferred sibling combine kernel (030_cut)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReduceStage:
     """One level's **tuned** partition: a ``width`` of partials at a hardware ``level``.
 
@@ -128,6 +129,14 @@ class ReduceStage:
     # lane-indexed smem tree across k-slices (no shuffle stage — each lane holds a
     # different output). The interleaved default keeps lanes on the reduce axis.
     transposed: bool = False
+    # BLOCK only (the ``/v<n>`` codec token): each lane owns ``columns`` adjacent elements of the axis
+    # its lanes sweep — output columns on a transposed band, reduce elements on an ordinary one — so
+    # its reads at one step are one contiguous run the load vectorizer widens into a single 4-, 8- or
+    # 16-byte load.
+    columns: int = 1
+    # BLOCK + transposed only (``/n8``): output lanes in each warp; the remaining lanes
+    # partition K. The established ``coop-t`` spelling keeps its 32 output lanes.
+    output_lanes: int = 32
 
     def __post_init__(self) -> None:
         if not isinstance(self.level, Level):
@@ -142,6 +151,12 @@ class ReduceStage:
             raise TypeError("ReduceStage transposed must be a bool")
         if self.level is not Level.BLOCK and self.transposed:
             raise ValueError("only a BLOCK ReduceStage can transpose its cooperative mapping")
+        if type(self.columns) is not int or self.columns < 1 or (self.columns > 1 and self.level is not Level.BLOCK):
+            raise ValueError(f"ReduceStage columns must be a positive integer on a cooperative band, got {self.columns!r}")
+        if self.output_lanes not in (8, 32) or (self.output_lanes != 32 and not self.transposed):
+            raise ValueError("ReduceStage output lanes must be 8 or 32 on a transposed band")
+        if self.transposed and self.width % self.output_lanes:
+            raise ValueError("ReduceStage width must be divisible by its output lanes")
 
     def combine(self, *, warp_size: int, segmented: bool = False) -> tuple[FoldMove, ...]:
         """The derived per-level combine fold(s), fine→coarse within this stage — the ONE
@@ -171,7 +186,7 @@ class ReduceStage:
         return (FoldMove.SMEM,)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Reduce:
     """The kernel's single reduce partition — the **tuned widths only**, coarse→fine.
 
@@ -191,7 +206,17 @@ class Reduce:
             raise ValueError("Reduce stages must be unique, active, and ordered GRID -> BLOCK -> REG")
 
     @classmethod
-    def of(cls, *, cta: int = 1, coop: int = 1, reg: int = 1, finalize: str = "kernel", coop_transposed: bool = False) -> Reduce:
+    def of(
+        cls,
+        *,
+        cta: int = 1,
+        coop: int = 1,
+        reg: int = 1,
+        finalize: str = "kernel",
+        coop_transposed: bool = False,
+        columns: int = 1,
+        output_lanes: int = 32,
+    ) -> Reduce:
         """Build a plan from per-level widths (1 = absent). Order is coarse→fine:
         GRID (cta) → BLOCK (coop) → REG (reg). ``finalize`` rides the GRID stage;
         ``coop_transposed`` rides the BLOCK stage (the ``coop-t`` k-major lane swap)."""
@@ -205,11 +230,13 @@ class Reduce:
             raise ValueError("Reduce finalization is meaningful only when cta > 1")
         if coop == 1 and coop_transposed:
             raise ValueError("Reduce cooperative transposition is meaningful only when coop > 1")
+        if coop == 1 and output_lanes != 32:
+            raise ValueError("Reduce output lanes are meaningful only when coop > 1")
         stages: list[ReduceStage] = []
         if cta > 1:
             stages.append(ReduceStage(Level.GRID, cta, finalize=finalize))
         if coop > 1:
-            stages.append(ReduceStage(Level.BLOCK, coop, transposed=coop_transposed))
+            stages.append(ReduceStage(Level.BLOCK, coop, transposed=coop_transposed, columns=columns, output_lanes=output_lanes))
         if reg > 1:
             stages.append(ReduceStage(Level.REG, reg))
         return cls(tuple(stages))
@@ -217,7 +244,7 @@ class Reduce:
     def spell(self) -> str:
         """The ``REDUCE`` codec value for this plan — the pipeline coarse→fine, SITE-LOCAL: the
         coop WIDTH lives in the kernel's ``WORK`` inventory, never here, so the value is
-        ``[g<n>[a|k]][/coop[-t]][/r<n>]``. ``""`` for the scalar serial fold (the per-thread
+        ``[g<n>[a|k]][/coop[-t][/n8][/v<n>]][/r<n>]``. ``""`` for the scalar serial fold (the per-thread
         serial remainder is never spelled — it derives as ``ceil(extent / parallel)``). The GRID
         finalize letter IS kept: ``a``/``k`` is the atomic-vs-deferred finalize MODE, a site-local
         fact — ``g4a`` and ``g2k`` are semantically different rows, both live in the golden
@@ -227,6 +254,10 @@ class Reduce:
             parts.append(f"g{self.cta}{'a' if self.finalize == 'atomic' else 'k'}")
         if self.coop > 1:
             parts.append("coop-t" if self.coop_transposed else "coop")
+        if self.coop_output_lanes != 32:
+            parts.append(f"n{self.coop_output_lanes}")
+        if self.coop_columns > 1:
+            parts.append(f"v{self.coop_columns}")
         if self.reg > 1:
             parts.append(f"r{self.reg}")
         return "/".join(parts)
@@ -234,11 +265,12 @@ class Reduce:
     @classmethod
     def parse(cls, spec: str | None, work: Work | None) -> Reduce:
         """Decode a ``REDUCE`` value against the kernel's ``WORK`` inventory (inverse of
-        :meth:`spell` — the coop width is ``work.count``, never the string). Empty / ``None`` =
-        the scalar serial fold. An unknown token raises, so a width-carrying spelling (the retired
-        ``b<n>`` embedded-worker grammar) is a loud error, not a silent second reading."""
+        :meth:`spell` — the coop width is the inventory's first unit, never the string; a second
+        unit packs cells per CTA). Empty / ``None`` = the scalar serial fold. An unknown token
+        raises, so a width-carrying spelling (the retired ``b<n>`` embedded-worker grammar) is a
+        loud error, not a silent second reading."""
         s = (spec or "").strip()
-        cta, coop, reg, finalize, transposed = 1, 1, 1, "kernel", False
+        cta, coop, reg, finalize, transposed, columns, output_lanes = 1, 1, 1, "kernel", False, 1, 32
         for t in s.split("/") if s else ():
             if t.startswith("g"):
                 body = t[1:]
@@ -249,15 +281,23 @@ class Reduce:
             elif t in ("coop", "coop-t"):
                 if work is None or work.kind != "thread":
                     raise ValueError(f"REDUCE {spec!r}: 'coop' requires a thread WORK inventory (t<N>)")
-                coop, transposed = work.count, t.endswith("-t")
+                coop, transposed = work.units[0], t.endswith("-t")
             elif t.startswith("r") and t[1:].isdigit():
                 reg = _codec_width(t[1:], tok=t, codec="REDUCE")
+            elif t.startswith("n") and t[1:].isdigit():
+                if not transposed:
+                    raise ValueError(f"REDUCE {spec!r}: 'n<n>' follows 'coop-t'")
+                output_lanes = _codec_width(t[1:], tok=t, codec="REDUCE")
+            elif t.startswith("v") and t[1:].isdigit():
+                if coop == 1:
+                    raise ValueError(f"REDUCE {spec!r}: 'v<n>' follows 'coop' or 'coop-t'")
+                columns = _codec_width(t[1:], tok=t, codec="REDUCE")
             else:
-                raise ValueError(f"REDUCE {spec!r}: unknown token {t!r} (expect g<n>[a|k] / coop[-t] / r<n>)")
+                raise ValueError(f"REDUCE {spec!r}: unknown token {t!r} (expect g<n>[a|k] / coop[-t][/n8][/v<n>] / r<n>)")
         return _canonical_choice(
             "REDUCE",
             spec,
-            cls.of(cta=cta, coop=coop, reg=reg, finalize=finalize, coop_transposed=transposed),
+            cls.of(cta=cta, coop=coop, reg=reg, finalize=finalize, coop_transposed=transposed, columns=columns, output_lanes=output_lanes),
         )
 
     @property
@@ -309,8 +349,18 @@ class Reduce:
         """True iff the BLOCK stage carries the ``coop-t`` k-major lane swap."""
         return any(s.transposed for s in self.stages if s.level is Level.BLOCK)
 
+    @property
+    def coop_columns(self) -> int:
+        """The contiguous run each lane of a cooperative band owns (``/v<n>``), or 1."""
+        return next((s.columns for s in self.stages if s.level is Level.BLOCK), 1)
 
-@dataclass(frozen=True)
+    @property
+    def coop_output_lanes(self) -> int:
+        """The output lanes of a transposed BLOCK band, or the established 32."""
+        return next((s.output_lanes for s in self.stages if s.level is Level.BLOCK), 32)
+
+
+@dataclass(frozen=True, slots=True)
 class Tile:
     """The contraction's output tile — **one descriptor for both tiers**, discriminated by
     :attr:`atom`: a tensor-core :class:`AtomKind` (the warp mma tile) or the scalar
@@ -501,7 +551,7 @@ class PlacedTile:
     # ---- the (m, n) output sides: each axis paired with its derived per-CTA tile geometry (width /
     # unit / register counts) + the bound block/unit var names (the original m/n names live in the
     # operand indices, so the bound axes take a fresh ``_b`` / ``_u`` suffix). --------------------- #
-    @property
+    @cached_property
     def mn(self) -> tuple[Side, Side]:
         """The ``(m, n)`` output :class:`Side` pair — each placed axis with its derived geometry.
         Requires :meth:`at` to have bound the placement; :attr:`m` / :attr:`n` index it."""
@@ -520,7 +570,7 @@ class PlacedTile:
         return self.mn[1]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Work:
     """The kernel's ONE worker inventory (1r in-memory; the step-7 ``WORK`` wire family) — the
     per-site ``w``/``n`` worker tokens factored out of the ``TILE`` values into a single
@@ -667,7 +717,7 @@ def derive_inventory(tiles, *, coop: int = 1, producer: int = 0) -> Work | None:
     return work
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Placement:
     """Kind-neutral free-axis → grid binding (the parallel output axes and their grid
     mapping). ``010_lift`` builds an UNMAPPED placement (just ``free``); the schedule
@@ -675,6 +725,12 @@ class Placement:
 
     free: tuple[Axis, ...] = ()
     grid: tuple[Axis, ...] = ()
+    #: SERIAL axes — a recurrence's time: the kernel is launched once per coordinate, in order,
+    #: each launch receiving the coordinate as a runtime ``int``. Outermost of everything, never
+    #: on the grid, never a loop in the body. What makes a lagged read of the kernel's own output
+    #: (``S[c − 1]`` while writing ``S[c]``) well-defined: every cell of step ``c − 1`` is stored
+    #: before any cell of step ``c`` runs.
+    serial: tuple[Axis, ...] = ()
     #: Set by the scheduling transition (:meth:`on_grid`) — the EXPLICIT "the grid has been
     #: decided" bit. A non-empty ``grid`` already says so, but a **free-less** kernel (a decode
     #: row whose every axis folded into the tile) maps onto an EMPTY grid, so its scheduled
@@ -701,7 +757,7 @@ class Placement:
 
     def on_grid(self) -> Placement:
         """The scalar-tier mapping: bind every free axis onto the thread grid."""
-        return Placement(free=self.free, grid=self.free, mapped=True)
+        return dc_replace(self, grid=self.free, mapped=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -714,36 +770,38 @@ class Placement:
 # --------------------------------------------------------------------------- #
 
 
-#: The transport tokens: the shared-memory intermediate named by its fill mechanism — the
+#: The transport tokens: register storage (``reg``), or shared memory named by its fill mechanism — the
 #: synchronous thread fill (``smem``: a byte copy of materialized edges, or the compute fill
 #: evaluating a computed edge into its slab), ``cp.async`` (``smem-async``) and TMA
 #: (``smem-tma``). An EMPTY ``STAGE`` is no intermediate at all: gmem→register on a
 #: materialized operand, register-to-register on a computed one.
-_TRANSPORTS = ("direct", "smem", "smem-async", "smem-tma")
+_TRANSPORTS = ("direct", "reg", "smem", "smem-async", "smem-tma")
 
 #: The ``STAGE`` grammar, rendered into every parse error so a bad pin names what it could have said.
-_STAGE_EXPECT = "expect d<n> / smem|smem-async|smem-tma / p<n>"
+_STAGE_EXPECT = "expect d<n> / reg|smem|smem-async|smem-tma / p<n>"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Stage:
-    """One operand-transport pipeline over the serial reduce loop — one ``Stage`` per reduce
-    loop (a reduce ``Loop`` ⇒ one reduce axis ⇒ one pipeline). The schedule's
-    operand-staging knob, decided by the tile schedule and materialized in
-    ``010_materialize``.
+    """The schedule's intermediate storage and fill mechanism.
 
     ``Stage.direct()`` is the register / gmem-direct baseline (no slab); every other ``Stage``
-    means staging is **on** (the reused gmem operands ride a shared-memory slab). Spelled by the
-    ``STAGE`` codec ``d<depth>/smem|smem-async|smem-tma[/p<reg_depth>]``
-    (decided by the tile schedule). Eligibility and sizing produce a separate
-    :class:`ResolvedStage`; this choice never stores shared-memory names or a derived K chunk.
+    names stored intermediate values. ``d1/reg`` retains one slot in registers for reuse by
+    consumers or loop iterations. It does not imply recurrence: the schedule determines the
+    value's lifetime and ownership. The other transports store operands in shared memory.
+    Spelled by the ``STAGE`` codec ``d<depth>/reg|smem|smem-async|smem-tma[/p<reg_depth>]``.
+    Shared-memory eligibility and sizing produce a separate :class:`ResolvedStage`; this choice
+    never stores shared-memory names or a derived K chunk.
 
-    The pipeline has two buffering levels down the memory hierarchy, each with its own depth:
+    Shared-memory pipelines have two buffering levels, each with its own depth:
     ``depth`` is the **gmem→smem** ring (a synchronous slot fill or the cp.async / TMA prefetch
     over the serial reduce loop), ``reg_depth`` is the **smem→register** double-buffer (the
     fragment-load ping-pong over the inner atom-K steps, breaking the WAR hazard on the operand fragments). They are
     orthogonal — ``d3/smem-async/p2`` is a 3-deep gmem ring feeding a 2-deep register ping-pong.
     ``reg_depth = 1`` (the default) is the "optional register" OFF point (no inner prefetch).
+    A ``wgmma`` drain loads no operand fragments; its ``reg_depth`` counts the MMA groups in
+    flight instead: ``p2`` leaves each chunk's group running while the next one is issued, and
+    releases its ring slot one chunk later.
     The slab K-*granularity* (how much K is resident) is ``Tile.bk``, NOT a third depth
     here — granularity and buffer depth are kept distinct.
 
@@ -752,18 +810,20 @@ class Stage:
     byte-identically with and without it."""
 
     depth: int = 1  # gmem→smem ring depth over the reduce loop (1 = single buffer, no prefetch)
-    transport: str = "smem"  # smem | smem-async | smem-tma (the intermediate and its fill mechanism)
+    transport: str = "smem"  # reg | smem | smem-async | smem-tma (the intermediate and its fill mechanism)
     reg_depth: int = 1  # smem→register double-buffer depth (1 = no inner ldmatrix prefetch)
 
     def __post_init__(self) -> None:
         if self.transport not in _TRANSPORTS:
-            raise ValueError(f"bad Stage transport {self.transport!r} (expect smem | smem-async | smem-tma)")
+            raise ValueError(f"bad Stage transport {self.transport!r} (expect reg | smem | smem-async | smem-tma)")
         if type(self.depth) is not int or self.depth < 1:
             raise ValueError(f"Stage depth must be a positive integer, got {self.depth!r}")
         if type(self.reg_depth) is not int or self.reg_depth < 1:
             raise ValueError(f"Stage reg_depth must be a positive integer, got {self.reg_depth!r}")
         if self.transport == "direct" and (self.depth != 1 or self.reg_depth != 1):
             raise ValueError("direct Stage cannot carry pipeline depths")
+        if self.transport == "reg" and (self.depth != 1 or self.reg_depth != 1):
+            raise ValueError("register storage has one live value and no operand prefetch")
 
     @classmethod
     def direct(cls) -> Stage:
@@ -778,6 +838,7 @@ class Stage:
     @classmethod
     def parse(cls, spec: str | None) -> Stage:
         """Decode the ``STAGE`` knob codec into a stage: ``/``-separated tokens —
+        ``d1/reg`` names one register slot. Shared-memory pipelines use
         ``d<depth>`` (gmem→smem ring depth), ``smem`` | ``smem-async`` | ``smem-tma`` (the
         intermediate and its fill mechanism: a synchronous thread fill — byte-copying a
         materialized edge, evaluating a computed one, converting when the dtypes differ — the
@@ -845,7 +906,7 @@ class Stage:
         return True
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ResolvedStage:
     """Materialization facts derived from a :class:`Stage` choice at one problem edge."""
 
@@ -868,7 +929,7 @@ class ResolvedStage:
         return getattr(object.__getattribute__(self, "choice"), name)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WarpSpec:
     """The producer band — the dedicated warps split off the uniform pipeline to drive the
     ``Stage`` gmem→smem load half, ORTHOGONAL to the pipeline (``reduce`` / ``tile`` / ``stage``):
@@ -881,12 +942,13 @@ class WarpSpec:
     The band is DECIDED as inventory — it rides ``WORK``'s ``+p<n>`` (``Work.producer``), which
     is where the retired ``WSPEC`` knob's one live decision went. ``ClassicScheduleContext`` and
     the private enumerator require a resolved TMA stage on an unsplit kernel that is not split
-    across CTAs and does not stage a packed byte slab. The box copy is issued by one elected
+    across CTAs and does not compute-fill a slab beside its box copies (a packed byte slab's
+    scales, a computed activation). The box copy is issued by one elected
     thread onto a slot mbarrier any thread can parity-wait, so the fill moves warps freely, while
     ``cp.async``'s wait-group is issuing-thread-scoped and an ``smem`` compute fill has no async load
-    half. The packed byte slab is refused for a different reason: its own TMA lowering returns the
-    plain staged K-loop and emits no split, so the widened block's spare warps reach the compute
-    body and a second thread arms the box-copy barrier.
+    half. TMA copies beside a compute fill are refused for a different reason: their lowering runs
+    both as groups of the plain staged K-loop and emits no split, so the widened block's spare
+    warps reach the compute body and a second thread arms the box-copy barrier.
 
     Materialized by the staged K-loop (``lowering/kernel/_stage.staged_kloop``): the producer band
     rides at the TAIL of the thread block (``threadIdx.x >= block_threads``), so the compute warps'
@@ -905,7 +967,7 @@ class WarpSpec:
         return f"p{self.producer_warps}" if self.producer_warps else ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Raster:
     """The CTA rasterization order — the bare kernel-scoped ``RASTER`` choice (one launch order
     per grid). It changes NO per-CTA work, layout, or schedule — only
@@ -967,7 +1029,7 @@ def _overhangs(axis: Axis, tile: int) -> bool:
     return not (axis.extent.is_static and axis.extent.as_static() % tile == 0)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Side:
     """One tiled output axis of a contraction — the outer ``m`` or inner ``n`` — paired with its
     derived per-CTA tile geometry. The two ride as a ``(m, n)`` pair (:attr:`Fold.mn`)

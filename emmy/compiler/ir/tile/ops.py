@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from emmy.compiler.dtype import get as get_dtype
+from emmy.compiler.ir.address import gmem_axis_step
 from emmy.compiler.ir.pure.fold import (
     Fold,
 )
@@ -29,9 +30,9 @@ from emmy.compiler.ir.schedule.classic import (
     classic_node_key,
     classic_stage_key,
 )
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Select, refs_axis, stmt_axis_names
+from emmy.compiler.ir.stmt import Accum, Affine, Assign, Body, Init, Let, Load, Loop, Select, refs_axis, stmt_axis_names
 from emmy.compiler.ir.stmt.base import Stmt, dtype_promote
-from emmy.compiler.ir.tile.ir import TileOp, apply_output_specs
+from emmy.compiler.ir.tile.boundary import apply_output_specs
 from emmy.compiler.ir.tile.path import UnknownSiteError, sites
 
 
@@ -51,14 +52,24 @@ def cone_stat_dtypes(pro: tuple, stats: tuple[str, ...], inputs) -> dict[str, ob
         if isinstance(stmt, Load):
             tensor = inputs.get(stmt.input) if inputs else None
             env.update((name, tensor.dtype if tensor is not None else None) for name in stmt.names)
-        elif isinstance(stmt, Assign):
-            args = [env.get(name) for name in stmt.args]
-            env[stmt.name] = stmt.dtype or (get_dtype(dtype_promote(stmt.op.name, [d.name for d in args])) if all(args) else None)
-        elif isinstance(stmt, Init):
+        elif isinstance(stmt, (Assign, Affine)):
+            env[stmt.name] = _promoted(stmt, env)
+        elif isinstance(stmt, (Init, Let)):
             env[stmt.name] = stmt.dtype
         else:
             env.update((name, None) for name in stmt.defines())
     return {nm: dt for nm in stats if (dt := env.get(nm)) is not None}
+
+
+def _promoted(stmt: Assign | Affine, env: dict) -> object:
+    """The dtype ``stmt`` computes at: its stamp, else the promotion of its named operands — a literal operand takes
+    the dtype of the computation and constrains nothing; ``None`` while an operand is untyped."""
+    if stmt.dtype is not None:
+        return stmt.dtype
+    args = [env.get(name) for name in stmt.deps()]
+    if not args or not all(args):
+        return None
+    return get_dtype(dtype_promote(stmt.op.name if isinstance(stmt, Assign) else "add", [dtype.name for dtype in args]))
 
 
 def edge_dtypes(edge, inputs, cache: dict[int, tuple] | None = None, scope: dict | None = None) -> tuple:
@@ -95,10 +106,9 @@ def edge_dtypes(edge, inputs, cache: dict[int, tuple] | None = None, scope: dict
             env.update((name, tensor.dtype if tensor is not None else None) for name in stmt.names)
         elif isinstance(stmt, Fold):
             env.update(zip(stmt.exposes, edge_dtypes(stmt, inputs, cache, env), strict=True))
-        elif isinstance(stmt, Assign):
-            args = [env.get(name) for name in stmt.args]
-            env[stmt.name] = stmt.dtype or (get_dtype(dtype_promote(stmt.op.name, [dtype.name for dtype in args])) if all(args) else None)
-        elif isinstance(stmt, Init):
+        elif isinstance(stmt, (Assign, Affine)):
+            env[stmt.name] = _promoted(stmt, env)
+        elif isinstance(stmt, (Init, Let)):
             env[stmt.name] = stmt.dtype
         elif isinstance(stmt, Select):
             branch_dtypes = [env.get(branch.value) for branch in stmt.branches]
@@ -307,15 +317,29 @@ class Sched:
         def orient(mn):
             # The pair is each side's own free axis, the first operand's leading — the placement
             # binds both, and a sibling output's sweep promoted beside them (the fused q/k/v
-            # projections, N 64 beside N 32) never stands in for either. With several own axes a
-            # side the trailing one is the role and the rest ride the grid; a side without one
-            # (the unit-row matvec) leaves the trailing pair to the placement.
+            # projections, N 64 beside N 32) never stands in for either. With several own axes,
+            # tile the smallest output stride, so a reordered grid still tiles channels rather
+            # than heads. Undetermined layouts retain the trailing-grid choice.
             view = node.as_contraction()
             if mn is None or view is None:
                 return mn
             order = {axis.name: (position, axis) for position, axis in enumerate((*self.place.free, *self.place.grid))}
-            left = max((order[name] for name in view.left_axes if name in order), default=None)
-            right = max((order[name] for name in view.right_axes if name in order), default=None)
+
+            def rank(item):
+                position, axis = item
+                steps = (
+                    gmem_axis_step(Load("", spec.write.output, spec.write.index), axis.name, self.tile.outputs)
+                    for spec in self.tile.output_specs
+                )
+                return min((abs(step[0]) for step in steps if step is not None and step[0]), default=float("inf")), -position
+
+            # An operand role with no axes of its own takes the unit coordinate the placement added for it.
+            unit = next((pair for name, pair in order.items() if name not in node.free_axes and pair[1].extent == 1), None)
+
+            def side(axes):
+                return min((order[name] for name in axes if name in order), key=rank, default=None) if axes else unit
+
+            left, right = side(view.left_axes), side(view.right_axes)
             if left is not None and right is not None:
                 return (left[1], right[1])
             first, second = mn
@@ -340,11 +364,14 @@ class Sched:
         ax = self.axis_of(parent.node.axis) if parent is not None else None
         if ax is None:
             return None
-        pair = (free[-2], ax.window.parent if ax.window is not None else ax)
+        stream = ax.window.parent if ax.window is not None else ax
         # Under a CHUNKED carrier the orientation is the CONSUMER's, not the term's: the tier
         # builds a ``(row, chunk)`` tile per chunk whichever operand the canonical form put in A,
-        # so the enclosing axis is N here even when A's own axis is the one that would take M.
-        return pair if parent.node.chunked() else orient(pair)
+        # so inherit its placed row axis even when batch axes follow it in the free-axis order.
+        if parent.node.chunked():
+            consumer = self._mn_for(parent.node)
+            return (consumer[0], stream) if consumer is not None else None
+        return orient((free[-2], stream))
 
 
 def sched_of(tile) -> Sched:
@@ -358,16 +385,14 @@ def sched_of(tile) -> Sched:
 
 
 def scheduled(
-    op,
+    tile,
     *,
     name: str,
     place,
     knobs: dict,
-    output_specs: tuple = (),
     schedule=None,
     materialization=None,
     workers=None,
-    axes: tuple = (),
 ):
     """Build a scheduled ``TileOp`` from one accepted semantic schedule.
 
@@ -382,14 +407,12 @@ def scheduled(
         raise ValueError(f"WORK producer band {work.producer} disagrees with WarpSpec producer band {producer}")
     if knobs.get("WORK") != work.spell():
         raise ValueError("encoded WORK does not agree with the accepted classic schedule")
-    return TileOp(
-        op=op,
+    return replace(
+        tile,
         name=name,
         place=place,
         workers=workers,
         knobs=knobs,
-        output_specs=tuple(output_specs),
-        axes=axes,
         schedule=schedule,
         materialization=materialization,
     )
@@ -420,9 +443,9 @@ def axis_names(root) -> set[str]:
 def projection_tail(tile) -> list[Stmt]:
     """The kernel's EFFECTFUL projection stmt stream — the root zero-axis fold's (pure) body with the
     kernel-boundary ``TileOp.output_specs`` reconstituted (:func:`~emmy.compiler.ir.tile.ir.apply_output_specs`).
-    The ONE read every scheduler gate that inspects "the tail" goes through, so the
-    ``coop-t`` band's no-sweep-``Loop`` condition keeps excluding rms/softmax rows after their
-    sweep moved to an ``OutputSpec`` decoration."""
+    This reads the outer projection, not work nested in its operands. The ``coop-t`` band's
+    no-sweep-``Loop`` condition keeps excluding rms/softmax rows after their sweep moved to an
+    ``OutputSpec`` decoration; fragment legality additionally checks nested projection work."""
     op = tile.op
     body = list(op.lift.body) if isinstance(op, Fold) and op.axis is None else []
     return apply_output_specs(body, tile.output_specs)
@@ -534,10 +557,9 @@ def head(op):
     node-level fact the scheduler dispatches on — the views, the
     reduce ``Axis``, the operand edges — is a STORED param on what this returns."""
     node = op
-    # A term composes through operands, so a projection's node is its first edge — through every
-    # zero-axis wrapper on the way (an output sweep's projection over its reduce).
+    # Skip slab providers just as the kernel binder does: a captured scalar can precede the reduce.
     while isinstance(node, Fold) and node.axis is None and node.operands:
-        node = node.operands[0]
+        node = next((edge for edge in node.operands if edge.as_slab() is None), None)
     return node if isinstance(node, Fold) and node.axis is not None else None
 
 
@@ -545,7 +567,7 @@ def kernel_roots(op) -> tuple[Fold, ...]:
     """The reduce nodes the kernel binder builds the kernel AROUND — the ones whose ``REDUCE``
     partition it realizes. The binder peels each zero-axis projection to one operand: the
     contraction root of a tiled edge (every such root at once for a multi-output kernel), else the
-    first operand; every other reduce in the tree lowers serially inside its reader, so a partition
+    first non-slab operand; every other reduce in the tree lowers serially inside its reader, so a partition
     offered on it would price a kernel the binder never builds. This is that peel, read off the
     term alone, so the schedule projection offers the partition catalog only where it is realized."""
     node = op
@@ -553,7 +575,7 @@ def kernel_roots(op) -> tuple[Fold, ...]:
         tiled = tuple(projection_root(edge) for edge in tiled_edges(node.operands))
         if len(tiled) > 1:
             return tiled
-        node = tiled[0] if tiled else node.operands[0]
+        node = tiled[0] if tiled else next((edge for edge in node.operands if edge.as_slab() is None), None)
     return (node,) if isinstance(node, Fold) else ()
 
 
@@ -567,8 +589,8 @@ def refused_roots(op, output_specs: tuple) -> tuple[Fold, ...]:
     reach no tensor-core tier where they are. A single-root kernel has nothing shared: the question
     only arises from :func:`kernel_roots` holding two or more.
 
-    It lives here rather than in the scheduler that reads it (``ir/schedule/classic._shared_roots``
-    refuses a prefix that output-tiles a second of these) because it is a fact about the term, read
+    It lives here rather than in the scheduler that reads it (``TileOp.shared_roots``, among which the
+    classic compatibility refuses a second output-tiled root) because it is a fact about the term, read
     off the same two rules the binder itself applies. :func:`owns_outputs_it_cannot_bind` asks the
     neighbouring question the placement lane's full-projection cut is offered on; the two differ,
     and both are needed: a projection whose outputs do not partition at ALL still refuses roots
@@ -595,7 +617,7 @@ def owns_outputs_it_cannot_bind(op, output_specs: tuple) -> bool:
     kernel around and lowers every reduce but one serially inside the projection.
 
     That combination is what the placement lane's full-projection cut is offered on
-    (``pipeline/passes/lowering/tile/_cut.full_projection_seams``): the ownership half says the
+    (``pipeline/passes/tile/_cut.full_projection_seams``): the ownership half says the
     pieces exist, the root half says the fused kernel cannot reach a tensor-core tier for more than
     one of its contractions. Where the outputs do not partition at all — one output over a whole
     tree, the ordinary fused kernel — there is no piece to hand anything to and the answer is
@@ -641,13 +663,12 @@ def chain_members(root: Fold) -> tuple[Fold, ...]:
 
 def chain_form(root: Fold) -> bool:
     """Whether a computed provider cone — a workspace row and its rsqrt — is hoisted ahead of this
-    root's loop, beside its own fold. The transposed band's σ-substitution and guarded close assume
-    the fold stands alone at the kernel root, so such a root takes no band.
+    root's loop, beside its own fold. A prefix scan does not yet bind that provider chain.
 
-    A MEMBER is not what decides that. The band absorbs one that folds serially, hoisted ahead of
-    its loop, which is what every recorded transposed row of a fused reduce does; only a member the
-    schedule PARTITIONS makes the root a chain, and that is a relation between two picks rather
-    than a fact about the term (``classic.context`` refuses the pair)."""
+    A MEMBER is not what decides that. A member that folds serially can be hoisted ahead of the
+    root's loop; only a member the schedule PARTITIONS makes the root a cooperative chain, and
+    that is a relation between two picks rather than a fact about the term (``classic.context``
+    refuses that member beside a transposed root)."""
     if not isinstance(root, Fold) or root.axis is None:
         return False
     return any(
@@ -658,24 +679,29 @@ def chain_form(root: Fold) -> bool:
     )
 
 
-def cone_stat(cone, axes: tuple) -> Fold | None:
-    """The per-row STATISTIC fold of a computed-A cone — the reduce its prologue (the cone's first
-    operand, the row-invariant edge) materializes first: the fold whose carried state the first
-    reduce ``Loop`` of the prologue's lowering folds. ``None`` for a cone without one — the
-    caller's serial fallback."""
-    prologue = cone.operands[0] if isinstance(cone, Fold) and cone.axis is None and cone.operands else None
-    if prologue is None:
+def cone_stat(cone, k_name: str, axes: tuple) -> Fold | None:
+    """The per-row STATISTIC fold of a computed-A cone — the fold whose carried state the first reduce
+    ``Loop`` of the cone's prologue folds. The prologue is every row-invariant edge, lowered in operand
+    order (:func:`~emmy.compiler.ir.schedule.views.cone_seam`), and formation does not promise the
+    statistic comes first: a fused norm→linear cone is two gmem reads and then the norm. An edge that
+    varies with the contraction axis ``k_name`` is the cell's, reduce or not. ``None`` for a cone without
+    a statistic — the caller's serial fallback."""
+    if not isinstance(cone, Fold) or cone.axis is not None:
         return None
-    first = next((stmt for stmt in prologue.lower(axes=axes) if isinstance(stmt, Loop) and stmt.is_reduce), None)
-    if first is None:
+    for edge in cone.operands:
+        if k_name in edge.free_axes:
+            continue
+        first = next((stmt for stmt in edge.lower(axes=axes) if isinstance(stmt, Loop) and stmt.is_reduce), None)
+        if first is None:
+            continue
+        carried = {stmt.name for stmt in first.body if isinstance(stmt, Accum)}
+        pending = [edge]
+        while pending:
+            term = pending.pop()
+            if term.axis is not None and set(term.combine.results) <= carried:
+                return term
+            pending.extend(reversed(term.operands))
         return None
-    carried = {stmt.name for stmt in first.body if isinstance(stmt, Accum)}
-    pending = [prologue]
-    while pending:
-        term = pending.pop()
-        if term.axis is not None and set(term.combine.results) <= carried:
-            return term
-        pending.extend(reversed(term.operands))
     return None
 
 

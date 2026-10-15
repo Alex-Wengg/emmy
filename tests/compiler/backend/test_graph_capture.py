@@ -1,6 +1,6 @@
 """CUDA graph capture of the per-kernel bench (``capture_graphs``).
 
-The per-kernel reproducer bench wraps the measured region in CUDA graphs — cupy stream capture for
+The per-kernel reproducer bench wraps the measured region in CUDA graphs — the runtime's stream capture for
 emmy's per-launch batch loop, ``torch.cuda.CUDAGraph`` for the torch closures — so the CUDA
 event windows measure dense GPU work instead of per-launch dispatch gaps. These tests cover:
 
@@ -32,7 +32,7 @@ def _make_two_launch_graph(n: int = 8) -> Graph:
     g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (n,)), node_id="A")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (n,)), node_id="B")
     op = CudaOp(
-        kernel_source=EW_ADD_SOURCE,
+        kernel_source=EW_ADD_SOURCE.replace("ELEMENTS", str(n)),
         kernel_name="ew_add",
         arg_order=("A", "B", "C"),
         grid=((n + 255) // 256, 1, 1),
@@ -40,7 +40,7 @@ def _make_two_launch_graph(n: int = 8) -> Graph:
     )
     g.add_node(op=op, inputs=["A", "B"], output=Tensor("C", (n,)), node_id="C")
     op2 = CudaOp(
-        kernel_source=EW_ADD_SOURCE,
+        kernel_source=EW_ADD_SOURCE.replace("ELEMENTS", str(n)),
         kernel_name="ew_add",
         arg_order=("C", "B", "D"),
         grid=((n + 255) // 256, 1, 1),
@@ -80,7 +80,7 @@ def test_benchmark_program_e2e_none_without_capture():
 def test_benchmark_program_e2e_capture_failure_is_nonfatal(monkeypatch):
     from emmy.compiler.backend.cuda.program import CompiledProgram
 
-    def _boom(self):
+    def _boom(self, batch_size=1):
         raise GraphCaptureError("forced whole-program capture failure")
 
     monkeypatch.setattr(CompiledProgram, "capture_program_graph", _boom)
@@ -155,6 +155,23 @@ def _lowered_rmsnorm():
     return fe, lowered
 
 
+def test_reference_free_benchmark_respects_iteration_budget():
+    """A slow reference-free target must not silently run ten iterations when the caller budgets one."""
+    from types import SimpleNamespace
+
+    from emmy.commands.run import bench_lowered_vs_torch
+
+    calls = []
+
+    async def benchmark(graph, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(time_ms=1.0, captured=True)
+
+    backend = SimpleNamespace(run=lambda graph, **kwargs: (SimpleNamespace(outputs={}, time_ms=1.0), None), benchmark_async=benchmark)
+    asyncio.run(bench_lowered_vs_torch(None, Graph(), backend, seed=0, do_bench=True, warmup=0, iters=1, bench_backends="emmy"))
+    assert calls == [{"warmup": 0, "num_iters": 1, "capture_graphs": True, "input_data": {}}]
+
+
 @requires_cuda
 def test_bench_lowered_vs_torch_captures():
     from emmy.commands.run import bench_lowered_vs_torch
@@ -197,7 +214,7 @@ def test_torch_capture_failure_disables_emmy_capture(monkeypatch):
     from emmy.compiler.backend.cuda.backend import CudaBackend
     from emmy.compiler.backend.cuda.program import CompiledProgram
 
-    def _boom(fn):
+    def _boom(fn, batch_size=1):
         raise RuntimeError("forced torch capture failure")
 
     emmy_captures: list = []
@@ -214,3 +231,36 @@ def test_torch_capture_failure_disables_emmy_capture(monkeypatch):
     assert not emmy_captures, "torch-side capture failure must also disable emmy-side capture"
     assert results.get("Eager PyTorch", 0) > 0
     assert results.get("Emmy", 0) > 0
+
+
+@requires_cuda
+def test_program_graph_batches_execute_every_forward_and_preserve_serving_replay():
+    """A mutable counter observes every submission; capture itself must not execute it."""
+    import numpy as np
+
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+
+    graph = Graph()
+    graph.add_node(op=InputOp(), inputs=[], output=Tensor("counter", (1,)), node_id="counter")
+    source = 'extern "C" __global__ void count(float* counter, float* out) { *out = ++*counter; }'
+    for name in ("a", "b"):
+        graph.add_node(
+            op=CudaOp(kernel_source=source, kernel_name="count", arg_order=("counter", name), grid=(1, 1, 1), block=(1, 1, 1)),
+            inputs=["counter"],
+            output=Tensor(name, (1,)),
+            node_id=name,
+        )
+    graph.inputs, graph.outputs = ["counter"], ["a", "b"]
+    with gpu_lock():
+        prog = CompiledProgram.build(graph, {"counter": np.zeros(1, dtype=np.float32)})
+        total = 0
+        for batch in (3, 3, 5, 1, 3):
+            prog.capture_program_graph(batch)
+            assert np.frombuffer(prog.executor.read("counter"), dtype=np.float32)[0] == total
+            assert prog.time_program_window(batch) > 0
+            total += 2 * batch
+            assert np.frombuffer(prog.executor.read("counter"), dtype=np.float32)[0] == total
+        prog.capture_program_graph()
+        prog.replay_program_graph()
+        assert np.frombuffer(prog.executor.read("counter"), dtype=np.float32)[0] == total + 2

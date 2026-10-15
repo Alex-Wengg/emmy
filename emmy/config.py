@@ -33,8 +33,6 @@ from pathlib import Path
 
 PREFIX = "EMMY_"
 TUNE_DB = "EMMY_TUNE_DB"
-FREEZE_DIR = "EMMY_FREEZE_DIR"
-ONLINE_FILE = "EMMY_ONLINE_FILE"
 OFFLINE_FILE = "EMMY_OFFLINE_FILE"
 GOLDEN_FILE = "EMMY_GOLDEN_FILE"
 STRICT_EVIDENCE = "EMMY_STRICT_EVIDENCE"
@@ -42,10 +40,6 @@ NVCC_FLAGS = "EMMY_NVCC_FLAGS"
 DEBUG = "EMMY_DEBUG"
 DUMP_DIR = "EMMY_DUMP_DIR"
 KNOBS = "EMMY_KNOBS"
-TUNE_PATIENCE = "EMMY_TUNE_PATIENCE"
-TUNE_EPS = "EMMY_TUNE_EPS"
-OFFLINE_TILT = "EMMY_OFFLINE_TILT"
-PRIOR_BLEND = "EMMY_PRIOR_BLEND"
 BENCH_BACKENDS = "EMMY_BENCH_BACKENDS"
 CUBIN_CACHE = "EMMY_CUBIN_CACHE"
 PACK_DIR = "EMMY_PACK_DIR"
@@ -54,8 +48,6 @@ KERNEL_TIMEOUT_MS = "EMMY_KERNEL_TIMEOUT_MS"
 FIRST_ITER_TIMEOUT_MS = "EMMY_FIRST_ITER_TIMEOUT_MS"
 BENCH_COMPILE_TIMEOUT_S = "EMMY_BENCH_COMPILE_TIMEOUT_S"
 BENCH_RUN_TIMEOUT_S = "EMMY_BENCH_RUN_TIMEOUT_S"
-BENCH_WALL_TIMEOUT_S = "EMMY_BENCH_WALL_TIMEOUT_S"
-PRICE_BUDGET_S = "EMMY_PRICE_BUDGET_S"
 GPU_LOCK = "EMMY_GPU_LOCK"
 NCU_CHILD = "EMMY_NCU_CHILD"
 SERVING_STATIC = "EMMY_SERVING_STATIC"
@@ -70,6 +62,8 @@ GEN_EMBED_HOST = "EMMY_GEN_EMBED_HOST"
 GEN_ROUTING_HISTOGRAM_INTERVAL = "EMMY_GEN_ROUTING_HISTOGRAM_INTERVAL"
 READABLE = "EMMY_READABLE"
 RENTAL_TAGS = "EMMY_RENTAL_TAGS"
+WORKERS = "EMMY_WORKERS"
+POOL_DRAW = "EMMY_POOL_DRAW"
 
 _CACHE_ROOT = Path.home() / ".cache" / "emmy"
 
@@ -176,69 +170,6 @@ def tune_db_path() -> Path:
     return Path(override) if override else _CACHE_ROOT / "autotune.db"
 
 
-def freeze_path() -> Path:
-    """The measurement freeze the prior is evaluated against: ``EMMY_FREEZE_DIR`` → the
-    repo-checked ``search/freezes/``.
-
-    A freeze is the only measurement store that is a durable, comparable ARTIFACT. It is
-    digest-pinned (``manifest.sha256``), stamped with the featurizer / knob / encoding versions
-    its rows are spelled in, and identical row-for-row on any machine that has it — so two
-    evaluations of two models are a fair comparison, and a number in a report is one someone
-    else can reproduce. The tune DB and the online prior's reservoir are neither: both are
-    machine-local, both are rewritten as tuning continues, and the reservoir is additionally a
-    bounded random SAMPLE that churns, so one model evaluated twice on one machine need not
-    score the same. They stay reachable through ``--db`` for looking at a specific machine's
-    data; they are not what a reported number should mean.
-
-    Advisory, like :func:`tune_db_path`: callers check it exists."""
-    override = os.environ.get(FREEZE_DIR)
-    if override:
-        return Path(override)
-    return Path(__file__).resolve().parent / "compiler" / "pipeline" / "search" / "freezes"
-
-
-def golden_identity_cache_path() -> Path:
-    """The derived golden store — ``~/.cache/emmy/golden_identity.json``. Purely a memo, keyed by a
-    compiler fingerprint + per-record content digests, of what the golden import derives from a
-    record: its kernel identity (``kernel_identity``), its strict-decode verdict, and its evidence
-    replay (``golden._replay`` — the rows a record files under which kernels, about two seconds per
-    multi-kernel record to derive); safe to delete at any time."""
-    return _CACHE_ROOT / "golden_identity.json"
-
-
-def online_path() -> Path:
-    """Online-prior checkpoint file: ``EMMY_ONLINE_FILE`` →
-    ``~/.cache/emmy/online.json``. A single JSON file (not
-    the tune DB) holding the one global prior; ``tune`` writes it, ``compile`` /
-    ``run`` read it."""
-    override = os.environ.get(ONLINE_FILE)
-    if override:
-        return Path(override)
-    return _CACHE_ROOT / "online.json"
-
-
-@contextmanager
-def online_file_override(path: str | Path | None):
-    """Temporarily point ``EMMY_ONLINE_FILE`` at ``path`` (``None`` is a no-op).
-
-    ``search.golden.sole_evidence`` (the release gate and the realization corpus) uses this with a
-    nonexistent path so a compile's evidence hierarchy sees NO machine-local online prior /
-    reservoir — the golden rows in scope are the only evidence, which is what makes their
-    strict-evidence verdict machine-independent."""
-    if path is None:
-        yield
-        return
-    prev = os.environ.get(ONLINE_FILE)
-    os.environ[ONLINE_FILE] = str(path)
-    try:
-        yield
-    finally:
-        if prev is None:
-            os.environ.pop(ONLINE_FILE, None)
-        else:
-            os.environ[ONLINE_FILE] = prev
-
-
 def golden_scope() -> str | None:
     """The golden evidence scope ``EMMY_GOLDEN_FILE`` names: ``None`` when unset (the repository's
     per-card goldens), a path (that file's measured rows instead), or ``""`` — set but empty — for
@@ -246,7 +177,7 @@ def golden_scope() -> str | None:
     because the correctness lane never asks how fast a pick is and importing a card's goldens is
     work every worker process would repeat. Set by ``emmy serve --golden PATH`` for the vLLM child
     it spawns; ``run`` / ``compile`` scope the same evidence in-process through
-    ``search.golden.records_override``, which takes precedence."""
+    ``search.golden.evidence_scope``, which takes precedence."""
     return os.environ.get(GOLDEN_FILE)
 
 
@@ -275,7 +206,7 @@ def golden_file_override(path: str | Path | None):
 
 def strict_evidence() -> bool:
     """``EMMY_STRICT_EVIDENCE`` — whether a compile may decide a fork by the prior at all. On,
-    a kernel with no measured evidence (reservoir, tune DB or golden row) for one of its forks
+    a kernel with no measured evidence (tune DB or golden row) for one of its forks
     fails the compile with ``EvidenceError`` instead of deploying a prediction. ``run`` /
     ``compile`` / ``serve`` set it from ``--strict-evidence``; the vLLM child inherits it."""
     return _bool(STRICT_EVIDENCE)
@@ -301,7 +232,7 @@ def strict_evidence_override(flag: bool | None):
 def offline_path() -> Path | None:
     """Offline-prior weights artifact override: ``EMMY_OFFLINE_FILE`` → ``None``.
 
-    ``None`` means the repo-checked default (``offline_weights.json`` next to
+    ``None`` means the repo-checked default (``weights/schedule.json`` next to
     ``search/prior/offline.py`` — package-relative, so it resolves there, not
     here). Swap in a candidate fit for an A/B by pointing this at another
     artifact; a version-mismatched or missing file is a hard error, never a
@@ -367,48 +298,6 @@ def dump_dir() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
-def tune_patience(default: int = 50) -> int:
-    """``EMMY_TUNE_PATIENCE`` — inner-MCTS patience fallback for ``tune``."""
-    return int_env(TUNE_PATIENCE, default)
-
-
-def tune_eps(default: float = 0.0) -> float:
-    """``EMMY_TUNE_EPS`` — inner-MCTS ε-greedy exploration fraction: the
-    probability a selection step descends a uniformly random child instead of the
-    PUCT argmax. Opt-in (default ``0`` = deterministic PUCT): on the fp16 sweep it
-    didn't recover the lost configs (the gap is a tune-path eligibility issue, not
-    selection) and pure randomness regresses
-    tuning, so it's a knob for shapes where the heuristic order is known-bad, not a
-    default."""
-    return float_env(TUNE_EPS, default)
-
-
-def prior_blend(default: str = "tilt") -> str:
-    """``EMMY_PRIOR_BLEND`` — how the online and offline priors interact:
-    ``tilt`` (default; online owns deploys, its PUCT policy tilted by the offline
-    one), ``gate`` (no interaction — whichever half is live answers), or the
-    single-half A/B arms ``online`` / ``offline``, which ignore the calibration
-    gate. See :mod:`emmy.compiler.pipeline.search.prior.blend`; an unknown name
-    raises there rather than silently defaulting, so a mislabelled A/B arm cannot
-    report the default's numbers."""
-    return os.environ.get(PRIOR_BLEND) or default
-
-
-def offline_tilt(default: float = 0.3) -> float:
-    """``EMMY_OFFLINE_TILT`` — exponent ``W`` in the ``tilt`` blend's PUCT policy,
-    ``p_online · p_offline**W`` (selection only): the cold heuristic's ranking nudges
-    exploration toward configs it favors without overriding the online model's order
-    (``W=0`` = pure online, large ``W`` = offline dominates). See
-    :class:`~emmy.compiler.pipeline.search.prior.blend.TiltBlend`."""
-    raw = os.environ.get(OFFLINE_TILT)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
 def serving_static(default: bool = False) -> bool:
     """``EMMY_SERVING_STATIC`` — opt into the serving plugin's fully-static
     program: **static extents for both batch and seq_len**. Off (default) keeps the
@@ -459,7 +348,7 @@ def gen_prefill_capacity(default: int = -1) -> int:
 
 def gen_chunk_capture(default: int = 1) -> int:
     """``EMMY_GEN_CHUNK_CAPTURE`` — capture WHOLE chunk-prefill and mixed prefill+decode steps
-    as vLLM CUDA graphs (default 1 = ON). ``emmy serve --generate`` then asks for
+    as vLLM CUDA graphs (default 1 = ON). ``emmy serve --runner generate`` then asks for
     ``cudagraph_mode: FULL`` instead of ``FULL_DECODE_ONLY``, extends the capture sizes with
     token-count rungs spanning the prefill widths (the exact chunk width and the rider top
     included), and selects the ``TRITON_ATTN`` attention backend — the one broadly-available
@@ -540,11 +429,11 @@ def gen_decode_bucket(default: int = 16) -> int:
     return int_env(GEN_DECODE_BUCKET, default)
 
 
-def bench_backends_raw(cli_value: str | None) -> str:
+def bench_backends_raw(cli_value: str | None, *, default: str = "eager,emmy") -> str:
     """Raw comma-separated bench-backend selection. Precedence: ``cli_value`` >
-    ``EMMY_BENCH_BACKENDS`` > ``"eager,emmy"``. Backend-key
+    ``EMMY_BENCH_BACKENDS`` > ``default`` (normally ``"eager,emmy"``). Backend-key
     normalization stays at the call site (``run.py:_resolve_backends``)."""
-    return cli_value or os.environ.get(BENCH_BACKENDS) or "eager,emmy"
+    return cli_value or os.environ.get(BENCH_BACKENDS) or default
 
 
 def cubin_cache_dir() -> Path:
@@ -562,8 +451,31 @@ def pack_dir() -> Path | None:
 
 
 def nvcc_disabled() -> bool:
-    """``EMMY_NO_NVCC`` — force the cupy/NVRTC path instead of offline nvcc."""
+    """``EMMY_NO_NVCC`` — declare nvcc unavailable (every kernel compile then fails loudly)."""
     return _bool(NO_NVCC)
+
+
+def pool_draw() -> int:
+    """``EMMY_POOL_DRAW`` — the complete rows a greedy compile draws from a schedule pool too large to walk
+    (default 8192). Seeded uniform descents cover every level's values, unlike an emission-order prefix; a descent
+    costs its depth, never a frontier. On two 5090 matmul pieces the prior's best drawn score stopped improving
+    near 8K rows; the test suite sets 512, which its prior reproduction gate draws too."""
+    return max(1, int_env(POOL_DRAW, 8192))
+
+
+def set_workers(count: int) -> None:
+    """Set ``EMMY_WORKERS`` for this process and its children: a worker process of a parallel loop sets ``1``, so
+    the compiles it runs draw in-process instead of multiplying the workers."""
+    os.environ[WORKERS] = str(count)
+
+
+def workers() -> int:
+    """``EMMY_WORKERS`` — the processes Emmy's CPU-parallel work runs on: a greedy compile's cold-pool draw and
+    ``emmy db export``'s pool enumeration and ``emmy eval prior``'s schedule reproduction (default: one per CPU this
+    process may use; ``1`` runs in this process).
+    Their results are the same at any count."""
+    default = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+    return max(1, int_env(WORKERS, default))
 
 
 def kernel_timeout_ms() -> float:
@@ -587,22 +499,10 @@ def first_iter_timeout_ms() -> float:
 
 def bench_compile_timeout_s(default: float = 30.0) -> float:
     """``EMMY_BENCH_COMPILE_TIMEOUT_S`` — wall-clock cap on the compile stage of one
-    ``benchmark()`` call. ``default`` is the caller's own budget (constructor policy —
-    e.g. ``tune`` shrinks it for fast-fail single-kernel sweeps); the env var, when set,
+    ``benchmark()`` call. ``default`` is the caller's own budget (constructor policy);
+    the env var, when set,
     overrides every caller uniformly. Semantics live on ``Backend.bench_compile_timeout_s``."""
     return float_env(BENCH_COMPILE_TIMEOUT_S, default)
-
-
-def price_budget_s() -> float | None:
-    """``EMMY_PRICE_BUDGET_S`` — optional wall-clock budget for the greedy compile's kernel-set
-    pricing: the nested resolutions that price every cut arm of a placement fork. Unset (the
-    default) means NO budget — pricing runs to completion, which is deterministic and independent
-    of machine speed, so it is what every test and recipe path uses. Set it only to bound a
-    pathological manual compile whose pricing explodes (the fused decode-tail offered more cut
-    arms than a compile could price in half an hour); past the budget an arm prices as unpriceable
-    and the fork falls to the ordinary ranking, the same contract a failed nested resolve has."""
-    raw = os.environ.get(PRICE_BUDGET_S)
-    return float(raw) if raw else None
 
 
 def bench_run_timeout_s(default: float = 10.0) -> float:
@@ -611,20 +511,6 @@ def bench_run_timeout_s(default: float = 10.0) -> float:
     a program whose per-launch latency times the iter count exceeds the default budget.
     Semantics live on ``Backend.bench_run_timeout_s``."""
     return float_env(BENCH_RUN_TIMEOUT_S, default)
-
-
-def bench_wall_timeout_s(default: float | None = None) -> float | None:
-    """``EMMY_BENCH_WALL_TIMEOUT_S`` — hard SIGKILL wall-clock cap on one isolated-worker
-    ``benchmark()`` call. Same override contract as :func:`bench_compile_timeout_s`;
-    ``None`` (unset, no caller value) keeps the in-process path. Semantics live on
-    ``Backend.bench_wall_timeout_s``."""
-    raw = os.environ.get(BENCH_WALL_TIMEOUT_S)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
 
 
 def gpu_lock_path() -> str | None:

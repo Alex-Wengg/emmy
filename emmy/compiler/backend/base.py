@@ -20,7 +20,7 @@ between the eager forward and the emmy comparison.
 
 Individual backends may do different internal lowerings: the CUDA backend
 calls ``run_pipeline`` through the full chain (decomposition →
-optimization → fusion → lowering/tile → lowering/cuda), the Loop
+optimization → fusion → tile → lowering/cuda), the Loop
 backend stops after fusion, and the numpy backend walks the graph
 directly. From the caller's perspective the interface is identical.
 """
@@ -30,13 +30,15 @@ from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from emmy import config
+from emmy.compiler.dtype import BF16, DataType, decode_bf16, encode_bf16
 from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.tensor.ir import BitcastOp, CastOp, ElementwiseOp
 
 if TYPE_CHECKING:
     from emmy.compiler.graph import Graph
@@ -44,10 +46,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class RunResult:
-    """Result of running a program: outputs as ndarrays + optional wall-time."""
+    """Result of running a program: outputs as ndarrays + optional wall-time. ``taps`` holds the intermediate buffers
+    the caller named in ``Backend.run``'s ``taps``, as the program computed them."""
 
     outputs: dict[str, Any]  # actually dict[str, np.ndarray] at runtime
     time_ms: float | None = None
+    taps: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass
@@ -55,9 +59,9 @@ class LaunchTime:
     """Per-launch GPU-event timing inside a benchmark run.
 
     ``time_ms`` is the median over ``samples`` (the canonical selection
-    statistic — robust to single-iter outliers from cupy framing
+    statistic — robust to single-iter outliers from host framing
     jitter). ``samples`` carries every measured per-iter latency in
-    ms so callers downstream (e.g. ``search.policy.terminal_bench``) can
+    ms so callers downstream (e.g. ``search.bench_record``) can
     compute min/max/mean/variance without re-running the bench."""
 
     idx: int
@@ -121,18 +125,9 @@ class Backend(ABC):
     # event-measured ms. Catches the case where every iter is just
     # under the per-launch ``_KERNEL_TIMEOUT_MS`` watchdog (e.g. 999 ms
     # × 20 iters = 20 s of GPU time) which the watchdog by design lets
-    # through. Distinct from a wall-clock cap so Python/cupy framing
+    # through. Distinct from a wall-clock cap so host framing
     # overhead doesn't artificially shrink the budget for tiny ops.
     _bench_run_timeout_s: float = 10.0
-    # Optional hard wall-clock cap on a single ``benchmark()`` call.
-    # When set, the call runs in a subprocess-isolated worker so the
-    # parent can SIGKILL the GPU process if a kernel keeps the device
-    # busy past the in-process per-launch / per-iter budgets (those
-    # budgets rely on ``cupy.cuda.Event.done`` which never trips on
-    # some hangs). Set this for autotune sweeps; leave ``None`` for
-    # interactive ``emmy run`` so on-iter callbacks and the
-    # parent's torch instance can be shared in-process.
-    _bench_wall_timeout_s: float | None = None
 
     @property
     def bench_compile_timeout_s(self) -> float:
@@ -141,10 +136,6 @@ class Backend(ABC):
     @property
     def bench_run_timeout_s(self) -> float:
         return config.bench_run_timeout_s(self._bench_run_timeout_s)
-
-    @property
-    def bench_wall_timeout_s(self) -> float | None:
-        return config.bench_wall_timeout_s(self._bench_wall_timeout_s)
 
     @abstractmethod
     def compile(self, graph: Graph) -> Any:
@@ -156,8 +147,9 @@ class Backend(ABC):
         *,
         input_data: dict[str, np.ndarray] | None = None,
         pre_run: Callable[[], Any] | None = None,
+        taps: tuple[str, ...] = (),
     ) -> tuple[RunResult, Any]:
-        """Execute; return ``(RunResult, pre_run_result)``.
+        """Execute; return ``(RunResult, pre_run_result)``, plus the intermediate buffers named in ``taps``.
 
         ``pre_run`` runs once before the backend executes the graph and
         inside whatever serialization the backend uses (the GPU lock on
@@ -167,9 +159,10 @@ class Backend(ABC):
 
         Default implementation walks ``compiled`` (a ``Graph``) in topological
         order and dispatches every compute node through ``op.forward``. Inputs
-        and ``ConstantOp`` overrides come from ``input_data``; scalar
-        ``ConstantOp``s without overrides materialize as single-element float32
-        arrays. ``LoopOp.forward`` plugs into this same walk, so post-fusion
+        and externally bound ``ConstantOp``s (``value=None``) come from
+        ``input_data``. A ``ConstantOp.value`` is fixed at compile time; changing
+        it requires recompilation, since lowering may already have consumed it.
+        ``LoopOp.forward`` plugs into this same walk, so post-fusion
         graphs interpret identically — used by ``NumpyBackend`` and
         ``LoopBackend``. Backends with native runtimes (e.g. CUDA) override.
         """
@@ -200,14 +193,14 @@ class Backend(ABC):
                 for buf, t in zip(node.buffer_names(), node.outputs, strict=True):
                     if buf not in input_data:
                         raise KeyError(f"Missing input for node {nid!r}")
-                    values[buf] = _coerce(input_data[buf], _shape_of(t), t.dtype.np)
+                    values[buf] = _coerce(input_data[buf], _shape_of(t), t.dtype)
                 continue
 
             if isinstance(node.op, ConstantOp):
                 if nid in input_data:
-                    values[nid] = _coerce(input_data[nid], shape, dtype_np)
+                    values[nid] = _coerce(input_data[nid], shape, node.output.dtype)
                 elif node.op.value is not None:
-                    values[nid] = np.array([node.op.value], dtype=dtype_np)
+                    values[nid] = _coerce([node.op.value], shape, node.output.dtype)
                 else:
                     raise KeyError(f"ConstantOp {nid!r} has no value and was not supplied in input_data")
                 continue
@@ -215,8 +208,17 @@ class Backend(ABC):
             if isinstance(node.op, InputOp):
                 continue
 
-            args = [values[inp] for inp in node.inputs]
-            result = node.op.forward(*args)
+            # A body op's ``forward`` zips its arrays with its own input order, which a bare op derives from its body;
+            # the node's edge order is the same set, so bind by name.
+            order = list(node.op.inputs) if set(getattr(node.op, "inputs", ())) == set(node.inputs) else list(node.inputs)
+            args = [
+                decode_bf16(values[inp]) if not isinstance(node.op, BitcastOp) and compiled.buffer(inp).dtype == BF16 else values[inp]
+                for inp in order
+            ]
+            if isinstance(node.op, ElementwiseOp) and dtype_np.kind == "f":
+                args = [a.astype(np.promote_types(a.dtype, dtype_np), copy=False) if a.dtype.kind == "f" else a for a in args]
+            # CastOp.forward sees BF16's uint16 carrier; numeric conversion belongs here.
+            result = args[0] if isinstance(node.op, CastOp) and node.op.dtype == "bf16" else node.op.forward(*args)
             # A multi-output node's ``forward`` returns a tuple matched
             # positionally to ``node.outputs``; values store per BUFFER.
             results = result if isinstance(result, tuple) else (result,)
@@ -224,15 +226,19 @@ class Backend(ABC):
             if len(results) != len(bufs):
                 raise ValueError(f"node {nid!r}: forward returned {len(results)} values for {len(bufs)} outputs")
             for buf, t, r in zip(bufs, node.outputs, results, strict=True):
-                values[buf] = _coerce(r, _shape_of(t), t.dtype.np)
+                values[buf] = _coerce(r, _shape_of(t), t.dtype, preserve_bits=isinstance(node.op, BitcastOp))
 
         elapsed = (time.perf_counter() - t0) * 1000
         outputs = {name: values[name] for name in compiled.outputs}
-        return RunResult(outputs=outputs, time_ms=elapsed), pre_result
+        return RunResult(outputs=outputs, time_ms=elapsed, taps={name: values[name] for name in taps}), pre_result
 
 
-def _coerce(data, shape: tuple[int, ...], dtype: np.dtype | None = None) -> np.ndarray:
-    arr = np.asarray(data, dtype=dtype if dtype is not None else np.float32)
+def _coerce(data, shape: tuple[int, ...], dtype: DataType | None = None, *, preserve_bits: bool = True) -> np.ndarray:
+    if dtype == BF16:
+        source = np.asarray(data)
+        arr = source if preserve_bits and source.dtype == np.uint16 else encode_bf16(source)
+    else:
+        arr = np.asarray(data, dtype=dtype.np if dtype is not None else np.float32)
     if shape and arr.shape != shape:
         arr = arr.reshape(shape)
     return arr

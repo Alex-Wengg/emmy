@@ -13,10 +13,14 @@ vllm serve Qwen/Qwen3-Embedding-0.6B --runner pooling --enforce-eager \
 `--stock` for the raw-vLLM baseline at the same max-model-len, and `--bench` for a one-shot start → `/health` →
 `vllm bench serve --backend openai-embeddings` → results → shutdown cycle.
 
-Requires the `serving` extra (`pip install -e ".[compile,serving]"` + cupy). vLLM discovers the plugin through the
+Requires the `serving` extra (`pip install -e ".[compile,serving]"`) and the runtime extension `make setup` builds.
+vLLM discovers the plugin through the
 `vllm.general_plugins` entry point (`emmy.serving:register` in pyproject.toml), which registers
 `EmmyEmbedModel` by lazy string path; `--hf-overrides` swaps the served repo's `architectures` to it, so the
 checkpoint, tokenizer, and sentence-transformers pooling config still come from the original HF repo.
+
+The opt-in native text server is a separate consumer of the Rust execution runtime. Its preparation and launcher
+contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains this integration's default.
 
 ## Module map
 
@@ -38,25 +42,24 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
 - `runner.py` — `EmmyForwardRunner`. At engine start: load the `AutoModel` **trunk** (hidden states out — no
   lm_head), `build_full_model_wrapper(dynamic=True)`, trace with the canonical 4-spec dynamic seq_len
   (`seq_len@input_ids:1`, `@attention_mask:2`, `@attention_mask:3`, `@position_ids:1`), compile through `CudaBackend`
-  (greedy fork picks from the global prior — benefits from any prior `emmy tune`), bind weights as graph
+  (greedy fork picks from the measured evidence, then the prior), bind weights as graph
   constants (`named_parameters` + `named_buffers`, `remove_duplicate=False`, in the traced dtype), and build ONE
   `CompiledProgram` over a buffer set sized at **`max_seq_len`** (`--max-model-len`). Per
   sequence (`forward_hidden_states`) it takes a **1-D int torch CUDA tensor** and returns an `(S, hidden)` **torch CUDA
-  tensor** — no host round-trip. It enters a cupy external stream bound to torch's current stream
-  (`cp.cuda.Stream.from_external`), then: bridge the
-  torch ids to cupy (`cp.from_dlpack`, zero-copy), size the launch grids to S (`set_sym_values`), copy ids /
-  **device-built** causal mask / position_ids into the buffers' contiguous **prefix** device-to-device
-  (`upload_prefix_device`), **capture-or-reuse** the whole-program CUDA graph for this S, **replay** it — one host launch
-  instead of the ~hundreds the uncaptured loop issues — and wrap the output buffer's real-S prefix back as a torch
-  tensor (`output_prefix_device` + `torch.from_dlpack`, cloned because the shared buffer is reused next request). The
-  causal mask is built once per S as a cupy array (the device twin of `_causal_mask_np`) and reused. Captured graphs are
-  cached per seq_len (bounded LRU);
+  tensor** — no host round-trip. It binds the program to torch's current stream (`on_stream`), then: size the
+  launch grids to S (`set_sym_values`), copy ids / **device-built** causal mask / position_ids into the buffers'
+  contiguous **prefix** device-to-device (`upload_prefix_device`, torch tensors in), **capture-or-reuse** the
+  whole-program CUDA graph for this S, **replay** it — one host launch instead of the ~hundreds the uncaptured loop
+  issues — and hand the output buffer's real-S prefix back as a torch view (`output_prefix_device`, cloned because the
+  shared buffer is reused next request; the program's memory IS torch tensors the runtime borrows). The causal mask is
+  built once per S as a device tensor (the device twin of `_causal_mask_np`) and reused. Captured graphs are cached per
+  seq_len (bounded LRU);
   each is captured at its EXACT S so every kernel runs at its exact grid — no oversized-grid masking (a single
   capacity-baked graph for all S is **not** viable: several symbolic-M kernels do illegal reads at an oversized grid,
   the swizzle decode + staged loads among them). See `compiler/backend/cuda/ARCHITECTURE.md`
-  → repeated execution + captured replay. Trunk compute dtype follows vLLM's `--dtype` (`mc.dtype`, mapped in
-  `vllm_model._trunk_dtype_str`): `float32`→fp32, `float16`→fp16, anything else (e.g. `bfloat16`/`auto`) downcasts to
-  fp16 with a warn — the runner's numpy weight carrier can't represent bf16, and only fp16/fp32 trunks are supported.
+  → repeated execution + captured replay. The pooling trunk supports fp16 and fp32. It still maps a BF16 vLLM dtype
+  to fp16 with a warning. The generative trunk accepts explicit BF16: its host arrays carry encoded `uint16` bits,
+  its device buffers expose `torch.bfloat16`, and its default remains fp16.
   With `EMMY_SERVING_BATCHED=1` (`config.serving_batched`) the symbolic-seq trace bakes the batch extent at
   `max_num_seqs` and `forward_hidden_states_batched` runs each step as one batched forward padded to the step's
   longest sequence; `EMMY_SERVING_STATIC=1` (`config.serving_static`) instead traces a **fully-static**
@@ -76,13 +79,16 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   audit nothing. A floor under `MIN_FLOOR_US` is still skipped as timer noise, which at low bit rates an expert
   launch can be — a 2.25 bpw GLM expert streams ~4 MB — so read the expert tiers' silence as "below the noise
   floor", not "clean".
-  Logs a loud WARNING naming any program >10x over it, with the `emmy tune` pointer. Conservative by construction
+  Logs a loud WARNING naming any program >10x over it. Conservative by construction
   (each floor is a true lower bound for its regime, both calibrations undershoot peak, quantized weights only
   underestimate the compute floor, and FAST_MATH kernels can only sit *under* the f32-acc-calibrated compute floor),
   advisory only (never raises, never blocks boot). A measurement failure is swallowed to debug, but an unusable
   `EMMY_GPU_LOCK` path is not — taking the lock is setup, not measurement, so that WARNs and an environment fault
   never reads as a clean audit. Born from the 2026-07-29 TinyLlama/4080 incident: a cold deploy
   served a fused-norm kernel ~150x off the floor (54x TPOT gap) with zero boot-time signal.
+  Under strict evidence, read a flagged program as a recording gap first: a fork with one measured row deploys
+  that row however slow. DeepSeek V4's single-token pre program ran 29.7 s per layer on its only row until a cut
+  route was recorded, with no compiler capability missing; list the program's rows before suspecting the compiler.
   **Two structural blind spots, and a compressed model lands in both.** The audit times ONE layer per attention
   class, and `MIN_FLOOR_US` drops anything whose weights stream in under 20 µs — so on GLM-4.5-Air at 2.25 bpw it
   reports on layer 0 alone, and layer 0 is the model's only DENSE layer (it clears the floor only because the
@@ -112,18 +118,32 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `config.json` alone (no checkpoint download — a trace never reads a weight value; `layer_types` collapses to one
   local + one `full_attention` layer, the vocab shrinks to a stub) and traces the `pre`/`post` twins through the same
   `build_attention_split_wrapper` / `trace_split` path serving uses. Backs the file-scoped `emmy eval golden
-  --golden GOLDEN_YAML --serving-config PATH` release audit and serving-image gate;
-  `scripts/capture_gen_twins.py` is its JSON writer, one graph per file, because `emmy tune` reads a graph per file.
+  --golden GOLDEN_FILE --serving-config PATH` release audit and serving-image gate.
+  Static linear-attention profiles additionally capture `gdn<width>` programs with explicit matrix state and
+  convolution history inputs and outputs. Each uses the installed block forward and can hand its returned state
+  from prefill into decode. Parameter identity retargets wrapper paths to the underlying block before checkpoint
+  spelling, including NVFP4. A GDN program has no symbolic form. Padding would also corrupt its recurrent state. So
+  capture traces a GDN layer at the decode and prefill buckets plus width 1; together these widths cover every token
+  count. The `emmy eval golden` audit therefore expects `gdn1` rows in every lane (each set of widths compiled under one
+  `FAST_MATH` setting). Twins trace in the data type of the `--dtype` flag in the serving config's
+  `SERVE_EXTRA_ARGS` (FP16 when absent), because buffer types are part of a kernel's identity. Checkpoint spelling
+  matches constants only against the layer stack with the most layers (the decoder trunk). It never takes a
+  multi-token-prediction layer numbered like a trunk layer for a trunk layer. `EmmyGenRunner` builds the same GDN
+  programs for serving (see `gen_runner.py` below). Native HTTP request dispatch does not run them: it lacks
+  allocation, reset and scheduling of the recurrent state.
+  Fused query/output-gate full-attention profiles retain the gate as the fourth pre output and third post input.
   A CODED TRUNK is spelled by the checkpoint's own spellers, in the order `gen_runner._compile_split`'s stamp runs them:
   the twin's wrapper-relative constant paths (`q_proj.weight`) are re-addressed to the representative layer's
-  checkpoint keys by dotted suffix, then `spell_quantized_constants` and — for a checkpoint declaring static 4-bit
-  input activations — `spell_static_fp4_activations` run over the checkpoint directory itself, yielding `…@nvfp4`.
+  checkpoint keys by dotted suffix, then `spell_quantized_constants` and the static input encode the checkpoint
+  declares — `spell_static_fp4_activations` for NVFP4, `spell_static_fp8_activations` for FP8 with static
+  activations, nothing for FP8 with dynamic ones — run over the checkpoint directory itself, yielding `…@nvfp4` or
+  `…@fp8`.
   Tuning evidence transfers to serving only while the twin's kernels have serving's identities, and one trace path
-  plus one spell sequence is what makes them equal. NVFP4 is the one format with no weight-free description: its
-  packed shapes live in the safetensors headers and its calibrated `input_scale` values in the shards, so
-  `loader.quant.nvfp4_checkpoint_dir` resolves the directory (consulting the loaded config first, so no other model
-  touches the hub for it). No rate multiplies these twins — one rate, one block size, and the representative layer is
-  the profile's lowest member.
+  plus one spell sequence is what makes them equal. These two formats have no weight-free description: NVFP4's
+  packed shapes live in the safetensors headers and either format's calibrated activation scales in the shards, so
+  `loader.quant.checkpoint_spelled_trunk_dir` resolves the directory (consulting the loaded config first, so no
+  other model touches the hub for it). No rate multiplies these twins — one rate, one block size, and the
+  representative layer is the profile's lowest member.
   Coded routed experts are spelled weight-free so the golden records the program serving deploys, not the f16 GEMM
   the trace promised: EXL3 from the allocation sidecar (`…@b4`, one twin per rate profile), fp8 from the config's
   `quantization_config` alone (`loader.quant.fp8_weight_profile` — format token, `weight_block_size`, skip patterns;
@@ -153,7 +173,8 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   operation or search key survives decomposition.
 - `release.py` — shell-free parsing of one pinned `models/<slug>.env` plus derivation of the release identity and
   exact compiler realization matrix. Trace and eval share it, so model, revision, GPU, canonical file, decode,
-  prefill, M=1, warm shapes, symbolic fallbacks and input pin regimes cannot drift across independent flags.
+  prefill, M=1, warm shapes, symbolic fallbacks and input pin regimes (the `:fm` lanes, the cache regime `SERVE_ENV`
+  declares) cannot drift across independent flags.
 - `gen_runner.py` — `EmmyGenRunner` (Phase 2; sibling to `EmmyForwardRunner`). Carves SDPA out of every
   decoder layer (`build_attention_split_wrapper`; Gemma-nano PLE blocks — `hidden_size_per_layer_input` — are
   rejected loudly there: the carve has no seam for the `per_layer_input` multiply), compiles **two dynamic-`num_tokens`
@@ -164,12 +185,25 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   A Laguna post program recomputes the input normalization needed by its softplus `g_proj` and applies that gate to
   the flattened attention output before `o_proj`; a per-head gate temporarily views the seam as
   `[num_tokens, num_heads, head_dim]`.
+  A Qwen3.5 full-attention layer's `q_proj` is twice its query width: per head, the second half is an output gate.
+  Its `pre` returns that gate as a fourth tensor and its `post` takes it as a third input and multiplies the attention
+  output by its sigmoid before `o_proj` (`EmmyGenRunner.from_model` reads which layers do this off `pre.emits_gate`).
+  The gate does not go through attention: every forward path, tier and rider split carries it from `pre` to `post`.
+  Head counts come from the query half, the same rule the serving-twin capture uses.
+  A GDN layer (gated DeltaNet; `layer_types` value `linear_attention` in Qwen3.5 / Qwen3.8) has no `pre`/`post` pair.
+  It carries recurrent state per request: a fp32 matrix state and a convolution history. Every token updates that
+  state, padded ones included: a padded token decays the matrix state and enters the convolution history.
+  `EmmyGenRunner.from_model` builds one whole-layer `gdn<width>` program per static width (1, the decode bucket,
+  `prefill_bucket`), with the state as explicit inputs and outputs. `forward_layer_gdn_device` runs the layer over the
+  consecutive tokens of ONE request. It decomposes the token count into those widths, widest first, and updates the
+  caller's state tensors in place. The runner keeps no state between calls. `layer_meta(L)` returns `None` for a GDN
+  layer, and every `pre`/`post` tier holds `None`.
   Attention dims are **per layer** (`layer_meta(L)` → head_dim / num_heads / num_kv / scaling) — Gemma-4's global layers
   use a larger `global_head_dim` than its sliding ones, so each layer's `pre`/`post` compiles at its own width. The
   caller stitches between `pre` and `post` (a reference torch SDPA in the Phase-2 host stitch; vLLM paged `Attention`
   in Phase 3). **I/O:**
   the plugin runs **device-resident at every width**: the **decode hot path** (`num_tokens ≤ bucket`) rides the
-  captured static twins (`run_device` — captured-replay, torch↔cupy DLPack zero-copy), a **FULL chunked-prefill
+  captured static twins (`run_device` — captured-replay, torch tensors in and out, zero-copy), a **FULL chunked-prefill
   step** rides the static **prefill-chunk twin** (`num_tokens == prefill_bucket` EXACTLY — default = the dynamic-dim
   cap, `EMMY_GEN_PREFILL_BUCKET` overrides / `0` disables; exact grids on the hot chunk width. The boundary is
   equality, not a range: the twin always computes `prefill_bucket` rows, so an over-bucket decode batch or a partial
@@ -196,14 +230,25 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   M=1; falls back to symbolic above the bucket or if a static compile fails. So
   up to 4 capacity programs/layer — a real memory-budget risk for the activation buffers, though the twin's
   **weights are shared**: `_compile_split` binds constants through a per-wrapper device cache
-  (`_bind_device_constants` — one upload per `(source_path, load_ops)`, the same cupy array fed to both builds), so
-  the decode twin adds no weight copy. **`EMMY_GEN_DECODE_BUCKET=0`** (`config.gen_decode_bucket`) still disables the
-  twin entirely at the cost of decode speed. A further static **M=1** twin pair (`EMMY_GEN_M1_TIER`, default on)
+  (`_bind_plan_constants` — one upload per `(source_path, load_ops, plan dtype)`, the same device tensor lent to both
+  builds when their logical dtypes agree), so
+  the decode twin adds no weight copy. The cut pass may store a transposed weight folded or in its source layout, a
+  choice per kernel. The per-wrapper scope (`twins.LayoutScope`) keeps one layout per weight: before any twin
+  compiles it settles folded every weight a twin reads with no layout fork, the runner builds the twins narrowest
+  first (M=1 when that tier is on, else the decode bucket; then the prefill bucket; the symbolic program last), and
+  each later twin compiles with the layouts settled so far (`settled_layouts`). A dropped tier takes its layouts and
+  device copies back out, and a plan that would still bind a weight in a second layout is refused (`LayoutConflict`,
+  never a reason to drop a tier). `emmy eval golden` and the `emmy run --golden` target walk order twins with
+  `twins.twins_in_build_order`, from the checkpoint tensors each program binds and its input and output sizes; the
+  serving test suite's golden (`tests/serving/regen.py`) replays the layouts the runner settled.
+  **`EMMY_GEN_DECODE_BUCKET=0`** (`config.gen_decode_bucket`) still disables the twin entirely at the cost of decode
+  speed. A further static **M=1** twin pair (`EMMY_GEN_M1_TIER`, default on)
   routes true single-token decode onto gemv-class matvec programs, and `EMMY_GEN_ALIAS_ATTN` lets
   vLLM's paged attention write directly into the post program's `attn_out` input backing — since A4 for EVERY
   tier (`post_attn_backing` routes rows exactly like `forward_layer_post_device`: M=1, decode bucket, exact
-  chunk, symbolic; rider widths return None — one contiguous attention output cannot alias two programs'
-  buffers) — so the prefix upload self-copy-skips on pointer equality, dropping the attention→post seam copy
+  chunk, symbolic; rider widths and LoRA steps spanning multiple chunks return None — one contiguous attention output
+  cannot alias two programs' buffers) — so the prefix upload self-copy-skips on pointer equality, dropping the
+  attention→post seam copy
   from captured decode graphs and eager chunk steps alike.
   **Post→pre chaining covers EVERY program family** (decode twins, M=1, symbolic, prefill-chunk — the vLLM
   integration plan's Milestone A2): each family's post OUTPUT array is rewired at build onto its pre twins'
@@ -220,6 +265,12 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   re-takes arena views and unwinds the rewire — is never mixed with the device path on one runner (the oracle
   and the device server are separate runners; `tests/serving/generation/test_gen_prefill_device_gpu.py` pins both the
   pointers and the two-phase discipline).
+  **Llama LoRA prefill:** the `pre` and `post` twins take the per-row adapter mask and the selected adapter's whole
+  weight matrices. Base and adapter rows can share one vLLM batch. With a prefill twin, a LoRA step at the full chunk
+  width uses it directly; a step less than one decode bucket short of that width pads into it. Wider steps run
+  consecutive static chunks, then send a short tail to the decode twin or the symbolic program. The mask and token
+  activations are sliced by row; adapter weights are never sliced. Pre/post projections are token-independent, so
+  this split preserves mixed-request outputs. The exact-width and rider rules above remain the base-model path.
   **Multimodal wrappers:** the trunk is resolved through `language_model` (gemma-4 "unified" nests the decoder stack +
   embed/norm there) and the text dims come from `config.text_config`.
   **MoE third seam (token-choice top-k, e.g. OLMoE / gpt-oss):** a layer whose `mlp` exposes the transformers-v5
@@ -232,25 +283,33 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `expert(x, w_gate_up, w_down[, b_gate_up, b_down])` with the weights — and gpt-oss's per-expert biases — as
   forward args → graph INPUTS, fed per-expert dim-0 slices of the E-stacked tensors, which live on device beside
   the routers via `_ensure_device` under the per-layer `inputs` map), and the partials weighted-`index_add_` into
-  `h`. **Tensor-parallel expert sharding** rides that same combine: one rank loads a contiguous expert shard
-  (`load_quantized_split`'s `expert_range`, stacked rank-locally) and `combine_routed_experts` filters the router's
-  GLOBAL selection against it via `local_expert_slice`, translating each owned hit to the rank's own index and
-  skipping the rest. The router is replicated so every rank selects identically; each routed contribution therefore
-  belongs to exactly one shard, and summing the ranks' partials — the caller's all-reduce — reproduces the unsharded
-  result exactly. A rank that wins no token returns zeros, so the reduction needs no special case. This is what makes
-  a 256-expert model fit at all: one DeepSeek V4 pipeline stage's experts are ~9.4 GB sharded eight ways against a 32
-  GB card that also carries attention, arenas and the KV cache. The expert layout (orientation / interleave / bias —
+  `h`. **Under tensor parallelism every rank holds a slice of EVERY expert** (`slice_routed_experts`, the slicing vLLM's
+  fused MoE does without expert parallelism): gate and up keep the same 1/world of the intermediate rows, down the
+  matching columns, so a rank's expert output is a partial sum the caller's all-reduce completes. The router is
+  replicated, so every rank runs the same picks and the same launches — the ranks stay in step, and the fixed-slot
+  tier below serves them. This is what makes a 256-expert model fit at all: one DeepSeek V4 pipeline stage's experts
+  are ~9.4 GB against a 32 GB card that also carries attention, arenas and the KV cache, ~1.2 GB per rank once sliced
+  eight ways. The slicing reaches the checkpoint read (`load_quantized_split`'s `expert_slice`), the twin's declared
+  expert shapes, the serving-twin capture (the config's `--tensor-parallel-size`) and the pack key. The router the
+  combine calls is the runner's own copy (`serving_router`), cast to the activation dtype except for the
+  expert-selection bias (`e_score_correction_bias`),
+  which stays float32 as Transformers keeps it: DeepSeek V4's bias reaches ~27, where float16 rounding flipped a top-6
+  pick in 9 of 27 layers for a probed token. DeepSeek V4's router runs wholly in float32, as its reference runtime
+  does. The expert layout (orientation / interleave / bias —
   gpt-oss vs OLMoE, incl. the clamped-SwiGLU spelling and
   the de-interleave-at-load contract) is the trace ARCHITECTURE's `moe_expert_layout` story; the runner just feeds
   named inputs. Program count is 2/layer + one expert program per SHAPE GROUP (see below) — not `E`/layer. MoE
   layers are
   device-resident only (`forward_layer_post` raises on the host path) and are excluded from post→pre chaining (two
-  outputs; the layer output is a fresh torch tensor). The ROUTED dispatch host-syncs (`indices.unique().tolist()`),
-  which a whole-step decode capture cannot record — but single-token decode is capture-legal through the fixed-slot
-  tier below, so `_is_moe_model` in `emmy/commands/serve.py` (local-config probe, UX only) has `_gen_graph_args`
-  emit a FULL_DECODE_ONLY compilation-config with the capture ladder capped at size 1 instead of forcing
-  `--enforce-eager`, and `EmmyGenModel.__init__` validates authoritatively against the runner: an MoE capture boot
-  is rejected loudly when the fixed-slot tier is unavailable or any capture size exceeds 1 (serve with
+  outputs; the layer output is a fresh torch tensor). The ROUTED dispatch host-syncs once per layer (the per-expert
+  row counts; each expert's rows come from one stable sort of the picks — a single row reads its `k` picks instead
+  and runs each expert on the row itself), which a whole-step decode capture cannot record — but single-token decode
+  is capture-legal through the
+  fixed-slot tier below, so `_is_moe_model` in `emmy/commands/serve.py` (local-config probe, UX only) has
+  `_gen_graph_args` emit a FULL_DECODE_ONLY compilation-config with the capture ladder capped at size 1 instead of
+  forcing `--enforce-eager`, and `EmmyGenModel.__init__` validates authoritatively against the runner: an MoE capture
+  boot is rejected loudly when the fixed-slot tier is unavailable or any capture size exceeds the width that tier
+  serves (`moe_slot_width`: one token on whole experts, the decode bucket on sliced ones; serve with
   `--enforce-eager` then).
   When the model declares `routed_scaling_factor`, the expert program ordinarily applies it to each routed expert
   result; an always-on dense shared expert remains unscaled and folds into `h` before the routed combine. Laguna
@@ -268,15 +327,15 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   static M=1 (`moe.expert.one`), static M=decode-bucket (`moe.expert.bucket`, pad → run → slice), static M=256
   (`moe.expert.m256` — the prefill twin at the mean per-expert chunk width T·k/E, serving routed row sets in
   (bucket, 256]), and the symbolic fallback for anything wider — routed per HIT expert by its routed row count.
-  Per-launch framing, not weight bytes, was the measured decode wall (~0.23 ms/launch through the per-call symbolic
-  path), so `_moe_combine` hoists the GPU lock + the cupy stream bind around the whole per-expert loop and
-  `_launch_expert` issues bare `upload_prefix_device` + `run_once` calls; the per-expert cupy weight views are
-  minted once at `_ensure_device`. A tier whose schedule stages no operand through a TMA descriptor (descriptors
-  bake pointers at build) takes the weight slices by POINTER SWAP into `program.arrays` — no D2D weight copy;
-  descriptor-bearing tiers upload the slices normally. The M=256 twin instead replays its captured whole-program
-  graph per expert (`capture_program_graph` — one host call instead of per-kernel Python framing; prefill FFN was
-  launch-bound at ~3×), which bakes the twin's own buffer pointers — so its weights always arrive by UPLOAD, never
-  by pointer swap (a swap would freeze the first expert's slices into every later replay).
+  Host framing, not weight bytes, paces this path: issued from Python, a dozen calls per expert (width, weight swaps,
+  input copy, launch, output view and copy) cost about three times an expert's GPU time on V100, so a routed prefill
+  layer left the GPU idle most of the time. `combine_routed_experts` therefore hands every hit expert to ONE
+  `run_experts(rows, counts)` call, and `_launch_experts` issues each tier's experts as one `run_each` — a runtime
+  call that, per expert, binds the width, lends the weight slices, copies the rows in, launches and copies the output
+  rows out. The per-expert weight addresses are read once per layer and program. A tier whose schedule stages no
+  operand through a TMA descriptor (descriptors bake pointers at build) takes the weight slices by POINTER SWAP — no
+  D2D weight copy, and no stream drain per swap: the slices are resident, so launches already queued may keep reading
+  the previous expert's; descriptor-bearing tiers copy the slices in instead.
   **Fixed-slot decode tier (T=1, capture-legal):** k slot INSTANCES of the INDIRECT M=1 expert twin
   (`moe.expert.one.ind`) are built at boot — the same expert graph compiled with `w_gate_up`/`w_down` marked as
   **indirect operands** (`_compile_split(indirect_inputs=...)` → the `cuda.indirect_inputs` graph hint; the ABI
@@ -295,7 +354,10 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   launch sequence, mirroring `run_device`). A schedule that stages an indirect operand through a TMA descriptor
   fails the compile loudly (descriptors bake the base address at encode) and single-token decode keeps the routed
   path (eager); a stale pre-indirect pack plan fails the `_indirect_covered` check and recompiles — no half-hit.
-  Wider decode steps and prefill always ride the routed dispatch; `combine_routed_experts` stays the parity
+  On a sliced-expert rank a decode batch up to the bucket width rides the slots too, row by row through the one
+  selector and partials pair (k launches per row): its picks reach nearly as many distinct experts as there are
+  picks, so the routed dispatch would launch about as often and add the per-layer host read. Wider steps, prefill
+  and whole-expert ranks ride the routed dispatch; `combine_routed_experts` stays the parity
   oracle (`test_gen_runner_gpu` fixed-slot-vs-routed + the direct-vs-indirect bit-exactness pin,
   `test_gen_capture_gpu` captured-step live-replay).
   **Per-input feed dtypes:** `_compile_split` binds every plan input at its own traced dtype rather than one blanket
@@ -303,7 +365,10 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   reinterprets via `.view`), a scale input keeps its traced f32. This is what lets input-sourced fp8 expert weights
   (`loader.quant.spell_quantized_inputs`, see the compiler ARCHITECTURE's quantized-checkpoints section) feed the
   expert programs. Native MXFP4 blocks and scales bind as plain `u8`; indirect operands compose across every stored
-  input slice.
+  input slice. A logical BF16 plan input uses encoded BF16 bits in the host carrier, and a BF16 device output is
+  exposed as `torch.bfloat16`. The constant cache materializes each destination's plan dtype before upload, so one
+  source can serve BF16 and F32 buffers without aliasing their physical storage. This boundary does not change the
+  runner's model-dtype selection described above.
   **Quantized-checkpoint serving load (FP8 and MXFP4):** `EmmyGenRunner.create` detects a quantized checkpoint
   (`quantized_checkpoint_dir`) and takes `load_quantized_split` (trace ARCHITECTURE): config-built META twin,
   dense trunk shard-streamed in as real values, expert tensors kept compressed in a per-layer store keyed by program
@@ -339,10 +404,10 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `final_norm_device` closes it through the model's learned `hc_head` collapse before the final norm
   — a module held beside the norm, not a mean. The `post` program returns THREE tensors of three
   different widths (`mixed[T, hc·H]`, `xn[T, H]`, `mix[T, hc]`), so the rider path sizes each
-  destination on its own width; the routed combine runs on `xn`, is reduced across the expert shards,
-  and lands on the streams through `place_routed_streams`. Verified on an sm_70 V100: the compiled
-  seam reproduces the eager `DeepseekV4DecoderLayer`, and per-shard expert partials sum to the
-  unsharded combine (`tests/serving/generation/test_gen_runner_deepseek_gpu.py`).
+  destination on its own width; the routed combine runs on `xn` (the fixed-slot tier for a decode
+  step, the routed dispatch otherwise), is reduced across the ranks' expert slices, and lands on the
+  streams through `place_routed_streams`. Verified on an sm_70 V100: the compiled seam reproduces the
+  eager `DeepseekV4DecoderLayer` (`tests/serving/generation/test_gen_runner_deepseek_gpu.py`).
 
   Inside the plugin, the whole attention sublayer is the FORK's: `EmmyGenModel` constructs one of the
   fork's own attention modules per local layer (shared top-k indexer buffer, shared aux streams,
@@ -359,22 +424,20 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   ids: a hash-routed MoE layer selects its experts by them (the frozen `tid2eid` table; the learned
   gate only weights the selection), and the runner refuses to route such a layer without them.
 
-  Under tensor parallelism the plugin derives each rank's CONTIGUOUS expert slice from the config's
-  routed-expert count and hands it to the runner (`expert_range`): the quantized loader narrows its
-  checkpoint read to the shard, the unquantized lane slices the twin's own expert tables, and the
-  rank's partial combine is completed by the group all-reduce. The distributed gate is a REAL-engine
-  parity test: the same tiny checkpoint served single-rank and TP2×PP2 must produce identical greedy
-  token ids (`tests/serving/generation/test_vllm_engine_deepseek_gpu.py`). Two seam contracts the
-  engine enforces that in-process gates cannot: compiled twins may hand outputs back in their
-  ACCUMULATION dtype, so the runner normalizes the carrier to the residual dtype and the routed
-  input / final-norm output to the activation dtype at the seam; and the cross-process GPU lock is
-  scoped per physical device — serving ranks each own a card, and one machine-wide lock deadlocks
-  a rank inside its combine against the peer its pending collective is waiting for.
+  Under tensor parallelism the plugin hands the runner the rank's slice (`expert_slice=(rank, world)`): the quantized
+  loader keeps that slice of every per-expert checkpoint tensor, the unquantized lane slices the twin's own expert
+  tables, and the group all-reduce sums the ranks' partial outputs. The distributed gate is a REAL-engine parity test:
+  the same tiny checkpoint served single-rank and TP2×PP2 must produce identical greedy token ids
+  (`tests/serving/generation/test_vllm_engine_deepseek_gpu.py`). Two seam contracts the engine enforces that
+  in-process gates cannot: compiled twins may hand outputs back in their ACCUMULATION dtype, so the runner normalizes
+  the carrier to the residual dtype and the routed input / final-norm output to the activation dtype at the seam; and
+  the cross-process GPU lock is scoped per physical device — serving ranks each own a card, and one machine-wide lock
+  deadlocks a rank inside its combine against the peer its pending collective is waiting for.
 
   **Expert shape groups.** One expert program set per DISTINCT per-expert weight shape, not one per model.
   `shape_key` covers every per-expert tensor's shape, the codebook ids, the activation and the layout flags;
   `from_model` interns it into a group index, compiles that group's whole tier set on first sight
-  (`_build_expert_group`), and stamps the index on the layer's `moe` entry, which is what `_launch_expert` and
+  (`_build_expert_group`), and stamps the index on the layer's `moe` entry, which is what `_launch_experts` and
   `_moe_combine_slots` route through. Homogeneous MoEs (gpt-oss, OLMoE) have exactly one group and group 0 keeps
   the original pack names (`moe.expert.sym` …), so their packs and plans are unchanged; later groups take a `g<N>`
   infix. The live driver is EXL3's MIXED bit allocation: bits are spent by Hessian sensitivity, so K varies per
@@ -397,6 +460,14 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   weights. vLLM never sees the scheme — `engine_config_overrides` nulls the quant config for NVFP4 declarations
   (including modelopt MIXED_PRECISION with a 4-bit weight group) exactly as for EXL3/AWQ/MXFP4.
 
+  **FP8 trunk.** Every FP8 checkpoint takes the coded-trunk lane too (`loader.quant.is_fp8_checkpoint`): the loader
+  leaves each paired FP8 weight undecoded, so the trunk sits on the card at its stored size rather than doubled. A
+  checkpoint that declares static activations (W8A8) also gets `spell_static_fp8_activations` after the coded-weight
+  speller. One with dynamic activations (the Qwen, DeepSeek and GLM block-FP8 releases) is served weight-only: each
+  weight decodes inside its GEMM under 16-bit activations, the form a card with no FP8 arithmetic runs, and the
+  dynamic activation quantize `emmy compile` spells is not applied. Qwen3.8-27B-FP8 fits four 16 GB V100s only this
+  way: decoded, its trunk alone needs 13.5 GB of each card.
+
   **gpt-oss attention (sinks + SWA-128 + YaRN), all vLLM-side:** `EmmyGenModel` creates a per-layer `sinks`
   `nn.Parameter` (`[num_heads]`; keyed on `model_type == "gpt_oss"` — the config carries no flag) and passes
   `sinks=` into each `Attention`, which makes vLLM's backend selection sinks-aware (sm_120 lands on TRITON_ATTN;
@@ -409,13 +480,19 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   way, a known small numeric drift.
   **Tuning what serving actually runs.** The deploy pick reads one measured-evidence index — the golden rows in
   scope (the card's repository files, or the file `emmy serve --golden PATH` names, which reaches the vLLM child as
-  `EMMY_GOLDEN_FILE`) beside box-local `perf` / reservoir rows, fastest first, the prior only where nothing was
+  `EMMY_GOLDEN_FILE`) beside the box-local `perf` rows, fastest first, the prior only where nothing was
   measured; `--strict-evidence` (`EMMY_STRICT_EVIDENCE`) fails the boot on a fork nothing measured decides — and only
   evidence recorded against the *serving graph* carries serving. An isolated snippet does not:
   fusion inside a real block produces a different graph (`F.rms_norm(x) @ w` binds a cone the in-model op does not).
+  The cache regime is the serving config's declaration, never an inference from the rows: `EMMY_COLD_CACHE=1` in
+  `SERVE_ENV` puts a `COLD_CACHE` pin on every lane's rows, `serve.sh` exports it before the server starts, and the
+  runner compiles every plan template under the live knob, reading that regime's rows only. A row recorded in the
+  other regime is no evidence, and the release audit `emmy eval golden` counts it as a missing row. The regime
+  selects evidence; serving inserts no eviction.
   So the evidence path is the **twins**. `emmy trace CHECKPOINT --serving-twins --serving-config PATH` captures
   every distinct structural target once as symbolic Loop IR and attaches the exact config-derived realization
-  matrix. `emmy tune --golden PATH` specializes and tunes each binding and precision regime. Capture a **global**
+  matrix. `emmy run --golden PATH --bench --record` (or `--record-greedy`) measures and records each binding and
+  precision regime. Capture a **global**
   (`full_attention`) layer alongside the sliding one for any model whose layers are not homogeneous — gemma-4's
   global layers carry a larger `head_dim`, so their projections are different shapes with different optimal configs.
   Re-capture whenever a tracer/recognizer change alters the graphs. The release audit re-traces the exact widths
@@ -427,8 +504,9 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   >    share one device buffer per weight via the per-wrapper constant cache (see decode bucket above);
   > 2. ~~every layer's program retains its own capacity-sized activation buffers~~ (~350 MB/layer ⇒ ~17 GB across
   >    48 layers at `max_num_batched_tokens=4096`) **fixed** — every program the runner builds shares one
-  >    `BufferArena` (`backend/cuda/program.py`): input/output buffers and the scratch slab are views into per-key
-  >    grow-only backings, so all layers hold ~one layer's worth. Safe because layers run sequentially and each
+  >    `BufferArena` (`backend/cuda/program.py`): input/output regions and the scratch slab are per-key grow-only
+  >    torch backings the runtime borrows, so all layers hold ~one layer's worth. Safe because layers run
+  >    sequentially and each
   >    program's outputs are host-copied/cloned before the next program runs; a backing that grows (e.g. gemma-4's
   >    wider global layers, or a bigger prefill `T`) leaves earlier generations alive so captured graphs / TMA
   >    descriptors never dangle. The re-validation of the 12B footprint on a real 5090 is pending (Phase-A exit run).
@@ -441,7 +519,9 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   allocates a KV-cache spec and runs paged attention; each is built at its **per-layer** dims (`runner.layer_meta` —
   Gemma-4 global layers use a larger head_dim) and gets `per_layer_sliding_window` so Gemma's sliding/global layers
   window correctly) + one RoPE module **per layer** (`_build_rotaries`: homogeneous models share one; Gemma-3/4
-  keys theta AND head_dim on layer type — local vs global — a bare `Attention` does no RoPE) + `ParallelLMHead` +
+  keys theta AND head_dim on layer type — local vs global — a bare `Attention` does no RoPE; each module takes vLLM's
+  fused kernel whatever `--compilation-config` says, because under inductor's default `custom_ops: none` vLLM would
+  hand it `forward_native` and nothing compiles the plugin) + `ParallelLMHead` +
   `LogitsProcessor` (`soft_cap=final_logit_softcapping`, so Gemma-4's final-logit softcap applies; `compute_logits`
   also -infs the generation config's `suppress_tokens` — gemma-4 lists the mm delimiter tokens
   `<image|>`/`<audio|>` there, HF
@@ -464,12 +544,31 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   (the gemma embed-scale re-applies at gather in fp32 — the head must read the table unscaled). An **untied**
   checkpoint has no table to share, and `EMMY_GEN_EMBED_HOST` is the reclaim for that case — see "The vocab table"
   under the device-footprint section. Either way it ends by
-  releasing both allocators' free blocks to the driver (`reclaim_device_memory` — torch's `empty_cache` plus cupy's
-  `free_all_blocks`) **before vLLM's KV-cache profiling**: vLLM budgets `util × total − currently-used` off the
+  releasing the allocator's free blocks to the driver (`reclaim_device_memory` — torch's `empty_cache`)
+  **before vLLM's KV-cache profiling**: vLLM budgets `util × total − currently-used` off the
   driver's accounting and cannot see that a cached block is free. The reclaimed memory becomes KV blocks
   (gemma-4-12B on a 5090: 17.7k → 27.5k KV tokens, the difference between admission-queueing and beating stock TTFT
   on the 4K/4K c=8 workload). `forward` brackets each `self.attn[L](q,k,v)` with two emmy replays (pre/post), applying that
   layer's RoPE in between (A2). Uniform sliding-window (Qwen2-style `use_sliding_window`) and dual-chunk are rejected.
+  **LoRA Llama:** `vllm_model_lora.py` registers `EmmyGenLoRAModel` for one FP16 Llama adapter slot. vLLM fills stable
+  GPU buffers for the seven projection pairs and supplies a per-token adapter index; the model turns it into a mask
+  and passes the mask and adapter weights to the runner's pre/post programs. vLLM still schedules mixed requests and
+  runs paged attention. The deployment defaults to eager execution until mixed CUDA graph replay is validated.
+  **GDN layers.** A checkpoint with GDN layers boots `EmmyGenHybridModel`, a subclass registered under its own
+  architecture name. vLLM's hybrid flag (`IsHybrid`) belongs to the class: on `EmmyGenModel` it would switch every
+  model emmy serves to hybrid KV-cache sizing. vLLM keeps each request's GDN state in its KV-cache blocks. One
+  `_GdnStateLayer` per GDN layer declares the layout to vLLM (the convolution history in the trunk dtype, then the
+  fp32 matrix state) through vLLM's linear-attention backend for per-request state
+  (`MambaAttentionBackendEnum.LINEAR`). At each step `_forward_gdn` reads every request's token range, sequence length
+  and the index of the KV-cache block that holds its state, from vLLM's attention metadata for that layer. vLLM never
+  zeroes a KV-cache block, so `_forward_gdn` zeroes the state of a request whose step covers its whole sequence (no
+  token computed yet). It then runs the runner's GDN call for one request after another. `EmmyGenModel.__init__`
+  refuses three settings on a model with GDN layers. It refuses prefix caching: a request keeps one state, with no
+  snapshot for a cached prefix to resume from. It refuses speculative decoding: a rejected draft token has already
+  advanced the state. It refuses CUDA graph capture: `_forward_gdn` reads token ranges on the host.
+  `serve --runner generate` picks the class and passes `--enforce-eager` when the checkpoint's `layer_types` contain
+  `linear_attention`, unless the caller already passed `--enforce-eager` or `--compilation-config`. A caller-supplied
+  compilation config also hits the init refusal.
   **Pipeline parallelism.** vLLM owns the pipeline schedule and hidden-state transport. Each `EmmyGenModel` rank uses
   `get_pp_indices` to load and compile only its absolute decoder interval; the first rank owns the embedding, the last
   owns the final norm and output head, and intermediate ranks return `IntermediateTensors`. Quantized checkpoint reads
@@ -478,6 +577,10 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   replayed on another. Pipeline hidden buffers use `runner.residual_dtype`, not vLLM's blanket model dtype: the marked
   Laguna EXL3 and gpt-oss MXFP4 contracts therefore preserve their fp32 residual streams across ranks while q/k/v and
   attention stay fp16.
+  A later stage blocks on the earlier one for a whole forward, so two deadlines bound every forward pass at two
+  stages: vLLM's `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` (default 300 s, raisable) and the NCCL collective watchdog,
+  which fired at 600 s on the 16× V100 DeepSeek V4 deployment whatever `TORCH_NCCL_ASYNC_ERROR_HANDLING` was set to.
+  A program that needs longer per forward cannot be served there, or measured there; bench it alone first.
   The coded output head remains whole only on the last rank (`tp_size == 1` within that pipeline stage); no
   `ParallelLMHead` or decoded copy is allocated there. Profile batches above one row execute the coded compiler program
   row-by-row, while captured decode requires one sampled row. Speculative decoding is unsupported with pipeline
@@ -493,10 +596,11 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   verifies the runner adopted that same tensor (not in the gather itself — vLLM compiles the drafter's forward, and
   dynamo can't trace `data_ptr()`). `forward` branches on `num_tokens`: the decode hot
   path (`≤ bucket`) runs `_forward_device` (q/k/v + attn_out stay CUDA tensors through RoPE + attention, no host
-  hop); prefill keeps the numpy path. Select via `--runner generate` +
-  `--hf-overrides '{"architectures":["EmmyGenModel"]}'` + `--dtype float16` (the `serve --generate` branch forces
-  this for seam coherence). Registered in `__init__.py`. **Whole-step CUDA graphs are the `emmy serve
-  --generate` DEFAULT — decode AND chunk/mixed steps**: no `--enforce-eager`; instead a `--compilation-config`
+  hop); prefill runs the symbolic device programs. Select via `--runner generate` +
+  `--hf-overrides '{"architectures":["EmmyGenModel"]}'` + `--dtype float16` (the `serve --runner generate` branch defaults
+  this for seam coherence; explicit `--dtype bfloat16` runs a BF16 residual stream). Registered in `__init__.py`.
+  **Whole-step CUDA graphs are the `emmy serve
+  --runner generate` DEFAULT — decode AND chunk/mixed steps**: no `--enforce-eager`; instead a `--compilation-config`
   with `cudagraph_mode: FULL` (full cudagraphs need no torch.compile — vLLM wraps the model in its
   `CUDAGraphWrapper`) and
   `cudagraph_capture_sizes` laddered up to `--max-num-seqs` PLUS token-count chunk rungs spanning the prefill
@@ -596,7 +700,7 @@ against eager, and the batch {2, 4, 32} × seq matrix in `tests/compiler/ir/test
 
 Each sequence runs **individually** through the compiled dynamic-seq_len program (batch axis is compile-time fixed at
 1), as a captured whole-program CUDA graph (one host launch) replayed over a single capacity-sized buffer set, with the
-request's torch inputs bridged to the buffers' prefix device-to-device (dlpack, no host hop) and the output handed back
+request's torch inputs copied into the buffers' prefix device-to-device (no host hop) and the output handed back
 as a torch view of the output buffer. One captured graph is cached per
 distinct seq_len (bounded LRU); a new length pays one capture (~one forward) on first sight, then replays. The captured
 graph removes the per-launch dispatch overhead and the ~hundreds of host calls the uncaptured loop made — the
@@ -613,11 +717,12 @@ Recorded follow-ups, in impact order:
    **done** (`EMMY_SERVING_BATCHED`, see the batched-modes section above); remaining is (b) cu_seqlens varlen tiles so
    one launch handles mixed lengths with no padding at all (its own session — the ragged row→sequence mapping in the
    attention schedule + the mask derivation from `cu_seqlens`).
-2. **dlpack zero-copy I/O** — **done**: `forward_hidden_states` takes/returns torch CUDA tensors, bridged to the cupy
-   buffers via `cp.from_dlpack` / `torch.from_dlpack` on torch's stream — no GPU↔host round-trip (`upload_prefix_device`
-   / `output_prefix_device`). The only residual host touch is `positions.cpu()` for span boundaries.
-3. **Device-side causal mask** — host build + upload **removed**: the `(1,1,S,S)` mask is now built once per S as a cupy
-   array on the GPU (`runner._mask`) and copied into the prefix device-to-device. Still open: an in-kernel `j <= i`
+2. **Zero-copy device I/O** — **done**: `forward_hidden_states` takes/returns torch CUDA tensors; the buffers are torch
+   tensors the runtime borrows, filled device-to-device on torch's stream — no GPU↔host round-trip
+   (`upload_prefix_device` / `output_prefix_device`). The only residual host touch is `positions.cpu()` for span
+   boundaries.
+3. **Device-side causal mask** — host build + upload **removed**: the `(1,1,S,S)` mask is now built once per S as a
+   device tensor (`runner._mask`) and copied into the prefix device-to-device. Still open: an in-kernel `j <= i`
    predicate would drop the mask input + its per-request D2D copy entirely.
 4. **Single capacity-baked graph** — would collapse the per-S cache to one graph, but needs every symbolic-M kernel to
    be correct at an oversized (capacity) grid; today several aren't (swizzle decode + staged loads read OOB). Future
@@ -630,15 +735,16 @@ Recorded follow-ups, in impact order:
   rotary buffer (`_SlicedRotary` precomputes `DYNAMIC_DIM_MAX + 1` positions).
 - `--enforce-eager`: the **embedding** plugin still serves eager — vLLM never torch.compiles an undecorated OOT
   class, and enforce-eager keeps the engine from capturing around the runner's own kernel launches. The
-  **generative** path no longer needs it: `run_device` is capture-aware and `serve --generate` defaults to
-  whole-step decode graphs (see `gen_runner.py` above).
+  **generative** path no longer needs it: `run_device` is capture-aware and `serve --runner generate` defaults to
+  whole-step decode graphs (see `gen_runner.py` above). A checkpoint with GDN layers is the exception: it serves
+  eager (see `vllm_model_gen.py` above).
 - Startup compiles the whole model (~1–2 min for 0.6B warm-cubin-cache; first boot pays nvcc). `EMMY_CUBIN_CACHE`
   persistence across container restarts is what keeps reboots fast. **`EMMY_PACK_DIR`** cuts the rest of the warm
   boot: `EmmyForwardRunner.create` keys an execution-plan pack (`compiler/backend/pack.py`) on model id + config
   hash + serving shape — a hit loads binary-keyed plans (`CompiledProgram.build_from_plan`) and skips trace, pass
   pipeline, fork resolution, and codegen entirely (weights still bind from the checkpoint via the plan's
   `source_path` refs); a miss compiles in full and writes the pack for the next boot. Any mismatch — retune under
-  a different config, nvcc/toolkit change, evicted cubin — silently falls back to the full compile.
+  a different config, nvcc/toolkit change, a changed golden, evicted cubin — silently falls back to the full compile.
   The generative arm's key drops the model id (a baked image resolves the model to a snapshot *path* offline while
   the warm boot uses the hub id) and excludes only `eos_token_id` from the config digest: EOS is generation policy
   consumed after the forward and cannot change a twin program, so base/IT checkpoints with identical tensor geometry
@@ -669,28 +775,33 @@ Recorded follow-ups, in impact order:
 - The shared buffer set is allocated at `max_seq_len` (`--max-model-len`); every accepted request (S ≤ `max_seq_len`)
   uses the captured-graph path. The S²-attention scratch dominates that allocation (0.6B at 4096 ≈ 15 GB), so lower
   `--max-model-len` for bigger models / smaller cards.
-- vLLM's memory profiler only sees torch allocations; the runner's cupy-held weights/activations are invisible to it.
-  Leave `--gpu-memory-utilization` headroom accordingly (the attention-free model needs no KV cache, so vLLM's own
-  budget is tiny). The GENERATIVE arm has the opposite problem — it needs a real KV cache, and vLLM budgets
+- The runner's weights and activations are torch tensors the runtime borrows, so vLLM's memory profiler counts them
+  inside `--gpu-memory-utilization` (the attention-free model needs no KV cache, so vLLM's own budget is
+  tiny). The GENERATIVE arm has the opposite problem — it needs a real KV cache, and vLLM budgets
   `util × total − currently-used`, so the default 0.90 line can fall below the emmy residents and fail the
   min-KV fit at long `--max-model-len` (gemma-4-12B at mml 8448: 1.37 GiB left of the 1.7 needed). `emmy serve
-  --generate` therefore defaults the emmy arm to `--gpu-memory-utilization 0.97` (stock keeps 0.90; an explicit
+  --runner generate` therefore defaults the emmy arm to `--gpu-memory-utilization 0.97` (stock keeps 0.90; an explicit
   flag wins).
 - **DeepSeek V4 (`deepseek-ai/DeepSeek-V4-Flash-0731`) serves the published checkpoint at TP8 × PP2.**
   The pieces above — the fork's attention hosted per layer, the native-naming loader lane with its `.scale` ue8m0
-  block scales and compressed MXFP4 routed experts, tensor-parallel expert sharding with the group all-reduce, the
-  carrier-width pipeline transport — are implemented and gated (see the hyper-connection section), including a
-  real-engine TP2×PP2 greedy-parity test on a small config. Decode capture is unsupported for this architecture
-  (the routed combine host-syncs every step; the fixed-slot selector is unsharded) — the boot guard and
-  `emmy serve` both force eager. The 16× V100 boot serving mixed prefill/decode, its memory and KV numbers, and
-  greedy agreement against the fork's own implementation are recorded in the recipe's `RESULTS.md`. Still ahead:
-  a prebuilt serving image with a warmed pack, and the equal-envelope A/B.
+  block scales and compressed MXFP4 routed experts, every routed expert sliced across the tensor-parallel ranks with the
+  group all-reduce summing the slices, the carrier-width pipeline transport — are implemented and gated (see the
+  hyper-connection section), including a real-engine TP2×PP2 greedy-parity test on a small config. Decode is captured
+  up to the decode bucket (capture sizes 1 to 16): with every rank running the same picks, the fixed-slot expert tier
+  serves the hyper-connection seam too, a batch's rows one after another. The 16× V100 boot serving mixed
+  prefill/decode, its memory and KV numbers, and greedy agreement against the fork's own implementation are recorded
+  in the recipe's `RESULTS.md`. The prebuilt serving image with its warmed pack is published
+  (`cloudriftai/vllm-emmy-deepseek-v4-flash-0731`) and the model's recipe serves it at the checkpoint's full
+  1,048,576-token context. It was warmed at 4,096: the pack is keyed on the prefill and decode widths, not on the
+  context length, so it hits at both. The equal-envelope A/B against the plain fork is
+  `experiments/DeepSeek-V4-Flash-0731/emmy_ab_v100_sxm3/RESULTS.md`: faster on one request, level at 8 concurrent.
+  That report names what is left against the fork: the 8-row decode step, the 4,096-token post program and start-up.
 
 ## Quantized KV — `--kv-cache-dtype fp8_e4m3` (generative)
 
 emmy owns no KV cache. The generative carve runs vLLM's paged `Attention` (and its cache) between the `pre` and
 `post` programs, so the cache dtype is entirely vLLM's: `--kv-cache-dtype fp8_e4m3` is an ordinary passthrough flag
-on both arms of `emmy serve --generate` (nothing in `commands/serve.py` reads it), and it **doubles the KV token
+on both arms of `emmy serve --runner generate` (nothing in `commands/serve.py` reads it), and it **doubles the KV token
 capacity** out of the same byte budget — the emmy arm's `--gpu-memory-utilization 0.97` needs no adjustment, since
 fp8 halves the bytes per token rather than changing what the budget is. Measured on `Qwen/Qwen3-0.6B` at
 `--max-model-len 4096`, 32 GB RTX 5090: 264 048 tokens out of 28.2 GiB (fp16) → 518 224 out of 27.68 GiB (fp8), i.e.
@@ -723,10 +834,10 @@ vLLM's free-memory check. Nothing to do with fp8 — but an fp8-KV deployment si
 The generative arm's throughput on long-request batched workloads is set by how many sequences vLLM can
 admit, and that is decided by emmy's device footprint rather than by kernel speed.
 
-**Mechanism.** The runner holds its trunk weights, activation arenas and scratch slabs in **cupy**
-buffers. vLLM's memory profiler only measures torch allocations, so it never attributes any of them; it
-budgets the KV cache as `util × total − currently-used`, i.e. out of whatever is left after emmy has
-already claimed its residents. Every byte of emmy's non-KV footprint therefore comes straight out of the
+**Mechanism.** The runner holds its trunk weights, activation arenas and scratch slabs in torch tensors
+the runtime borrows, claimed before vLLM's memory profiler runs; vLLM budgets the KV cache as
+`util × total − currently-used`, i.e. out of whatever is left after emmy has already claimed its
+residents. Every byte of emmy's non-KV footprint therefore comes straight out of the
 KV cache, and the KV cache is what caps concurrency: a request needing `input + output` tokens of KV
 consumes that much of a fixed pool, so a smaller pool admits proportionally fewer streams and queues or
 **preempts** the rest (a preempted request recomputes its prefill — wasted work that yields no token).
@@ -751,7 +862,7 @@ still pays for `max_tokens`-row buffers** — so the first place to look when re
 `capacity` defaults to the dynamic-dim cap and is deliberately NOT derived from
 `max_num_batched_tokens` — the pack key carries it, so tying it to a scheduler knob recompiles the whole
 program set every time a lane is retuned. **`EMMY_GEN_PREFILL_CAPACITY` pins it instead**, and
-`emmy serve --generate` moves its `--max-num-batched-tokens` default (`capacity + decode_bucket`, the
+`emmy serve --runner generate` moves its `--max-num-batched-tokens` default (`capacity + decode_bucket`, the
 rider headroom) to match. Reach for it when the arena is competing with the KV cache rather than with
 nothing: a model that fills the card with weights pays for every token of capacity it never serves.
 
@@ -829,17 +940,33 @@ list does not get the flooring treatment described above, so it can violate the 
 - `tests/serving/generation/test_gen_lm_head.py` — where the one vLLM-owned weight comes from (no GPU): the three sources
   (`lm_head.weight`, the tied embed alias, an EXL3-coded head decoded off a synthetic checkpoint) and the loud failure
   when none applies. Also pins that the coded path does NOT walk vLLM's weight stream.
+- `tests/serving/generation/test_gen_runner_gdn_gpu.py` — GDN layers through the runner, needs CUDA: prompt lengths
+  on both sides of the static widths against the eager model, prefill followed by single-token steps, a request run
+  after another one that must be bit-identical to the same request run alone, a padded step that must corrupt the
+  state, and a hybrid model (one GDN layer, one gated full-attention layer).
+- `tests/serving/generation/test_vllm_plugin_gdn_gpu.py` — `perf`-marked, needs CUDA + vllm: a tiny hybrid Qwen3.5
+  through `EmmyGenHybridModel` in an in-process engine. Greedy tokens must equal Hugging Face's for single requests,
+  for several requests in one batch, and for the same requests again on reused KV-cache blocks.
+- `tests/serving/generation/test_gen_gdn_refusals.py` — no GPU, needs vllm: `EmmyGenModel` refuses GDN layers and
+  names `EmmyGenHybridModel`; the prefix-caching, speculative-decoding and CUDA-graph refusals; the state layout
+  matches the GDN programs' inputs.
 - `tests/serving/test_vllm_plugin_gpu.py` — `perf`-marked (deselected by default), needs CUDA + vllm: in-process
   `vllm.LLM(runner="pooling", hf_overrides=...)` on Qwen3-Embedding-0.6B, `.embed()` cosine vs the HF eager reference.
   The three texts have different token counts, so it exercises the per-seq_len captured-graph cache end to end.
 - `tests/compiler/ir/test_dynamic_shapes.py` — the captured-replay primitives directly (RMSNorm + a 1-layer Qwen3
   trunk through `set_sym_values` + `upload_prefix` + `capture_program_graph` + `replay_program_graph` +
   `outputs(sym_values)`); run under `compute-sanitizer` in dev to confirm zero illegal accesses. Plus
-  `test_capture_replay_device_io_matches_eager` — the zero-copy device path (`upload_prefix_device` + cupy-in,
-  `output_prefix_device` + `torch.from_dlpack`-out) matches eager, the primitive behind the runner's torch I/O.
+  `test_capture_replay_device_io_matches_eager` — the zero-copy device path (`upload_prefix_device` with torch
+  tensors in, `output_prefix_device` views out) matches eager, the primitive behind the runner's torch I/O.
 - `tests/serving/generation/test_runner_batched_gpu.py` — `perf`-marked: a 1-layer static `(batch, S)` trunk wrapped
   in a runner;
   `forward_hidden_states_batched` runs several different-length sequences in one padded batched forward and matches
   eager per row (the causal-independence-under-padding gate for `EMMY_SERVING_STATIC`).
 - `scripts/compare_embeddings.py` — the accuracy gate against a *server*: embeds a fixed text set through two
   OpenAI-compatible endpoints (emmy-backed and stock) and asserts pairwise cosine > 0.99.
+
+## Standalone cached generation
+
+The experimental Rust cached-generation path is documented in
+[`native/ARCHITECTURE.md`](native/ARCHITECTURE.md). It prepares dense FP16 Qwen3 artifacts and executes them without
+Python model operations. It does not change the vLLM adapter, scheduler, or serving defaults.

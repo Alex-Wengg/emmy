@@ -1,10 +1,10 @@
 tags:
-  - maintained
+  - best-effort
 
 model:
   huggingface: "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"
-  rationale: "Qwen3 Coder family strong on OR yet outshined by Qwen3.8 Coder variants."
-  heat: 50
+  rationale: "Superseded in name by Qwen3-Coder-Next, but no single-32GB complete replacement exists (80B class needs 2x)."
+  heat: 30
 engine:
   llm:
     tensor_parallel_size: 1

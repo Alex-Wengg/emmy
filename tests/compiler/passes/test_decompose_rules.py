@@ -30,7 +30,7 @@ from emmy.compiler.ir.frontend.ir import (
     UnsqueezeOp,
 )
 from emmy.compiler.ir.loop import LoopOp
-from emmy.compiler.ir.stmt import Assign
+from emmy.compiler.ir.stmt import Affine, Assign
 from emmy.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, ReduceOp
 from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
@@ -163,7 +163,7 @@ def test_pow_neg_half_correctness():
 
 
 # ===================================================================
-# SiLU decomposition: silu(x) → x * recip(1 + exp(-x))
+# SiLU decomposition: silu(x) → x / (1 + exp(-x))
 # ===================================================================
 
 
@@ -192,23 +192,27 @@ def test_silu_uses_the_input_opmath_dtype(dtype, opmath_dtype):
     by_name = {n.op.name: n for n in elementwise}
 
     assert [n.op.name for n in elementwise].count("copy") == (dtype != opmath_dtype)
-    assert all(by_name[name].output.dtype == opmath_dtype for name in ("negative", "exp", "add", "reciprocal"))
-    assert by_name["multiply"].output.dtype == dtype
-    assert all(result.nodes[inp].output.dtype == opmath_dtype for inp in by_name["multiply"].inputs)
+    assert all(by_name[name].output.dtype == opmath_dtype for name in ("negative", "exp", "add"))
+    assert by_name["divide"].output.dtype == dtype
+    assert all(result.nodes[inp].output.dtype == opmath_dtype for inp in by_name["divide"].inputs)
 
 
 def test_silu_f16_lifting_keeps_one_widening_and_one_final_narrowing():
     result = Pipeline.build(LOOP_PASSES).run(_make_silu_graph(F16))
     loop = next(n.op for n in result.nodes.values() if isinstance(n.op, LoopOp))
-    assigns = [(stmt.op.name, stmt.dtype) for stmt in loop.body.iter() if isinstance(stmt, Assign)]
+    assigns = [
+        (stmt.op.name if isinstance(stmt, Assign) else type(stmt).__name__, stmt.dtype)
+        for stmt in loop.body.iter()
+        if isinstance(stmt, (Assign, Affine))
+    ]
 
+    # The negation and the ``1 + exp`` sum are Affine statements.
     assert assigns == [
         ("copy", F32),
-        ("negative", None),
+        ("Affine", None),
         ("exp", None),
-        ("add", None),
-        ("reciprocal", None),
-        ("multiply", F16),
+        ("Affine", None),
+        ("divide", F16),
     ]
 
 
@@ -670,6 +674,21 @@ def test_matmul_with_bias_correctness():
     _assert_close(before, after, rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.parametrize("dtype", [F16, F32])
+def test_matmul_products_do_not_round_before_accumulation(dtype):
+    graph = Graph()
+    graph.add_node(InputOp(), [], Tensor("a", (1, 3), dtype), node_id="a")
+    graph.add_node(InputOp(), [], Tensor("b", (3, 1), dtype), node_id="b")
+    graph.add_node(MatmulOp(), ["a", "b"], Tensor("out", (1, 1), dtype), node_id="out")
+    graph.inputs, graph.outputs = ["a", "b"], ["out"]
+    # The large products overflow fp16 separately, but cancel in a full-width dot product.
+    # An exact final product keeps the reference independent of the BLAS accumulation order.
+    inputs = {"a": np.array([[300, 300, 1]], dtype=dtype.np), "b": np.array([[300], [-300], [1]], dtype=dtype.np)}
+    before = _run(graph, inputs)
+    after = _run(_apply(graph, "070_matmul.py"), inputs)
+    _assert_close(before, after, rtol=1e-4, atol=1e-5)
+
+
 # ===================================================================
 # Unsqueeze → IndexMapOp
 # ===================================================================
@@ -808,22 +827,25 @@ def test_slice_negative_start_normalizes_symbolic():
 # ===================================================================
 
 
-def _make_cat_graph():
+def _make_cat_graph(widths=(3, 5)):
     g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 3)), node_id="a")
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (4, 5)), node_id="b")
+    names = [f"t{i}" for i in range(len(widths))]
+    for name, width in zip(names, widths, strict=True):
+        g.add_node(op=InputOp(), inputs=[], output=Tensor(name, (4, width)), node_id=name)
     g.add_node(op=ConstantOp(name="dim", value=1.0), inputs=[], output=Tensor("dim", (1,)), node_id="dim")
-    g.add_node(op=CatOp(), inputs=["a", "b", "dim"], output=Tensor("out", (4, 8)), node_id="out")
-    g.inputs, g.outputs = ["a", "b"], ["out"]
+    g.add_node(op=CatOp(), inputs=[*names, "dim"], output=Tensor("out", (4, sum(widths))), node_id="out")
+    g.inputs, g.outputs = names, ["out"]
     return g
 
 
-def test_cat_to_indexmap_correctness():
-    g = _make_cat_graph()
-    a = rng.standard_normal((4, 3)).astype(np.float32)
-    b = rng.standard_normal((4, 5)).astype(np.float32)
-    before = _run(g, {"a": a, "b": b})
-    after = _run(_apply(g, "150_cat.py"), {"a": a, "b": b})
+@pytest.mark.parametrize("widths", [(3, 5), (6,), (2, 3, 4)], ids=["two", "one", "three"])
+def test_cat_to_indexmap_correctness(widths):
+    """Any number of tensors: rotary's two halves, and a windowed encoder's one window or several."""
+    g = _make_cat_graph(widths)
+    feed = {f"t{i}": rng.standard_normal((4, width)).astype(np.float32) for i, width in enumerate(widths)}
+    before = _run(g, feed)
+    after = _run(_apply(g, "150_cat.py"), feed)
+    assert not any(isinstance(node.op, CatOp) for node in _apply(g, "150_cat.py").nodes.values())
     _assert_close(before, after)
 
 

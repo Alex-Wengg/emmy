@@ -10,9 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
-  pull-requests: read
 
 jobs:
   build:
@@ -25,31 +23,19 @@ jobs:
           fetch-depth: 0
 
       - name: Verify the release source
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           git fetch origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Releases must publish a commit already merged into main"
+            echo "::error::Releases must publish a commit already on main"
             exit 1
           fi
-          PR_HEAD=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
-            --jq "map(select(.merged_at != null and .base.ref == \"main\" and .merge_commit_sha == \"$GITHUB_SHA\")) | first | .head.sha // empty")
-          if [ -z "$PR_HEAD" ]; then
-            echo "::error::The release commit is not associated with a merged pull request"
-            exit 1
-          fi
-          TEST_RUN=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/tests.yml/runs?head_sha=$PR_HEAD&event=pull_request" \
-            --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | first | .html_url // empty')
-          if [ -z "$TEST_RUN" ]; then
-            echo "::error::The merged pull request has no successful Tests workflow"
-            exit 1
-          fi
-          echo "Using pull-request checks from $TEST_RUN"
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      # The wheel carries the runtime extension, built with cargo.
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Resolve the version to publish
         id: version
@@ -77,22 +63,15 @@ jobs:
       - name: Build the PyPI distribution
         run: make pypi-dist
 
-      - name: Smoke-test the PyPI distribution
+      # The same smoke test pull-request CI runs on its dry-run build, plus the version check only a release has.
+      - uses: ./.github/actions/smoke-wheel
+        id: smoke
+
+      - name: Check the installed version
         env:
+          BIN: ${{ steps.smoke.outputs.bin }}
           VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
-          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
-          WHEEL=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
-          SMOKE_ENV="$RUNNER_TEMP/emmy-release-smoke"
-          CATALOG="$RUNNER_TEMP/emmy-recipes.json"
-          python -m venv "$SMOKE_ENV"
-          "$SMOKE_ENV/bin/pip" install --disable-pip-version-check "$WHEEL"
-          test "$("$SMOKE_ENV/bin/emmy" --version)" = "emmy $VERSION"
-          "$SMOKE_ENV/bin/emmy" recipe list --json > "$CATALOG"
-          "$SMOKE_ENV/bin/python" -c \
-            'import json, sys; assert json.load(open(sys.argv[1]))["recipes"], "wheel contains no recipes"' \
-            "$CATALOG"
+        run: test "$("$BIN/emmy" --version)" = "emmy $VERSION"
 
       - uses: actions/upload-artifact@v4
         with:

@@ -15,6 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from emmy.compiler.context import Context
 from emmy.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F8E4M3, F16, F32, DataType
@@ -26,7 +27,7 @@ from emmy.compiler.ir.schedule import Stage, Tile, Work
 from emmy.compiler.ir.schedule.catalog import stage_moves
 from emmy.compiler.ir.schedule.staging import resolve_warp_stage
 from emmy.compiler.ir.stmt import Load
-from tests.compiler.helpers import requires_cuda
+from tests.compiler.helpers import requires_cuda, requires_sm
 from tests.compiler.terms import contraction
 
 K16 = "mma_m16n8k16_f16_f32"
@@ -36,10 +37,9 @@ K32 = "mma_m16n8k32_e4m3_f32"
 def _tma_pins() -> tuple[str, ...]:
     """The TMA stage pins, only where the live device has TMA (sm_90+) — below it a TMA pin
     correctly resolves to gmem-direct, which is not the staged form under test."""
-    import cupy
+    import torch
 
-    cap = cupy.cuda.Device().compute_capability  # e.g. "89" / "120"
-    return ("d2/smem-tma",) if int(cap) >= 90 else ()
+    return ("d2/smem-tma",) if torch.cuda.get_device_capability() >= (9, 0) else ()
 
 
 def _node(*, a_dtype: DataType = F16, b_dtype: DataType = F8E4M3, m=512, n=4096, k=4096, b_trans=False):
@@ -128,7 +128,7 @@ def test_16bit_operands_resolve_exactly_as_without_dtype_info():
     so no new forks appear for the 16-bit family."""
     node, inputs, mn, ka = _node(b_dtype=F16)
     tile = _tile(K16, "f4x1/k4", "w1x8", mn)
-    for move in stage_moves(warp=True):
+    for move in stage_moves(warp=True, ctx=Context.from_target((9, 0))):  # a card that issues every transport
         with_info = resolve_warp_stage(node, tile, move, 100 * 1024, inputs, k_axis=ka)
         without = resolve_warp_stage(node, tile, move, 100 * 1024, None, k_axis=ka)
         assert (with_info is None) == (without is None)
@@ -213,6 +213,7 @@ def _run_w8a16(backend, stage_pin, x, bits, scale, m, n, k):
 
 @requires_cuda
 @pytest.mark.xdist_group("cuda")
+@requires_sm(8)
 def test_w8a16_staged_bit_identical_to_gmem_direct_cuda():
     """Staged fp8-B (cp.async and TMA) is BIT-identical to the gmem-direct fragment-convert
     kernel — same per-element convert, same K order, same atoms — and the staged source carries
@@ -239,6 +240,7 @@ def test_w8a16_staged_bit_identical_to_gmem_direct_cuda():
 
 @requires_cuda
 @pytest.mark.xdist_group("cuda")
+@requires_sm(8)
 def test_canonical_byte_b_and_splitk_compose_cuda():
     """The CANONICAL (K-major ``B[k, n]``) byte slab — K-strided bytes, so the drain is the
     scalar convert gather — and split-K composed with the staged byte slab. Each staged form is
@@ -286,6 +288,7 @@ def test_canonical_byte_b_and_splitk_compose_cuda():
 
 @requires_cuda
 @pytest.mark.xdist_group("cuda")
+@requires_sm(8, 9)
 def test_k32_staged_bit_identical_to_gmem_direct_cuda():
     """Staged W8A8 (the k32 byte repack — raw bytes both slabs) is BIT-identical to the
     gmem-direct ``_b8`` gathers, and the contiguous-K drains ride the vector (u32) loaders."""

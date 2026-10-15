@@ -5,12 +5,9 @@ Defined here rather than under any one IR package because all three IRs
 (Loop, Tile, Kernel) consume the same leaf vocabulary:
 
 - ``Stmt`` — abstract base for every body statement.
-- Leaves: ``Load``, ``Assign``, ``Accum``, ``Mma``, ``Init``, ``Write``,
+- Leaves: ``Load``, ``Assign``, ``Accum``, ``Init``, ``Write``,
   ``Select``, ``SelectBranch`` — pure compute primitives that read/write SSA
-  names and external buffers (in :mod:`.leaves`). ``Mma`` is the tensor-core
-  fused multiply-accumulate (``c += a @ b``) — it carries the atom kind and
-  names its A/B operand ``Load``s by SSA value (the operand loads stay plain),
-  and is lowered by ``kernel/005_lower_atom_tile``.
+  names and external buffers (in :mod:`.leaves`).
 - Block stmts: ``Loop``, ``StridedLoop``, ``Cond`` — carry child bodies
   (in :mod:`.blocks`).
 - Tree walks: :meth:`Body.iter` (pre-order recursive) and
@@ -31,13 +28,13 @@ Each IR layer adds its own scheduling-specific Stmts on top:
 - Kernel IR: ``Smem``, ``Sync``, ``TreeHalve``, plus the shared
   constructs.
 
-Loop-IR's ``LoopOp``, ``LoopMeta``, and validation stay in ``ir/loop/`` because they enforce
-Loop-IR-specific invariants. Shared body normalization and structural identity stay here in
-``ir/stmt/``.
+Loop-IR's ``LoopOp`` and validation stay in ``ir/loop/`` because they enforce Loop-IR-specific
+invariants. Body analysis, demand reconstruction, normalization and structural identity stay here.
 """
 
 from emmy.compiler.ir.stmt.base import (
     INDENT,
+    Paged,
     RenderCtx,
     Stmt,
     op_to_expr,
@@ -56,18 +53,19 @@ from emmy.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from emmy.compiler.ir.stmt.body import Body, refs_axis, stmt_axis_names
 from emmy.compiler.ir.stmt.leaves import (
     Accum,
+    Affine,
     Assign,
-    Const,
+    Carry,
     Init,
+    Let,
     Load,
-    Mma,
     OutputSpec,
-    Pack,
+    Pre,
     Select,
     SelectBranch,
-    Unpack,
     Write,
     ZeroPrologue,
+    binary,
     mask_select_predicate,
 )
 from emmy.compiler.ir.stmt.normalize import normalize_body
@@ -77,23 +75,25 @@ __all__ = [
     "stmt_axis_names",
     "INDENT",
     "Accum",
+    "Pre",
+    "Carry",
+    "Affine",
+    "binary",
     "Assign",
     "Body",
     "Cond",
-    "Const",
     "Init",
+    "Let",
     "Load",
     "Loop",
-    "Mma",
     "mask_select_predicate",
-    "Pack",
+    "Paged",
     "RenderCtx",
     "ZeroPrologue",
     "Select",
     "SelectBranch",
     "Stmt",
     "StridedLoop",
-    "Unpack",
     "Write",
     "OutputSpec",
     "normalize_body",
