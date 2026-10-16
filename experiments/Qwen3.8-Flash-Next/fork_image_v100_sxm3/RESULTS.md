@@ -4,10 +4,11 @@
 v1.5.1 release did in `fork_baseline_v100_sxm3`, within the spread of repeated runs? Only then can it replace the
 release wheel as the fork that Emmy's serving image builds on.
 
-**Image.** `cloudriftai/1cat-vllm-qwen3.8-flash-next:1.5.1-248d877c5`, built from `docker/1cat-vllm-sm70/` at the
-fork's `cloudrift/v1.5.1` branch (`248d877c549c`): upstream v1.5.1 (`589a5d1e1a9e`) plus the Poolside tool-call fix
-and the Laguna FP8 precision fix, with Transformers 5.19.0. The branch also reverts the non-MTP Gated DeltaNet
-full-forward guard that CloudRift's older branch carried, which upstream does not use.
+**Image.** `cloudriftai/1cat-vllm-qwen3.8-flash-next:1.5.1-248d877c5`, built from
+`docker/1cat-vllm-sm70/Dockerfile.v1.5.1` at the fork's `cloudrift/v1.5.1` branch (`248d877c549c`): upstream v1.5.1
+(`589a5d1e1a9e`) plus the Poolside tool-call fix and the Laguna FP8 precision fix, with Transformers 5.19.0. The
+branch also reverts the non-MTP Gated DeltaNet full-forward guard that CloudRift's older branch carried, which
+upstream does not use.
 
 ## v100x16 (16x NVIDIA Tesla V100 SXM3 32GB, rows on cards 0-3 or all sixteen)
 

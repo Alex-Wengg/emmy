@@ -9,13 +9,16 @@
 # JIT_CACHE_MANIFEST_SHA256 is the sha256 of the sorted `sha256sum` listing of `cache/`.
 #
 #   docker build -f Dockerfile.triton-cache \
-#     --build-arg BASE_IMAGE=cloudriftai/1cat-vllm-qwen3.8-flash-next-nvfp4-base:1.5.1-248d877c5 \
-#     --build-arg JIT_CACHE_MANIFEST_SHA256=<sha256> \
-#     --build-arg PUBLISH_VERSION=1.5.1 \
-#     --build-arg PUBLISH_REVISION=248d877c549c5800be8a05de5743f173364a7d5a \
-#     --build-arg MODEL=RadixArk/Qwen3.8-Flash-Next-NVFP4 \
-#     --build-arg MODEL_REVISION=7b719225242aacd3dbd3f9407468c2ee9a9d2594 \
-#     -t cloudriftai/1cat-vllm-qwen3.8-flash-next-nvfp4:1.5.1-248d877c5 .
+#     --build-arg BASE_IMAGE=<the unbaked 1Cat image> \
+#     --build-arg JIT_CACHE_MANIFEST_SHA256=<sha256 of the cache manifest> \
+#     --build-arg PUBLISH_VERSION=<runtime version> \
+#     --build-arg PUBLISH_REVISION=<fork commit> \
+#     --build-arg MODEL=<HF model id> \
+#     --build-arg MODEL_REVISION=<checkpoint commit> \
+#     -t cloudriftai/1cat-vllm-<model-slug>:<runtime-version>-<source-sha> .
+#
+# DeepSeek V4's bake (1.2.3-d76126608) wrote three folders; in this layout they are cache/root/.triton/cache,
+# cache/root/.tilelang/cache and cache/root/.cache/tilelang.
 
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}

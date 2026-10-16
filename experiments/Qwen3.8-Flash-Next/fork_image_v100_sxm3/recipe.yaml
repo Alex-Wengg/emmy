@@ -1,11 +1,11 @@
 # Step 2's baseline rerun on our own 1Cat image, the gate for moving CloudRift's fork to v1.5.1: the same rows,
 # flags and seeds as fork_baseline_v100_sxm3, so its numbers must reproduce within the spread of repeated runs.
 #
-# The image is built from docker/1cat-vllm-sm70/ at the fork's cloudrift/v1.5.1 branch: upstream v1.5.1 plus the
-# CloudRift commits it lacks, the Poolside tool-call fix and the Laguna FP8 precision fix, with Transformers 5.19.0
-# as in the release image. The non-MTP Gated DeltaNet full-forward guard our older branch carried is reverted there:
-# it added about 130 ms to every first token, and upstream does not use it either. The image is tagged locally on the
-# test node and not published yet.
+# The image is built from docker/1cat-vllm-sm70/Dockerfile.v1.5.1 at the fork's cloudrift/v1.5.1 branch: upstream
+# v1.5.1 plus the CloudRift commits it lacks, the Poolside tool-call fix and the Laguna FP8 precision fix, with
+# Transformers 5.19.0 as in the release image. The non-MTP Gated DeltaNet full-forward guard our older branch carried
+# is reverted there: it added about 130 ms to every first token, and upstream does not use it either. The image is
+# tagged locally on the test node and not published yet.
 #
 # Rows, repeats and the no-warm-up rule are step 2's: time to first token and per-token decode at one request (1K,
 # 8K, 32K and the full context), total output at four and eight concurrent requests, and the node at four replicas

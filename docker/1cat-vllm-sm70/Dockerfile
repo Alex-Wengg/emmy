@@ -4,10 +4,7 @@
 #
 # Build from the repository root:
 #   docker build -f docker/1cat-vllm-sm70/Dockerfile \
-#     -t cloudriftai/1cat-vllm-qwen3.8-flash-next:1.5.1-248d877c5 .
-#
-# The source is upstream 1Cat-vLLM v1.5.1 plus the CloudRift commits it still lacks, on the fork's
-# `cloudrift/v1.5.1` branch. Images built from earlier commits stay pinned by digest in their recipes.
+#     -t emmy-round2-laguna-fp8-sm70:96f26179bf28 .
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:4b9ed5fa8361736996499f64ecebf25d4ec37ff56e4d11323ccde10aa36e0c43
 
 FROM ${CUDA_IMAGE} AS builder
@@ -37,8 +34,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ARG ONECAT_REPO=https://github.com/cloudrift-ai/1Cat-vLLM.git
-ARG ONECAT_COMMIT=248d877c549c5800be8a05de5743f173364a7d5a
-ARG ONECAT_BASE_COMMIT=589a5d1e1a9ea7c42d533eed724a7d67c5f1779d
+ARG ONECAT_COMMIT=96f26179bf28aaea645635b8ec6f26c98360e0c2
+ARG ONECAT_BASE_COMMIT=644d8a7cd05ed4ecd1cd188e3c05b4bbd074f504
 RUN git init /src \
     && git -C /src remote add origin "${ONECAT_REPO}" \
     && git -C /src fetch --depth 128 origin "${ONECAT_COMMIT}" \
@@ -61,13 +58,10 @@ RUN cd /src \
         -r requirements/common.txt \
         build
 
-# The 1Cat wheel builds and embeds the Flash-V100 package itself, as its release wheel does. The fork's
-# clone carries no tags, so the version is set to the release this source is based on; the image tag
-# carries the exact source commit.
-ARG ONECAT_VERSION=1.5.1
-RUN cd /src \
-    && VLLM_VERSION_OVERRIDE="${ONECAT_VERSION}" CMAKE_BUILD_TYPE=Release \
-        python -m build --wheel --no-isolation --outdir /wheels
+RUN cd /src/flash-attention-v100 \
+    && python -m build --wheel --no-isolation --outdir /wheels \
+    && cd /src \
+    && CMAKE_BUILD_TYPE=Release python -m build --wheel --no-isolation --outdir /wheels
 
 # The emmy wheel with its runtime extension, built against this image's own Python and libc from
 # the sdist ``make wheel`` produced.
@@ -79,7 +73,11 @@ FROM ${CUDA_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda-12.8 \
-    PATH=/opt/venv/bin:/usr/local/cuda-12.8/bin:$PATH
+    PATH=/opt/venv/bin:/usr/local/cuda-12.8/bin:$PATH \
+    VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=0 \
+    VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=0 \
+    VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG=1 \
+    VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL=0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -93,9 +91,6 @@ RUN apt-get update \
     && pip install --no-cache-dir --upgrade pip setuptools wheel \
     && rm -rf /var/lib/apt/lists/*
 
-# Transformers 5.19.0, the version the 1Cat v1.5.1 release image resolved and the one Emmy pins: the
-# fork's own requirement has no upper bound, so a later build would otherwise pick a newer release.
-ARG TRANSFORMERS_VERSION=5.19.0
 RUN --mount=from=builder,source=/wheels,target=/tmp/wheels,ro \
     pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cu128 \
@@ -106,12 +101,12 @@ RUN --mount=from=builder,source=/wheels,target=/tmp/wheels,ro \
         --prefer-binary \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
         /tmp/wheels/*.whl \
-        "transformers==${TRANSFORMERS_VERSION}" \
     && pip install --no-cache-dir \
         catboost==1.2.10 \
     && find /opt/venv/lib/python3.12/site-packages/vllm -type f -name '*.so' \
         -exec strip --strip-unneeded {} + \
-    && find /opt/venv/lib/python3.12/site-packages/flash_attn_v100 -type f -name '*.so' \
+    && find /opt/venv/lib/python3.12/site-packages -maxdepth 1 -type f \
+        \( -name 'flash_attn_v100_cuda*.so' -o -name 'paged_kv_utils*.so' \) \
         -exec strip --strip-unneeded {} +
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
