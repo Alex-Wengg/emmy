@@ -231,8 +231,9 @@ specializes the twin's program first, since a kernel at a size is a kernel of it
 per template in each regime (`ServingConfig.realizations_for`, keyed on the width the twin's name spells): a static
 twin's kernels carry that width's rows in both lanes, a symbolic twin's the dynamic rows. An MoE's expert twins also
 take width 1, with the standard M=1 row, whatever M=1 the trunk serves: every MoE boot compiles that expert program
-for the fixed-slot tier. Expert twins are traced at the slice of every expert that each rank of the config's
-`--tensor-parallel-size` holds. The audit expects the same split per twin. A static-only release is accepted only when the same env proves that no wider or symbolic path is
+for the fixed-slot tier. They take width 256 too, with an M=256 row per any-width lane: a boot with an any-width
+program also compiles that static expert prefill program. Expert twins are traced at the slice of every expert that
+each rank of the config's `--tensor-parallel-size` holds. The audit expects the same split per twin. A static-only release is accepted only when the same env proves that no wider or symbolic path is
 reachable. The resulting working file is measured and verified by `run --golden PATH [--realization NAME] --bench`.
 
 `emmy golden list [PATH…]` prints every measured row — its kernel's time and reference, the schedules tried, the
@@ -885,7 +886,9 @@ default, so nothing here can touch the tune DB (`_data/dataset.db` in the exampl
 `import [SOURCES…] --db PATH [--fresh] [--repository]` fills it, and nothing else does: a source is a measurement
 freeze directory, a golden file, or a tune DB file, which is frozen first; `--repository` adds every repository golden
 — the hardware goldens and each maintained recipe's, the set the priors are fit on under `--fresh` (README, "Fit the
-priors"); a tune DB is the source to add when the fit needs more. A golden file is the DB's shape, so the import goes
+priors") — and the measurement freeze kept with the repository (`search/freezes/`) when it holds files; a tune DB
+is the source to add when the fit needs more, and merging it into that freeze is how it stays. A golden file is the
+DB's shape, so the import goes
 row for row (`golden.evidence.import_file`), each row under the context of its own regime and the exact identity
 computed from its stored kernel (one whose body no longer lowers is skipped with a warning), and its rows are sourced
 by the file's kind and digest — `freeze:` for a freeze directory's files, `golden:` for a golden file; a source the

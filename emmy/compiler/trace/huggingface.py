@@ -1054,6 +1054,32 @@ def _interleave_gate_up(t):
     return torch.stack((t[..., :half], t[..., half:]), dim=-1).flatten(-2).contiguous()
 
 
+def _materialize_nvfp4_expert_store(model, layers_store: dict[int, dict], dtype) -> None:
+    """Decode a shard-streamed NVFP4 store into the selected eager-reference layers: each expert's packed pairs
+    times its e4m3 block scales and per-row global scale, the fused scale rounded once to f16 as
+    ``fuse_nvfp4_scales`` rounds it, in the ``(out, in)`` layout an ``F.linear`` experts module stores."""
+    import numpy as np  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from emmy.compiler.dtype import F8E4M3, decode_f4x2, decode_f8  # noqa: PLC0415
+    from emmy.compiler.loader.quant import dequantize  # noqa: PLC0415
+
+    trunk = getattr(model, "model", model)
+    trunk = getattr(trunk, "language_model", trunk)
+    for layer, store in layers_store.items():
+        experts = trunk.layers[layer].mlp.experts
+        if moe_expert_layout(experts) != (False, False, False):
+            raise NotImplementedError(f"NVFP4 experts of layer {layer}: only the concatenated F.linear layout is decoded")
+
+        def _decoded(name, *, _store=store):
+            packed, bits, scale_2 = (_store[n].numpy() for n in (name, f"{name}_scale", f"{name}_scale_2"))
+            fused = (decode_f8(bits, F8E4M3.name) * scale_2).astype(np.float16).astype(np.float32)
+            return torch.from_numpy(np.stack([dequantize(decode_f4x2(p), f) for p, f in zip(packed, fused, strict=True)]))
+
+        values = {"gate_up_proj": _decoded("w_gate_up").to(dtype), "down_proj": _decoded("w_down").to(dtype)}
+        experts.load_state_dict(values, strict=True, assign=True)
+
+
 def _materialize_mxfp4_expert_store(model, layers_store: dict[int, dict], dtype) -> None:
     """Decode a shard-streamed MXFP4 store into the selected eager-reference layers.
 
@@ -1130,12 +1156,17 @@ def hyper_connection_seam(block):
     DeepSeek V4 keeps ``hc_mult`` parallel residual streams per token (mHC); the serving carrier is
     that stack flattened to ``[num_tokens, hc_mult * hidden]``, and the attention seam carries the whole
     attention sublayer's ``[num_tokens, hidden]`` output rather than q/k/v (the 1Cat fork's paged MLA
-    attention owns the projections, compressors, indexer and output projection)."""
+    attention owns the projections, compressors, indexer and output projection). Qwen4Exp's gated
+    residual keeps ``hc_count`` streams already flattened, and the seam carries its token mixer's
+    output: the fork's Gated DeltaNet or sparse attention."""
     attn_hc = getattr(block, "attn_hc", None)
-    if attn_hc is None:
-        return None
-    hidden = int(block.input_layernorm.weight.shape[0])
-    return int(attn_hc.hc_mult) * hidden, hidden
+    if attn_hc is not None:
+        hidden = int(block.input_layernorm.weight.shape[0])
+        return int(attn_hc.hc_mult) * hidden, hidden
+    gated = getattr(block, "attn_hyper_connection", None)
+    if gated is not None:
+        return int(gated.hc_count) * int(gated.hidden_size), int(gated.hidden_size)
+    return None
 
 
 def place_routed_streams(mixed, routed, mix):
@@ -1160,10 +1191,13 @@ def _build_hyper_connection_split(block):
       routed combine (:func:`place_routed_streams`).
 
     Both mirror ``DeepseekV4DecoderLayer.forward`` by calling the block's own hyper-connection modules on a
-    ``[1, T, hc, H]`` view, so the Sinkhorn / sigmoid / float32 contract is the installed modeling code's."""
+    ``[1, T, hc, H]`` view, so the Sinkhorn / sigmoid / float32 contract is the installed modeling code's.
+    A Qwen4Exp block takes :func:`_build_gated_residual_split`, the same contract."""
     import torch
     import torch.nn as nn
 
+    if getattr(block, "attn_hc", None) is None:
+        return _build_gated_residual_split(block)
     hc = int(block.attn_hc.hc_mult)
     hidden_size = int(block.input_layernorm.weight.shape[0])
     shared_experts = block.mlp.shared_experts
@@ -1205,6 +1239,54 @@ def _build_hyper_connection_split(block):
     return Pre(), Post()
 
 
+def _build_gated_residual_split(block):
+    """``(pre, post)`` of one Qwen4Exp layer over the flattened stream carrier, with the same signature as
+    DeepSeek V4's (:func:`_build_hyper_connection_split`).
+
+    - ``pre(hidden[T, hc·H]) -> x[T, H]`` — the attention-site gated residual's mixed input, what the Gated
+      DeltaNet or sparse-attention sublayer consumes.
+    - ``post(attn_out[T, H], residual[T, hc·H]) -> (mixed[T, hc·H], xn[T, H], mix[T, hc])`` — the mixer output
+      injected into the streams (the injection weights are recomputed from ``residual``), the MLP-site gated
+      residual's mixed input ``xn`` for the router and the experts, the gated shared expert injected into the
+      streams, and the MLP-site injection weights that place the routed combine (:func:`place_routed_streams`).
+
+    Both call the block's own gated-residual modules, as ``Qwen4ExpTextDecoderLayer.forward`` does. Layer 2's
+    n-gram embedding is added to the carrier ahead of ``pre`` and is not part of either program."""
+    import torch
+    import torch.nn as nn
+
+    class Pre(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attn_hyper_connection = block.attn_hyper_connection
+
+        def forward(self, hidden):  # ``hidden`` is the seam's arg name (the symbolic num_tokens spec keys on it)
+            mixed, _streams, _inject = self.attn_hyper_connection(hidden)
+            return mixed
+
+    class Post(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attn_hyper_connection = block.attn_hyper_connection
+            self.mlp_hyper_connection = block.mlp_hyper_connection
+            self.shared_expert = block.mlp.shared_expert
+            self.shared_expert_gate = block.mlp.shared_expert_gate
+
+        def forward(self, attn_out, residual):
+            _mixed, streams, inject = self.attn_hyper_connection(residual)
+            streams = streams + (attn_out.unsqueeze(-2) * inject.unsqueeze(-1)).flatten(-2)
+            xn, streams, inject = self.mlp_hyper_connection(streams)
+            shared = torch.sigmoid(self.shared_expert_gate(xn)) * self.shared_expert(xn)
+            return streams + (shared.unsqueeze(-2) * inject.unsqueeze(-1)).flatten(-2), xn, inject
+
+    return Pre(), Post()
+
+
+#: The per-expert weight inputs an ``expert`` program of :func:`build_moe_split_wrapper` takes beside its rows ``x``:
+#: every routed expert's slices arrive as inputs, not constants.
+EXPERT_WEIGHT_INPUTS = frozenset({"w_gate", "w_up", "w_gate_up", "w_down", "b_gate_up", "b_down"})
+
+
 def build_moe_split_wrapper(block, *, split_gate_up: bool = False, float32_residual: bool = False):
     """Carve one MoE decoder layer into the third-seam form. Returns ``(pre, post_attn, expert)``:
 
@@ -1239,9 +1321,9 @@ def build_moe_split_wrapper(block, *, split_gate_up: bool = False, float32_resid
 
     The router (linear + softmax/sigmoid + topk — untraceable ops) and the weighted combine stay in
     torch, orchestrated by the serving runner. Token-choice top-k MoE with the 2-norm (Llama-style)
-    block layout only; the Gemma 4-norm MoE form and Qwen-MoE's GATED shared expert
-    (``shared_expert_gate``) are rejected loudly until a model needs them — a silent pass would
-    drop (or mis-weight) the shared term from every layer's output."""
+    block layout only; the Gemma 4-norm MoE form is rejected loudly, and so is Qwen-MoE's GATED shared
+    expert (``shared_expert_gate``) outside the hyper-connection seam, whose ``post`` applies the gate —
+    a silent pass would drop (or mis-weight) the shared term from every layer's output."""
     import torch
     import torch.nn as nn
 
@@ -1249,7 +1331,8 @@ def build_moe_split_wrapper(block, *, split_gate_up: bool = False, float32_resid
     if parts is None:
         raise NotImplementedError("build_moe_split_wrapper: block.mlp does not expose the (router, experts) MoE interface")
     gate, experts = parts
-    if getattr(block.mlp, "shared_expert_gate", None) is not None:
+    hyper = _build_hyper_connection_split(block) if hyper_connection_seam(block) is not None else None
+    if hyper is None and getattr(block.mlp, "shared_expert_gate", None) is not None:
         raise NotImplementedError(
             "build_moe_split_wrapper: block.mlp carries a `shared_expert_gate` (Qwen-MoE gated shared expert) — "
             "the ungated shared-experts fold below would silently drop the gate, mis-weighting every layer's output"
@@ -1261,11 +1344,10 @@ def build_moe_split_wrapper(block, *, split_gate_up: bool = False, float32_resid
     expert_scaling_factor = 1.0 if routed_scale_folded else routed_scaling_factor
     if getattr(block, "pre_feedforward_layernorm", None) is not None:
         raise NotImplementedError("build_moe_split_wrapper: the Gemma 4-norm MoE block layout is not supported yet")
-    hyper = _build_hyper_connection_split(block) if hyper_connection_seam(block) is not None else None
     if hyper is not None and (float32_residual or split_gate_up):
         raise NotImplementedError("build_moe_split_wrapper: the hyper-connection seam has no coded-trunk or float32-residual form")
     pre = hyper[0] if hyper is not None else _build_pre_wrapper(block, float32_residual=float32_residual)
-    attn = block.self_attn
+    attn = getattr(block, "self_attn", None)  # a hyper-connection layer's mixer is the fork's: PostAttn alone reads it
 
     class PostAttn(nn.Module):
         def __init__(self) -> None:
@@ -1653,7 +1735,7 @@ _EXL3_EXPERT_LEAF = {"trellis": "", "suh": "_suh", "svh": "_svh"}
 # The per-expert-module fp8 / dense lineage: one 2-D weight per expert projection, with its
 # block scale (DeepSeek's ``weight_scale_inv`` is the dequant MULTIPLIER — see
 # :func:`~emmy.compiler.loader.quant.scale_is_reciprocal`).
-_PER_EXPERT_LEAF = {"weight": "", "weight_scale_inv": "_scale", "weight_scale": "_scale"}
+_PER_EXPERT_LEAF = {"weight": "", "weight_scale_inv": "_scale", "weight_scale": "_scale", "weight_scale_2": "_scale_2"}
 
 
 def _auto_config_from_pretrained(model_dir, **kwargs):
@@ -1770,8 +1852,9 @@ def _stack_expert_modules(layer: int, by_name: dict, model) -> dict:  # noqa: AR
     """Stack one MoE layer's per-expert-module fp8 (or dense) tensors into the E-leading program
     inputs the runner feeds: ``w_gate_up`` is the ``[gate | up]`` concatenation along the output
     axis (the de-interleaved convention the expert wrapper's ``chunk(2)`` reads), ``w_down`` as
-    stored, and their block scales concatenated the same way. fp8 bits stay on the ``uint8``
-    carrier; scales are f32 values. Expert order is the checkpoint's own index and must be
+    stored, and their block scales concatenated the same way. fp8 bits and NVFP4 pairs stay on the
+    ``uint8`` carrier; scales are f32 values, except NVFP4's e4m3 block scales, which stay bits, and
+    its global scales, spread to one per row. Expert order is the checkpoint's own index and must be
     gapless."""
     import torch  # noqa: PLC0415
 
@@ -1782,8 +1865,13 @@ def _stack_expert_modules(layer: int, by_name: dict, model) -> dict:  # noqa: AR
         if indices != list(range(n_e)):
             raise ValueError(f"expert store: layer {layer} input {name!r} covers experts {indices[:4]}... — expected 0..{n_e - 1}")
         stacked[name] = torch.stack([by_name[name][e] for e in indices], dim=0)
+    for proj in ("w_gate", "w_up", "w_down"):
+        if (scale_2 := stacked.get(proj + "_scale_2")) is not None:
+            # An NVFP4 global scale is one value per stored tensor: spread it over that tensor's rows, so
+            # the [gate | up] concatenation keeps each half's own.
+            stacked[proj + "_scale_2"] = scale_2.expand(n_e, stacked[proj].shape[1], 1)
     out: dict = {}
-    for suffix in ("", "_scale"):
+    for suffix in ("", "_scale", "_scale_2"):
         gate, up = stacked.get("w_gate" + suffix), stacked.get("w_up" + suffix)
         if gate is not None and up is not None:
             out["w_gate_up" + suffix] = torch.cat([gate, up], dim=1).contiguous()
@@ -2045,7 +2133,7 @@ def load_quantized_split(
     experts at the sliced shapes (:func:`slice_routed_experts`), so the store and the twin agree. Only
     per-expert-module checkpoints are sliced; an E-stacked or EXL3 expert table is refused.
 
-    Returns ``(model, expert_store)`` with ``expert_store = {"fmt": "mxfp4" | "f8e4m3" | "exl3" | None,
+    Returns ``(model, expert_store)`` with ``expert_store = {"fmt": "mxfp4" | "nvfp4" | "f8e4m3" | "exl3" | None,
     "layers": {layer_index: {input_name: tensor}}}`` (``fmt`` None = experts unquantized), plus
     ``"codebooks": {layer_index: {input_name: cb}}`` on the EXL3 path (the codebook id the
     speller stamps on each decode), ``"dir"`` (the resolved checkpoint directory) and
@@ -2176,6 +2264,8 @@ def load_quantized_split(
                     base = k.rsplit(".", 1)[0]
                     if base + "." + packed4[1].leaves[0] in index:
                         continue
+                if qc4 is not None and ".experts." in k and k.endswith(".input_scale"):
+                    continue  # the NVFP4 expert program is weight-only, as the 1Cat fork's V100 experts are
                 slot = _expert_slot(rename(k))
                 if slot is not None:
                     layer, name, expert = slot
@@ -2198,11 +2288,12 @@ def load_quantized_split(
                                 f"tensor {k!r} must be uint8 blocks/scales, got {t.dtype}"
                             )
                         fmt = "mxfp4"
-                    elif qc4 is not None and t.dtype == torch.uint8 and k + "_scale_2" in index:
-                        raise NotImplementedError(
-                            f"NVFP4 expert weight {k!r}: the expert lane has no packed-trio decode yet; "
-                            "casting the raw bytes would silently corrupt the values"
-                        )
+                    elif qc4 is not None and expert is not None and k.rsplit(".", 1)[0] + ".weight_scale_2" in index:
+                        # modelopt's NVFP4 trio stays packed for the expert program (``spell_nvfp4_inputs``):
+                        # the e2m1 pairs and the e4m3 block-scale bits on the uint8 carrier, the global
+                        # scale as one f32, spread per row when the layer is stacked.
+                        fmt = "nvfp4"
+                        t = t.float().reshape(1, 1) if name.endswith("_scale_2") else t.view(torch.uint8)
                     elif t.dtype in torch_f8:
                         fmt = "f8e4m3" if t.dtype == torch.float8_e4m3fn else "f8e5m2"
                         t = t.view(torch.uint8)
@@ -2607,6 +2698,8 @@ def load_quantized_layer_twin(model_dir, dtype, layer: int):
     )
     if store.get("fmt") == "mxfp4":
         _materialize_mxfp4_expert_store(model, store["layers"], dtype)
+    elif store.get("fmt") == "nvfp4":
+        _materialize_nvfp4_expert_store(model, store["layers"], dtype)
     decoder = find_text_decoder(model)
     rotary_type = type(decoder.rotary_emb)
     decoder.rotary_emb = rotary_type(decoder.config)

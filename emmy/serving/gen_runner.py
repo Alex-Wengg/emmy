@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field, replace
 
+from emmy.serving.release import EXPERT_PREFILL_M
 from emmy.serving.twins import LayoutConflict, LayoutScope, fork_less_weights, plan_layouts
 
 logger = logging.getLogger(__name__)
@@ -302,13 +303,6 @@ def _pad_rows(arr, bucket):
     return out
 
 
-# The static prefill expert twin's row count: the mean per-expert width of a full 2048-token
-# chunk (T·k/E — OLMoE 2048·8/64 = 256, gpt-oss 2048·4/32 = 256). Routed rows in
-# (decode_bucket, 256] ride this twin via the prefix upload (pad-up; per-token-independent),
-# wider row sets fall to the symbolic program.
-_EXPERT_PREFILL_M = 256
-
-
 @dataclass
 class _WeightScope(LayoutScope):
     """What the programs of one wrapper — its width twins — share: the layout each transposed weight is bound in
@@ -525,6 +519,7 @@ def _compile_split(
     quant_specs=None,
     mxfp4_specs=None,
     mxfp4_transposed=None,
+    nvfp4_specs=None,
     trellis_specs=None,
     aux_examples=None,
     weight_inputs=(),
@@ -561,7 +556,9 @@ def _compile_split(
     ``mxfp4_specs`` is the native MXFP4 counterpart: each logical weight input is
     replaced by uint8 blocks and an appended uint8 E8M0 scale input. Its build feed
     comes by name through ``aux_examples`` because both the shape and dtype differ
-    from the traced logical argument.
+    from the traced logical argument. ``nvfp4_specs`` is the NVFP4 one
+    (:func:`~emmy.compiler.loader.quant.spell_nvfp4_inputs`): packed e2m1 pairs with appended e4m3
+    block-scale and per-row f32 global-scale inputs, fed by name the same way.
     ``trellis_specs`` (the EXL3 expert path) feeds ``spell_trellis_inputs`` the same way — the
     named weight inputs become int16 CODES inputs with appended channel-vector inputs — but its
     extra examples come by NAME in ``aux_examples`` rather than by position, so the build feed
@@ -582,7 +579,7 @@ def _compile_split(
     cold path (an explicit pack ``plan`` still wins), after every loader spelling and ABI hint has
     reached the graph; each hit returns a fresh plan carrying THIS wrapper's real source paths.
     ``traced`` is the :func:`_traced_split` of these arguments when the caller already holds it."""
-    if sum(bool(specs) for specs in (quant_specs, mxfp4_specs, trellis_specs)) > 1:
+    if sum(bool(specs) for specs in (quant_specs, mxfp4_specs, nvfp4_specs, trellis_specs)) > 1:
         raise ValueError("expert input formats are mutually exclusive")
     if mxfp4_specs and mxfp4_transposed is None:
         raise ValueError("mxfp4_specs needs mxfp4_transposed: the experts module's weight layout decides the decode's orientation")
@@ -610,6 +607,10 @@ def _compile_split(
             from emmy.compiler.loader.quant import spell_mxfp4_inputs
 
             spell_mxfp4_inputs(graph, mxfp4_specs, transposed=mxfp4_transposed)
+        if nvfp4_specs:
+            from emmy.compiler.loader.quant import spell_nvfp4_inputs
+
+            spell_nvfp4_inputs(graph, nvfp4_specs)
         if trellis_specs:
             from emmy.compiler.loader.quant import spell_trellis_inputs
 
@@ -1339,7 +1340,7 @@ class EmmyGenRunner:
                 inter, hidden_e = experts.gate_up_proj.shape[1] // 2, experts.gate_up_proj.shape[2]
                 logical = {"w_gate": (inter, hidden_e), "w_up": (inter, hidden_e), "w_down": (hidden_e, inter)}
                 w_names = list(logical)
-            elif expert_fmt == "mxfp4":
+            elif expert_fmt in ("mxfp4", "nvfp4"):
                 w_names = ["w_gate_up", "w_down"] + (["b_gate_up", "b_down"] if has_bias else [])
                 logical = {
                     "w_gate_up": tuple(experts.gate_up_proj.shape[1:]),
@@ -1351,8 +1352,8 @@ class EmmyGenRunner:
                 w_names = ["w_gate_up", "w_down"] + (["b_gate_up", "b_down"] if has_bias else [])
                 logical = {n: tuple(einputs[n].shape[1:]) for n in w_names}
             example_w = [torch.zeros(*logical[n], dtype=dtype) for n in w_names]
-            quant_specs = mxfp4_specs = trellis_specs = aux_examples = None
-            if expert_fmt is not None and expert_fmt != "mxfp4" and not trellis and einputs["w_gate_up"].dtype == torch.uint8:
+            quant_specs = mxfp4_specs = nvfp4_specs = trellis_specs = aux_examples = None
+            if expert_fmt not in (None, "mxfp4", "nvfp4") and not trellis and einputs["w_gate_up"].dtype == torch.uint8:
                 quant_specs = {
                     "w_gate_up": (expert_fmt, tuple(einputs["w_gate_up_scale"].shape[1:]), "f32"),
                     "w_down": (expert_fmt, tuple(einputs["w_down_scale"].shape[1:]), "f32"),
@@ -1363,6 +1364,13 @@ class EmmyGenRunner:
                 aux_examples = {
                     n: torch.zeros(*einputs[n].shape[1:], dtype=torch.uint8)
                     for n in ("w_gate_up", "w_down", "w_gate_up_scale", "w_down_scale")
+                }
+            if expert_fmt == "nvfp4":
+                nvfp4_specs = {n: (tuple(einputs[n].shape[1:]), tuple(einputs[f"{n}_scale"].shape[1:])) for n in ("w_gate_up", "w_down")}
+                aux_examples = {
+                    n + leaf: torch.zeros(*einputs[n + leaf].shape[1:], dtype=einputs[n + leaf].dtype)
+                    for n in ("w_gate_up", "w_down")
+                    for leaf in ("", "_scale", "_scale_2")
                 }
             if trellis:
                 cbs = (expert_store or {}).get("codebooks", {}).get(layer) or {}
@@ -1385,6 +1393,7 @@ class EmmyGenRunner:
                 "quant_specs": quant_specs,
                 "mxfp4_specs": mxfp4_specs,
                 "mxfp4_transposed": transposed if mxfp4_specs else None,
+                "nvfp4_specs": nvfp4_specs,
                 "trellis_specs": trellis_specs,
                 "aux_examples": aux_examples,
                 "weight_inputs": ind_names,
@@ -1420,7 +1429,7 @@ class EmmyGenRunner:
                 # program stays the correct fallback. Names avoid the ".decode"/".m1"
                 # pack keep-filter suffixes — these tiers are not gated by the per-layer
                 # twin flags.
-                for tier, m in (("bucket", decode_bucket if decode_ok else 0), ("one", 1), ("m256", _EXPERT_PREFILL_M)):
+                for tier, m in (("bucket", decode_bucket if decode_ok else 0), ("one", 1), ("m256", EXPERT_PREFILL_M)):
                     # The M=256 prefill twin is the mean per-expert chunk width (§4 of the
                     # dispatch design); it only pays above the decode bucket (an equal-or-larger
                     # bucket fully shadows it).
@@ -2177,11 +2186,15 @@ class EmmyGenRunner:
                     free / 2**30,
                     total / 2**30,
                 )
-                for m in self._moe:
+                host_layers = emmy_config.gen_experts_host()
+                for layer, m in enumerate(self._moe):
                     if m is None:
                         continue
                     m["gate"] = m["gate"].to("cuda")
-                    m["inputs"] = {n: t.cuda() for n, t in m["inputs"].items()}
+                    if layer in host_layers:
+                        m["host_pinned"], m["inputs"] = self._map_experts_to_host(m["inputs"])
+                    else:
+                        m["inputs"] = {n: t.cuda() for n, t in m["inputs"].items()}
                     # Each expert's slice of every E-leading tensor as (input, address, bytes).
                     sizes = {n: t.stride(0) * t.element_size() for n, t in m["inputs"].items()}
                     m["slices"] = [
@@ -2277,6 +2290,32 @@ class EmmyGenRunner:
             table.nbytes / 2**30,
         )
         return host, arr
+
+    def _map_experts_to_host(self, inputs):
+        """Move one layer's E-stacked expert tensors into **mapped host memory** and return
+        ``(pinned keepalives, {name: CUDA view})`` (``EMMY_GEN_EXPERTS_HOST``).
+
+        The same move as :meth:`_map_embed_table_to_host`: each view's address is a host address
+        the device can read, so the expert table entries and the prefill slices built from these
+        views point at host memory, and every expert kernel reads its weights over PCIe with no
+        copy and no program change. Each tensor is pinned as bytes and viewed back, so any expert
+        dtype (packed codes, scales, bfloat16) maps the same way."""
+        import torch  # noqa: PLC0415
+
+        from emmy.compiler.backend.cuda.program import device_view  # noqa: PLC0415
+
+        pinned, views = [], {}
+        for name, t in inputs.items():
+            raw = torch.empty(t.numel() * t.element_size(), dtype=torch.uint8, pin_memory=True)
+            raw.view(t.dtype).view(t.shape).copy_(t)
+            pinned.append(raw)
+            views[name] = device_view(raw).view(t.dtype).view(t.shape)
+        logger.info(
+            "[gen_runner] experts (%s, %.3f GiB) mapped in host memory",
+            ", ".join(inputs),
+            sum(r.numel() for r in pinned) / 2**30,
+        )
+        return pinned, views
 
     def adopt_embed_table(self, weight, *, scale=1.0):
         """Share an already-resident device copy of the RAW (unscaled) embed table — gemma ties
@@ -2708,7 +2747,7 @@ class EmmyGenRunner:
         order, ``counts[e]`` how many, and the outputs come back in the same order. Tier routing
         mirrors the main programs: M=1 twin, then the decode-bucket twin (pad → run → slice; stale
         prefix rows are per-token-independent), then the static M=256 prefill twin for row sets up
-        to ``_EXPERT_PREFILL_M`` (same pad-up contract), then the symbolic program. Each tier runs
+        to ``EXPERT_PREFILL_M`` (same pad-up contract), then the symbolic program. Each tier runs
         its experts in ONE runtime call (``run_each``): per expert it binds the width, points the
         weight operands at the expert's resident slices (a tier with TMA descriptors, which bake
         pointers at build, copies the slices in instead), copies the rows in and the output rows
@@ -2723,7 +2762,7 @@ class EmmyGenRunner:
         start = 0
         for e, count in enumerate(counts):
             if count:
-                if tiers["m256"] is not None and self._decode_bucket < count <= _EXPERT_PREFILL_M:
+                if tiers["m256"] is not None and self._decode_bucket < count <= EXPERT_PREFILL_M:
                     prog = tiers["m256"]
                 elif count == 1 and tiers["one"] is not None:
                     prog = tiers["one"]

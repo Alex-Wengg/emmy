@@ -139,21 +139,26 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   activations, nothing for FP8 with dynamic ones — run over the checkpoint directory itself, yielding `…@nvfp4` or
   `…@fp8`.
   Tuning evidence transfers to serving only while the twin's kernels have serving's identities, and one trace path
-  plus one spell sequence is what makes them equal. These two formats have no weight-free description: NVFP4's
-  packed shapes live in the safetensors headers and either format's calibrated activation scales in the shards, so
-  `loader.quant.checkpoint_spelled_trunk_dir` resolves the directory (consulting the loaded config first, so no
-  other model touches the hub for it). No rate multiplies these twins — one rate, one block size, and the
-  representative layer is the profile's lowest member.
-  Coded routed experts are spelled weight-free so the golden records the program serving deploys, not the f16 GEMM
-  the trace promised: EXL3 from the allocation sidecar (`…@b4`, one twin per rate profile), fp8 from the config's
+  plus one spell sequence is what makes them equal. These two formats have no weight-free description: NVFP4's packed
+  shapes live in the safetensors headers and either format's calibrated activation scales in the shards, so the
+  capture reads the checkpoint: `loader.quant.declares_coded_weights` asks the loaded config first, so no other model
+  touches the hub, and the weight index alone (`loader.safetensors.checkpoint_weight_names`) then says whether any
+  trunk twin reads a weight stored with its scales. Only then are the shards fetched, so a checkpoint that codes its
+  routed experts alone (Qwen3.8-Flash-Next's NVFP4) is never downloaded. No rate multiplies these twins — one rate,
+  one block size, and the representative layer is the profile's lowest member.
+  Coded routed experts are spelled weight-free so the golden records the program serving deploys, not the f16 GEMM the
+  trace promised: EXL3 from the allocation sidecar (`…@b4`, one twin per rate profile), fp8 from the config's
   `quantization_config` alone (`loader.quant.fp8_weight_profile` — format token, `weight_block_size`, skip patterns;
   `…@f8e4m3` carries `w_gate_up` / `w_down` as bits + block scales tiled over the traced weight shapes), with the
   plain twin kept beside it only for a profile whose layers the quantizer left unconverted (Laguna's last four), and
   native MXFP4 from logical expert shapes (`…@mxfp4`, uint8 blocks plus uint8 E8M0 scales, in the layout the experts
-  module declares). The format follows the EXPERTS, not the trunk: a checkpoint may declare an fp8 trunk beside
-  natively MXFP4 routed experts (DeepSeek V4's `expert_dtype: fp4`), and `loader.quant.native_mxfp4_experts` is the
-  one predicate both this capture and the serving loader read, so the two cannot disagree about what the expert
-  program binds.
+  module declares), and NVFP4 the same way (`…@nvfp4` via `loader.quant.nvfp4_weight_profile`: packed e2m1 pairs, e4m3
+  block scales and one f32 global scale per row, so a gate/up weight stacked from two stored tensors keeps each one's
+  own). The NVFP4 expert program is weight-only: the checkpoint's static input scales are not read, as the 1Cat fork's
+  V100 NVFP4 experts do not read them. The format follows the EXPERTS, not the trunk: a checkpoint may declare an fp8
+  trunk beside natively MXFP4 routed experts (DeepSeek V4's `expert_dtype: fp4`), and
+  `loader.quant.native_mxfp4_experts` is the one predicate both this capture and the serving loader read, so the two
+  cannot disagree about what the expert program binds.
   Query-head discovery validates the classic `q_proj` signature and DeepSeek's complete low-rank `q_a_proj` /
   `q_b_proj` plus shared-`kv_proj` layout. A DeepSeek V4 layer is captured through the attention-sublayer seam
   (`hyper_connection_seam` in `compiler/trace/huggingface.py`): the carrier is the `hc_mult` hyper-connection residual
@@ -167,6 +172,11 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   image can warm; on that host the `pre`/`expert` forms realize in minutes while the `post` twin's lowering sits in
   the Loop splicer's merge-region dependency resolution for hours — the fresh-trace stall the recipe's RESULTS.md
   already records for full DeepSeek V4 layers.
+  Qwen3.8-Flash-Next (`qwen4_exp`) takes the same seam. Its gated residual keeps `hc_count` streams already flattened;
+  `pre` emits the attention-site gated residual's mixed input, which the fork's Gated DeltaNet or sparse-attention
+  sublayer consumes, and `post` injects that sublayer's output, runs the MLP-site gated residual and places the gated
+  shared expert on the streams, returning the same three tensors. The n-gram PLE on layer 2 adds to the carrier ahead
+  of `pre`, outside the twins, so every layer folds into the one profile.
   For EXL3 checkpoints the loader-only allocation inventory supplies exact sibling shapes and
   provenance; `loader/trellis.py` spells those weights as generic tensor algebra before capture.
   Distinct allocation profiles may still produce distinct inventory rows, but no checkpoint-specific
@@ -190,7 +200,8 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   output by its sigmoid before `o_proj` (`EmmyGenRunner.from_model` reads which layers do this off `pre.emits_gate`).
   The gate does not go through attention: every forward path, tier and rider split carries it from `pre` to `post`.
   Head counts come from the query half, the same rule the serving-twin capture uses.
-  A GDN layer (gated DeltaNet; `layer_types` value `linear_attention` in Qwen3.5 / Qwen3.8) has no `pre`/`post` pair.
+  A GDN layer (gated DeltaNet; `layer_types` value `linear_attention` in Qwen3.5 / Qwen3.8) has no `pre`/`post` pair
+  unless it sits on a hyper-connection seam, as Qwen3.8-Flash-Next's do, where the fork runs the mixer.
   It carries recurrent state per request: a fp32 matrix state and a convolution history. Every token updates that
   state, padded ones included: a padded token decays the matrix state and enters the convolution history.
   `EmmyGenRunner.from_model` builds one whole-layer `gdn<width>` program per static width (1, the decode bucket,
@@ -369,7 +380,7 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   exposed as `torch.bfloat16`. The constant cache materializes each destination's plan dtype before upload, so one
   source can serve BF16 and F32 buffers without aliasing their physical storage. This boundary does not change the
   runner's model-dtype selection described above.
-  **Quantized-checkpoint serving load (FP8 and MXFP4):** `EmmyGenRunner.create` detects a quantized checkpoint
+  **Quantized-checkpoint serving load (FP8, MXFP4 and NVFP4):** `EmmyGenRunner.create` detects a quantized checkpoint
   (`quantized_checkpoint_dir`) and takes `load_quantized_split` (trace ARCHITECTURE): config-built META twin,
   dense trunk shard-streamed in as real values, expert tensors kept compressed in a per-layer store keyed by program
   input name, and gate/up de-interleaved once on its physical output axis. FP8 keeps raw bits,
@@ -387,6 +398,12 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   expert tensors; the DeepSeek / Laguna lineage stores one module per expert, so the split loader stacks each layer
   into the same program inputs,
   concatenating gate/up weights and block scales along their output axis while leaving ignored dense layers unscaled.
+  NVFP4 experts (modelopt trios, one module per expert: RadixArk's Qwen3.8-Flash-Next) keep the e2m1 pairs and the
+  e4m3 block-scale bits on the uint8 carrier and each tensor's global scale as one f32, which the stacking spreads
+  over that tensor's rows, so `[gate | up]` keeps each half's own; `_compile_split` applies `spell_nvfp4_inputs`, fed
+  by name like MXFP4. A rank's slice keeps the same intermediate rows of gate and up and the matching block columns of
+  down. The stored `input_scale` tensors are skipped: the expert program is weight-only, as the 1Cat fork's V100 NVFP4
+  experts are.
   **EXL3 experts.** The loader stacks each per-expert checkpoint module into E-leading
   codes and padded channel-vector tensors. Gate and up remain separate program inputs.
   `spell_trellis_inputs` replaces each logical weight input and its linear consumer with the
@@ -888,6 +905,12 @@ box, not the format's fault): 22.6 us for an 8-token decode step and 1.25 ms for
 chunk, against a device-resident gather's 3.4 us flat. On that model those are 0.02 % of TPOT and 0.1 %
 of TTFT; a x16 link would divide them again. It is still strictly a *reclaim* knob — leave it off
 wherever the card has room, because the device gather is two orders of magnitude faster and free.
+
+**`EMMY_GEN_EXPERTS_HOST` does the same for routed experts,** per decoder layer: the listed layers' E-stacked
+expert tensors are allocated in mapped host memory, so the fixed-slot tier's indirect table entries and the prefill
+path's expert slices point at host addresses, and the same programs read the weights over PCIe. Tokens do not change.
+Each hit expert crosses the link whole on every launch, so it is a measurement knob for host-resident experts, not a
+reclaim knob.
 
 ### The attention workspace is invisible to the KV budget
 
