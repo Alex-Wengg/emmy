@@ -283,12 +283,9 @@ def freeze_documents(db: SearchDB) -> tuple[dict[str, object], Counter]:
     return documents, dropped
 
 
-def write_freeze(db_path: Path | str, out_dir: Path | str) -> dict[str, str]:
-    """Read the DB instance at ``db_path`` read-only and atomically write the freeze DIRECTORY at
-    ``out_dir``: one golden document per card. Returns each file's name and digest. Hard-errors when nothing
-    survives the filter — a zero-row freeze means the wrong DB, not an empty dataset. An existing ``out_dir``
-    is replaced only when it is itself a freeze (holds golden files and nothing else) — anything else is
-    refused rather than deleted."""
+def freeze_db(db_path: Path | str) -> dict[str, object]:
+    """The admitted rows of the DB instance at ``db_path``, read read-only, as one golden document per card keyed by
+    the card's file name (:func:`freeze_documents`); what was left out is logged by reason."""
     db = SearchDB.open_readonly(db_path)
     try:
         documents, dropped = freeze_documents(db)
@@ -296,6 +293,15 @@ def write_freeze(db_path: Path | str, out_dir: Path | str) -> dict[str, str]:
         db.close()
     for reason, n in dropped.most_common():
         logger.info("[freeze] left out %d row(s): %s", n, reason)
+    return documents
+
+
+def write_freeze(db_path: Path | str, out_dir: Path | str) -> dict[str, str]:
+    """Atomically write the freeze DIRECTORY at ``out_dir`` from the DB instance at ``db_path``: one golden document
+    per card. Returns each file's name and digest. Hard-errors when nothing survives the filter — a zero-row freeze
+    means the wrong DB, not an empty dataset. An existing ``out_dir`` is replaced only when it is itself a freeze
+    (holds golden files and nothing else) — anything else is refused rather than deleted."""
+    documents = freeze_db(db_path)
     if not documents:
         raise RuntimeError(f"no freezable rows in {db_path} — wrong DB, or its rows are in another regime")
     out = Path(out_dir)
@@ -335,18 +341,18 @@ def write_run_freeze(db_path: Path | str, out_dir: Path | str) -> list[Path]:
     holds one card), ``<card>.r<UTC stamp>.<sha256[:12]>.json`` — the bytes :func:`write_freeze` writes for the card,
     named to sort after ``<card>.json`` and in time order among runs, so ``emmy db import`` reads it last and its
     rows win. The digest is the ``freeze:`` source the import files the rows under. Empty when no row survives
-    admission."""
+    admission; a DB this emmy cannot read is an error, as anywhere."""
+    documents = freeze_db(db_path)
+    if not documents:
+        return []
     out, written = Path(out_dir), []
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     with tempfile.TemporaryDirectory() as scratch:
-        try:
-            digests = write_freeze(db_path, Path(scratch) / "freeze")
-        except RuntimeError:
-            return written
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        out.mkdir(parents=True, exist_ok=True)
-        for name, digest in sorted(digests.items()):
-            path = out / f"{Path(name).stem}.r{stamp}.{digest[:12]}.json"
-            shutil.move(Path(scratch) / "freeze" / name, path)  # move, not replace: the scratch may be another filesystem
+        for name, document in sorted(documents.items()):
+            data = document.dump(Path(scratch) / name).read_bytes()
+            path = out / f"{Path(name).stem}.r{stamp}.{hashlib.sha256(data).hexdigest()[:12]}.json"
+            path.write_bytes(data)
             written.append(path)
     return written
 
