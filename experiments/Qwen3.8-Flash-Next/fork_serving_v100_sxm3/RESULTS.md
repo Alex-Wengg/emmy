@@ -35,7 +35,7 @@ Two findings shaped the bake:
 
 ## v100x4 (4x NVIDIA Tesla V100 SXM3 32GB, cards 0-3)
 
-**Zero-compile check.** A fresh container from the baked image, through `emmy deploy` with this recipe, then a fifth
+**Zero-recompile check.** A fresh container from the baked image, through `emmy deploy` with this recipe, then a fifth
 workload of the same kinds with new seeds (14 benchmark runs, 5 chat requests, all succeeded). `docker diff` lists
 every file a container writes outside its image: zero new files under `/root/.cache`, `/root/.triton` and
 `/root/.tilelang` after the boot, and zero after the workload. The only files written there are one empty
@@ -66,7 +66,7 @@ unchanged.
 SXM3. A different flag, or `emmy deploy` on a 16-card host without `--gpu-count 4` (which runs four data-parallel
 copies in one container), compiles anew. The boot is online and was not checked with Hugging Face unreachable. Of the
 remaining five minutes, loading the weights takes about 2.4; the graph vLLM cannot save is re-traced on every boot (15
-s of Dynamo tracing) and its compiled code then loads from the cache. The warm and zero-compile workloads ran from
+s of Dynamo tracing) and its compiled code then loads from the cache. The warm and zero-recompile workloads ran from
 scripts on the test node and are not in the archive; this record carries their method and counts. The image is
 published to a private Docker Hub repository (2026-10-16, through `emmy publish`, registry digest
 `sha256:bf976828fc00…`, equal to the local image ID). In the archived raw files the test node's address is replaced
