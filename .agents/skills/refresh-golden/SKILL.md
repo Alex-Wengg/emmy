@@ -136,7 +136,8 @@ For the whole-target check, request `--bench-backends eager,tcompile,emmy --stri
 isolated rows are recorded, `--no-record-evidence` keeps that check from replacing their measurements. The
 `--record-greedy` writer copies the picked kernel set from the DB and records a root seed's whole-pick latency beside
 `torch.compile`; each measured row's `tried` is the number of schedules the DB held for that kernel. Missing
-`torch.compile` timing remains a reported gap.
+`torch.compile` timing remains a reported gap. A record run's clean rows also land in the card's tune DB; before the
+card goes away, merge that DB into the repository freeze (README, "Keep what a tune measured").
 
 Promote the validated entries through `GoldenFile.edit(path)` with `add_kernel`, `add_routing` and `upsert_row`,
 including qualified whole-target latency on its root seed. A canonical file can know the same exact kernel under a

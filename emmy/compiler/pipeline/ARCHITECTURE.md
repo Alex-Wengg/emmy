@@ -880,7 +880,7 @@ tables hold compilable kernels, the decisions that minted them, and measurements
   the LOWERING passes, never the Loop passes, which normalize a size-one axis away and mint another kernel.
 - **`context`** — one row per backend, card and regime: the card (`Context.hardware_id`, the PCIe product name — two
   SKUs off one die, H100 and H200, RTX 5090 and RTX PRO 6000, share a compute capability, and without it their rows
-  would meet under the keep-best upsert), the target as the backend spells it (`sm_120`), the cicc opt level and the
+  would overwrite each other), the target as the backend spells it (`sm_120`), the cicc opt level and the
   residual compiler flags (`""` in the plain regime, so `""` and `-Xcicc -O3` are one regime), every effective
   precision decision, and `cold_cache`. Independent overrides of the `FAST_MATH` umbrella partition evidence even
   when they leave nvcc flags unchanged. The context captures these inputs before compilation; A/B recording
@@ -911,10 +911,12 @@ tables hold compilable kernels, the decisions that minted them, and measurements
   identity ignores the hint, so without them one kernel at two sizes would be one row), then the stats, `status`,
   `captured`, a `bench_fail` row's `error` and `source` (`measured`; `golden:<digest>` or `freeze:<digest>` for an
   imported row — the digest of the golden scope or the freeze it came from, which is how a re-recorded golden's rows
-  are told from the current file's and let go).
-  Failed rows ARE recorded — the next compile disqualifies that arm instead of failing the same way again — and an
-  `ok` row is never downgraded by
-  a later failure; a config whose **compile** ran past its budget is not recorded at all, since a stored row would
+  are told from the current file's and let go). The row written last wins: a schedule benched again takes the new
+  numbers, faster or slower. Three rows are never replaced: a row measured here by an import, a golden file's row by
+  a freeze's (the golden readers read `golden:` rows alone, so a freeze repeating a golden's schedule would otherwise
+  take the pool out of the fit), and an `ok` row by a later failure. Failed rows ARE recorded — the next compile
+  disqualifies that arm instead of failing the same way again; a config whose **compile** ran past its budget is
+  not recorded at all, since a stored row would
   make it a permanent cache hit that is never re-benched (see the two bench budgets in
   `backend/cuda/ARCHITECTURE.md`). No route rows, no whole-slice totals, no kernel-set verdicts.
 - **`constant`** — one row per constant input a golden file's program binds on a target kernel at one set of sizes,
@@ -978,9 +980,15 @@ behind.
   body no longer lowers is skipped with a warning, with its rows; a stale file is a restamp, not an import option. A
   golden file's rows become, through `emmy db export`, the golden pools `emmy fit` and `eval prior` read (Part 8); a
   compile never reads this instance, and the tune DB imports the goldens on its own.
-- No freeze is checked in at the moment. The RTX 5090 freeze predates the `kernel` table and was dropped rather than
-  converted; the card is re-collected through the `perf` writer, after which `emmy db freeze` writes the next
-  one into `search/freezes/`.
+- **The freeze kept with the repository** is the directory `search/freezes/` (`freeze.REPOSITORY_FREEZE`): one
+  file per card, exactly what `emmy db freeze` writes, payload in git LFS and left out of the wheel. `emmy db import
+  --repository` reads it beside the repository goldens, and nothing else does — not a compile, not the reproduction
+  gate, not the placement export, which iterate the golden paths. It grows by merge (README, "Keep what a tune
+  measured"): the directory and a tune DB go into one dataset DB, which is frozen back into the directory, so a new
+  schedule joins, a schedule measured on both sides takes the tune DB's row (the later source wins, faster or
+  slower), and merging the same tune DB again rewrites the same bytes. A row whose kernel no longer lowers drops out
+  at the next import, with a warning per kernel and no count: the measured pools the nightly refresh reports, rows
+  and regret per card, are where a large drop shows.
 
 **Recording benches** is Part 5's subject: a `run --bench` that benched rows with hand-forced knob values (golden or
 `--ab` rows) records each clean measurement — plus the greedy pick, through its comparable `greedy (isolated)`
