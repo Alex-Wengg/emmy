@@ -210,8 +210,8 @@ emmy db import --db _data/freeze.db --fresh emmy/compiler/pipeline/search/freeze
 emmy db freeze --db _data/freeze.db --out emmy/compiler/pipeline/search/freezes
 ```
 
-A schedule measured on both sides keeps its best median, a kernel the compiler no longer lowers drops out, and
-merging the same tune DB again changes nothing. Commit the rewritten files.
+A schedule measured on both sides takes the tune DB's row, faster or slower, a kernel the compiler no longer lowers
+drops out, and merging the same tune DB again changes nothing. Commit the rewritten files.
 
 ## Deploy
 

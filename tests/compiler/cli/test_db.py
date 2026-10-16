@@ -219,10 +219,10 @@ def test_repository_import_reads_the_checked_in_freeze_beside_the_goldens(tmp_pa
 
 def test_the_freeze_grows_by_merging_a_tune_db_and_a_second_merge_changes_nothing(tmp_path):
     """The repository freeze grows by import and freeze: the directory and a tune DB go into one instance, the
-    instance is frozen back into the directory. A schedule measured on both sides keeps its best median, a new
-    schedule joins, and merging the same tune DB again rewrites the same bytes."""
+    instance is frozen back into the directory. A schedule measured on both sides takes the tune DB's row, faster or
+    slower, a new schedule joins, and merging the same tune DB again rewrites the same bytes."""
     _freeze(tmp_path, "freezes", 500.0)
-    tune = tuned_db(tmp_path / "autotune.db", (_CASE,), us=400.0)
+    tune = tuned_db(tmp_path / "autotune.db", (_CASE,), us=700.0)
     [row] = list(tune.iter_perf_rows())
     tune.record_perf_row(dataclasses.replace(row, knobs={**row.knobs, "WORK": "t8"}, stats=dataclasses.replace(row.stats, median=600.0)))
     tune.close()
@@ -235,7 +235,7 @@ def test_the_freeze_grows_by_merging_a_tune_db_and_a_second_merge_changes_nothin
     first = merge()
     handle_db_import(Namespace(sources=[str(tmp_path / "freezes")], db=str(tmp_path / "check.db"), fresh=True))
     db = SearchDB.open_readonly(tmp_path / "check.db")
-    assert sorted(row.stats.median for row in db.iter_perf_rows()) == [400.0, 600.0]
+    assert sorted(row.stats.median for row in db.iter_perf_rows()) == [600.0, 700.0]
     db.close()
     assert merge() == first
 
