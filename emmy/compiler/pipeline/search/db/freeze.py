@@ -19,7 +19,9 @@ deterministic. A file's identity is its bytes — ``emmy db import`` sources its
 ``freeze:<sha256[:12]>`` of the file (``golden.evidence.file_source``), so a report over a dataset DB names the
 exact snapshot it was computed over. The freeze kept with the repository is the directory ``search/freezes/``
 (:data:`REPOSITORY_FREEZE`, payload in git LFS): ``emmy db import --repository`` reads it beside the repository
-goldens, and it grows by merging a tune DB into it — import both, freeze back out (README, "Fit the priors").
+goldens. It grows by the files tunes write beside each card's (:func:`write_run_freeze`), which the nightly refresh
+folds into one file per card; a tune DB from a machine with no checkout is merged by hand — import both, freeze back
+out (README, "Keep what a tune measured").
 
 Produced by ``emmy db freeze``.
 """
@@ -31,8 +33,10 @@ import logging
 import math
 import re
 import shutil
+import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 from emmy.compiler.pipeline.search.dataset import regime_of
@@ -308,6 +312,43 @@ def write_freeze(db_path: Path | str, out_dir: Path | str) -> dict[str, str]:
         shutil.rmtree(out)
     tmp.replace(out)
     return digests
+
+
+def run_freeze_dir() -> Path | None:
+    """Where a tune writes the freeze of its run (``config.freeze_dir``): ``EMMY_FREEZE_DIR`` when set — a path, or
+    empty for none — else the repository freeze of an editable checkout. A wheel leaves the directory out, and then
+    the tune's rows stay in the tune DB alone, said once per tune."""
+    from emmy import config  # noqa: PLC0415
+
+    out = config.freeze_dir(REPOSITORY_FREEZE)
+    if out is REPOSITORY_FREEZE and not out.is_dir():
+        logger.warning(
+            "[record-evidence] no freeze directory in this install; the tune's rows stay in the tune DB — merge it by hand "
+            "(README, 'Keep what a tune measured')"
+        )
+        return None
+    return out
+
+
+def write_run_freeze(db_path: Path | str, out_dir: Path | str) -> list[Path]:
+    """Freeze the rows of the DB at ``db_path`` into ``out_dir`` as a file beside each card's (a tune's scratch DB
+    holds one card), ``<card>.r<UTC stamp>.<sha256[:12]>.json`` — the bytes :func:`write_freeze` writes for the card,
+    named to sort after ``<card>.json`` and in time order among runs, so ``emmy db import`` reads it last and its
+    rows win. The digest is the ``freeze:`` source the import files the rows under. Empty when no row survives
+    admission."""
+    out, written = Path(out_dir), []
+    with tempfile.TemporaryDirectory() as scratch:
+        try:
+            digests = write_freeze(db_path, Path(scratch) / "freeze")
+        except RuntimeError:
+            return written
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        out.mkdir(parents=True, exist_ok=True)
+        for name, digest in sorted(digests.items()):
+            path = out / f"{Path(name).stem}.r{stamp}.{digest[:12]}.json"
+            shutil.move(Path(scratch) / "freeze" / name, path)  # move, not replace: the scratch may be another filesystem
+            written.append(path)
+    return written
 
 
 def is_lfs_pointer(path: Path | str) -> bool:
