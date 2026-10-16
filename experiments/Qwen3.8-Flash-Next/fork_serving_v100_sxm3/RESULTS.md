@@ -67,9 +67,10 @@ SXM3. A different flag, or `emmy deploy` on a 16-card host without `--gpu-count 
 copies in one container), compiles anew. The boot is online and was not checked with Hugging Face unreachable. Of the
 remaining five minutes, loading the weights takes about 2.4; the graph vLLM cannot save is re-traced on every boot (15
 s of Dynamo tracing) and its compiled code then loads from the cache. The warm and zero-compile workloads ran from
-scripts on the test node and are not in the archive; this record carries their method and counts. The image is not
-published. In the archived raw files the test node's address is replaced with `test-node` and the local run directory
-with its repository path; nothing else in them was changed.
+scripts on the test node and are not in the archive; this record carries their method and counts. The image is
+published to a private Docker Hub repository (2026-10-16, through `emmy publish`, registry digest
+`sha256:bf976828fc00…`, equal to the local image ID). In the archived raw files the test node's address is replaced
+with `test-node` and the local run directory with its repository path; nothing else in them was changed.
 
 **Run.** 2026-10-16T18:34:37Z, run ID `20261016T183437Z`, Emmy revision `03ebe3c05`, 1 of 1 rows `succeeded`, no
 failed requests. Host: the same VM as `fork_image_v100_sxm3`, 16x Tesla V100-SXM3-32GB, driver 580.178.04, kernel

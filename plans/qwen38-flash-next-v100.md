@@ -321,7 +321,8 @@ minimum with all four replicas running and passes the step 1 accuracy sets. The 
   nothing at boot or on any request path the warm reached (`fork_serving_v100_sxm3`); the weights are downloaded at
   deploy. Not met as written: the boot is online, because `HF_HUB_OFFLINE=1` moves vLLM's compile key to the host's
   model path. Not run: the full-context DeepSeek V4, Laguna FP8 and Poolside checks, which come with moving those
-  recipes to this fork. Publication waits for a private Docker Hub repository.
+  recipes to this fork. Published 2026-10-16 to the private Docker Hub repository, digest
+  `sha256:bf976828fc00…`, through `emmy publish`.
 
 ### 4. Emmy serves the model, correctly
 
