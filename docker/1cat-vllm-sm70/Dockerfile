@@ -4,7 +4,7 @@
 #
 # Build from the repository root:
 #   docker build -f docker/1cat-vllm-sm70/Dockerfile \
-#     -t cloudriftai/1cat-vllm-qwen3.8-flash-next:1.5.1-8808137bf .
+#     -t cloudriftai/1cat-vllm-qwen3.8-flash-next:1.5.1-248d877c5 .
 #
 # The source is upstream 1Cat-vLLM v1.5.1 plus the CloudRift commits it still lacks, on the fork's
 # `cloudrift/v1.5.1` branch. Images built from earlier commits stay pinned by digest in their recipes.
@@ -37,7 +37,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ARG ONECAT_REPO=https://github.com/cloudrift-ai/1Cat-vLLM.git
-ARG ONECAT_COMMIT=8808137bfecb5b00e4880171d439fb5f3d4b89f0
+ARG ONECAT_COMMIT=248d877c549c5800be8a05de5743f173364a7d5a
 ARG ONECAT_BASE_COMMIT=589a5d1e1a9ea7c42d533eed724a7d67c5f1779d
 RUN git init /src \
     && git -C /src remote add origin "${ONECAT_REPO}" \
