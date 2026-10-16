@@ -30,13 +30,16 @@ def test_onecat_image_is_reproducibly_pinned(project_root) -> None:
     dockerfile = Path(project_root, "docker/1cat-vllm-sm70/Dockerfile").read_text()
     assert "12.8.1-devel-ubuntu24.04@sha256:4b9ed5fa" in dockerfile
     assert "ONECAT_REPO=https://github.com/cloudrift-ai/1Cat-vLLM.git" in dockerfile
-    assert "ONECAT_COMMIT=96f26179bf28aaea645635b8ec6f26c98360e0c2" in dockerfile
-    assert "ONECAT_BASE_COMMIT=644d8a7cd05ed4ecd1cd188e3c05b4bbd074f504" in dockerfile
+    assert "ONECAT_COMMIT=248d877c549c5800be8a05de5743f173364a7d5a" in dockerfile
+    assert "ONECAT_BASE_COMMIT=589a5d1e1a9ea7c42d533eed724a7d67c5f1779d" in dockerfile
     assert 'fetch --depth 128 origin "${ONECAT_COMMIT}"' in dockerfile
     assert 'test "$(git -C /src rev-parse HEAD)" = "${ONECAT_COMMIT}"' in dockerfile
     assert 'merge-base --is-ancestor "${ONECAT_BASE_COMMIT}" "${ONECAT_COMMIT}"' in dockerfile
     assert "python -m build --wheel --no-isolation --outdir /wheels" in dockerfile
-    assert "CMAKE_BUILD_TYPE=Release python -m build" in dockerfile
+    assert "ARG ONECAT_VERSION=1.5.1" in dockerfile
+    assert 'VLLM_VERSION_OVERRIDE="${ONECAT_VERSION}" CMAKE_BUILD_TYPE=Release' in dockerfile
+    assert "ARG TRANSFORMERS_VERSION=5.19.0" in dockerfile
+    assert '"transformers==${TRANSFORMERS_VERSION}"' in dockerfile
     assert "--mount=from=builder,source=/wheels,target=/tmp/wheels,ro" in dockerfile
     assert "TORCH_CUDA_ARCH_LIST=7.0" in dockerfile
     assert "FLASH_ATTN_V100_CUDA_ARCH_LIST=7.0" in dockerfile
@@ -44,7 +47,7 @@ def test_onecat_image_is_reproducibly_pinned(project_root) -> None:
     assert "emmy_ml-*.tar.gz" in dockerfile
     assert "apt-get install -y --no-install-recommends curl" in dockerfile
     assert "strip --strip-unneeded" in dockerfile
-    assert "VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=0" in dockerfile
+    assert "VLLM_SM70_" not in dockerfile  # the fork's switches belong to each recipe, not the image
     assert "patch_onecat.py" not in dockerfile
 
 

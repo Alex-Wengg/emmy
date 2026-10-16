@@ -312,6 +312,16 @@ minimum with all four replicas running and passes the step 1 accuracy sets. The 
   the registry write.
 - Gate: step 2's numbers reproduce on our image within the spread of repeated runs, and it boots offline with no new
   compile.
+- *Done, 2026-10-16:* the fork branch `cloudrift/v1.5.1` (`248d877c5`) is upstream v1.5.1 plus the Poolside tool-call
+  parser and the Laguna FP8 precision fix. Our warm-up trio and the decode-workspace commit are dropped, the rest was
+  upstream already, and the non-MTP Gated DeltaNet full-forward guard is reverted: it cost about 130 ms per first
+  token, and upstream does not use it. The image reproduces step 2 within the spread (`fork_image_v100_sxm3`) and
+  keeps the same 3 GiB per card free under the worst-case loads. With the fork's JIT caches baked in,
+  `cloudriftai/1cat-vllm-qwen3.8-flash-next-nvfp4:1.5.1-248d877c5` boots in 303 s instead of 553 s and compiles
+  nothing at boot or on any request path the warm reached (`fork_serving_v100_sxm3`); the weights are downloaded at
+  deploy. Not met as written: the boot is online, because `HF_HUB_OFFLINE=1` moves vLLM's compile key to the host's
+  model path. Not run: the full-context DeepSeek V4, Laguna FP8 and Poolside checks, which come with moving those
+  recipes to this fork. Publication waits for a private Docker Hub repository.
 
 ### 4. Emmy serves the model, correctly
 
