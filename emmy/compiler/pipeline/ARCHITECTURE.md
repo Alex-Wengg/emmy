@@ -432,11 +432,14 @@ with equal Loop histograms but different projection placement). A split arm's `R
 `D_*` occupancy features — its CTA count, its waves against the card's SM count and how full the last wave is —
 which say what a split buys on a given card where the piece stamps only say how large the pieces are. Its dataset is
 `emmy db export --space placement`: one pool per kernel-set fork of every golden kernel, walked through the lift and
-the cut pass only (`ranking.walk_placement`), the arm the golden
-took marked — the cut, or the split width; the first arm, which keeps the kernel as it is, where it took none.
-A naturally offered complete cut is positive instead of its subsets. Without that arm, its subsets remain positive;
-the registered route's composed steering arm is never a training candidate. Dataset version 4 requires re-exporting
-older labels; the feature vocabulary and artifact version are unchanged. A
+the cut pass only (`ranking.walk_placement`) one seam at a time, as a deploy with no recorded route walks it. A
+several-seam cut a golden recorded is the kernel set it left: at the kernel's fork every single seam carving a piece
+of that set is positive, the deepest first, and the remainder's fork is the next pool, until the remainder is itself
+a piece of the set and stays whole; a naturally offered arm leaving exactly that set is positive instead of the
+seams. A split fork's positive is the width the golden took; the first arm, which keeps the kernel as it is, is the
+positive where it took none. A composed route — the one decision a pinned compile consumed several seams as — steers
+no walk and is no arm: a cold compile never sees one. A kernel set no single-seam walk reaches is skipped by name.
+Dataset version 6 requires re-exporting older labels; the feature vocabulary and artifact version are unchanged. A
 fork's group carries the report tier of its domain — `place`, `split` or `layout` — or `dyn` where the kernel has a
 symbolic axis, as every golden group of a symbolic kernel does. The tier comes from the root kernel's derived shape
 and must agree with the dynamic flag in every arm's features. The greedy asks it at every kernel-set fork no
@@ -1225,9 +1228,10 @@ pass with the placement prior deciding against the golden's arm) — the deploy-
 
 **The reproduction gate.** `tests/compiler/pipeline/search/prior/test_reproduction.py` checks both shipped priors
 against every hardware golden and maintained recipe golden with no measurements in scope. A placement fork must
-choose its recorded arm; a recorded schedule must rank within the better half of its sampled pool. Tests split each
-golden's pools into slices of 16, drawing schedule rows with the same `EMMY_POOL_DRAW` as a greedy compile in the
-suite. A failure names the rows the prior cannot reproduce. A PR that changes a hardware golden refits both priors;
+choose its recorded arm, at every fork of the golden's path to its kernel set; a recorded schedule must rank within
+the better half of its sampled pool. Tests split each golden's pools into slices of 16 — a placement slice walks with
+every decision of its golden in scope — drawing schedule rows with the same `EMMY_POOL_DRAW` as a greedy compile in
+the suite. A failure names the rows the prior cannot reproduce. A PR that changes a hardware golden refits both priors;
 a recipe golden that fails needs a refit or the recipe tag `prior-pending`. That tag skips its reproduction check
 until a refit reproduces it and removes the tag; the golden remains evidence and training data. Never lower the
 tolerance or exempt a hardware golden. The [refit commands](../../../README.md#fit-the-priors) and
