@@ -1606,9 +1606,9 @@ provenance stay in memory for `run --bench`'s per-kernel benchmarking and are ne
 
 At `compile -vv` (DEBUG) the engine emits one block per rule application: a unified diff between the matched subgraph
 and the rewritten fragment, bracketed by `>>> <pass>:NNN_rulename` and `<<< <pass>:NNN_rulename` markers. The `<pass>`
-prefix is the single-letter shorthand from `PASS_SHORTHAND` (`d` / `o` / `l` / `f` / `n` / `s` / `t` / `p` / `h` / `k`
-/ `c`) — the same letters the CLI accepts in `--passes dolfstph` (`commands/compile.py` imports `PASS_SHORTHAND` so
-the flag and the marker prefix can't drift). The three tile passes have a letter each, so `--passes dolfstp` ends
+prefix is the single-letter shorthand from `PASS_SHORTHAND` (`d` / `o` / `l` / `f` / `n` / `s` / `t` / `p` / `m` / `h`
+/ `k` / `c`) — the same letters the CLI accepts in `--passes dolfstpmh` (`commands/compile.py` imports `PASS_SHORTHAND`
+so the flag and the marker prefix can't drift). The four tile passes have a letter each, so `--passes dolfstp` ends
 after the cut pass: the greedy decides every kernel-set fork as a full compile does (no arm is scheduled to decide
 one) and the tile IR shows the chosen kernel set unscheduled. Skipped rules collapse to a one-liner. The bracketing
 makes per-rule / per-pass slicing trivial via `awk`; ANSI color is applied only inside the diff body so the markers

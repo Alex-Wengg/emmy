@@ -829,6 +829,14 @@ that canonical input:
   before any schedule is enumerated.
   Each fresh piece then enters the ordinary schedule pass with the partition receipt described below.
 
+**Duplicate kernels merge once the kernel set is decided.** Fusion computes a producer with several readers inside
+each reader's cone, so cuts can carve one value out of several kernels: kernels with one exact identity whose bodies
+match once each one's output is named by position, over the same buffers. `tile/merge` runs between `tile/cut` and
+`tile/schedule`, keeps one such kernel per computation and points the readers of the others at its output; a program
+output keeps its name. It decides nothing and mints no kernel, so no evidence prices it. Pointing a reader at the kept
+kernel renames a buffer in the reader, and the rename reaches the formed loop op along the reader's source chain,
+which is what its stored row and its wire are built from.
+
 **Every split piece is a new kernel.** The rewrite consumes the scheduled kernel and returns fresh unmapped Tile IR
 for the partial and, when required, the finalize. The partial keeps the same `Fold(init, combine)` over an axis
 slice; the finalize identity-lifts stored state tuples through that same monoid. This is one carrier-independent
