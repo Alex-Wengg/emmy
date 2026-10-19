@@ -2,26 +2,32 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.ir.stmt import Assign, Write
 from emmy.compiler.ir.tile import OutputSpec, Placement, TileOp
 from emmy.compiler.pipeline import Pipeline
+from emmy.compiler.wire import kernel_wire
 from tests.compiler.terms import projection, slab
 
 _M, _N = Axis("m", 8), Axis("n", 16)
 
 
 def _tile(name: str, reads: tuple, body: tuple, value: str) -> TileOp:
-    return TileOp(
+    """A tile kernel formed from its loop op, as a cut piece is: the loop op is the body its row stores."""
+    tile = TileOp(
         op=projection(reads, body, (value,)),
         name=name,
         place=Placement(free=(_M, _N)),
         axes=(_M, _N),
         output_specs=(OutputSpec(Write(name, (Var("m"), Var("n")), value)),),
     )
+    return replace(tile, source=LoopOp(body=tile.loop_body, name=name))
 
 
 def _program(*, second_reads: str = "x", outputs: tuple[str, ...] = ("z",)) -> Graph:
@@ -47,6 +53,10 @@ def test_two_kernels_with_one_computation_become_one() -> None:
     graph.validate()
     [kept] = sorted(set(_tiles(graph)) - {"z"})
     assert len(_tiles(graph)) == 2 and graph.nodes["z"].inputs == [kept, kept]
+    # The kept kernel and its reader still store a body over their own buffers: a row of either records.
+    for node_id in (kept, "z"):
+        node = graph.nodes[node_id]
+        assert kernel_wire(node.op.with_io(graph, node))["outputs"] == [node_id]
 
 
 def test_a_kernel_that_is_a_program_output_keeps_its_name() -> None:

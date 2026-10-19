@@ -1613,10 +1613,14 @@ def _rename_buf_in_op(op, old: str, new: str):
                 lift=replace(term.lift, body=rename_body(term.lift.body)),
             )
 
+        # A tile kernel's formed loop op is its definition — the body its row stores and a freeze re-lowers — so a
+        # rename reaches it too; its own ``source`` rides along, keeping the chain to the frontend op.
+        source = op.source.rename_buffers({old: new}) if isinstance(op.source, LoopOp) else op.source
         renamed = replace(
             op,
             op=rename_term(op.op),
             output_specs=tuple(replace(store, write=fn(store.write)) for store in op.output_specs),
+            source=source,
         )
     return replace(renamed, inputs=renamed_io(op.inputs), outputs=renamed_io(op.outputs))
 
