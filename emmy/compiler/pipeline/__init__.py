@@ -37,9 +37,9 @@ from emmy.compiler.pipeline.search import Candidate
 # and tests should reference these rather than re-listing pass names.
 TENSOR_PASSES = ["frontend/decomposition", "frontend/optimization"]
 LOOP_PASSES = [*TENSOR_PASSES, "loop/lowering", "loop/fusion", "loop/stamp"]
-# The tile passes: Loop IR to an unmapped tile, the kernel-set cuts to their fixpoint, then a schedule per
-# kernel. A pipeline that ends after ``tile/cut`` shows the cuts a kernel offers without scheduling any piece.
-TILE_LOWERING = ["tile/lift", "tile/cut", "tile/schedule"]
+# The tile passes: Loop IR to an unmapped tile, the kernel-set cuts to their fixpoint, duplicate kernels merged, then
+# a schedule per kernel. A pipeline that ends after ``tile/cut`` shows the cuts a kernel offers without scheduling any piece.
+TILE_LOWERING = ["tile/lift", "tile/cut", "tile/merge", "tile/schedule"]
 TILE_PASSES = [*LOOP_PASSES, *TILE_LOWERING]
 KERNEL_PASSES = [*TILE_PASSES, "lowering/kernel"]
 CUDA_PASSES = [*KERNEL_PASSES, FINAL_LOWERING_PASS]

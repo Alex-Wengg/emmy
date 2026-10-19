@@ -38,6 +38,7 @@ PASS_SHORTHAND = {
     "loop/stamp": "s",
     "tile/lift": "t",
     "tile/cut": "p",
+    "tile/merge": "m",
     "tile/schedule": "h",
     "lowering/kernel": "k",
     "lowering/cuda": "c",
