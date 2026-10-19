@@ -19,7 +19,7 @@ _M, _N = Axis("m", 8), Axis("n", 16)
 
 
 def _tile(name: str, reads: tuple, body: tuple, value: str) -> TileOp:
-    """A tile kernel formed from its loop op, as a cut piece is: the loop op is the body its row stores."""
+    """A tile kernel formed from a loop op, as a cut or split piece is: the loop op is the body its row stores."""
     tile = TileOp(
         op=projection(reads, body, (value,)),
         name=name,
@@ -27,7 +27,9 @@ def _tile(name: str, reads: tuple, body: tuple, value: str) -> TileOp:
         axes=(_M, _N),
         output_specs=(OutputSpec(Write(name, (Var("m"), Var("n")), value)),),
     )
-    return replace(tile, source=LoopOp(body=tile.loop_body, name=name))
+    # Through one tile hop, as a split piece is formed from the kernel it split: its row's body is the loop op at the
+    # end of the chain.
+    return replace(tile, source=replace(tile, source=LoopOp(body=tile.loop_body, name=name)))
 
 
 def _program(*, second_reads: str = "x", outputs: tuple[str, ...] = ("z",)) -> Graph:

@@ -1613,9 +1613,10 @@ def _rename_buf_in_op(op, old: str, new: str):
                 lift=replace(term.lift, body=rename_body(term.lift.body)),
             )
 
-        # A tile kernel's formed loop op is its definition — the body its row stores and a freeze re-lowers — so a
-        # rename reaches it too; its own ``source`` rides along, keeping the chain to the frontend op.
-        source = op.source.rename_buffers({old: new}) if isinstance(op.source, LoopOp) else op.source
+        # A tile kernel's formed loop op is its definition — the body its row stores and a freeze re-lowers, the first
+        # loop op along its source chain — so a rename reaches it, through any tile it was formed from on the way;
+        # that loop op's own ``source`` rides along, keeping the chain to the frontend op.
+        source = _rename_buf_in_op(op.source, old, new) if isinstance(op.source, (LoopOp, TileOp)) else op.source
         renamed = replace(
             op,
             op=rename_term(op.op),
