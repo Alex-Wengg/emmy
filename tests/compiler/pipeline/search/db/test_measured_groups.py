@@ -8,27 +8,47 @@ misgrouped or mislabelled pool still produces a confident-looking correlation.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from emmy.compiler.pipeline.search.dataset.group import GoldenGroup, Group
 from emmy.compiler.pipeline.search.db.export import measured_groups
-from tests.compiler.pipeline.search.helpers import F16_MATMUL_FEATS
+from tests.compiler.pipeline.search.helpers import F16_MATMUL_ROW, F16_MATMUL_STAMPS, StubKernel
 from tests.compiler.pipeline.search.helpers import GPU_5090 as _GPU
 from tests.compiler.pipeline.search.helpers import perf_row as _row
 
 _GPU2 = "NVIDIA GeForce RTX 4090"
 
+_KERNEL = StubKernel(F16_MATMUL_STAMPS)
+
+
+def _stamped(row) -> StubKernel:
+    """A stand-in for the row's kernel op: every row here measures one kernel of the shared plausible shape —
+    inventing a smaller one would sidestep the very gate these tests are about."""
+    del row
+    return _KERNEL
+
 
 def _feats(**knobs) -> dict:
-    """A row the admission filter accepts — the shared plausible fixture. Inventing a smaller dict here
-    would sidestep the very gate these tests are about."""
-    return {**F16_MATMUL_FEATS, **knobs}
+    """A schedule row of that kernel."""
+    return {**F16_MATMUL_ROW, **knobs}
 
 
 def test_configs_that_competed_land_in_one_group():
     rows = [_row(f"n{i}", us=200.0 + 100 * i, knobs=_feats(TILE=f"f2x{2 + i}")) for i in range(4)]
-    (group,), dropped = measured_groups(rows)
+    (group,), dropped = measured_groups(rows, _stamped)
     assert not dropped
     assert group.latency_us.tolist() == [200.0, 300.0, 400.0, 500.0]
     assert len(group.feats) == 4 and group.gpu == _GPU
+
+
+def test_cold_and_hot_measurements_form_separate_groups():
+    hot = _row("a", us=200.0, knobs=_feats())
+    cold = replace(hot, cold_cache=True, stats=replace(hot.stats, median=400.0))
+    groups, dropped = measured_groups([hot, cold], _stamped)
+    assert not dropped
+    assert len(groups) == 2
+    assert {tuple(group.latency_us) for group in groups} == {(200.0,), (400.0,)}
+    assert len({group.key for group in groups}) == 2
 
 
 def test_cards_never_pool_and_a_non_deployable_regime_never_arrives():
@@ -43,7 +63,7 @@ def test_cards_never_pool_and_a_non_deployable_regime_never_arrives():
         _row("b", us=300.0, knobs=_feats(), opt=1),  # same kernel, non-deployable regime
         _row("d", us=500.0, knobs=_feats(), opt=3, gpu=_GPU2),
     ]
-    groups, dropped = measured_groups(rows)
+    groups, dropped = measured_groups(rows, _stamped)
     assert dropped == {"non-deployable regime (H_opt=1)": 1}
     assert len(groups) == 2 and all(len(g.feats) == 1 for g in groups)
 
@@ -51,9 +71,9 @@ def test_cards_never_pool_and_a_non_deployable_regime_never_arrives():
 def test_the_same_kernel_from_two_sites_is_one_tuning_problem():
     """The key is the KERNEL's structure, not where it came from.
 
-    A kernel minted by a cross-CTA split has its own structural identity, so tuning it is the same
-    question as tuning an identical standalone kernel. The deploy path already joins their evidence
-    that way (the deploy's evidence index is keyed on ``S_*``). Keyed on the site that offered them the two
+    A kernel minted by a cross-CTA split has its own structure, so tuning it is the same
+    question as tuning a standalone kernel of that structure: the two share a pool whatever their exact
+    identities. Keyed on the site that offered them the two
     land in different pools and get searched twice: on the RTX 5090 measurement freeze 73 structures
     were fragmented like that, the losing pool's best coming in a median 1.46x behind the winning
     pool's."""
@@ -61,7 +81,7 @@ def test_the_same_kernel_from_two_sites_is_one_tuning_problem():
         _row("from-a-split", us=200.0, knobs=_feats(TILE="f2x2")),
         _row("standalone", us=150.0, knobs=_feats(TILE="f4x4")),
     ]
-    (group,), dropped = measured_groups(rows)
+    (group,), dropped = measured_groups(rows, _stamped)
     assert not dropped
     assert sorted(group.latency_us.tolist()) == [150.0, 200.0]
 
@@ -74,13 +94,15 @@ def test_one_offer_site_over_different_work_is_not_one_group():
     Left merged this cost a real number: nine pools of the RTX 5090 freeze paired a fused rms_norm->linear
     megakernel with one kernel of the same op's unfused realization, and the report priced a 5.9 µs norm
     kernel against a 131 ms whole-op row as a 22 221x miss."""
-    small = _feats(S_ext_free_prod=30720.0, S_ext_reduce_prod=3840.0, REDUCE="coop")
-    large = _feats(S_ext_free_prod=69632.0, S_ext_reduce_prod=14745600.0, REDUCE="coop")
+    shapes = {
+        "small": StubKernel({**F16_MATMUL_STAMPS, "S_ext_free_prod": 30720.0, "S_ext_reduce_prod": 3840.0}),
+        "large": StubKernel({**F16_MATMUL_STAMPS, "S_ext_free_prod": 69632.0, "S_ext_reduce_prod": 14745600.0}),
+    }
     # Both latencies are plausible for their OWN extents — the point is the grouping, so neither row may be
     # one the plausibility gate would have dropped anyway.
-    rows = [_row("small", us=2000.0, knobs=small), _row("large", us=131496.0, knobs=large)]
+    rows = [_row("small", us=2000.0, knobs=_feats(REDUCE="coop")), _row("large", us=131496.0, knobs=_feats(REDUCE="coop"))]
 
-    groups, dropped = measured_groups(rows)
+    groups, dropped = measured_groups(rows, lambda row: shapes[row.kernel])
     assert not dropped
     assert sorted(g.latency_us.tolist() for g in groups) == [[2000.0], [131496.0]]
 
@@ -89,14 +111,14 @@ def test_alternative_schedules_of_one_kernel_stay_one_group():
     """Two schedules of one kernel share every ``S_*`` stamp, so they share a pool — which is what makes a
     pool a comparison at all.
 
-    They share them by construction, not by luck: the identity strategy stamps a kernel at BIRTH, in
-    recognition, before ``040_schedule`` offers the first fork — that pass's own error text says so. Nothing
-    a schedule fork decides can move an ``S_*`` value, which is what makes keying on them safe."""
+    They share them by construction, not by luck: the stamps are computed from the kernel — the tile its schedule
+    fork was offered — and a schedule is no part of it. Nothing a schedule fork decides can move an ``S_*``
+    value, which is what makes keying on them safe."""
     rows = [
         _row("a", us=200.0, knobs=_feats(TILE="f2x2", WORK="w1x8")),
         _row("b", us=400.0, knobs=_feats(TILE="f8x8", WORK="w4x2")),
     ]
-    (group,), _ = measured_groups(rows)
+    (group,), _ = measured_groups(rows, _stamped)
     assert len(group.feats) == 2
 
 
@@ -107,7 +129,7 @@ def test_a_failed_bench_carries_a_sentinel_not_a_latency():
         _row("ok", us=500.0, knobs=_feats()),
         _row("fail", us=1e9, knobs=_feats(TILE="f4x4"), status="bench_fail"),
     ]
-    (group,), dropped = measured_groups(rows)
+    (group,), dropped = measured_groups(rows, _stamped)
     assert dropped == {"bench_fail": 1}
     assert group.latency_us.tolist() == [500.0]
 
@@ -119,10 +141,10 @@ def test_every_row_is_either_grouped_or_counted():
         _row("a", us=500.0, knobs=_feats()),
         _row("b", us=1e9, knobs=_feats(TILE="f4x4"), status="bench_fail"),
         _row("c", us=200.0, knobs=_feats(TILE="f8x8"), opt=1),
-        _row("d", us=300.0, knobs=_feats(TILE="f8x8"), flags="--use_fast_math"),  # the other precision regime: its own pool
+        _row("d", us=300.0, knobs=_feats(TILE="f8x8"), precision={"FAST_MATH": True}),  # the other precision regime: its own pool
         _row("e", us=400.0, knobs=_feats(TILE="f2x4"), flags="-lineinfo"),  # not a regime: pools with the plain row
     ]
-    groups, dropped = measured_groups(rows)
+    groups, dropped = measured_groups(rows, _stamped)
     assert sum(len(g.feats) for g in groups) + sum(dropped.values()) == len(rows)
     assert dropped == {"bench_fail": 1, "non-deployable regime (H_opt=1)": 1}
     assert [g.latency_us.tolist() for g in groups] == [[500.0, 400.0], [300.0]]
@@ -137,7 +159,7 @@ def test_only_a_golden_pool_can_be_asked_which_rows_are_the_answer():
     says so by taking :class:`GoldenGroup`, and nothing has to check a flag at runtime. The supervision lives
     on the subclasses for the same reason: on the base it would be one field with two meanings."""
     rows = [_row(f"n{i}", us=200.0 + 100 * i, knobs=_feats(TILE=f"f2x{2 + i}")) for i in range(3)]
-    (measured,), _ = measured_groups(rows)
+    (measured,), _ = measured_groups(rows, _stamped)
     golden = GoldenGroup.from_dicts("g/x", "x", "warp", "g", "x", 1, [{"D_a": float(i)} for i in range(3)])
 
     assert measured.latency_us.tolist() == [200.0, 300.0, 400.0]  # per row, in microseconds
@@ -155,8 +177,18 @@ def test_a_measured_pool_carries_the_regime_it_was_measured_under():
         _row("a", us=200.0, knobs=_feats(), opt=3),
         _row("b", us=300.0, knobs=_feats(), opt=1),
     ]
-    groups, _ = measured_groups(rows)
+    groups, _ = measured_groups(rows, _stamped)
     assert [g.h_opt for g in groups] == [3.0]
+
+
+def test_measured_pools_do_not_combine_independent_precision_regimes():
+    rows = [
+        _row("same", us=200.0 + i * 100, precision=pins)
+        for i, pins in enumerate(({}, {"FAST_EXP": True}, {"F16_MMA_F32_ACC": True}, {"FP8_MMA": True}))
+    ]
+    groups, dropped = measured_groups(rows, _stamped)
+    assert not dropped and len(groups) == 4
+    assert sorted(g.latency_us.tolist() for g in groups) == [[200.0], [300.0], [400.0], [500.0]]
 
 
 def test_goldens_go_in_as_row_indices_and_come_back_as_row_indices():
@@ -179,6 +211,6 @@ def test_a_row_the_freeze_would_refuse_is_refused_here_too():
         _row("honest", us=500.0, knobs=_feats()),
         _row("phantom", us=0.05, knobs=_feats(TILE="f8x8")),
     ]
-    groups, dropped = measured_groups(rows)
+    groups, dropped = measured_groups(rows, _stamped)
     assert [g.latency_us.tolist() for g in groups] == [[500.0]]
     assert sorted(dropped) == ["implausible value"]

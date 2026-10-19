@@ -301,7 +301,7 @@ def test_run_job_run_inputs_executes_before_bench(monkeypatch) -> None:
         def __init__(self, **kwargs) -> None:
             pass
 
-        def run(self, graph, *, input_data=None):
+        def run(self, graph, *, input_data=None, taps=()):
             calls.append(("run", input_data))
             return SimpleNamespace(outputs={"n0": [1.0]}), None
 
@@ -342,7 +342,7 @@ def test_run_job_caches_run_inputs_by_key(monkeypatch) -> None:
         def __init__(self, **kwargs) -> None:
             pass
 
-        def run(self, graph, *, input_data=None):
+        def run(self, graph, *, input_data=None, taps=()):
             seen_inputs.append(input_data)
             return SimpleNamespace(outputs={"n0": [1.0]}), None
 
@@ -438,7 +438,7 @@ def test_run_job_trace_args_accuracy_gates_the_bench(monkeypatch) -> None:
         def __init__(self, **kwargs) -> None:
             pass
 
-        def run(self, graph, *, input_data=None):
+        def run(self, graph, *, input_data=None, taps=()):
             return SimpleNamespace(outputs={"n0": [2.0]}), None
 
     benched: list = []
@@ -487,7 +487,7 @@ def test_run_job_trace_args_want_ref_without_eager_accuracy(monkeypatch) -> None
         def __init__(self, **kwargs) -> None:
             pass
 
-        def run(self, graph, *, input_data=None):
+        def run(self, graph, *, input_data=None, taps=()):
             return SimpleNamespace(outputs={"n0": [2.0]}), None
 
     async def _fake_full_model(module, args_t, kwargs, graph, backend, *, warmup, iters, bench_backends, input_data=None):
@@ -574,6 +574,57 @@ def test_run_job_trace_args_strict_accuracy_records_direct_proof(monkeypatch) ->
     assert resp["accuracy_error"] is None
     assert resp["correctness"]["status"] == "pass"
     assert resp["results"] == {"Eager PyTorch": 2.0, "Emmy": 3.0}
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_worker_returns_a_throwing_torch_reference_error(monkeypatch, strict) -> None:
+    from types import SimpleNamespace
+
+    import numpy as np
+    import torch
+
+    from emmy.commands import run as run_mod
+    from emmy.compiler.backend import torch_ref
+    from emmy.compiler.backend.cuda import _bench_worker
+    from emmy.compiler.backend.cuda import backend as backend_mod
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import ReshapeOp
+
+    graph = Graph()
+    graph.add_node(InputOp(), [], Tensor("x", (4,)), node_id="x")
+    graph.add_node(ReshapeOp((3,)), ["x"], Tensor("out", (3,)), node_id="out")
+    graph.inputs, graph.outputs = ["x"], ["out"]
+
+    class FakeBackend:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, _graph, **_kwargs):
+            return SimpleNamespace(outputs={"out": np.ones(3)}, time_ms=1.0), None
+
+        async def benchmark_async(self, _graph, **_kwargs):
+            return SimpleNamespace(time_ms=1.0, captured=True)
+
+    monkeypatch.setattr(backend_mod, "CudaBackend", FakeBackend)
+    monkeypatch.setattr(run_mod, "_to_cuda_tensor", lambda arr, dtype: torch.as_tensor(arr, dtype=torch_ref.torch_dtype(dtype)))
+    response = asyncio.run(
+        _bench_worker._run_job(
+            {
+                "graph": graph,
+                "torch_spec": ("frontend_graph", graph),
+                "bench_backends": "emmy",
+                "warmup": 1,
+                "iters": 1,
+                "seed": 0,
+                "want_ref": True,
+                "strict_accuracy": strict,
+            }
+        )
+    )
+
+    assert "shape '[3]' is invalid for input of size 4" in response["accuracy_error"]
+    assert response["run_io"] is None and response["torch_available"] is False
 
 
 def test_embedded_reference_survives_later_greedy_timing_failure(monkeypatch) -> None:
@@ -739,14 +790,14 @@ def test_unsupplied_inputs_fill_with_seeded_normal_values() -> None:
     division's slow path. Each buffer draws its own stream, deterministically."""
     import numpy as np
 
-    from emmy.compiler.backend.cuda.program import _host_bytes
+    from emmy.compiler.backend.binding import host_bytes
     from emmy.compiler.backend.plan import BufferSpec
     from emmy.compiler.dim import Dim
     from emmy.compiler.dtype import F16
 
     def fill(name: str) -> np.ndarray:
         buf = BufferSpec(name=name, shape=(Dim(4096),), dtype=F16, role="input")
-        return np.frombuffer(_host_bytes(buf, (4096,), None, {}), dtype=np.float16)
+        return np.frombuffer(host_bytes(buf, (4096,), None, {}), dtype=np.float16)
 
     x = fill("x")
     assert np.array_equal(x, fill("x")), "the fill is deterministic"

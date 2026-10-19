@@ -195,6 +195,15 @@ def _is_moe_model(model: str, vllm_args: list[str]) -> bool:
     return bool(getattr(cfg, "num_experts", None) or getattr(cfg, "num_local_experts", None))
 
 
+def _has_gdn_layers(model: str, vllm_args: list[str]) -> bool:
+    """True when the checkpoint's config lists GDN layers (``linear_attention`` in ``layer_types``:
+    Qwen3.5 / Qwen3.8). Best-effort LOCAL config probe (:func:`_hf_config`), UX only: on a probe miss
+    the plain ``EmmyGenModel`` boots and refuses such a checkpoint, naming the class to use."""
+    cfg = _hf_config(model, vllm_args)
+    cfg = getattr(cfg, "text_config", cfg)
+    return "linear_attention" in (getattr(cfg, "layer_types", None) or ())
+
+
 def _chunk_capture_rungs(vllm_args: list[str], bucket: int) -> set[int]:
     """Token-count capture sizes for the chunk/prefill and mixed prefill+decode steps
     (``EMMY_GEN_CHUNK_CAPTURE``). vLLM pads a step UP to the first rung at or above its
@@ -256,33 +265,29 @@ def _gen_graph_args(vllm_args: list[str], *, model: str | None = None) -> list[s
     are not spec-adjusted."""
     from emmy import config as emmy_config  # noqa: PLC0415
 
+    if _has_flag(vllm_args, "--enforce-eager") or _has_flag(vllm_args, "--compilation-config"):
+        return []  # the caller decided; forward theirs untouched (the boot guard in EmmyGenModel validates it)
+    if _has_flag(vllm_args, "--enable-lora"):
+        return ["--enforce-eager"]  # capture follows after mixed base/adapter replay has passed the behavior gate
+    # A GDN layer runs request after request over token ranges it reads on the host: a capture records its own
+    # step's ranges, which only a uniform decode step repeats, so such a model captures decode steps only.
+    gdn = model is not None and _has_gdn_layers(model, vllm_args)
     if model is not None and _is_moe_model(model, vllm_args):
         # MoE decode capture is FIXED-SLOT: single-token steps ride the runner's k-slot expert
         # dispatch (fixed launch set, no host sync — capture-legal), while wider decode steps
         # keep the routed dispatch, which host-syncs and stays eager. The ladder is therefore
-        # capped at capture size 1. Whether the fixed-slot tier actually built is unknowable
+        # capped at capture size 1 (a caller's config may reach the decode bucket on a
+        # tensor-parallel boot, where the slots serve batches). Whether the tier built is unknowable
         # pre-boot — the AUTHORITATIVE guard is in ``EmmyGenModel.__init__``, which inspects
         # the runner and rejects an MoE capture boot loudly when the tier is missing (serve
         # with --enforce-eager then). A caller-supplied config forwards untouched and faces
         # the same boot guard.
-        if _has_flag(vllm_args, "--enforce-eager") or _has_flag(vllm_args, "--compilation-config"):
-            return []  # the caller decided; the boot guard validates capture against the runner
-        cfg = _hf_config(model, vllm_args)
-        cfg = getattr(cfg, "text_config", cfg)
-        if int(getattr(cfg, "hc_mult", 1) or 1) > 1:
-            # A hyper-connection MoE (DeepSeek V4) has no fixed-slot tier: its routed combine
-            # host-syncs on every step (the placement closes the layer after the shard
-            # reduction), so decode capture is unsupported — the boot guard rejects it too.
-            logger.warning("hyper-connection MoE: decode capture is not supported (the routed combine host-syncs); serving eager")
-            return ["--enforce-eager"]
         bucket = emmy_config.gen_decode_bucket()
         if bucket <= 0:
             logger.warning("decode bucket is off (EMMY_GEN_DECODE_BUCKET=0) — the symbolic decode path is not capturable; serving eager")
             return ["--enforce-eager"]
         cfg = '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1], "custom_ops": ["+rotary_embedding"]}'
         return ["--compilation-config", cfg]
-    if _has_flag(vllm_args, "--enforce-eager") or _has_flag(vllm_args, "--compilation-config"):
-        return []  # the caller decided; forward theirs untouched
     bucket = emmy_config.gen_decode_bucket()
     if bucket <= 0:
         logger.warning("decode bucket is off (EMMY_GEN_DECODE_BUCKET=0) — the symbolic decode path is not capturable; serving eager")
@@ -318,7 +323,7 @@ def _gen_graph_args(vllm_args: list[str], *, model: str | None = None) -> list[s
             return ["--enforce-eager"]
     mode = "FULL_DECODE_ONLY"
     backend_args: list[str] = []
-    if query_len == 1 and emmy_config.gen_chunk_capture():
+    if query_len == 1 and not gdn and emmy_config.gen_chunk_capture():
         # WHOLE-STEP CHUNK CAPTURE: mode FULL records the mixed prefill+decode steps too —
         # the eager mixed steps' per-program host framing (gpu_lock + DLPack dispatch) and
         # their per-step staging D2D were the measured c64 TPOT loss, and the eager
@@ -394,15 +399,23 @@ def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str], generate: 
         # those are (naming a checkpoint format here would cross the band).
         from emmy.compiler.loader.quant import engine_config_overrides  # noqa: PLC0415
 
-        overrides: dict = {"architectures": ["EmmyGenModel"]}
+        # A checkpoint with GDN layers boots the hybrid class, which declares those layers'
+        # per-request state to vLLM.
+        architecture = (
+            "EmmyGenLoRAModel"
+            if _has_flag(vllm_args, "--enable-lora")
+            else "EmmyGenHybridModel"
+            if _has_gdn_layers(model, vllm_args)
+            else "EmmyGenModel"
+        )
+        overrides: dict = {"architectures": [architecture]}
         overrides.update(engine_config_overrides(_hf_config(model, vllm_args)))
         cmd += ["--hf-overrides", json.dumps(overrides)]
-        # Force fp16 across the emmy↔vLLM seam: vLLM defaults --dtype auto → bf16 for a
-        # bf16 checkpoint, but the emmy trunk emits fp16. Reject an incompatible override.
+        # Keep the default fp16; an explicit bf16 or fp32 keeps the engine and trunk aligned.
         if _has_flag(vllm_args, "--dtype"):
             dt = _flag_value(vllm_args, "--dtype", "")
-            if dt not in ("float16", "half", "fp16"):
-                raise ValueError(f"generative serving requires fp16; --dtype {dt!r} is incompatible (use --dtype float16)")
+            if dt not in ("float16", "half", "fp16", "bfloat16", "bf16", "float32", "fp32"):
+                raise ValueError(f"generative serving requires fp16, bf16, or fp32; --dtype {dt!r} is incompatible")
         else:
             cmd += ["--dtype", "float16"]
         # The flattened width (sum of newly-scheduled tokens per step) must stay within the
@@ -414,7 +427,7 @@ def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str], generate: 
         # model's startup bound, so default it to the covered maximum here.
         bucket = emmy_config.gen_decode_bucket()
         capacity = emmy_config.gen_prefill_capacity()
-        top = (capacity if 0 < capacity else int(_DEFAULT_MAX_MODEL_LEN)) + max(bucket, 0)
+        top = (capacity if 0 < capacity else int(_DEFAULT_MAX_MODEL_LEN)) + (0 if _has_flag(vllm_args, "--enable-lora") else max(bucket, 0))
         if _has_flag(vllm_args, "--max-num-batched-tokens"):
             mnbt = _flag_value(vllm_args, "--max-num-batched-tokens", "")
             if mnbt.isdigit() and int(mnbt) > top:
@@ -523,10 +536,10 @@ def _golden_regime_env(golden: str, env: dict) -> dict:
     pin at another value fails the boot instead of being overridden."""
     from emmy import config as emmy_config  # noqa: PLC0415
     from emmy.compiler.pipeline.knob import get  # noqa: PLC0415
-    from emmy.compiler.pipeline.search.golden import GoldenFile, shared_regime_pins  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import GoldenFile  # noqa: PLC0415
 
     out = {}
-    for name, value in shared_regime_pins(GoldenFile.load(golden).records()).items():
+    for name, value in GoldenFile.load(golden).shared_regime().items():
         key = emmy_config.knob_var(name)
         if key in env and get(name.split("@", 1)[0]).parse(env[key]) != value:
             logger.error("%s: its rows were measured under %s=%s, but the environment pins %s=%r", golden, name, value, key, env[key])

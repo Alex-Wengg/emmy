@@ -1,6 +1,7 @@
 """Working-golden execution tests."""
 
 import argparse
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -8,7 +9,8 @@ from unittest import mock
 import pytest
 
 from emmy.commands import run as run_mod
-from emmy.compiler.pipeline.search.golden import GoldenFile
+from emmy.compiler.pipeline.search.db import RoutingRow
+from emmy.compiler.pipeline.search.golden import GoldenFile, Kernel, Row
 
 
 def _parser():
@@ -45,41 +47,42 @@ def _args(tmp_path, **updates):
     return SimpleNamespace(**values)
 
 
-def _records(names):
-    program = {}
-    return [
-        SimpleNamespace(
-            name=name,
-            identity=None,
-            loop_wire=None,
-            program_wire=program,
-            target_key=name,
-            compute_cap=(7, 0),
-            bindings=(),
-            pin_map={},
-            is_routing=False,
-            emmy_us=0.0,
-            config_index=0,
-        )
-        for name in names
-    ]
+def _hex(tag: str) -> str:
+    return hashlib.sha256(tag.encode()).hexdigest()
 
 
-#: A golden with no targets: the tests below patch the records a load yields.
-_EMPTY = GoldenFile(compute_cap=(8, 9), programs=[], configs=[])
+def _kernel(tag: str, *, piece: bool = False) -> Kernel:
+    """A fake kernel the file calls ``k_<tag>``, its identity handed in: nothing here lowers its (empty) wire."""
+    kernel = Kernel(loop_ir={"inputs": [], "outputs": [], "nodes": []}, name=f"k_{tag}", formed=True, traced=None if piece else 0)
+    return kernel.keyed(_hex(tag))
 
 
-def _patch_records(monkeypatch, names):
+def _document(rows, routing=()) -> GoldenFile:
+    """A golden of fake kernels: ``rows`` as ``(name, kernel tag, pins)``, ``routing`` as ``(parent tag, child tags)``
+    — a child is a piece, with no program of its own."""
+    children = {child for _, kids in routing for child in kids}
+    tags = {tag for _, tag, _ in rows} | {parent for parent, _ in routing} | children
+    return GoldenFile(
+        compute_cap=(8, 9),
+        programs=[{"inputs": [], "outputs": [], "nodes": []}],
+        kernels=[_kernel(tag, piece=tag in children) for tag in sorted(tags)],
+        routing=[RoutingRow(f"k_{parent}", {"PLACE": "cut"}, tuple(f"k_{child}" for child in kids)) for parent, kids in routing],
+        rows=[Row(name=name, kernel=f"k_{tag}", pins=dict(pins)) for name, tag, pins in rows],
+    )
+
+
+#: A golden with no rows: the tests below patch the document a load yields.
+_EMPTY = GoldenFile(compute_cap=(8, 9))
+
+
+def _patch_document(monkeypatch, document: GoldenFile) -> None:
     from emmy.compiler.pipeline.search import golden
 
-    rows = _records(names)
-    monkeypatch.setattr(golden.GoldenFile, "load", classmethod(lambda _cls, _path, **_: _EMPTY))
-    monkeypatch.setattr(golden.GoldenFile, "records", lambda _self: rows)
-    return rows
+    monkeypatch.setattr(golden.GoldenFile, "load", classmethod(lambda _cls, _path, **_: document))
 
 
 def test_golden_runs_every_distinct_target_in_process(monkeypatch, tmp_path):
-    _patch_records(monkeypatch, ["linear.layer0", "linear.layer0", "linear.layer1"])
+    _patch_document(monkeypatch, _document([("linear.layer0", "a", {}), ("linear.layer0", "a", {}), ("linear.layer1", "b", {})]))
     calls = []
     monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
 
@@ -89,15 +92,18 @@ def test_golden_runs_every_distinct_target_in_process(monkeypatch, tmp_path):
     assert all(args.golden.endswith("working.json") and args._explicit_realization is False for args in calls)
 
 
-def test_golden_walk_benches_each_target_once_not_its_receipts(monkeypatch, tmp_path):
-    """Routing rows and child-identity receipts (``<target>.<identity>``) are evidence for their target's
-    walk, not targets: the walk names the target once and leaves the rows to the evidence pick."""
-    rows = _patch_records(
-        monkeypatch, ["k_mean.aaaa", "k_mean.aaaa.c5cd", "k_lin.bbbb", "k_lin.bbbb.8270", "k_lin.bbbb.4d7f", "orphan.cccc.dddd"]
-    )
-    for index, parent in ((1, 0), (3, 2), (4, 2)):
-        rows[index].target_key = rows[parent].target_key
-        rows[index].identity = "receipt"
+def test_golden_walk_benches_each_target_once_not_its_pieces(monkeypatch, tmp_path):
+    """A piece a decision minted runs with its target: the walk names the target once, by the shortest row name of
+    the set, and leaves the rows to the evidence pick."""
+    rows = [
+        ("k_mean.aaaa", "mean", {}),
+        ("k_mean.aaaa.c5cd", "mean_piece", {}),
+        ("k_lin.bbbb", "lin", {}),
+        ("k_lin.bbbb.8270", "lin_a", {}),
+        ("k_lin.bbbb.4d7f", "lin_b", {}),
+        ("orphan.cccc.dddd", "orphan", {}),
+    ]
+    _patch_document(monkeypatch, _document(rows, routing=[("mean", ("mean_piece",)), ("lin", ("lin_a", "lin_b"))]))
     calls = []
     monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
 
@@ -106,67 +112,60 @@ def test_golden_walk_benches_each_target_once_not_its_receipts(monkeypatch, tmp_
     assert [args.realization for args in calls] == ["k_mean.aaaa", "k_lin.bbbb", "orphan.cccc.dddd"]
 
 
-def test_golden_walk_without_seeds_benches_the_row_pricing_the_whole_target(monkeypatch, tmp_path):
-    """A file that dropped its seed rows still benches each target once: a split target through its
-    fastest routing row, an unsplit one through its fastest row — never a piece's receipt."""
-    from emmy.compiler.pipeline.search import golden
+def test_golden_walk_names_a_target_by_its_own_row_before_a_shorter_piece_row(monkeypatch, tmp_path):
+    """The seed row on the target names the walk's run — ``--record`` writes the whole target's latency onto that name
+    — even where a piece's row has a shorter name."""
+    rows = [("k_layer_seed_long_name", "layer", {}), ("qk.t32", "layer_piece", {})]
+    _patch_document(monkeypatch, _document(rows, routing=[("layer", ("layer_piece",))]))
+    calls = []
+    monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
 
-    program = {}
+    run_mod._run_golden_targets(_args(tmp_path))
 
-    def row(name, routing, emmy_us):
-        record = _records([name])[0]
-        record.identity, record.is_routing, record.emmy_us = name[-4:] * 16, routing, emmy_us
-        record.program_wire, record.target_key = program, name.rsplit(".", 1)[0]
-        return record
+    assert [args.realization for args in calls] == ["k_layer_seed_long_name"]
 
+
+def test_golden_walk_without_seeds_names_a_target_by_its_shortest_row(monkeypatch, tmp_path):
+    """A file that dropped its seed rows still benches each target once, through the shortest row name of its set —
+    a piece's row where the target itself has none."""
     rows = [
-        row("post16.k_a.1111.m16.aaaa", False, 4.0),
-        row("post16.k_a.1111.m16.bbbb", True, 9.0),
-        row("post16.k_a.1111.m16.cccc", True, 7.0),
+        ("post16.k_a.1111.m16.bbbb", "a_piece_b", {}),
+        ("post16.k_a.1111.m16.aaaa", "a_piece_a", {}),
+        ("pre1.k_b.2222.m1.dddd", "b", {}),
+        ("pre1.k_b.2222.m1.eeee", "b", {}),
     ]
-    rows += [row("pre1.k_b.2222.m1.dddd", False, 30.0), row("pre1.k_b.2222.m1.eeee", False, 20.0)]
-    monkeypatch.setattr(golden.GoldenFile, "load", classmethod(lambda _cls, _path, **_: _EMPTY))
-    monkeypatch.setattr(golden.GoldenFile, "records", lambda _self: rows)
+    _patch_document(monkeypatch, _document(rows, routing=[("a", ("a_piece_a", "a_piece_b"))]))
     calls = []
     monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
 
     run_mod._run_golden_targets(_args(tmp_path))
 
-    assert [args.realization for args in calls] == ["post16.k_a.1111.m16.cccc", "pre1.k_b.2222.m1.eeee"]
+    assert [args.realization for args in calls] == ["post16.k_a.1111.m16.aaaa", "pre1.k_b.2222.m1.dddd"]
 
 
-def test_golden_walk_selects_the_root_route_before_a_child_split(monkeypatch, tmp_path):
-    rows = _patch_records(monkeypatch, ["layer.root", "layer.split", "layer.piece"])
-    for row in rows:
-        row.target_key = "layer"
-    rows[0].identity, rows[0].is_routing, rows[0].emmy_us = "root", True, 20.0
-    rows[1].identity, rows[1].is_routing, rows[1].emmy_us = "child", True, 2.0
-    rows[2].identity, rows[2].emmy_us = "piece", 1.0
+def test_golden_walk_keeps_dotted_names_sizes_and_pin_regimes(monkeypatch, tmp_path):
+    """Two kernels are two targets whatever their names share; a kernel at two sizes is two kernels; one kernel's
+    rows in two precision regimes run once each."""
+    rows = [
+        ("k_mean", "m", {}),
+        ("k_mean.type_as", "t", {}),
+        ("dynamic.m16", "d16", {}),
+        ("dynamic.m32", "d32", {}),
+        ("exact", "p", {"FAST_MATH": False}),
+        ("fast", "p", {"FAST_MATH": True}),
+    ]
+    _patch_document(monkeypatch, _document(rows))
     calls = []
     monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
 
     run_mod._run_golden_targets(_args(tmp_path))
 
-    assert [args.realization for args in calls] == ["layer.root"]
-
-
-def test_golden_walk_keeps_dotted_names_bindings_and_pin_regimes(monkeypatch, tmp_path):
-    rows = _patch_records(monkeypatch, ["k_mean", "k_mean.type_as", "dynamic.m16", "dynamic.m32", "exact", "fast"])
-    rows[2].target_key = rows[3].target_key = "dynamic"
-    rows[2].bindings, rows[3].bindings = (("m", 16),), (("m", 32),)
-    rows[4].target_key = rows[5].target_key = "precision"
-    rows[4].pin_map, rows[5].pin_map = {"FAST_MATH": False}, {"FAST_MATH": True}
-    calls = []
-    monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
-
-    run_mod._run_golden_targets(_args(tmp_path))
-
-    assert [args.realization for args in calls] == [row.name for row in rows]
+    assert [args.realization for args in calls] == [name for name, _, _ in rows]
 
 
 def test_golden_walk_reports_every_target_before_failing(monkeypatch, tmp_path):
     """A target that fails does not hide the targets after it: the walk runs them all and exits 1."""
-    _patch_records(monkeypatch, ["linear.layer0", "linear.layer1", "linear.layer2"])
+    _patch_document(monkeypatch, _document([(f"linear.layer{i}", f"k{i}", {}) for i in range(3)]))
     calls = []
 
     def run_once(args):
@@ -194,7 +193,7 @@ def test_naming_one_target_skips_the_multi_target_walk(run_cli):
 
 
 def test_multi_target_json_uses_one_readable_file_per_target(monkeypatch, tmp_path):
-    _patch_records(monkeypatch, ["linear/layer0", "linear/layer1"])
+    _patch_document(monkeypatch, _document([("linear/layer0", "k0", {}), ("linear/layer1", "k1", {})]))
     calls = []
     monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
     output = tmp_path / "results"
@@ -287,14 +286,34 @@ def test_strict_result_accepts_same_input_greedy_only_for_reference_free_loop():
     )
 
 
+def test_golden_walk_resolves_one_name_in_two_regimes_to_each_regimes_rows(monkeypatch, tmp_path):
+    """A row name both precision regimes share runs once per regime, and each run selects only its regime's rows:
+    the compile publishes that regime and ``--record`` attributes the timing to one row."""
+    from emmy.commands import compile as compile_mod
+
+    document = _document([("matmul", "p", {"FAST_MATH": False}), ("matmul", "p", {"FAST_MATH": True})])
+    _patch_document(monkeypatch, document)
+    monkeypatch.setattr(GoldenFile, "executable", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(GoldenFile, "reference_program", lambda *_args, **_kwargs: None)
+    calls = []
+    monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
+
+    run_mod._run_golden_targets(_args(tmp_path))
+
+    assert [(args.realization, args._golden_pins) for args in calls] == [("matmul", {"FAST_MATH": False}), ("matmul", {"FAST_MATH": True})]
+    for args in calls:
+        vars(args).update(input=None, code=None, ir=None, dynamic=None)
+        compile_mod.resolve_golden_arg(args)
+        assert [row.pins for row in args._golden_rows] == [args._golden_pins]
+
+
 def test_golden_document_is_parsed_once_for_every_target(monkeypatch, tmp_path):
     """A whole-model inventory must not be re-read and re-validated per target."""
     from emmy.compiler.pipeline.search import golden
 
     loads = []
-    document = _EMPTY
+    document = _document([(name, name, {}) for name in ("a", "b", "c")])
     monkeypatch.setattr(golden.GoldenFile, "load", classmethod(lambda _cls, _path, **_: loads.append(_path) or document))
-    monkeypatch.setattr(golden.GoldenFile, "records", lambda _self: _records(("a", "b", "c")))
     calls = []
     monkeypatch.setattr(run_mod, "_handle_run_once", calls.append)
 
@@ -313,7 +332,6 @@ def test_resolve_golden_arg_prefers_the_document_the_caller_loaded(monkeypatch, 
         raise AssertionError("load_golden_file must not be called when a document is supplied")
 
     monkeypatch.setattr(golden.GoldenFile, "load", classmethod(_explode))
-    monkeypatch.setattr(golden.GoldenFile, "records", lambda _self: [])
 
     args = SimpleNamespace(
         realization="missing",
@@ -345,11 +363,27 @@ def test_record_latency_ignores_a_child_receipt_of_the_same_target():
     )
     args = SimpleNamespace(golden="working.json", realization="linear.layer0")
     with mock.patch.object(run_mod, "_bench_total_us", side_effect=AssertionError("a receipt's timing is not the program's")):
-        with mock.patch("emmy.compiler.pipeline.search.working_golden.record_latency", lambda *a, **kw: seen.update(kw)):
+        with mock.patch("emmy.compiler.pipeline.search.golden.record_latency", lambda *a, **kw: seen.update(kw)):
             run_mod._record_golden_latency(args, {"Emmy": 12.5, "Eager PyTorch": 30.0}, [receipt])
 
     assert seen["emmy_us"] == 12.5
     assert seen["knobs"] is None and seen["pins"] is None
+
+
+def test_record_latency_of_two_measured_schedules_lands_on_the_faster():
+    """Two measured schedules of one target in one regime: the evidence pick deploys the faster, so its row takes
+    the target's latency."""
+    seen = {}
+
+    def row(knobs, us):
+        return SimpleNamespace(status="ok", bench=us, flags=[], sample=SimpleNamespace(name="mm", knobs=knobs, pins={"FAST_MATH": False}))
+
+    args = SimpleNamespace(golden="working.json", realization="mm")
+    with mock.patch.object(run_mod, "_bench_total_us", lambda us: (us, "e2e")):
+        with mock.patch("emmy.compiler.pipeline.search.golden.record_latency", lambda *a, **kw: seen.update(kw)):
+            run_mod._record_golden_latency(args, {"torch.compile": 9.0}, [row({"WORK": "w4x4"}, 12.0), row({"WORK": "w4x2"}, 10.0)])
+
+    assert seen["emmy_us"] == 10.0 and seen["knobs"] == {"WORK": "w4x2"} and seen["tcompile_us"] == 9.0
 
 
 def test_record_greedy_is_a_golden_bench_flag(run_cli):
@@ -412,20 +446,45 @@ def test_pinned_rows_bench_when_the_greedy_returned_no_outputs():
     assert run_mod.pinned_reference_refusal(ab_ref=None, torch_twin=True, greedy_fail=None) is None
 
 
-def test_record_refuses_a_row_benched_without_a_reference(tmp_path):
-    """An unverified row must never become golden evidence -- a miscompiling tile runs at a
-    perfectly plausible latency, so a recorded number for an unchecked kernel is worse than none."""
-    sample = SimpleNamespace(name="pinned.row", knobs={"WORK": "w2x2"}, pins={}, dynamic=None, shape=None)
-    gb = SimpleNamespace(
-        status="ok",
-        bench=SimpleNamespace(min_ms=1.0, time_ms=1.0, per_launch=[]),
-        sample=sample,
-        flags=[f"{run_mod.UNVERIFIED_ROW}: greedy run/bench failed"],
-    )
-    args = SimpleNamespace(golden=str(tmp_path / "g.json"), realization="pinned.row")
-    with pytest.raises(SystemExit) as exc:
-        run_mod._record_golden_latency(args, {"Emmy": 1000.0}, [gb])
-    assert exc.value.code == 2
+@pytest.mark.parametrize("record", ["--record", "--record-greedy"])
+@pytest.mark.parametrize("flagged_side", ["pinned", "isolated"])
+@pytest.mark.parametrize(
+    "flags",
+    [[], [f"{run_mod.UNVERIFIED_ROW}: the greedy worker returned no run outputs"], ["wrong-answer", "new integrity flag"]],
+    ids=["clean", "missing-reference", "other-flags"],
+)
+def test_record_requires_every_benched_row_to_be_unflagged(monkeypatch, caplog, record, flagged_side, flags):
+    """A clean isolated greedy row cannot authorize recording beside a flagged pinned comparison."""
+    from emmy.compiler.graph import Graph
+
+    args = _parser().parse_args(["run", "--golden", "working.json", "--realization", "target", "--bench", record])
+    args._golden_graph = Graph()
+    pinned = SimpleNamespace(status="ok", flags=flags if flagged_side == "pinned" else [])
+    isolated = SimpleNamespace(status="ok", flags=flags if flagged_side == "isolated" else [])
+
+    def session(coro):
+        coro.close()
+        return None, {}, None, False, False, None, None, [pinned], isolated, None, {}, None, False
+
+    monkeypatch.setattr(run_mod.asyncio, "run", session)
+    monkeypatch.setattr(run_mod, "_replay_stage_and_passes", lambda *_args, **_kwargs: ("cuda", []))
+    monkeypatch.setattr(run_mod, "_print_kernel_stats", lambda *_args, **_kwargs: None)
+    writes = {name: mock.Mock() for name in ("_record_greedy_pick", "_record_golden_latency", "_record_bench_evidence")}
+    for name, writer in writes.items():
+        monkeypatch.setattr(run_mod, name, writer)
+    backend = mock.Mock(return_value=SimpleNamespace(tune_db=None))
+    dump = SimpleNamespace(resolve=lambda _path: None)
+
+    if flags:
+        with pytest.raises(SystemExit) as exc:
+            run_mod._handle_run_ir(args, backend, dump)
+        assert exc.value.code != 0
+        assert all(flag in caplog.text for flag in flags)
+        for writer in writes.values():
+            writer.assert_not_called()
+    else:
+        run_mod._handle_run_ir(args, backend, dump)
+        writes["_record_greedy_pick" if record == "--record-greedy" else "_record_golden_latency"].assert_called_once()
 
 
 def test_an_env_pin_that_did_not_realize_is_flagged_like_an_ab_pin(monkeypatch):
@@ -478,11 +537,11 @@ def test_a_greedy_pick_whose_env_pin_did_not_realize_is_never_recorded(monkeypat
     the recording still filed an f32-accumulate schedule under ``FAST_MATH: true``."""
     realized = [{"WORK": "w4x2", "TILE": "mma_m16n8k16_f16_f32/f2x4/k2", "STAGE": "d2/smem-tma"}]
 
-    assert run_mod.greedy_record_refusal(realized, accuracy_error=None) is None
-    assert "accuracy" in run_mod.greedy_record_refusal(realized, accuracy_error="max error 0.3")
+    assert run_mod.record_refusal(realized, accuracy_error=None) is None
+    assert "accuracy" in run_mod.record_refusal(realized, accuracy_error="max error 0.3")
 
     monkeypatch.setenv("EMMY_TILE", "mma_m16n8k16_f16_f16/f4x8/k4")
-    refusal = run_mod.greedy_record_refusal(realized, accuracy_error=None)
+    refusal = run_mod.record_refusal(realized, accuracy_error=None)
     assert refusal is not None
     assert "f16_f16/f4x8/k4" in refusal and "f16_f32/f2x4/k2" in refusal
 

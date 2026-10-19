@@ -1,16 +1,18 @@
-"""Native Qwen3 preparation rejects unsupported models before CUDA work."""
+"""Native preparation accepts dense Qwen3 and Qwen3.5 text models and rejects the rest before CUDA work."""
 
+import numpy as np
 import pytest
 
-from emmy.serving.native.prepare import validate_model
-from tests.serving.helpers import qwen3_model
+from emmy.serving.native.prepare import load_model, validate_model
+from tests.compiler.helpers import requires_cuda
+from tests.serving.helpers import fp8_block_checkpoint, qwen3_5_model, qwen3_model
 
 
 def test_configuration_rejections():
     model = qwen3_model(2).half()
     validate_model(model, 8)
     model.config.quantization_config = {"quant_method": "fp8"}
-    with pytest.raises(ValueError, match="unquantized"):
+    with pytest.raises(ValueError, match="load_model"):
         validate_model(model, 8)
     del model.config.quantization_config
     for length in (0, 65, 4097):
@@ -81,3 +83,63 @@ def test_native_cli_rejects_invalid_deadlines(timeout):
     args = parser.parse_args(["generate", "unused", "--native-pack", "artifact", "--timeout", timeout])
     with pytest.raises(ValueError, match="finite and positive"):
         handle_generate(args)
+
+
+def test_qwen3_5_text_model_is_accepted_and_its_decoder_returned():
+    """Partial rotary embedding and Gated DeltaNet layers are this family's shape, not a rejection;
+    the rotated part of a head must still be even, as the rotation pairs its halves."""
+    model = qwen3_5_model().half()
+    assert validate_model(model, 8) is model.model
+    model.config.rope_parameters["partial_rotary_factor"] = 3 / 16
+    with pytest.raises(ValueError, match="rotary"):
+        validate_model(model, 8)
+
+
+def test_quantized_checkpoint_loads_as_a_coded_twin(tmp_path):
+    """An FP8 checkpoint loads onto the serving runner's checkpoint-sourced lane: the twin passes
+    validation with its coded linears as FP16 placeholders, and the ``ckpt`` pair names the
+    checkpoint and each parameter's key in it — what the exporter spells and binds from. An
+    ordinary checkpoint keeps the module lane."""
+    fp8_block_checkpoint(qwen3_model(2).half(), tmp_path / "fp8")
+    model, (directory, id_to_key) = load_model(str(tmp_path / "fp8"))
+    assert validate_model(model, 8) is model.model
+    assert directory == str(tmp_path / "fp8")
+    assert id_to_key[id(model.model.layers[0].self_attn.q_proj.weight)] == "model.layers.0.self_attn.q_proj.weight"
+
+    qwen3_model(2).half().save_pretrained(tmp_path / "plain")
+    model, ckpt = load_model(str(tmp_path / "plain"))
+    assert ckpt is None and validate_model(model, 8) is model.model
+
+
+@pytest.mark.parametrize("backend", ["loop", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("value", [0.0, np.inf, -np.inf, np.nan], ids=["finite", "inf", "-inf", "nan"])
+def test_greedy_token_is_the_lowest_peak_and_no_token_on_a_nonfinite_logit(backend, value):
+    """The greedy module returns the lowest token ID among the maximum logits, and the vocabulary
+    size, which the runtime rejects, when any logit is nonfinite — eager and compiled alike. The
+    compiled maximum skips NaN (``fmaxf``), so a NaN must not leave a finite peak behind."""
+    import torch
+
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.loader.binder import evaluate_source_graph
+    from emmy.compiler.trace.torch import trace_module
+    from emmy.serving.native.prepare import greedy_module
+
+    vocab = 8
+    logits = np.array([[0.5, -2.0, 1.0, 0.25, -1.0, 1.0, value, 0.75]], np.float32)
+    expected = 2 if np.isfinite(value) else vocab
+    module = greedy_module(vocab)
+    assert module(torch.from_numpy(logits)).tolist() == [expected]
+
+    graph = trace_module(module, (torch.zeros(1, vocab, dtype=torch.float32),))
+    if backend == "loop":
+        from emmy.compiler.backend.loop import LoopBackend as Backend
+    else:
+        from emmy.compiler.backend.cuda.backend import CudaBackend as Backend
+    compiled = Backend().compile(graph)
+    # The folded token IDs are a generated constant the plain interpreter does not evaluate itself.
+    data = {"logits": logits}
+    for nid, node in compiled.nodes.items():
+        if isinstance(node.op, ConstantOp) and node.op.source_graph is not None:
+            data[nid] = evaluate_source_graph(node.op.source_graph, {})
+    (token,) = Backend().run(compiled, input_data=data)[0].outputs.values()
+    assert token.tolist() == [expected]

@@ -12,7 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const SUPPORTED_PLAN_FORMATS: [u32; 4] = [1, 2, 3, 4];
+/// Format 2 carried the per-launch pointer-table operand the serving MoE dispatch once resolved in-kernel; a plan
+/// stored in it is refused and recompiled.
+const SUPPORTED_PLAN_FORMATS: [u32; 4] = [1, 3, 4, 5];
+/// The first plan format whose launches may carry a `cpu` thread split.
+const CPU_PLAN_FORMAT: u32 = 5;
 const PACK_FORMAT: u32 = 1;
 const STANDALONE_FORMAT: u32 = 1;
 const LAUNCH_DIMENSIONS: usize = 3;
@@ -153,6 +157,10 @@ pub struct Buffer {
     pub shape: Vec<Expr>,
     pub dtype: String,
     pub role: String,
+    /// The buffer this one is stored in, when its producer writes it in place: the two share
+    /// their bytes, the producer stores only the cells it names, and nothing reads the other
+    /// after that store.
+    pub alias: Option<String>,
 }
 
 impl Buffer {
@@ -195,6 +203,9 @@ impl Buffer {
 pub struct Paging {
     pub axis: usize,
     pub page: u64,
+    /// How many pages the device holds at once — the pager's slots; `None` holds every page.
+    #[serde(default)]
+    pub slots: Option<usize>,
 }
 
 impl Paging {
@@ -232,19 +243,22 @@ impl Paging {
 }
 
 #[derive(Debug, Clone)]
-pub struct Indirect {
-    pub arg: String,
-    pub table: String,
-    pub sel: String,
-    pub slot: i64,
-}
-
-#[derive(Debug, Clone)]
 pub struct Tma {
     pub name: String,
     pub src_buf: String,
     pub box_extents: Vec<u32>,
     pub swizzle: String,
+}
+
+/// How a CPU launch splits across threads: each thread runs iterations `[lo, hi)` of a split
+/// axis of `extent` iterations. A `reduce` launch writes `partial_floats` per thread and its
+/// kernel's `finish` combines them; a launch that is not `parallel` runs on the calling thread.
+#[derive(Debug, Clone)]
+pub struct CpuLaunch {
+    pub reduce: bool,
+    pub extent: Expr,
+    pub partial_floats: usize,
+    pub parallel: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -258,10 +272,10 @@ pub struct Launch {
     pub zero_outputs: Vec<String>,
     pub zero_prologues: Vec<String>,
     pub writes: Vec<String>,
-    pub indirect: Vec<Indirect>,
     pub runtime_args: Vec<String>,
     pub serial: Vec<(String, i64)>,
     pub tma: Vec<Tma>,
+    pub cpu: Option<CpuLaunch>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +309,8 @@ pub struct Layout {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub format: u32,
+    /// `"cuda"` or `"cpu"`: which executor runs the plan.
+    pub backend: String,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub buffers: Vec<Buffer>,
@@ -322,6 +338,8 @@ struct RawBuffer {
     shape: Vec<Value>,
     dtype: String,
     role: String,
+    #[serde(default)]
+    alias: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -364,8 +382,11 @@ struct RawLaunch {
     node_id: String,
     kernel: String,
     args: Vec<String>,
+    #[serde(default)]
     grid: Vec<Vec<Value>>,
+    #[serde(default)]
     block: Vec<Vec<Value>>,
+    #[serde(default)]
     smem: u32,
     #[serde(default)]
     zero_outputs: Vec<String>,
@@ -374,13 +395,22 @@ struct RawLaunch {
     #[serde(default)]
     writes: Vec<String>,
     #[serde(default)]
-    indirect: Vec<(String, String, String, i64)>,
-    #[serde(default)]
     runtime_args: Vec<String>,
     #[serde(default)]
     serial: Vec<(String, i64)>,
     #[serde(default)]
     cuda: Option<RawCuda>,
+    #[serde(default)]
+    cpu: Option<RawCpu>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCpu {
+    mode: String,
+    extent: Value,
+    partial_floats: usize,
+    parallel: bool,
 }
 
 #[derive(Deserialize)]
@@ -394,6 +424,28 @@ struct RawSymbols {
     caps: BTreeMap<String, i64>,
 }
 
+/// A plan constant: a JSON number, or `"inf"`, `"-inf"` or `"nan"`, which JSON has no number for.
+struct Scalar(f64);
+
+impl<'de> Deserialize<'de> for Scalar {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Number(n) => n
+                .as_f64()
+                .map(Scalar)
+                .ok_or_else(|| serde::de::Error::custom("constant out of range")),
+            Value::String(s) if s == "inf" => Ok(Scalar(f64::INFINITY)),
+            Value::String(s) if s == "-inf" => Ok(Scalar(f64::NEG_INFINITY)),
+            Value::String(s) if s == "nan" => Ok(Scalar(f64::NAN)),
+            other => Err(serde::de::Error::custom(format!(
+                "constant is not a number: {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPlan {
@@ -403,7 +455,7 @@ struct RawPlan {
     outputs: Vec<String>,
     buffers: Vec<RawBuffer>,
     #[serde(default)]
-    constants: BTreeMap<String, f64>,
+    constants: BTreeMap<String, Scalar>,
     #[serde(default)]
     runtime_constants: BTreeMap<String, Value>,
     launches: Vec<RawLaunch>,
@@ -449,7 +501,16 @@ impl Program {
             "unsupported plan format {}",
             raw.format
         );
-        ensure!(raw.backend == "cuda", "only CUDA plans are supported");
+        ensure!(
+            ["cuda", "cpu"].contains(&raw.backend.as_str()),
+            "unsupported plan backend {}",
+            raw.backend
+        );
+        let cpu = raw.backend == "cpu";
+        ensure!(
+            !cpu || raw.format >= CPU_PLAN_FORMAT,
+            "a cpu plan needs format {CPU_PLAN_FORMAT}"
+        );
         let symbols = raw.symbols.unwrap_or(RawSymbols {
             bindings: BTreeMap::new(),
             hints: BTreeMap::new(),
@@ -457,6 +518,7 @@ impl Program {
         });
         let program = Program {
             format: raw.format,
+            backend: raw.backend,
             inputs: raw.inputs,
             outputs: raw.outputs,
             buffers: raw
@@ -472,10 +534,15 @@ impl Program {
                         name: b.name,
                         dtype: b.dtype,
                         role: b.role,
+                        alias: b.alias,
                     })
                 })
                 .collect::<Result<_>>()?,
-            constants: raw.constants,
+            constants: raw
+                .constants
+                .into_iter()
+                .map(|(name, value)| (name, value.0))
+                .collect(),
             runtime_constants: raw
                 .runtime_constants
                 .iter()
@@ -485,9 +552,14 @@ impl Program {
                 .launches
                 .into_iter()
                 .map(|l| {
+                    ensure!(
+                        l.cpu.is_some() == cpu,
+                        "launch {} must carry a cpu section exactly when the plan's backend is cpu",
+                        l.node_id
+                    );
                     Ok(Launch {
-                        grid: factors(&l.grid)?,
-                        block: factors(&l.block)?,
+                        grid: if cpu { Vec::new() } else { factors(&l.grid)? },
+                        block: if cpu { Vec::new() } else { factors(&l.block)? },
                         node_id: l.node_id,
                         kernel: l.kernel,
                         args: l.args,
@@ -495,16 +567,6 @@ impl Program {
                         zero_outputs: l.zero_outputs,
                         zero_prologues: l.zero_prologues,
                         writes: l.writes,
-                        indirect: l
-                            .indirect
-                            .into_iter()
-                            .map(|(arg, table, sel, slot)| Indirect {
-                                arg,
-                                table,
-                                sel,
-                                slot,
-                            })
-                            .collect(),
                         runtime_args: l.runtime_args,
                         serial: l.serial,
                         tma: l
@@ -519,6 +581,26 @@ impl Program {
                                 swizzle: t.swizzle,
                             })
                             .collect(),
+                        cpu: l
+                            .cpu
+                            .map(|c| {
+                                ensure!(
+                                    ["range", "reduce"].contains(&c.mode.as_str()),
+                                    "unknown cpu launch mode {}",
+                                    c.mode
+                                );
+                                ensure!(
+                                    (c.mode == "reduce") == (c.partial_floats > 0),
+                                    "a cpu reduce launch, and only one, writes partials"
+                                );
+                                Ok(CpuLaunch {
+                                    reduce: c.mode == "reduce",
+                                    extent: Expr::from_value(&c.extent)?,
+                                    partial_floats: c.partial_floats,
+                                    parallel: c.parallel,
+                                })
+                            })
+                            .transpose()?,
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -593,6 +675,48 @@ impl Program {
                 "symbolic axis {axis} reads past the rank of {buffer}"
             );
         }
+        // A buffer stored over another is a scratch or output a kernel produced; what it is stored
+        // over is anything but a constant, which the host uploaded to read back unchanged.
+        for buffer in self.buffers.iter().filter(|b| b.alias.is_some()) {
+            let alias = buffer.alias.as_deref().unwrap();
+            let target = self.buffer(alias)?;
+            ensure!(
+                alias != buffer.name && target.role != "constant" && buffer.dtype == target.dtype,
+                "{} cannot be stored over the {} buffer {alias}",
+                buffer.name,
+                target.role
+            );
+            // Two paged buffers, one stored over the other, are one set of pages: the alias shares
+            // its root's table, and may view the pages at another shape as long as a page is a page.
+            // A paged buffer has no bytes to store a flat one over, nor the reverse; a flat alias is
+            // something a kernel produced, never an input or a constant the host would upload.
+            match (self.paged.get(&buffer.name), self.paged.get(alias)) {
+                (None, None) => ensure!(
+                    buffer.role != "input" && buffer.role != "constant",
+                    "{} cannot be stored over {alias}",
+                    buffer.name
+                ),
+                (Some(mine), Some(theirs)) => {
+                    let env = Env::new();
+                    ensure!(
+                        mine.page_bytes(buffer, &env)? == theirs.page_bytes(target, &env)?
+                            && mine.page_count(buffer, &env)? == theirs.page_count(target, &env)?,
+                        "{} is stored over {alias} but their pages differ",
+                        buffer.name
+                    );
+                }
+                _ => bail!("a paged buffer has no bytes to store {} over", buffer.name),
+            }
+            ensure!(
+                !self
+                    .launches
+                    .iter()
+                    .any(|l| l.zero_outputs.contains(&buffer.name)),
+                "zeroing {} would erase {alias}, which it is stored over",
+                buffer.name
+            );
+        }
+        self.alias_roots()?;
         // A paged buffer is what a kernel reads or writes through a table: only inputs and
         // outputs, never a slab the runtime would allocate or zero.
         let tables: BTreeSet<String> = self.paged.keys().map(|n| Paging::table(n)).collect();
@@ -605,6 +729,10 @@ impl Program {
             ensure!(
                 paging.axis < buffer.shape.len() && paging.page > 0,
                 "invalid paging for {name}"
+            );
+            ensure!(
+                paging.slots.is_none_or(|slots| slots > 0),
+                "a paged buffer holds at least one page: {name}"
             );
             // Pages are sized and counted once, at load: a shape the environment could grow
             // later would leave a table short of pages.
@@ -650,9 +778,6 @@ impl Program {
                     "paged buffer {name} cannot be zero-initialized per launch"
                 );
             }
-            // An indirect operand's table and selector are operands the host binds by address
-            // at run time; the plan need not declare them as buffers, and an entry whose arg
-            // this launch does not take is simply unused.
             for t in &launch.tma {
                 ensure!(
                     names.contains(t.src_buf.as_str()),
@@ -675,6 +800,14 @@ impl Program {
             }
             for (_, extent) in &launch.serial {
                 ensure!(*extent >= 0, "negative serial extent");
+            }
+            if launch.cpu.is_some() {
+                // A CPU kernel takes plain pointers and runs once per launch.
+                ensure!(
+                    launch.tma.is_empty() && launch.serial.is_empty(),
+                    "cpu launch {} uses a CUDA-only feature",
+                    launch.node_id
+                );
             }
         }
         Ok(())
@@ -704,18 +837,24 @@ impl Program {
 
     /// Every buffer's placement under `env`. Scratch buffers share one slab: a buffer is live
     /// from the launch that first writes it to the last launch that reads it, and buffers whose
-    /// intervals do not overlap share bytes (largest first, deterministic). A paged buffer has
-    /// no place here: it is reached through its table.
+    /// intervals do not overlap share bytes (largest first, deterministic). A buffer stored over
+    /// another (`Buffer::alias`) takes that buffer's bytes: the same region and offset outside the
+    /// slab, one packed interval covering both inside it. A paged buffer has no place here: it is
+    /// reached through its table.
     pub fn layout(&self, env: &Env) -> Result<Layout> {
         let mut layout = Layout::default();
-        let scratch: BTreeSet<&str> = self
-            .buffers
-            .iter()
-            .filter(|b| b.role == "scratch")
-            .map(|b| b.name.as_str())
-            .collect();
+        let roots = self.alias_roots()?;
+        let root_role = |name: &str| -> &str {
+            self.buffers
+                .iter()
+                .find(|b| b.name == roots[name])
+                .map_or("", |b| b.role.as_str())
+        };
         for buffer in &self.buffers {
-            if buffer.role == "scratch" || self.paged.contains_key(&buffer.name) {
+            if buffer.role == "scratch"
+                || self.paged.contains_key(&buffer.name)
+                || buffer.alias.is_some()
+            {
                 continue;
             }
             let bytes = buffer.byte_len(env)?;
@@ -731,26 +870,86 @@ impl Program {
                 },
             );
         }
-        if scratch.is_empty() {
+        for buffer in &self.buffers {
+            // A paged alias shares its root's table, not a placement.
+            if buffer.alias.is_none()
+                || root_role(&buffer.name) == "scratch"
+                || self.paged.contains_key(&buffer.name)
+            {
+                continue;
+            }
+            let base = layout.buffers[roots[buffer.name.as_str()]].clone();
+            let bytes = buffer.byte_len(env)?;
+            ensure!(
+                bytes == base.bytes,
+                "{} is stored over {} but their sizes differ",
+                buffer.name,
+                roots[buffer.name.as_str()]
+            );
+            layout.buffers.insert(
+                buffer.name.clone(),
+                Placement {
+                    region: base.region,
+                    offset: base.offset,
+                    bytes,
+                    shape: buffer.resolve_shape(env)?,
+                },
+            );
+        }
+        let members: BTreeSet<&str> = self
+            .buffers
+            .iter()
+            .filter(|b| root_role(&b.name) == "scratch" && !self.paged.contains_key(&b.name))
+            .map(|b| b.name.as_str())
+            .collect();
+        if members.is_empty() {
             return Ok(layout);
         }
-        let intervals = self.live_intervals(&scratch)?;
-        let mut sizes = BTreeMap::new();
-        for name in &scratch {
-            sizes.insert(*name, self.buffer(name)?.byte_len(env)?);
+        let intervals = self.live_intervals(&members)?;
+        let mut grouped: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut sizes: BTreeMap<&str, usize> = BTreeMap::new();
+        for name in &members {
+            let root = roots[name];
+            let (first, last_read) = intervals[*name];
+            // A buffer nothing reads is live to the end when it is a program output, and to the
+            // store over it when another buffer is stored over it; otherwise it is dead scratch.
+            let free = match last_read {
+                Some(last) => last + 1,
+                None if self.outputs.iter().any(|o| o == name) => self.launches.len(),
+                None if members.iter().any(|m| {
+                    self.buffer(m)
+                        .is_ok_and(|b| b.alias.as_deref() == Some(name))
+                }) =>
+                {
+                    first + 1
+                }
+                None => bail!("scratch buffer {name:?} has no consuming launch (dead scratch)"),
+            };
+            if *name != root {
+                // The bytes are the root's until its last reader has run: a store over it before
+                // that would be read back as the root's value.
+                ensure!(
+                    intervals[root].1.is_none_or(|last| last <= first),
+                    "{name} is stored over {root}, which a later launch reads"
+                );
+            }
+            let group = grouped.entry(root.to_owned()).or_insert((first, free));
+            *group = (group.0.min(first), group.1.max(free));
+            let size = sizes.entry(root).or_insert(0);
+            *size = (*size).max(self.buffer(name)?.byte_len(env)?);
         }
-        let (offsets, total) = plan_offsets(&intervals, &sizes);
+        let (offsets, total) = plan_offsets(&grouped, &sizes);
         layout
             .regions
             .insert(SCRATCH_REGION.to_owned(), total.max(1));
-        for name in &scratch {
+        for name in &members {
             let buffer = self.buffer(name)?;
             layout.buffers.insert(
                 (*name).to_owned(),
                 Placement {
                     region: SCRATCH_REGION.to_owned(),
-                    offset: offsets[*name],
-                    bytes: sizes[*name],
+                    offset: offsets[roots[name]],
+                    bytes: buffer.byte_len(env)?,
                     shape: buffer.resolve_shape(env)?,
                 },
             );
@@ -758,11 +957,46 @@ impl Program {
         Ok(layout)
     }
 
-    /// Per scratch buffer, its half-open live interval `[first_write, last_read + 1)` over the
-    /// launch order. A launch reads a buffer named in its args or as a TMA source; a serial
-    /// launch also reads what its own earlier steps stored. The `+ 1` is load-bearing: a
-    /// launch's output overlaps its inputs, so an output never aliases its own input.
-    fn live_intervals(&self, scratch: &BTreeSet<&str>) -> Result<BTreeMap<String, (usize, usize)>> {
+    /// The paged buffer whose pages `name` reads and writes: itself, or the one it is stored over.
+    pub fn paged_root<'a>(&'a self, name: &'a str) -> &'a str {
+        let mut root = name;
+        while let Some(alias) = self.buffer(root).ok().and_then(|b| b.alias.as_deref()) {
+            if !self.paged.contains_key(alias) {
+                break;
+            }
+            root = alias;
+        }
+        root
+    }
+
+    /// Every buffer's root: the buffer whose bytes it is stored in, itself when it is no alias.
+    fn alias_roots(&self) -> Result<BTreeMap<&str, &str>> {
+        let mut roots = BTreeMap::new();
+        for buffer in &self.buffers {
+            let mut root = buffer.name.as_str();
+            let mut hops = 0;
+            while let Some(alias) = &self.buffer(root)?.alias {
+                root = alias;
+                hops += 1;
+                ensure!(
+                    hops <= self.buffers.len(),
+                    "{} is stored over itself",
+                    buffer.name
+                );
+            }
+            roots.insert(buffer.name.as_str(), root);
+        }
+        Ok(roots)
+    }
+
+    /// Per slab member, the launch that first writes it and the last that reads it (`None` when
+    /// nothing does). A launch reads a buffer named in its args or as a TMA source; a serial
+    /// launch also reads what its own earlier steps stored. A launch's output overlaps its inputs,
+    /// so an output never shares bytes with its own input unless the plan says it is stored over it.
+    fn live_intervals(
+        &self,
+        members: &BTreeSet<&str>,
+    ) -> Result<BTreeMap<String, (usize, Option<usize>)>> {
         let mut first_write: BTreeMap<&str, usize> = BTreeMap::new();
         let mut last_read: BTreeMap<&str, usize> = BTreeMap::new();
         for (i, launch) in self.launches.iter().enumerate() {
@@ -780,7 +1014,7 @@ impl Program {
                     .collect::<Vec<_>>()
                     .iter(),
             ) {
-                if scratch.contains(w) {
+                if members.contains(w) {
                     first_write.entry(w).or_insert(i);
                 }
             }
@@ -790,21 +1024,18 @@ impl Program {
                 .map(String::as_str)
                 .chain(launch.tma.iter().map(|t| t.src_buf.as_str()));
             for name in reads {
-                if scratch.contains(name) && (!writes.contains(&name) || !launch.serial.is_empty())
+                if members.contains(name) && (!writes.contains(&name) || !launch.serial.is_empty())
                 {
                     last_read.insert(name, i);
                 }
             }
         }
         let mut intervals = BTreeMap::new();
-        for name in scratch {
+        for name in members {
             let first = *first_write
                 .get(name)
                 .with_context(|| format!("scratch buffer {name:?} has no producing launch"))?;
-            let last = *last_read.get(name).with_context(|| {
-                format!("scratch buffer {name:?} has no consuming launch (dead scratch)")
-            })?;
-            intervals.insert((*name).to_owned(), (first, last + 1));
+            intervals.insert((*name).to_owned(), (first, last_read.get(name).copied()));
         }
         Ok(intervals)
     }
@@ -984,6 +1215,18 @@ mod tests {
     }
 
     #[test]
+    fn plan_reads_non_finite_constants_spelled_as_strings() {
+        let mut plan = example();
+        plan["constants"] = json!({"w": "-inf"});
+        assert_eq!(
+            Program::parse(&plan.to_string()).unwrap().constants["w"],
+            f64::NEG_INFINITY
+        );
+        plan["constants"] = json!({"w": "huge"});
+        assert!(Program::parse(&plan.to_string()).is_err());
+    }
+
+    #[test]
     fn plan_parses_and_rejects_bad_references() {
         Program::parse(&example().to_string()).unwrap();
         for (pointer, value) in [
@@ -1007,6 +1250,89 @@ mod tests {
         let mut unknown = example();
         unknown["launches"][0]["unrecognized_abi"] = json!(true);
         assert!(Program::parse(&unknown.to_string()).is_err());
+    }
+
+    /// `y = x * w` on the CPU, split over a runtime-sized axis.
+    fn cpu_example() -> Value {
+        json!({
+            "format": 5, "backend": "cpu", "inputs": ["x"], "outputs": ["y"],
+            "buffers": [
+                {"name":"x", "shape":["n"], "dtype":"f32", "role":"input"},
+                {"name":"y", "shape":["n"], "dtype":"f32", "role":"output"},
+                {"name":"w", "shape":[1], "dtype":"f32", "role":"constant"}
+            ],
+            "constants": {"w": 2.0}, "runtime_constants": {}, "weights": {},
+            "kernels": {"k0": {"arch_specific":false}},
+            "symbols": {"bindings":{"n":["x",0]},"hints":{"n":4},"caps":{}},
+            "launches": [{"node_id":"y", "kernel":"k0", "args":["x","w","y"], "writes":["y"],
+                "zero_outputs":["y"], "runtime_args":["n"],
+                "cpu":{"mode":"range","extent":"n","partial_floats":0,"parallel":true}}]
+        })
+    }
+
+    #[test]
+    fn cpu_plan_carries_a_thread_split_and_no_cuda_launch_fields() {
+        let program = Program::parse(&cpu_example().to_string()).unwrap();
+        let split = program.launches[0].cpu.as_ref().unwrap();
+        let env: Env = [("n".to_owned(), 300)].into_iter().collect();
+        assert_eq!(split.extent.eval(&env).unwrap(), 300);
+        assert!(!split.reduce && split.parallel);
+        assert!(program.launches[0].grid.is_empty());
+        let mut reduce = cpu_example();
+        reduce["launches"][0]["cpu"]["mode"] = json!("reduce");
+        reduce["launches"][0]["cpu"]["partial_floats"] = json!(32);
+        assert!(
+            Program::parse(&reduce.to_string()).unwrap().launches[0]
+                .cpu
+                .as_ref()
+                .unwrap()
+                .reduce
+        );
+
+        let rejected = |edit: &dyn Fn(&mut Value), base: Value, reason: &str| {
+            let mut plan = base;
+            edit(&mut plan);
+            let error = Program::parse(&plan.to_string()).unwrap_err().to_string();
+            assert!(error.contains(reason), "expected {reason:?}, got {error:?}");
+        };
+        let cpu = cpu_example;
+        rejected(
+            &|p| p["backend"] = json!("metal"),
+            cpu(),
+            "unsupported plan backend",
+        );
+        rejected(&|p| p["format"] = json!(4), cpu(), "needs format 5");
+        // A cpu split appears exactly when the plan's backend is cpu.
+        rejected(
+            &|p| p["backend"] = json!("cuda"),
+            cpu(),
+            "cpu section exactly",
+        );
+        rejected(
+            &|p| drop(p["launches"][0].as_object_mut().unwrap().remove("cpu")),
+            cpu(),
+            "cpu section exactly",
+        );
+        rejected(
+            &|p| p["launches"][0]["cpu"] = cpu()["launches"][0]["cpu"].clone(),
+            example(),
+            "cpu section exactly",
+        );
+        rejected(
+            &|p| p["launches"][0]["cpu"]["mode"] = json!("tiled"),
+            cpu(),
+            "unknown cpu launch mode",
+        );
+        rejected(
+            &|p| p["launches"][0]["cpu"]["partial_floats"] = json!(32),
+            cpu(),
+            "writes partials",
+        );
+        rejected(
+            &|p| p["launches"][0]["serial"] = json!([["t", 4]]),
+            cpu(),
+            "CUDA-only feature",
+        );
     }
 
     /// One step of a cache fill: `k` holds the four keys this step produces, written through
@@ -1041,6 +1367,70 @@ mod tests {
         assert_eq!(paging.page_bytes(k, &Env::new()).unwrap(), 2 * 8 * 8 * 4);
         assert_eq!(paging.page_count(k, &Env::new()).unwrap(), 1);
         assert_eq!(Paging::table("k"), "k__pages");
+    }
+
+    fn aliased_example() -> Value {
+        // k0: s = f(x); k1: y stored over x at idx; k2: t stored over s at idx; k2's t is the output.
+        json!({
+            "format": 1, "backend": "cuda", "inputs": ["x", "idx"], "outputs": ["y", "t"],
+            "buffers": [
+                {"name":"x", "shape":[8, 4], "dtype":"f32", "role":"input"},
+                {"name":"idx", "shape":[3], "dtype":"i64", "role":"input"},
+                {"name":"s", "shape":[8, 4], "dtype":"f32", "role":"scratch"},
+                {"name":"y", "shape":[8, 4], "dtype":"f32", "role":"output", "alias":"x"},
+                {"name":"t", "shape":[8, 4], "dtype":"f32", "role":"output", "alias":"s"}
+            ],
+            "constants": {}, "runtime_constants": {}, "weights": {},
+            "kernels": {"k": {"binary_key":"k", "arch_specific":false}},
+            "symbols": {"bindings":{},"hints":{},"caps":{}},
+            "launches": [
+                {"node_id":"s", "kernel":"k", "args":["x","s"], "grid":[[1],[1],[1]],"block":[[32],[1],[1]],"smem":0,
+                 "zero_outputs":[],"runtime_args":[],"cuda":{"tma":[]}},
+                {"node_id":"y", "kernel":"k", "args":["idx","y"], "grid":[[1],[1],[1]],"block":[[32],[1],[1]],"smem":0,
+                 "zero_outputs":[],"runtime_args":[],"cuda":{"tma":[]}},
+                {"node_id":"t", "kernel":"k", "args":["idx","t"], "grid":[[1],[1],[1]],"block":[[32],[1],[1]],"smem":0,
+                 "zero_outputs":[],"runtime_args":[],"cuda":{"tma":[]}}
+            ]
+        })
+    }
+
+    #[test]
+    fn a_buffer_stored_over_another_takes_its_bytes() {
+        let program = Program::parse(&aliased_example().to_string()).unwrap();
+        let layout = program.layout(&Env::new()).unwrap();
+        // Over an input: the input's region, no region of its own.
+        assert_eq!(layout.buffers["y"].region, "input:x");
+        assert!(!layout.regions.contains_key("output:y"));
+        // Over a scratch buffer: the slab, at the same offset, one interval for both.
+        assert_eq!(layout.buffers["t"].region, SCRATCH_REGION);
+        assert_eq!(layout.buffers["t"].offset, layout.buffers["s"].offset);
+        assert_eq!(layout.regions[SCRATCH_REGION], 8 * 4 * 4);
+    }
+
+    #[test]
+    fn storing_over_a_buffer_something_still_reads_is_refused() {
+        let mut plan = aliased_example();
+        // A launch after the store over `s` reads `s`.
+        plan["launches"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"node_id":"u", "kernel":"k", "args":["s","y"], "grid":[[1],[1],[1]],"block":[[32],[1],[1]],
+                "smem":0, "zero_outputs":[],"runtime_args":[],"cuda":{"tma":[]}}));
+        let program = Program::parse(&plan.to_string()).unwrap();
+        assert!(program.layout(&Env::new()).is_err());
+        for (pointer, value) in [
+            ("/buffers/3/alias", json!("y")),
+            ("/buffers/3/alias", json!("idx")),
+            ("/buffers/3/alias", json!("missing")),
+            ("/launches/1/zero_outputs", json!(["y"])),
+        ] {
+            let mut bad = aliased_example();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                Program::parse(&bad.to_string()).is_err(),
+                "accepted {pointer}"
+            );
+        }
     }
 
     #[test]
@@ -1116,6 +1506,7 @@ mod tests {
             shape: vec![Expr::Int(2), Expr::Int(3)],
             dtype: "f16".into(),
             role: "input".into(),
+            alias: None,
         };
         assert_eq!(buffer.byte_len(&Env::new()).unwrap(), 12);
         buffer.shape = vec![Expr::Int(i64::MAX), Expr::Int(i64::MAX)];

@@ -1,7 +1,7 @@
 """GreedyStrategy — the greedy compile as a search shape (``Pipeline.run``'s orchestration).
 
-The decide callback it resolves with — :func:`~..policy.greedy.greedy_decide` — and the pricing
-machinery live in ``policy/greedy.py``: that is the POLICY (what to pick at one fork); this
+The decide callback it resolves with — :func:`~..policy.greedy.greedy_decide` — lives in
+``policy/greedy.py``: that is the POLICY (what to pick at one fork); this
 module is the SHAPE (how many resolves, the blocklist retries, the loud failure).
 """
 
@@ -15,19 +15,19 @@ from typing import TYPE_CHECKING
 from emmy.compiler.context import Context
 from emmy.compiler.ir.loop.ir import LoopOp
 from emmy.compiler.ir.tile.ir import TileOp
-from emmy.compiler.pipeline.fork import stamp_signature
-from emmy.compiler.pipeline.knob import KERNEL_IDENTITY, family_of
+from emmy.compiler.pipeline.knob import axis_of, family_of, family_pins
 from emmy.compiler.pipeline.pipeline import Decision, LoweringError, Run
 from emmy.compiler.pipeline.search.db import SearchDB
 from emmy.compiler.pipeline.search.golden.evidence import evidence_db
 from emmy.compiler.pipeline.search.pins import (
+    PLACEMENT_APPLIED_PINS_HINT,
     PLACEMENT_DECISIONS_HINT,
     composed_routes,
     place_keys_tracked,
     tracking_place_keys,
     unmatched_place_pins,
 )
-from emmy.compiler.pipeline.search.policy.greedy import _strip_fork_stamps, greedy_decide, logger, tile_identity
+from emmy.compiler.pipeline.search.policy.greedy import greedy_decide, logger, tile_identity
 from emmy.compiler.pipeline.search.strategy.base import SearchStrategy
 
 if TYPE_CHECKING:
@@ -53,11 +53,13 @@ class GreedyStrategy(SearchStrategy):
     * **Structural retirement** — a refused row blocklists at the piece's own schedule fork (its
       node id is stable across re-resolves), so the composed route replays while the piece
       re-ranks; once no row of the piece binds, the cut that minted it is retired at its own
-      fork — that one splice withdrawn, every other kernel-set decision still priced by the
+      fork — that one splice withdrawn, every other kernel-set decision still taken from the
       evidence — and the pieces' blocklists go with it.
-    * **Prior-off re-resolve** — when the blocklist budget exhausts, one final resolve without
-      the prior (emission-order pick) drops the extrapolation that overflowed; the measured
-      arms still decide the kernel-set forks they spell, and ``blocked`` rides along.
+    * **Prior-off re-resolve** — when the retry budget runs out or the retries have nothing left to
+      block, one final resolve drops the schedule prior at the nodes still un-lowered, and with it the
+      extrapolation that overflowed: those nodes take the first leaf the enumeration produces that
+      ``blocked`` does not list. Every other schedule fork keeps the prior, and kernel-set forks
+      still use measured arms and the placement prior.
     * **Loud failure** — a node the settled terminal left un-lowered raises
       :class:`~emmy.compiler.pipeline.pipeline.LoweringError` instead of a downstream
       ``CudaBackend`` mystery. What counts as un-lowered is the whole terminal when the
@@ -77,9 +79,8 @@ class GreedyStrategy(SearchStrategy):
         pipeline, backend, dump = self.pipeline, self.backend, self.dump
         if ctx is None:
             ctx = Context.probe()
-        backend_name = getattr(backend, "name", "cuda")
-        if ctx.backend_name != backend_name:
-            ctx = replace(ctx, backend_name=backend_name)
+        if ctx.backend_name != (name := getattr(backend, "name", ctx.backend_name)):
+            ctx = replace(ctx, backend_name=name)
         t_start = time.monotonic()
 
         # Only a pipeline that runs to the final lowering pass promises a Graph[CudaOp]; a
@@ -95,33 +96,30 @@ class GreedyStrategy(SearchStrategy):
         # measured it did.
         names = {pass_.name for pass_ in pipeline.passes}
         reaches_placement = "tile/cut" in names
-        # A kernel-set arm is priced by scheduling its pieces, so a pipeline that ends between
-        # ``tile/cut`` and ``tile/schedule`` cannot price one: its cut forks resolve by pins alone and
-        # otherwise keep the fused tree. That is what lets ``compile --passes dolfnstp`` show the
-        # cuts a kernel offers without paying for a schedule.
-        prices = not reaches_placement or "tile/schedule" in names
         db = evidence_db(self.db, ctx) if reaches_placement else (self.db if self.db is not None else SearchDB())
         # A caller already collecting resolved keys (the golden route check) reports them itself.
         report_pins = reaches_placement and not place_keys_tracked()
         with composed_routes(_measured_composed_routes(db) if reaches_placement else []), tracking_place_keys() as resolved:
             for _attempt in range(_MAX_GREEDY_RETRIES):
+                resolved.clear()
                 rejections: list[tuple[str, str, str]] = []
                 run = Run(pipeline=pipeline, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
-                terminal, trace = run.resolve(graph.copy(), greedy_decide(blocked=blocked, db=db, price_structural=prices))
+                terminal, trace = run.resolve(graph.copy(), greedy_decide(blocked=blocked, db=db))
                 stuck = _stuck(terminal, rejections, lowers_to_cuda=complete)
                 if not stuck or not _retire(blocked, trace, stuck):
                     break
-            # The prior-ranked tiles all overflowed ``validate(ctx)`` within the retry budget — an
-            # *online* prior can extrapolate a large tile onto a small shape, and the blocklist
-            # retry exhausts before reaching an in-budget leaf. Re-resolve WITHOUT the prior (the
-            # emission-order pick): the point is dropping the extrapolation that overflowed, not
-            # the quality of what emission order lands on. When that leaf overflows too the
-            # re-resolve stays un-lowered and ``_raise_on_unlowered`` fires below, exactly as
-            # before.
-            if _stuck(terminal, rejections, lowers_to_cuda=complete):
+            # The retries ran out, or had nothing left to block, with a node still un-lowered — an
+            # *online* prior can extrapolate a large tile onto a small shape, and the retry budget
+            # runs out before reaching an in-budget leaf. Re-resolve WITHOUT the schedule prior
+            # at the nodes still un-lowered (the emission-order pick): the point is dropping the
+            # extrapolation that overflowed, not the quality of what emission order lands on. Every
+            # other kernel keeps its prior-ranked pick. When that leaf overflows too the re-resolve
+            # stays un-lowered and ``_raise_on_unlowered`` fires below.
+            if stuck := _stuck(terminal, rejections, lowers_to_cuda=complete):
+                resolved.clear()
                 rejections = []
                 run = Run(pipeline=pipeline, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
-                terminal, trace = run.resolve(graph.copy(), greedy_decide(blocked=blocked, prior=None, db=db, price_structural=prices))
+                terminal, trace = run.resolve(graph.copy(), greedy_decide(blocked=blocked, db=db, unranked=frozenset(stuck)))
         _raise_on_unlowered(terminal, rejections, lowers_to_cuda=complete)
         if report_pins:
             for key in unmatched_place_pins(resolved):
@@ -129,24 +127,29 @@ class GreedyStrategy(SearchStrategy):
         terminal.hints.set(
             PLACEMENT_DECISIONS_HINT,
             [
-                {str(key): str(value) for key, value in decision.knob_delta.items() if family_of(str(key)) == "PLACE"}
+                {str(key): str(value) for key, value in decision.knob_delta.items() if family_of(str(key)) in {"PLACE", "LAYOUT"}}
                 for decision in trace
-                if any(family_of(str(key)) == "PLACE" for key in decision.knob_delta)
+                if any(family_of(str(key)) in {"PLACE", "LAYOUT"} for key in decision.knob_delta)
             ],
+        )
+        terminal.hints.set(
+            PLACEMENT_APPLIED_PINS_HINT,
+            {key: value for key, value in family_pins("PLACE", kernels=True) if key in resolved and axis_of(key) is not None},
         )
         logger.info("compile: total %.2fs (deterministic resolve)", time.monotonic() - t_start)
         return terminal
 
 
-def _measured_composed_routes(db) -> list[tuple[frozenset, tuple[str, ...]]]:
-    """Every kernel-set decision ``db`` stores that marks several seams ``cut`` — a composed decision,
-    keyed by the signature of the kernel it was recorded on (less the stamps a schedule fork mints, as
-    the evidence pick matches rows) — for the cut pass to offer."""
-    out: list[tuple[frozenset, tuple[str, ...]]] = []
-    for parent, stamps, arm in db.decisions():
+def _measured_composed_routes(db) -> list[tuple[str, tuple[str, ...]]]:
+    """Measured placement cuts by exact parent identity.
+
+    Multi-seam routes add a composed arm; any route can keep its fresh child open
+    when that child has a later measured cut.
+    """
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for parent, arm in db.decisions():
         keys = tuple(sorted(key for key, value in arm.items() if family_of(key) == "PLACE" and value == "cut"))
-        signature = _strip_fork_stamps(stamp_signature({**stamps, KERNEL_IDENTITY: parent}))
-        if len(keys) > 1 and (entry := (signature, keys)) not in out:
+        if keys and (entry := (parent, keys)) not in out:
             out.append(entry)
     return out
 

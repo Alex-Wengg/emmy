@@ -1,6 +1,6 @@
-"""``emmy db import`` — a DB instance filled from a measurement freeze, golden files and tune DBs, every kernel
-re-lowered by the current compiler; ``emmy db export``, the instance's rows as a dataset; the readers' refusal of a
-missing instance; and ``emmy db check``, the checks that an instance's tables agree with themselves."""
+"""``emmy db import`` — a DB instance filled from a measurement freeze, golden files and tune DBs, each a copy of the
+file's tables; ``emmy db export``, the instance's rows as a dataset; the readers' refusal of a missing instance; and
+``emmy db check``, the checks that an instance's tables agree with themselves."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pytest
 
 from emmy.commands.db import db_path, handle_db_check, handle_db_export, handle_db_import
 from emmy.compiler.pipeline.search.db import RoutingRow, SearchDB, knobs_json
-from emmy.compiler.pipeline.search.db.freeze import write_freeze
+from emmy.compiler.pipeline.search.db.freeze import write_freeze, write_run_freeze
 from emmy.compiler.pipeline.search.golden.evidence import file_source
 from emmy.compiler.structural import digest
 from tests.compiler.pipeline.search.helpers import tuned_db
@@ -77,7 +77,7 @@ def test_export_writes_a_dataset_the_readers_load(tmp_path):
     from emmy.compiler.pipeline.search.dataset import Dataset
 
     tuned_db(tmp_path / "dataset.db", (_CASE,), us=500.0).close()
-    args = Namespace(out=str(tmp_path / "dataset"), db=str(tmp_path / "dataset.db"), pool_sample=0, seed=0)
+    args = Namespace(out=str(tmp_path / "dataset"), db=str(tmp_path / "dataset.db"), pool_sample=0, seed=0, space="schedule", jobs=1)
     handle_db_export(args)
     dataset = Dataset.load(tmp_path / "dataset")
     assert (len(dataset.golden), len(dataset.measured)) == (0, 1) and dataset.provenance["source"] == str(tmp_path / "dataset.db")
@@ -87,9 +87,23 @@ def test_export_writes_a_dataset_the_readers_load(tmp_path):
     assert (tmp_path / "dataset" / "manifest.json").read_bytes() == first
 
 
-def test_a_tune_db_is_frozen_and_re_lowered_on_import(tmp_path):
-    """A tune DB's rows reach the dataset the way a freeze of it would: re-lowered from each kernel's
-    definition and sourced by the frozen file's digest. A golden row a compile imported into the tune DB
+def test_placement_export_reads_the_instance_alone(tmp_path):
+    """A placement export opens no golden file: what a layout fork is offered on came in with the import."""
+    from emmy.compiler.pipeline.search.dataset import Dataset
+
+    tuned_db(tmp_path / "source.db", ("fused/linear-add-place-cut-sm70.json",), us=500.0).close()
+    write_freeze(tmp_path / "source.db", tmp_path / "goldens")
+    [golden] = (tmp_path / "goldens").glob("*.json")
+    database = tmp_path / "dataset.db"
+    handle_db_import(Namespace(sources=[str(golden)], db=str(database), fresh=True))
+    args = Namespace(out=str(tmp_path / "placement"), db=str(database), pool_sample=0, seed=0, space="placement", jobs=1)
+    handle_db_export(args)
+    assert Dataset.load(args.out).golden
+
+
+def test_a_tune_db_is_frozen_on_import(tmp_path):
+    """A tune DB's rows reach the dataset the way a freeze of it would: as the frozen file's rows, sourced by its
+    digest. A golden row a compile imported into the tune DB
     stays behind — the golden file holds it — and a file the instance already holds is not imported twice."""
     tune = tuned_db(tmp_path / "autotune.db", (_CASE, "fused/linear-add-place-cut-sm70.json"))
     [plain] = [row for row in tune.iter_perf_rows() if row.cc == 120]
@@ -129,7 +143,7 @@ def _instance(path):
     stats = PerfStats(median=10.0, min=10.0, max=10.0, mean=10.0, variance=0.0, n_samples=3)
     for tile in (parent, piece):
         identity = tile.identity_key(structural=False, with_io=True)
-        db.record_perf(ctx, identity, bindings=kernel_bindings(tile), knobs={"WORK": "t16"}, backend="cuda", status="ok", stats=stats)
+        db.record_perf(ctx, identity, bindings=kernel_bindings(tile), knobs={"WORK": "t16"}, status="ok", stats=stats)
     db.record_routing(
         RoutingRow(
             parent=parent.identity_key(structural=False, with_io=True),
@@ -143,7 +157,7 @@ def _instance(path):
 _TAMPERS = {
     "schedule and placement digests match their knob rows": "UPDATE placement SET digest = 'moved'",
     "every row names the rows it references": "DELETE FROM kernel WHERE kernel_name = 'k_piece'",
-    "every context names a registry card": "UPDATE context SET gpu_name = 'Mystery GPU'",
+    "every CUDA context names a registry card": "UPDATE context SET gpu_name = 'Mystery GPU'",
     "schedule knobs and placement knobs stay apart": (
         f"INSERT INTO schedule (id, digest) VALUES (99, '{digest(knobs_json({'PLACE': 'cut'}))}'); "
         "INSERT INTO schedule_knob VALUES (99, 'PLACE', 'cut')"
@@ -180,3 +194,80 @@ def test_check_exits_nonzero_on_drift(tmp_path):
     db.close()
     with pytest.raises(SystemExit):
         handle_db_check(Namespace(db=str(tmp_path / "tune.db")))
+
+
+def test_repository_import_reads_the_checked_in_freeze_beside_the_goldens(tmp_path, monkeypatch):
+    """``--repository`` reads the measurement freeze kept with the repository beside the repository goldens — its
+    rows land under their ``freeze:`` sources — and adds nothing where no freeze is checked in."""
+    from contextlib import nullcontext
+
+    from emmy.compiler.pipeline.search.db import freeze
+    from emmy.compiler.pipeline.search.golden import repository
+
+    monkeypatch.setattr(repository, "repository_golden_paths", lambda: nullcontext([]))  # the goldens are not the subject
+    monkeypatch.setattr(freeze, "REPOSITORY_FREEZE", tmp_path / "freezes")
+    args = Namespace(sources=[], db=str(tmp_path / "dataset.db"), fresh=True, repository=True)
+    with pytest.raises(SystemExit):  # no freeze checked in and no golden: nothing to import
+        handle_db_import(args)
+
+    frozen = _freeze(tmp_path, "freezes", 500.0)
+    handle_db_import(args)
+    db = SearchDB.open_readonly(tmp_path / "dataset.db")
+    assert db.perf_sources() == dict.fromkeys(frozen, 1)
+    db.close()
+
+
+def test_the_freeze_grows_by_merging_a_tune_db_and_a_second_merge_changes_nothing(tmp_path):
+    """The repository freeze grows by import and freeze: the directory and a tune DB go into one instance, the
+    instance is frozen back into the directory. A schedule measured on both sides takes the tune DB's row, faster or
+    slower, a new schedule joins, and merging the same tune DB again rewrites the same bytes."""
+    _freeze(tmp_path, "freezes", 500.0)
+    tune = tuned_db(tmp_path / "autotune.db", (_CASE,), us=700.0)
+    [row] = list(tune.iter_perf_rows())
+    tune.record_perf_row(dataclasses.replace(row, knobs={**row.knobs, "WORK": "t8"}, stats=dataclasses.replace(row.stats, median=600.0)))
+    tune.close()
+
+    def merge():
+        sources = [str(tmp_path / "freezes"), str(tmp_path / "autotune.db")]
+        handle_db_import(Namespace(sources=sources, db=str(tmp_path / "merge.db"), fresh=True))
+        return write_freeze(tmp_path / "merge.db", tmp_path / "freezes")
+
+    first = merge()
+    handle_db_import(Namespace(sources=[str(tmp_path / "freezes")], db=str(tmp_path / "check.db"), fresh=True))
+    db = SearchDB.open_readonly(tmp_path / "check.db")
+    assert sorted(row.stats.median for row in db.iter_perf_rows()) == [600.0, 700.0]
+    db.close()
+    assert merge() == first
+
+
+def test_a_tunes_freeze_file_imports_after_the_cards_and_the_fold_leaves_one_file(tmp_path):
+    """The file a tune writes beside the card's sorts after it, so the import reads it last and its row wins; the
+    nightly fold — import the directory, freeze it back — leaves one file per card holding that row, and folding
+    again rewrites the same bytes."""
+    _freeze(tmp_path, "freezes", 500.0)
+    tuned_db(tmp_path / "run.db", (_CASE,), us=700.0).close()
+    [run] = write_run_freeze(tmp_path / "run.db", tmp_path / "freezes")
+    names = sorted(path.name for path in (tmp_path / "freezes").glob("*.json"))
+    assert len(names) == 2 and names[-1] == run.name
+
+    handle_db_import(Namespace(sources=[str(tmp_path / "freezes")], db=str(tmp_path / "fold.db"), fresh=True))
+    db = SearchDB.open_readonly(tmp_path / "fold.db")
+    assert [(row.stats.median, row.source) for row in db.iter_perf_rows()] == [(700.0, file_source("freeze", run))]
+    db.close()
+    first = write_freeze(tmp_path / "fold.db", tmp_path / "freezes")
+    assert sorted(path.name for path in (tmp_path / "freezes").glob("*.json")) == sorted(first)
+    handle_db_import(Namespace(sources=[str(tmp_path / "freezes")], db=str(tmp_path / "again.db"), fresh=True))
+    assert write_freeze(tmp_path / "again.db", tmp_path / "freezes") == first
+
+
+def test_a_freeze_row_never_replaces_a_golden_row(tmp_path):
+    """A golden file's row is the file's: a freeze that measured the same schedule faster — a tune re-benching the
+    golden's own pick — does not take it over, or the golden readers, which read ``golden:`` rows alone, would lose
+    the pool from the fit."""
+    _freeze(tmp_path, "goldens", 500.0)
+    [golden] = (tmp_path / "goldens").glob("*.json")
+    _freeze(tmp_path, "faster", 400.0)
+    handle_db_import(Namespace(sources=[str(golden), str(tmp_path / "faster")], db=str(tmp_path / "dataset.db"), fresh=True))
+    db = SearchDB.open_readonly(tmp_path / "dataset.db")
+    assert [(row.source.split(":")[0], row.stats.median) for row in db.iter_perf_rows()] == [("golden", 500.0)]
+    db.close()

@@ -38,14 +38,17 @@ changes the model's forward changes these twins — exactly as it would change s
 from __future__ import annotations
 
 import logging
+import math
 import re
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from emmy.compiler.loader.exl3 import coded_tensor_storage
+from emmy.serving.release import EXPERT_PREFILL_M
 
 if TYPE_CHECKING:
     from emmy.compiler.graph import Graph
+    from emmy.serving.release import ServingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,115 @@ def twin_width(name: str) -> int | None:
     or ``None`` for a symbolic twin (``pre-sym``)."""
     match = re.match(r"[a-z_]+(\d+)", name)
     return int(match.group(1)) if match else None
+
+
+def _bound_tensors(graph) -> frozenset:
+    """The checkpoint tensors a traced program binds."""
+    return frozenset(path for _, op in graph.loadable_constants() for path in (op.source_path, *(p for p, _ in op.source_parts)) if path)
+
+
+def _width(graph) -> float:
+    """How wide a twin is: the elements of its inputs and outputs. The twins of one family differ only in their token
+    width, so this orders them by it; a symbolic twin is widest."""
+    buffers = (graph.buffer(name) for name in (*graph.inputs, *graph.outputs))
+    sizes = [[dim if isinstance(dim, int) else dim.to_wire() for dim in buffer.shape] for buffer in buffers]
+    if any(not isinstance(dim, int) for shape in sizes for dim in shape):
+        return float("inf")
+    return sum(math.prod(shape) for shape in sizes)
+
+
+def fork_less_weights(graph, ctx) -> set[str]:
+    """The transposed weights of traced program ``graph`` that one of the kernels the cut pass starts from reads with
+    no layout fork: they stay folded, so a family holding them settles them folded before any twin decides."""
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.tile._layout import fork_less_reads  # noqa: PLC0415
+
+    return fork_less_reads(Pipeline.build([*LOOP_PASSES, "tile/lift"]).run(graph.copy(), ctx=ctx, db=None))
+
+
+def twins_in_build_order(graphs, fork_less):
+    """``(key, scope)`` for each traced program of ``graphs`` (key -> program), in the order the serving runner builds a
+    wrapper's twins (it orders its builds explicitly; the serving audit and the golden target walk order through this).
+
+    A *family* is the programs that bind the same checkpoint tensors: one serving wrapper's twins. They share one
+    :class:`LayoutScope` and build narrowest first, a symbolic one last, so the decode widths, where a weight's layout
+    costs most, decide it. Before any of them decides, the scope settles folded every weight ``fork_less`` (graph ->
+    names; :func:`fork_less_weights`) finds a fork-less reader of in any of them. A program that binds no checkpoint
+    tensor has a scope of its own. The grouping needs the exact same set: two twins of one wrapper that differed by one
+    bound tensor would get separate scopes here, though serving shares one per wrapper."""
+    families: dict[frozenset, list] = {}
+    for key, graph in graphs.items():
+        families.setdefault(_bound_tensors(graph) or frozenset({("own", key)}), []).append(key)
+    for keys in families.values():
+        scope = LayoutScope()
+        for key in keys:
+            scope.fix(str(key), fork_less(graphs[key]))
+        for key in sorted(keys, key=lambda key: _width(graphs[key])):
+            yield key, scope
+
+
+class LayoutConflict(RuntimeError):
+    """A program would read a weight in a second layout, a second device copy: never a reason to drop a tier."""
+
+
+@dataclass
+class LayoutScope:
+    """The layout each transposed weight of one family of twins is bound in (folded buffer name -> ``folded`` /
+    ``source``) and what settled it. The cut pass offers a layout fork per kernel and the first kernel to decide fixes
+    it for its program; serving keeps one device copy per layout, so a later twin compiles with these layouts settled
+    (:meth:`settled`, for :func:`~emmy.compiler.pipeline.passes.tile._layout.settled_layouts`)."""
+
+    layouts: dict[str, tuple[str, str]] = field(default_factory=dict)
+
+    def settled(self) -> dict[str, str]:
+        return {weight: layout for weight, (layout, _by) in sorted(self.layouts.items())}
+
+    def describe(self) -> str:
+        return ", ".join(f"{weight}={layout} settled by {by}" for weight, (layout, by) in sorted(self.layouts.items()))
+
+    def fix(self, twin: str, weights) -> None:
+        """Settle folded each of ``weights``, which a reader in twin ``twin`` reads with no layout fork."""
+        for weight in sorted(weights):
+            self.layouts.setdefault(weight, ("folded", f"{twin}'s reader with no layout fork"))
+
+    def record(self, twin: str, constants) -> None:
+        """Take the layouts twin ``twin`` binds — ``constants`` pairs each bound constant's buffer name with whether
+        its load chain ends in a transpose — into the scope; raise :class:`LayoutConflict` when it reads a weight in
+        both layouts, or in the other layout than the scope already holds."""
+        from emmy.compiler.pipeline.passes.tile._layout import SOURCE_SUFFIX  # noqa: PLC0415
+
+        bound: dict[str, set[str]] = {}
+        for name, transposed in constants:
+            if name.endswith(SOURCE_SUFFIX):
+                bound.setdefault(name.removesuffix(SOURCE_SUFFIX), set()).add("source")
+            elif transposed:
+                bound.setdefault(name, set()).add("folded")
+        for weight, layouts in sorted(bound.items()):
+            if len(layouts) > 1:
+                raise LayoutConflict(f"{twin} reads weight {weight!r} both folded and source — two device copies")
+            (layout,) = layouts
+            held, settled_by = self.layouts.setdefault(weight, (layout, twin))
+            if held != layout:
+                raise LayoutConflict(
+                    f"{twin} reads weight {weight!r} {layout}, but it is {held}, settled by {settled_by} — two device copies"
+                )
+
+
+def graph_layouts(graph):
+    """The ``(buffer name, read through a trailing transpose)`` pairs of a compiled graph's bound constants."""
+    from emmy.compiler.ir.frontend.ir import TransposeOp  # noqa: PLC0415
+
+    return [(name, bool(op.load_ops) and isinstance(op.load_ops[-1], TransposeOp)) for name, op in graph.loadable_constants()]
+
+
+def plan_layouts(plan):
+    """:func:`graph_layouts` of the program an execution plan was built from."""
+    return [(name, bool(w.load_ops) and w.load_ops[-1][0] == "transpose") for name, w in plan.weights.items()]
+
+
+def twin_realizations(serving: ServingConfig, name: str) -> tuple:
+    """The serving config's rows the twin ``name`` reaches (:meth:`ServingConfig.realizations_for`)."""
+    return serving.realizations_for(twin_width(name), expert=name.startswith("expert"), gdn=name.startswith("gdn"))
 
 
 def _serving_twin_buckets(
@@ -82,6 +194,18 @@ def _serving_twin_buckets(
     return buckets
 
 
+def capture_serving_twins(model: str, serving: ServingConfig) -> dict[str, Graph]:
+    """The twins of one serving config's matrix, in its data type: its static widths plus the any-width
+    programs, or exactly width 1 for a static-only config. ``emmy trace --serving-twins`` records these and
+    ``emmy eval golden`` compiles them."""
+    common = {"dtype": serving.dtype, "expert_slices": serving.tensor_parallel_size}
+    if serving.lora_rank is not None:
+        common["lora_rank"] = serving.lora_rank
+    if serving.static_only:
+        return capture_twin_graphs(model, decode_bucket=1, prefill_bucket=0, symbolic=False, static_only=True, **common)
+    return capture_twin_graphs(model, decode_bucket=0, prefill_bucket=0, extra_widths=serving.static_widths, symbolic=True, **common)
+
+
 def capture_twin_graphs(
     model: str,
     *,
@@ -91,6 +215,8 @@ def capture_twin_graphs(
     symbolic: bool = True,
     dtype: str = "float16",
     static_only: bool = False,
+    expert_slices: int = 1,
+    lora_rank: int | None = None,
 ) -> dict[str, Graph]:
     """Trace every serving twin of ``model`` from its config alone (no weights).
 
@@ -99,20 +225,26 @@ def capture_twin_graphs(
     the rungs differ in exactly the bit allocation the keys carry). Returns
     ``{"pre32": Graph, "post32": …, "pre256": …, "pre-sym": …}`` plus ``-global``
     variants of each when the model has ``full_attention`` layers — the names the serving-twin
-    trace writes. ``extra_widths`` adds release-specific decode or
+    trace writes. A gated DeltaNet layer traces one whole-layer program per static width plus width 1
+    (``gdn1``, ``gdn32``) and has no any-width form, unless it sits on a hyper-connection seam (Qwen4Exp),
+    where the fork runs the mixer and the layer takes the pre/post/expert programs. ``extra_widths`` adds release-specific decode or
     prefill buckets. On an EXL3 checkpoint each twin holding coded weights is replaced by its
     spelled forms, one per rate profile (``…@b4``). An FP8 expert twin is replaced by the
     config-declared storage form (``…@f8e4m3``), retaining a plain form only when its layer
     profile includes unconverted experts. Native MXFP4 expert twins carry the corresponding
     ``@mxfp4`` suffix and the exact packed block/scale inputs. ``static_only`` is the deliberate exception: it accepts
-    only the proven decode-1/prefill-0 envelope and emits M=1 without any standard or symbolic twins."""
+    only the proven decode-1/prefill-0 envelope and emits M=1 without any standard or symbolic twins.
+    ``expert_slices`` is the serving tensor-parallel width: each rank holds that slice of every routed
+    expert (:func:`~emmy.compiler.trace.huggingface.slice_routed_experts`), so the expert twins are
+    the sliced programs serving compiles."""
     import torch  # noqa: PLC0415
     from transformers import AutoConfig, AutoModel  # noqa: PLC0415
 
     from emmy.compiler.loader.quant import (  # noqa: PLC0415
+        declares_coded_weights,
         fp8_weight_profile,
         mxfp4_weight_profile,
-        nvfp4_checkpoint_dir,
+        nvfp4_weight_profile,
         strip_engine_quant_config,
     )
     from emmy.compiler.loader.safetensors import split_revision  # noqa: PLC0415
@@ -125,14 +257,20 @@ def capture_twin_graphs(
         moe_block_parts,
         moe_expert_layout,
         retarget_constants_to_model,
+        slice_routed_experts,
     )
     from emmy.serving.gen_runner import trace_split  # noqa: PLC0415
 
     model, revision = split_revision(model)
     cfg = AutoConfig.from_pretrained(model, revision=revision)
     text = getattr(cfg, "text_config", cfg)
+    if lora_rank is not None and (lora_rank < 1 or getattr(text, "model_type", None) != "llama"):
+        raise ValueError("LoRA serving twins require a positive rank and a Llama checkpoint")
     storage = coded_tensor_storage(model, cfg, revision=revision)
-    fp4_dir = nvfp4_checkpoint_dir(model, cfg, revision=revision)
+    coded_weights = declares_coded_weights(cfg)
+    nvfp4 = nvfp4_weight_profile(cfg)
+    if lora_rank is not None and storage:
+        raise ValueError("LoRA serving twins currently require an unquantized Llama checkpoint")
     fp8 = fp8_weight_profile(text)
     mxfp4 = mxfp4_weight_profile(text)
     strip_engine_quant_config(text)
@@ -152,6 +290,8 @@ def capture_twin_graphs(
             if "trust_remote_code" not in str(exc):
                 raise
             trunk = AutoModel.from_config(text, dtype=td, trust_remote_code=True).eval()
+        if expert_slices > 1:
+            slice_routed_experts(trunk, 0, expert_slices)
     hidden = text.hidden_size
 
     # Every static width a serving mode deploys gets a twin, so the in-model golden audit
@@ -182,11 +322,14 @@ def capture_twin_graphs(
     for layer_idx, block, suffix in layers:
         members = {i for i, signature in enumerate(signatures) if signature == signatures[layer_idx]}
         mixer = getattr(block, "linear_attn", None)
-        if mixer is not None:
-            if any(rows is None for _name, rows in buckets):
-                raise NotImplementedError("GDN state programs require static sequence widths; capture with symbolic=False")
+        if mixer is not None and hyper_connection_seam(block) is None:
+            # A GDN state program exists at static widths only, and a padded token would corrupt the state, so the
+            # runner serves any token count as a sum of static widths. Width 1 makes every count reachable, so a GDN
+            # layer always has a width-1 twin and never an any-width one.
+            static = sorted({rows for _name, rows in buckets if rows is not None} | {1})
             wrapper = build_gdn_state_wrapper(block).to_empty(device="cpu").to(td)
-            for name, rows in buckets:
+            for rows in static:
+                name = str(rows)
                 args = [
                     torch.zeros(1, rows, hidden, dtype=td),
                     torch.zeros(1, mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim, dtype=torch.float32),
@@ -198,8 +341,15 @@ def capture_twin_graphs(
                 layer_scopes[twin_name] = members
             continue
         parts = moe_block_parts(block.mlp)
+        if lora_rank is not None and parts is not None:
+            raise ValueError("LoRA serving twins currently require dense Llama layers")
         if parts is None:
-            pre_w, post_w = build_attention_split_wrapper(block)
+            if lora_rank is None:
+                pre_w, post_w = build_attention_split_wrapper(block)
+            else:
+                from emmy.serving.lora import build_lora_attention_split_wrapper
+
+                pre_w, post_w = build_lora_attention_split_wrapper(block)
             expert_w = None
         else:
             pre_w, post_w, expert_w = build_moe_split_wrapper(block, split_gate_up=bool(storage))
@@ -220,8 +370,20 @@ def capture_twin_graphs(
             if getattr(pre_w, "emits_gate", False):
                 post_args.append(torch.zeros(rows, attn_width, dtype=td))
                 post_names.append("gate")
+            pre_args = [torch.zeros(rows, carrier, dtype=td)]
+            pre_names = ["hidden"]
+            if lora_rank is not None:
+                from emmy.serving.lora import POST_PROJECTIONS, PRE_PROJECTIONS, weight_examples
+
+                examples = weight_examples(block, lora_rank, td)
+                pre_args += [torch.zeros(rows, 1, dtype=td)]
+                pre_args += [tensor for projection in PRE_PROJECTIONS for tensor in examples[projection]]
+                post_args += [torch.zeros(rows, 1, dtype=td)]
+                post_args += [tensor for projection in POST_PROJECTIONS for tensor in examples[projection]]
+                pre_names.append("lora_mask")
+                post_names.append("lora_mask")
             halves = [
-                ("pre", pre_w, [torch.zeros(rows, carrier, dtype=td)], ["hidden"] if m is None else None),
+                ("pre", pre_w, pre_args, pre_names if m is None else None),
                 (
                     "post",
                     post_w,
@@ -235,7 +397,13 @@ def capture_twin_graphs(
                     graphs[twin_name] = trace_split(wrapper, example_args, argnames)
                     layer_scopes[twin_name] = members
 
-            if expert_w is not None:
+        if expert_w is not None:
+            # Every MoE boot compiles the M=1 expert program — the fixed-slot tier runs it — whatever
+            # widths the trunk serves, so the expert twins carry width 1 too. A boot with an any-width
+            # program also compiles the static M=256 expert prefill twin.
+            widths = {m for _name, m in buckets}
+            expert_buckets = [*buckets, *((str(m), m) for m in (1, EXPERT_PREFILL_M) if m not in widths and (m == 1 or None in widths))]
+            for name, m in expert_buckets:
                 rows = 8 if m is None else m
                 examples = _expert_examples(parts[1], rows, hidden, td, split_gate_up=bool(storage))
                 argnames = ["x"] if m is None else None
@@ -247,14 +415,37 @@ def capture_twin_graphs(
                     # BEFORE fp8: a checkpoint can declare an fp8 trunk beside natively MXFP4
                     # routed experts (DeepSeek V4), and the experts are what this twin records.
                     graphs.update(_spell_mxfp4_expert_twins(expert_name, graph, mxfp4, members, moe_expert_layout(parts[1])[0]))
+                elif nvfp4 is not None:
+                    graphs.update(_spell_nvfp4_expert_twins(expert_name, graph, nvfp4, members, moe_expert_layout(parts[1])[0]))
                 elif fp8 is not None:
                     graphs.update(_spell_fp8_expert_twins(expert_name, graph, fp8, members))
                 else:
                     graphs[expert_name] = graph
+            # The fixed-slot decode program: the row's k picks gathered from the E-stacked expert tensors
+            # (``gen_runner._slot_program``), spelled like the per-expert twins with the expert axis leading.
+            top_k = int(getattr(text, "num_experts_per_tok", 0) or 0)
+            if top_k:
+                from emmy.serving.gen_runner import _slot_program  # noqa: PLC0415
+
+                count = int(parts[1].gate_up_proj.shape[0])
+                one = _expert_examples(parts[1], 1, hidden, td, split_gate_up=bool(storage))
+                stacked = [one[0], torch.zeros(top_k, dtype=torch.int64), *(torch.zeros((count, *a.shape), dtype=a.dtype) for a in one[1:])]
+                graph = trace_split(_slot_program(expert_w), stacked, None)
+                slots_name = f"expert-slots{suffix}"
+                if storage:
+                    graphs.update(_spell_expert_twins(slots_name, graph, storage, lead=(count,)))
+                elif mxfp4 is not None:
+                    graphs.update(_spell_mxfp4_expert_twins(slots_name, graph, mxfp4, members, moe_expert_layout(parts[1])[0]))
+                elif nvfp4 is not None:
+                    graphs.update(_spell_nvfp4_expert_twins(slots_name, graph, nvfp4, members, moe_expert_layout(parts[1])[0]))
+                elif fp8 is not None:
+                    graphs.update(_spell_fp8_expert_twins(slots_name, graph, fp8, members))
+                else:
+                    graphs[slots_name] = graph
     if storage:
         return _spell_coded_twins(graphs, storage, layer_scopes=layer_scopes)
-    if fp4_dir is not None:
-        return _spell_fp4_twins(graphs, fp4_dir, layer_scopes)
+    if coded_weights:
+        return _spell_checkpoint_twins(graphs, model, revision, layer_scopes)
     return graphs
 
 
@@ -306,6 +497,12 @@ def _layer_signatures(trunk, config) -> list[tuple[str, str, int]]:
 
     out = []
     for i, block in enumerate(trunk.layers):
+        if hyper_connection_seam(block) is not None:
+            # The token mixer is the fork's and the router runs outside the twins, so every DeepSeek V4 layer
+            # (sliding/HCA/CSA attention, hash/top-k router) and every Qwen4Exp layer (Gated DeltaNet or sparse
+            # attention, with or without the n-gram PLE) compiles the same pre/post/expert programs: one profile.
+            out.append(("sparse", "hyper_connection", 0))
+            continue
         attn = at(types, i, "homogeneous")
         attention = getattr(block, "self_attn", None)
         if attention is None:
@@ -319,12 +516,6 @@ def _layer_signatures(trunk, config) -> list[tuple[str, str, int]]:
                 "blocks whose token mixer is not attention (e.g. a gated delta net) have no serving program yet"
             )
         inferred_heads, _width = _attention_query_layout(attention)
-        if hyper_connection_seam(block) is not None:
-            # The attention sublayer is the fork's and the router runs outside the twins, so every
-            # DeepSeek V4 layer compiles the same pre/post/expert programs whatever its attention
-            # (sliding/HCA/CSA) or router (hash/top-k) kind: one profile, lowered once.
-            out.append(("sparse", "hyper_connection", int(inferred_heads)))
-            continue
         mlp = at(mlp_types, i, "sparse" if moe_block_parts(block.mlp) is not None else "dense")
         nheads = at(heads, i, inferred_heads)
         out.append((str(mlp), str(attn), int(nheads)))
@@ -427,14 +618,39 @@ def _spell_fp8_expert_twins(name: str, graph: Graph, profile, layers: set[int]) 
     if coded:
         specs = {}
         for inp in ("w_gate_up", "w_down"):
-            n, k = (int(d.as_static()) for d in graph.nodes[inp].output.shape)
-            specs[inp] = (fmt, (1, 1) if block is None else (-(-n // block[0]), -(-k // block[1])), "f32")
+            *lead, n, k = (int(d.as_static()) for d in graph.nodes[inp].output.shape)  # lead: a stacked expert axis
+            specs[inp] = (fmt, (*lead, *((1, 1) if block is None else (-(-n // block[0]), -(-k // block[1])))), "f32")
         spelled = graph.copy()
         spell_quantized_inputs(spelled, specs)
         out[f"{name}@{fmt}"] = spelled
     if layers - coded:
         out[name] = graph
     return out
+
+
+def _spell_nvfp4_expert_twins(name: str, graph: Graph, patterns: list[str], layers: set[int], transposed: bool) -> dict[str, Graph]:
+    """The NVFP4 routed-expert twin derived from logical input shapes, weight-only.
+
+    Serving binds each expert's packed e2m1 pairs, e4m3 block scales and one global scale per row
+    (:func:`~emmy.compiler.loader.quant.spell_nvfp4_inputs`), and the activations stay in the model dtype: the
+    checkpoint's static input scales are not read, as the 1Cat fork's V100 NVFP4 experts do not read them."""
+    from emmy.compiler.loader.quant import NVFP4_BLOCK, _is_skipped, spell_nvfp4_inputs  # noqa: PLC0415
+
+    if transposed:
+        raise NotImplementedError(f"NVFP4 expert twin {name!r}: only the F.linear (out, in) expert layout is spelled")
+    coded = {i for i in layers if not _is_skipped(f"model.layers.{i}.mlp.experts.weight", patterns)}
+    if skipped := layers - coded:
+        raise NotImplementedError(
+            f"NVFP4 serving requires every routed-expert layer in profile {name!r} to stay compressed; "
+            f"quantization skip patterns exclude layer(s) {sorted(skipped)}"
+        )
+    specs = {}
+    for inp in ("w_gate_up", "w_down"):
+        *lead, n, k = (int(d.as_static()) for d in graph.nodes[inp].output.shape)  # lead: a stacked expert axis
+        specs[inp] = ((*lead, n, k // 2), (*lead, n, k // NVFP4_BLOCK))
+    spelled = graph.copy()
+    spell_nvfp4_inputs(spelled, specs)
+    return {f"{name}@nvfp4": spelled}
 
 
 def _spell_mxfp4_expert_twins(name: str, graph: Graph, patterns: list[str], layers: set[int], transposed: bool) -> dict[str, Graph]:
@@ -453,18 +669,19 @@ def _spell_mxfp4_expert_twins(name: str, graph: Graph, patterns: list[str], laye
         )
     specs = {}
     for inp in ("w_gate_up", "w_down"):
-        logical = tuple(int(d.as_static()) for d in graph.nodes[inp].output.shape)
-        k, n = logical if transposed else logical[::-1]
+        *lead, a, b = (int(d.as_static()) for d in graph.nodes[inp].output.shape)  # lead: a stacked expert axis
+        k, n = (a, b) if transposed else (b, a)
         if k % 32:
             raise ValueError(f"MXFP4 expert input {inp!r} has input width {k}, not divisible by 32")
-        specs[inp] = ((n, k // 32, 16), (n, k // 32))
+        specs[inp] = ((*lead, n, k // 32, 16), (*lead, n, k // 32))
     spelled = graph.copy()
     spell_mxfp4_inputs(spelled, specs, transposed=transposed)
     return {f"{name}@mxfp4": spelled}
 
 
-def _spell_expert_twins(name: str, graph: Graph, storage: dict) -> dict[str, Graph]:
-    """Spell each distinct EXL3 routed-expert allocation profile into input-sourced twins."""
+def _spell_expert_twins(name: str, graph: Graph, storage: dict, *, lead: tuple[int, ...] = ()) -> dict[str, Graph]:
+    """Spell each distinct EXL3 routed-expert allocation profile into input-sourced twins. ``lead`` is the stacked
+    expert axis of the slots twin, which every expert's codes carry ahead of their own shape."""
     from emmy.compiler.loader.quant import spell_trellis_inputs  # noqa: PLC0415
 
     groups: dict[tuple[str, int, int], dict[str, str]] = {}
@@ -487,7 +704,7 @@ def _spell_expert_twins(name: str, graph: Graph, storage: dict) -> dict[str, Gra
         for inp, proj in (("w_gate", "gate_proj"), ("w_up", "up_proj"), ("w_down", "down_proj")):
             base = modules[proj]
             args = _spell_args(base, storage[base])
-            specs[inp] = (args["cb"], args["shapes"]["trellis"])
+            specs[inp] = (args["cb"], (*lead, *args["shapes"]["trellis"]))
             profile.append((inp, int(storage[base]["bits_per_weight"]), specs[inp]))
         frozen = tuple(profile)
         if frozen in seen:
@@ -522,50 +739,94 @@ def _spell_coded_twins(graphs: dict[str, Graph], storage: dict, *, layer_scopes:
     return out
 
 
-def _spell_fp4_twins(graphs: dict[str, Graph], model_dir, layer_scopes: dict[str, set[int]]) -> dict[str, Graph]:
-    """Replace every twin holding NVFP4 weights by the W4A4 program serving compiles from them
-    (``pre32@nvfp4``), leaving a twin with no such weight untouched under its original name.
+def _spell_checkpoint_twins(
+    graphs: dict[str, Graph], model: str, revision: str | None, layer_scopes: dict[str, set[int]]
+) -> dict[str, Graph]:
+    """Replace every twin holding checkpoint-coded trunk weights by the program the checkpoint
+    declares over them (``pre32@nvfp4``, ``pre32@fp8``), leaving a twin with no such weight
+    untouched under its original name.
 
     The transferable form is the whole point: tuning evidence reaches serving only when the twin's
     kernels have serving's identities, so this runs the SAME spellers on the SAME checkpoint that
-    ``gen_runner._compile_split``'s stamp runs, in that order — the weight trio first
-    (``spell_quantized_constants``: packed bits, e4m3 block scales, tensor scale), then the
-    activation half the checkpoint's calibration declares (``spell_static_fp4_activations``: a
-    ``to_f4e2m1`` encode ahead of each marked linear). ``spell_trellis_constants``, the stamp's
-    third speller, is EXL3's and this lane reaches it through :func:`_spell_coded_twins`.
+    ``gen_runner._compile_split``'s stamp runs, in that order — the coded weights first
+    (``spell_quantized_constants``: NVFP4's packed bits, e4m3 block scales and tensor scale, or
+    FP8's bits and scale), then the activation half the checkpoint's calibration declares
+    (``spell_static_fp4_activations``: a ``to_f4e2m1`` encode ahead of each marked linear;
+    ``spell_static_fp8_activations``: an FP8 encode at the stored per-linear scale).
+    ``spell_trellis_constants``, the stamp's last speller, is EXL3's and this lane reaches it
+    through :func:`_spell_coded_twins`.
 
     Those spellers address a checkpoint key, while a twin's constants are wrapper-relative
     (``q_proj.weight`` for ``model.layers.0.self_attn.q_proj.weight``), so each constant is first
     re-addressed by dotted-suffix within one layer — the same pairing :func:`_spell_coded_twins`
     makes, and the same re-addressing ``_compile_split`` does off parameter identity.
 
-    Unlike the EXL3 lane, no rate multiplies the twins: NVFP4 codes every weight at one rate over
-    one block size. The layer whose keys are read is the profile's representative (its lowest
-    member — :func:`_profile_layers` selects each signature's first layer), which is also where
-    the recorded program's activation-quantize sharing comes from: consumers reading one
-    activation share a quantize when their stored ``input_scale`` values are equal, and a
-    checkpoint is free to calibrate one layer's fused q/k/v group differently from another's."""
-    from emmy.compiler.loader.quant import spell_quantized_constants, spell_static_fp4_activations  # noqa: PLC0415
-    from emmy.compiler.loader.safetensors import _build_index  # noqa: PLC0415
+    Unlike the EXL3 lane, no rate multiplies the twins: either format codes every weight at one
+    rate. The layer whose keys are read is the profile's representative (its lowest member —
+    :func:`_profile_layers` selects each signature's first layer), which is also where the
+    recorded program's activation-quantize sharing comes from: consumers reading one activation
+    share a quantize when their stored scale values are equal, and a checkpoint is free to
+    calibrate one layer's fused q/k/v group differently from another's.
 
-    by_layer = dict(_layers(_build_index(model_dir)))
-    out: dict[str, Graph] = {}
+    The re-addressing needs only the checkpoint's weight index, so the shards are fetched only when some twin reads
+    a weight stored with its scales. A checkpoint that codes its routed experts alone (Qwen3.8-Flash-Next's NVFP4)
+    leaves every trunk twin as traced and is never downloaded here: its expert twins spell from logical shapes."""
+    from emmy.compiler.loader.quant import (  # noqa: PLC0415
+        is_nvfp4_checkpoint,
+        spell_quantized_constants,
+        spell_static_fp4_activations,
+        spell_static_fp8_activations,
+    )
+    from emmy.compiler.loader.safetensors import _build_index, _resolve_model_dir, checkpoint_weight_names  # noqa: PLC0415
+
+    names = checkpoint_weight_names(model, revision)
+    if names is None:  # no index: a single-file checkpoint is read whole
+        names = list(_build_index(_resolve_model_dir(model, revision)))
+    present = set(names)
+    by_layer = dict(_layers(_trunk_names(names)))
+    readdressed: dict[str, Graph] = {}
     for name, graph in graphs.items():
         members = layer_scopes.get(name)
         keys = by_layer.get(min(members)) if members else None
         if keys is None:
-            out[name] = graph  # a routed-expert twin, whose weights are program INPUTS, not constants
-            continue
-        spelled = graph.copy()
+            continue  # a routed-expert twin, whose weights are program INPUTS, not constants
+        spelled, coded = graph.copy(), False
         for nid, op in list(spelled.loadable_constants()):
             if op.source_path and (key := _match(keys, op.source_path)):
                 spelled.nodes[nid].op = replace(op, source_path=key)
-        if not spell_quantized_constants(spelled, str(model_dir)):
+                coded |= f"{key}_scale" in present or f"{key}_scale_inv" in present
+        if coded:
+            readdressed[name] = spelled
+    if not readdressed:
+        return graphs
+    model_dir = _resolve_model_dir(model, revision)
+    suffix = "nvfp4" if is_nvfp4_checkpoint(model_dir) else "fp8"
+    out: dict[str, Graph] = {}
+    for name, graph in graphs.items():
+        spelled = readdressed.get(name)
+        if spelled is None or not spell_quantized_constants(spelled, str(model_dir)):
             out[name] = graph
             continue
         spell_static_fp4_activations(spelled, str(model_dir))
-        out[f"{name}@nvfp4"] = spelled
+        spell_static_fp8_activations(spelled, str(model_dir))
+        out[f"{name}@{suffix}"] = spelled
     return out
+
+
+def _trunk_names(names) -> list[str]:
+    """The ``names`` under the decoder trunk: the ``<head>.layers.N`` stack with the most layers.
+
+    A checkpoint may carry a second stack whose layer numbers collide with the trunk's, such as Qwen3.5's
+    multi-token-prediction head (``mtp.layers.0`` beside ``model.language_model.layers.0``). Twins trace
+    trunk layers only, so pairing a twin with the other stack's keys would spell the wrong program."""
+    stacks: dict[str, set[str]] = {}
+    for name in names:
+        head, sep, rest = name.partition(".layers.")
+        idx = rest.split(".", 1)[0]
+        if sep and idx.isdigit():
+            stacks.setdefault(head, set()).add(idx)
+    trunk = max(stacks, key=lambda head: len(stacks[head]), default=None)
+    return [name for name in names if trunk is not None and name.startswith(f"{trunk}.layers.")]
 
 
 def _layers(names) -> list[tuple[int, list[str]]]:

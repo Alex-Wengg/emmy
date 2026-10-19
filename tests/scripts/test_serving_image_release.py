@@ -362,13 +362,13 @@ def test_serve_sh_renders_the_quantized_moe_invocation(tmp_path):
     assert argv[-2:] == ["--kv-cache-dtype", "fp8_e4m3"], "SERVE_EXTRA_ARGS must word-split into flags"
 
 
-def test_serve_sh_renders_the_deepseek_v4_parallel_eager_invocation(tmp_path):
-    """DeepSeek V4 on 16 V100s: the vLLM arguments every strict boot of its golden ran (boot51's
-    non-default args), rendered from the pinned config. The pinned `--enforce-eager` drops the capture
-    config, as a caller's does in emmy serve: the hyper-connection MoE host-syncs every decode step."""
+def test_serve_sh_renders_the_deepseek_v4_parallel_invocation(tmp_path):
+    """DeepSeek V4 on 16 V100s: the vLLM arguments every strict boot of its golden ran, rendered from the
+    pinned config, with decode captured up to the decode bucket — each rank holds a slice of every
+    expert, so those steps ride the fixed-slot expert tier, and every wider step runs eager."""
     config = {key: value.strip('"') for key, value in config_values(SERVE_DIR / "models" / "deepseek-v4-flash-0731.env").items()}
     argv = render_serve_sh(tmp_path, config)
-    assert "--compilation-config" not in argv
+    capture = '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1, 2, 4, 8, 16], "custom_ops": ["+rotary_embedding"]}'
     assert argv == [
         "-m",
         "vllm.entrypoints.openai.api_server",
@@ -389,8 +389,10 @@ def test_serve_sh_renders_the_deepseek_v4_parallel_eager_invocation(tmp_path):
         "--no-enable-prefix-caching",
         "--hf-overrides",
         '{"architectures": ["EmmyGenModel"]}',
+        "--compilation-config",
+        capture,
         *"--tensor-parallel-size 8 --pipeline-parallel-size 2 --distributed-executor-backend mp".split(),
-        *"--kv-cache-dtype fp8 --block-size 256 --tokenizer-mode deepseek_v4 --enforce-eager".split(),
+        *"--kv-cache-dtype fp8 --block-size 256 --tokenizer-mode deepseek_v4".split(),
     ]
 
 
@@ -506,6 +508,22 @@ def test_server_env_is_warm_bake_verify_parity():
     assert 'check_baked SERVE_ENV "${SERVE_ENV:-}"' in verify
 
 
+@pytest.mark.parametrize(("key", "build_arg"), [("SERVE_CAPTURE_SIZES", "CAPTURE_SIZES"), ("SERVE_EXTRA_ARGS", "EXTRA_ARGS")])
+def test_capture_ladder_and_pinned_flags_are_warm_bake_verify_parity(key, build_arg):
+    """The capture ladder decides which decode steps replay a graph and the pinned flags are the rest of the
+    server's command line, and nothing else in verify would notice an image baked from other values (its
+    packs can still hit, its one request completes): the warm passes each, the bake bakes it and verify
+    refuses an image baked from another value."""
+    make = (PROJECT_ROOT / "Makefile").read_text()
+    warm = (SERVE_DIR / "warm.sh").read_text()
+    dockerfile = (SERVE_DIR / "Dockerfile").read_text()
+    verify = (SERVE_DIR / "verify.sh").read_text()
+    assert warm.count(f"-e {key}") == 2, "the initial boot and every fixpoint pass"
+    assert f'{key}="${{{build_arg}}}"' in dockerfile
+    assert f"--build-arg '{build_arg}=$({key}_VALUE)'" in make
+    assert f'check_baked {key} "${{{key}:-}}"' in verify
+
+
 def test_release_bakes_and_verifies_the_request_time_triton_cache():
     warm = (SERVE_DIR / "warm.sh").read_text()
     dockerfile = (SERVE_DIR / "Dockerfile").read_text()
@@ -590,6 +608,27 @@ def test_release_config_uses_capacity_as_default_prefill_bucket(tmp_path):
     )
     serving = load_serving_config(config)
     assert serving.static_widths == (1, 32, 96)
+
+
+def test_release_config_reads_the_tensor_parallel_width(tmp_path):
+    """The expert twins are traced at the slice each tensor-parallel rank holds, so the config's own
+    serving flags are where that width comes from."""
+    deepseek = load_serving_config(SERVE_DIR / "models" / "deepseek-v4-flash-0731.env")
+    assert deepseek.tensor_parallel_size == 8
+    # No M=1 trunk is served, yet the M=1 expert program is: the fixed-slot tier compiles it on every MoE boot.
+    assert deepseek.realizations_for(1) == ()
+    assert [row.name for row in deepseek.realizations_for(1, expert=True)] == ["m1"]
+    # Nor an M=256 trunk, yet the static expert prefill twin is built beside the any-width program.
+    assert [row.name for row in deepseek.realizations_for(256, expert=True)] == ["m256"]
+    config = tmp_path / "model.env"
+    config.write_text(
+        f"SERVE_MODEL=org/model\nSERVE_GPU=NVIDIA-Test\nSERVE_GOLDEN_FILE={tmp_path / 'golden.json'}\n"
+        "SERVE_MAX_NUM_BATCHED_TOKENS=96\nSERVE_DECODE_BUCKET=32\nSERVE_PREFILL_CAPACITY=96\n"
+    )
+    assert load_serving_config(config).tensor_parallel_size == 1
+    config.write_text(config.read_text() + 'SERVE_EXTRA_ARGS="--enforce-eager --tensor-parallel-size=x"\n')
+    with pytest.raises(ValueError, match="positive integer"):
+        load_serving_config(config)
 
 
 def test_release_config_rejects_zero_prefill_capacity(tmp_path):

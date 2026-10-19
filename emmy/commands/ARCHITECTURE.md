@@ -37,7 +37,10 @@ commands/publish ─► publish (image naming, metadata, collision and digest ga
 - `emmy/benchmark/` — config, logging, workload, tasks, execution, and YAML experiment records
 
 Golden replay keeps the selected input precision pins active through lowering, NVCC compilation, measurement, and
-recording. Tuning creates its measurement context inside each target's precision scope. `FAST_MATH` defaults to true
+recording. It publishes all effective recorded precision decisions, so omitted independent pins inherit the recorded
+umbrella rather than the caller's environment. Raw pins stay unchanged for exact row matching. Partial `--ab` pins
+still override only the named live choices; an empty or mixed golden scope publishes no regime.
+Tuning creates its measurement context inside each target's precision scope. `FAST_MATH` defaults to true
 and controls NVCC `--use_fast_math`; `--nvcc-flags=--fmad=false` remains a custom contraction diagnostic.
 
 ## Layers
@@ -89,7 +92,7 @@ providers.
 
 ### `emmy/benchmark/` — Benchmark Library
 
-Benchmark configuration (`load_config()` / `validate_config()`), per-run logging, task enumeration
+Benchmark configuration (`load_config()`; every section optional), per-run logging, task enumeration
 (`enumerate_tasks()`), execution (`run_execution_group()` — times provisioning per group + deploy/bench/teardown per
 task; task results are `(task, ok, timing)` triples), and the sole structured output (`experiment_record` — the typed
 experiment-record schema, lifecycle transitions, and atomic YAML serialization). Top-level `system_info` owns the
@@ -145,19 +148,27 @@ requires `--layer`, accepts the checkpoint's layers 0-27, and rejects dynamic sh
 includes the adapter in the isolated worker's reconstruction payload, so eager PyTorch, `torch.compile`,
 and Emmy always rebuild the same module and example inputs. Reference-free runs also honor `--warmup` and `--iters`.
 Inductor compiles with
-`fullgraph=True, mode="max-autotune-no-cudagraphs"`; the harness supplies the shared outer CUDA graph so every backend
-has identical captured timing semantics. Inductor output must match eager on the same inputs at `rtol=atol=1e-3`
-before its latency is accepted. `run --strict` makes every requested backend, captured timing, exact pin, and direct
+`fullgraph=True, mode="max-autotune-no-cudagraphs"`; the harness captures each backend's calibrated batch into one
+graph before its event window, then submits one replay. Reference samples exclude the same dynamically extended
+warmup as Emmy. A capture failure at any batch size re-runs every backend uncaptured. Inductor output must match eager
+on the same inputs at `rtol=atol=1e-3` before its latency is accepted. `run --strict` makes every requested backend,
+captured timing, exact pin, and direct
 Emmy-vs-eager proof authoritative. Strict comparisons disable Torch's FP16/BF16 reduced-precision reductions for
 both correctness and timing; otherwise a shape-dependent cuBLAS algorithm can round intermediate sums and reject
 a kernel that accumulates at full width. The worker restores the prior precision and split-K settings after each
 job, including failures. `--strict-evidence` (`run`, `compile`, `serve`; `EMMY_STRICT_EVIDENCE`) is the
 deploy-side strictness: a fork no measured row decides raises `EvidenceError` naming the kernel instead of deploying
-a prediction. BF16 inputs and constants bind through the compiler's raw `uint16` carrier, and
-backend output bits are decoded to numeric values before every command-layer correctness check. The eager forward
+a prediction. BF16 inputs and constants bind through the compiler's raw `uint16` carrier. BF16, packed FP4 and FP8
+output carriers are decoded to numeric values on both sides of every command-layer correctness check, including
+the FP64 reference; different encodings of signed zero therefore compare equal. The eager forward
 that serves as the correctness reference runs inside `correctness_oracle`, which turns torch's reduced-precision GEMM
 reductions off: with them on, the FP16 GEMM at K = 15360 leaves one element in ten of its own output outside
 `rtol=atol=1e-3` of an FP64 product, and a kernel nearer the truth than eager failed `--strict` for eager's error.
+Eager still rounds every intermediate to FP16, so a different summation order can land one element an FP16 step away
+from it, past the elementwise rule once a later residual add cancels most of the value. When that rule fails and the
+frontend graph can run, the proof evaluates the same graph in FP64 on the same inputs and passes only if the
+candidate's largest error against FP64 is no larger than eager's and its mean error at most 1% above eager's; a
+wrong element beyond eager's own error, or a bias across the output, still fails.
 The TIMED eager forward keeps torch's defaults, the library a user runs. The `torch.compile` column is admitted by the
 same dtype-scaled verdict as the Emmy output (Inductor's own FP16 GEMM is outside a flat `1e-3` of cuBLAS at these
 depths on an RTX 4090), and a backend that cannot be built travels as a failure in the results, printed `failed` in
@@ -181,83 +192,100 @@ result; `run` uses that same binding when rendering dynamic per-kernel grid stat
 attributes come from the runtime cubin loader, so reporting reuses the measured binary and its compiler flags
 and architecture target instead of compiling a separate diagnostic kernel. The kernel table includes per-thread
 local-memory bytes beside register counts, making spills visible in the archived benchmark log.
+
+`run --bench --cold-cache` uses a separate evidence regime: `COLD_CACHE` is a golden input pin and a context-key field,
+independent of compiler flags. An omitted pin means hot-cache measurement. Import, lookup and export preserve that
+distinction, so a cold measurement cannot replace or price a hot one, or the reverse. Cold kernel timing uses one
+launch per event window after same-stream L2 eviction, outside the measured interval. It models weights read from
+memory, not the partial cache reuse of a served model.
+Cold mode times Emmy kernels only; peer Torch forwards retain internal cache reuse and are not comparable to
+per-kernel cold sums. Explicit peer timings and whole-row `--record` are refused. The correctness oracle, per-kernel
+DB writes, tuner candidates, and `--record-greedy` retain their usual roles. Cold windows always contain one replay;
+whole-program e2e timing is absent, rather than a hot measurement under a cold label.
+
+`run --gpu-arch cpu` compiles a model id or `--code` on the CPU backend under the host CPU's context instead, checks it
+against eager torch on the CPU (against the numpy backend on the same graph under `--quantize`, whose graph eager
+torch no longer computes), and with `--bench` times each kernel alone through the runtime — cold under `--cold-cache`,
+where every thread first reads twice the last-level cache — beside eager torch's whole forward. A bench at the tune
+standard files each kernel's row under the CPU's context, at the sizes it ran at, and `--json` writes the record.
+The thread count is one per physical core the process may run on, so a cpuset or `taskset` sets it. The GPU-only
+paths (`--golden`, `--ir`, `--ab`, `--tune`, `--profile`) are refused; a CPU schedule is swept by pinning its knobs.
 For a single-layer trace, the loader derives a missing attention `layer_type` from
 `config.layer_types[self_attn.layer_idx]`. Rotary modules keyed by that attention label supply one `(cos, sin)` tuple;
 modules with independent rotary keys (for example DeepSeek V4's `main` / `compress`) supply the complete mapping.
 
 The trace and run handlers delegate working-golden inventory construction, target reconstruction and the record
-write-back to `compiler/pipeline/search/working_golden.py`. Scoped exact knob pins shared by `run` and the golden
-replay live beside that search lifecycle in `compiler/pipeline/search/pins.py`; command handlers retain only the
-workflow's argument validation and user-facing error/reporting.
+write-back to the golden package (`compiler/pipeline/search/golden/working.py`, every write one locked
+`GoldenFile.edit`). Scoped exact knob pins shared by `run` and the golden replay live beside that search lifecycle in
+`compiler/pipeline/search/pins.py`; command handlers retain only the workflow's argument validation and user-facing
+error/reporting.
 
-`emmy trace MODEL -o PATH` lowers through post-fusion Loop IR and writes one self-contained golden file inventory.
-The file embeds stable frontend Torch IR programs and emits one target row for every post-fusion kernel occurrence;
-structurally identical occurrences are not collapsed and a missing cache key never drops a target. Every target is its
-kernel's standalone Loop IR, stored in `loops` and selected by index, with the frontend provenance origins beside it
-(`target: {loop, origins}`) when it computes every one of them whole — the traced ops a benchmark compares it against.
-Flash score producers absorbed into their consumer are stored as part of that one fused target rather than as a second
-kernel. Trace records neither knobs nor timings,
-refuses replacement, and never writes a traced Graph JSON or provenance sidecar. Quantized traces store their
-checkpoint-declaration digest in the same file.
+`emmy trace MODEL -o PATH` lowers through post-fusion Loop IR and writes one self-contained golden file inventory
+(`golden.working.inventory`): the traced program, every kernel it lowers to — its standalone Loop IR and the traced
+ops it computes whole, no identity or stamps, which are computed from the Loop IR when read — and one unmeasured row
+per kernel. Two occurrences of one kernel are one kernel.
+Trace records neither knobs nor timings, refuses replacement, and never writes a traced Graph JSON or provenance
+sidecar. Quantized traces store their checkpoint-declaration digest in the same file.
+A model that holds several decoder stacks (Qwen3-Omni's thinker, talker, code predictor and codec transformer) is
+traced one stack at a time: `--decoder PATH` names the stack `--layer` indexes, and `--append` collects them, with the
+model's other paths (`--code` and `--model-provenance`), into one inventory.
 
 `emmy trace LOCAL_CHECKPOINT --serving-twins --serving-config PATH -o PATH` is the release inventory variant. It
 calls the config/allocation-metadata-only `serving.twins.capture_twin_graphs` path, combines every distinct
 pre/post/expert and coded rate-profile kernel into one document, and stores each structural target once as symbolic
 Loop IR. The pinned env supplies the model provenance and complete realization matrix: decode, prefill, M=1, extra
-warm shapes, symbolic fallbacks, and standard/precision-trading input pin regimes. Each target receives a
-`realizations` array with those named bindings and explicit registered input pins; trace no longer accepts an
-independent serving-shape surface. Every twin is its own structural target — serving compiles a static twin at
-its own width, and today's loop fusion gives each width its own fused kernel — so a target carries the rows its
-twin reaches (`ServingConfig.realizations_for`, keyed on the width the twin's name spells): a static twin's
-target holds that width's rows in both lanes, a symbolic twin's the dynamic rows. The audit expects the same
-split per target. A static-only release is accepted
-only when the same env proves that no wider or symbolic path is reachable. The resulting working file is measured and
-verified by `run --golden PATH [--realization NAME] --bench`.
+warm shapes, symbolic fallbacks, and standard/precision-trading input pin regimes. Each row template with sizes
+specializes the twin's program first, since a kernel at a size is a kernel of its own, and every kernel receives a row
+per template in each regime (`ServingConfig.realizations_for`, keyed on the width the twin's name spells): a static
+twin's kernels carry that width's rows in both lanes, a symbolic twin's the dynamic rows. An MoE's expert twins also
+take width 1, with the standard M=1 row, whatever M=1 the trunk serves: every MoE boot compiles that expert program
+for the fixed-slot tier. They take width 256 too, with an M=256 row per any-width lane: a boot with an any-width
+program also compiles that static expert prefill program. Expert twins are traced at the slice of every expert that
+each rank of the config's `--tensor-parallel-size` holds. The audit expects the same split per twin. A static-only release is accepted only when the same env proves that no wider or symbolic path is
+reachable. The resulting working file is measured and verified by `run --golden PATH [--realization NAME] --bench`.
 
-`emmy golden check [PATH…]` names the stored targets of a golden that a fresh lowering of its own programs no longer
-writes. It is two existing commands diffed per traced program: `emmy golden kernels PATH --program N` prints the Loop
-IR pool the golden stores, sorted by output set, and `emmy compile --golden PATH --program N --ir loop -o fresh.json`
-writes the same pool lowered fresh from the stored program (a `.json` output path is the wire a golden stores, for
-`--ir torch` the traced program and for `--ir loop` the kernel pool; any other path gets the readable listing). The
-check restricts the diff to the targets the file stores. `emmy golden restamp [PATH…]` rewrites the golden onto that
-lowering; `check` and `restamp` default to every repository golden, none of the three needs a card, and the
-`refresh-golden` skill is the flow around them. What a restamp keeps per row is decided in
-`compiler/pipeline/search/restamp.py`: a measurement survives only when the row's kernel renders the same CUDA source
-from the fresh Loop IR, otherwise the row becomes a proposal. A row naming the target takes the fresh target's
-identity; a row naming a piece of the target's cut or split set keeps its own and survives only if the fresh set
-still mints that piece; this holds for a target whose own Loop IR is unchanged too, since its cut or split pieces can
-take new identities without it. A row that no longer decodes, a row whose kernel no fresh kernel writes, and a
-kernel-set row whose members all lost their measurements are dropped and named. The command never deletes a file: one nothing survives
-in is left alone and reported. The lowering behind the check, the restamp and `emmy trace`'s inventory is one function
-(`working_golden.lowered_kernels`), and every command that reads a golden by path loads it through
-`golden.load_golden`, which validates a repository golden strictly and anything else as a working file.
+`emmy golden list [PATH…]` prints every measured row — its kernel's time and reference, the schedules tried, the
+whole row's time beside `torch.compile` where a record run timed it, the note — sorted by that ratio, filterable, and as
+JSON. A directory argument is searched for golden files, so the realization corpus lists the same way. `--missing`
+lists what a record run on the file's card must measure instead — each proposal row, and each target with no
+`torch.compile` time — named by the realization to run; the nightly golden fill reads it. It reads and
+judges nothing; the nightly refresh posts its counts.
+
+`emmy golden check [PATH…]` says what a restamp onto the fresh lowering of a golden's own programs would change, and
+`emmy golden restamp [PATH…]` writes it (the pipeline ARCHITECTURE's Part 7 owns what a restamp keeps per entry:
+a kernel that kept its identity keeps its entry and its rows' measurements, a re-keyed kernel keeps its rows as
+proposals, a kernel or decision the fresh lowering no longer takes is dropped with its rows). A whole-target timing
+names the kernel set it timed and is cleared when one of those kernels is re-keyed or dropped. Both default to every
+repository golden, neither needs a card, and the `refresh-golden` skill is the flow around them. The command never
+deletes a file: one nothing survives in is left alone and reported. Every command that reads a golden by path loads it
+through `GoldenFile.load`, which validates a repository golden strictly and anything else as a working file.
 
 **One golden flag pair on every command.** `--golden PATH` names a golden file (working or canonical) on `run`,
 `compile`, `serve`, `generate` and `eval golden`: its MEASURED rows are the golden evidence that command deploys from,
 instead of the repository's per-card goldens, joining the tune DB's rows in the one measured-evidence index the
-greedy pick reads (`search.golden.records_override` in-process; `EMMY_GOLDEN_FILE` for the vLLM child `serve`
+greedy pick reads (`search.golden.evidence_scope` in-process; `EMMY_GOLDEN_FILE` for the vLLM child `serve`
 spawns, together with the precision regime the file's rows share — `EMMY_FAST_MATH` and friends — because a row
 is evidence only in its own regime and the child learns it from nowhere else; an environment pin at another value
 fails the boot). `--realization NAME` (`run`, `compile`) selects one realization by exact name or an unambiguous
-substring — inside `--golden PATH`, or, on `run` / `compile` without it, inside the live card's repository goldens.
+substring — inside `--golden PATH`, or, on `run` / `compile` without it, inside the live card's repository goldens
+(with no card, every repository golden: the same kernel recorded on several cards is one target, and each file that
+records it is evidence for it).
 There is no second spelling: no file flag beside `--golden`, no name flag beside `--realization`. `--pin-route` compiles
-the named realization under the kernel-set decisions it records — the cut its route spells, a cross-CTA split — as a
-hand pin, the same one `EMMY_KNOBS` publishes (a hand pin of the same seam with another value is refused); without it
-the compile picks the kernel set from the evidence, and a routing row alone prices nothing.
+the named row under the kernel-set decisions that mint its kernel — the cut, a cross-CTA split — as a hand pin, the
+same one `EMMY_KNOBS` publishes (a hand pin of the same seam with another value is refused); without it the compile
+picks the kernel set from the evidence, and a routing row alone prices nothing.
+Replay remints the stored path to address fresh child names. Each cut keeps its parent's kernel and remainder-step
+scope, including a bare cut recorded on a child with one site.
 
-`run --golden PATH` without `--realization` walks every persisted target, binding and input regime in one process,
-benching each target's verified rows and skipping its proposals (the unmeasured rows). A routing row
-or child-identity receipt is evidence for its target's walk, not a target of its own. Grouping uses the stored target,
-not dotted name prefixes. A file that dropped its seed rows (a promoted serving-twin golden) benches each target
-through the row pricing all of it: the fastest root routing row, else its fastest routing row, else its fastest row. A
-failing target does not stop the walk: every target reports, and the command exits non-zero at the end naming
-the failures. A receipt of a piece a routing row minted (its identity is no routing row's) replays under the target's
-routing rows composed, plus `PLACE=fuse` when no
-cut was recorded: bare, its piece keys would spell against the unsplit program and match nothing. It parses and validates the
-document once and hands that object to each name's resolution step, because a whole-model inventory is large
-enough that re-reading it per target dominates the replay: the 279-target DeepSeek V4 Flash golden costs about
-15 s per load, so reloading turned a four-minute replay into more than an hour of redundant parsing. Only this
-read-only replay path shares a document; a record write-back loads its own mutable copy.
+`run --golden PATH` without `--realization` walks every target kernel of the file once per input regime its rows
+record, in one process. Measured rows whose kernel is the complete target also run as pinned schedules; descendant
+rows remain evidence for their own pieces, even when a descendant's name selects the target. Proposals remain
+unbenched. A piece a decision minted runs with its target, not as a target of its own; the target is named by the
+shortest row name on it or on its pieces — the seed a record run wrote the set under. A failing target does not stop
+the walk. Every target reports, and the command exits non-zero at the end naming the failures. It parses and validates
+the document once and hands that object to each name's resolution step, because a whole-model inventory is large
+enough that re-reading it per target dominates the replay. Only this read-only replay path shares a document; a record
+write-back loads its own copy under the file's lock.
 
 The in-model audit uses those serving twins for every architecture, DeepSeek V4 included (its layers take the
 attention-sublayer seam; see `emmy/serving/ARCHITECTURE.md`).
@@ -268,25 +296,31 @@ Loop IR, without canonical-corpus or live-card filtering; `compile` requires the
 visits every target name sequentially in the current process unless `--realization` narrows the file to one
 exact or unambiguous substring match. With several targets, `--json DIR` writes one readable JSON record per target;
 there is no repeat or child-process orchestration layer. Invoke `emmy run` again when independent process
-observations are required. Which rows bench as pinned rows: a realization named explicitly is always benched,
-measurement state notwithstanding — the realization corpus and the perf lane replay unmeasured cases this way — while
-the whole-file walk benches a name's verified rows and skips its proposals. Every pinned row (a golden row and an
+observations are required. Which rows bench as pinned rows: a realization named explicitly is benched regardless of
+measurement state — the realization corpus and the perf lane replay unmeasured cases this way. A whole-target latency
+without schedule knobs or a kernel measurement supplies no pinned comparison; `--pin-route` pins the decisions that
+mint the kernel set the latency names. Recorded cuts and reduction splits are scoped to the parent kernel where they
+were taken; layout
+decisions retain their buffer scope. The whole-file walk pins only measured
+rows of the complete target. Every pinned row (a golden row and an
 `--ab` hand row alike) is MEASURED under a hand pin published to the
 environment for that one compile, then recorded (see `--record` and the bench-to-DB recording below); deploying it
 is the evidence pick's business, never the pin's. The selected target's records are also the compile's golden
-evidence for the greedy row. The selected realization's input regime is published so its rows read as live
-measurements. A schedule or routing row deploys only where it is the fastest measured row for its kernel.
+evidence for the greedy row. The selected realization's input regime is published even when it supplies no automatic
+pin, so its rows read as live measurements. A schedule or routing row deploys only where it is the fastest measured
+row for its kernel.
 Embedded Loop IR stores stable algebra rather than derived structural stamps. Registered
 Boolean values in an explicit `--ab` row remain input pins, so false values are not dropped with kernel pass markers
 and the JSON record identifies the inputs that were compiled. A scoped schedule-key OFF beside a non-OFF bare family
 pin also remains explicit as the exact-site exception to that bare pin. A failed row with
 no realized graph reports the precision lane requested by those parsed input pins, including explicit false
 overrides, rather than defaulting every failure to the standard lane. `run --golden PATH` replays it through the
-full compiler pipeline. When that replay has
-pinned rows, its greedy execution returns same-input outputs so every pinned schedule receives the normal wrong-answer
-check; strict JSON labels the reference `same-input-greedy` when no Torch twin exists. That reference is accepted only
+full compiler pipeline. Its greedy execution returns same-input outputs when checking pinned rows, recording a pick,
+or strictly verifying an embedded Loop target, including a file walk whose measured rows name only cut pieces.
+Strict JSON labels the reference `same-input-greedy` when no Torch twin exists. That reference is accepted only
 for an embedded Loop target whose worker returned the exact same inputs and outputs; runnable frontend targets still
-require direct eager correctness. A completed reference survives a later greedy
+require direct eager correctness. A Torch reference exception returns through `accuracy_error`, so the parent logs
+its type and message and preserves it in JSON even in a non-strict run. A completed reference survives a later greedy
 timing watchdog: JSON records the exact failure and one-run timing, omits the isolated greedy row, and keeps the command
 nonzero while the pinned schedules receive their normal timed and reference-clean checks. Frontend replay can instead
 request a direct eager correctness proof. Reference-free Loop replay does not allocate a duplicate Torch device copy
@@ -295,19 +329,34 @@ Repeated names that resolve to different embedded targets remain ambiguous;
 qualification scopes a temporary working golden file to one target rather than guessing. A direct `run --ir` input remains a
 stage-complete artifact and runs only the later passes. JSON records whole-program end-to-end timing for multi-kernel
 rows, so promotion compares aggregate execution rather than a sum of isolated launch windows.
-`--record` (with `--golden PATH --bench`) attributes that latency to the measured realization by exact name, pins,
-and knobs; a repeated name alone is never enough to choose a row. `--record-greedy` (with `--golden PATH
---realization NAME --bench`) records the OTHER side of the table — the kernel set the greedy row picked — as
-measured realizations of the named target: one routing row per kernel-set decision the compile took, priced at the
-summed isolated launches of the kernels that decision produced, and one child-identity schedule receipt per kernel at
-its own isolated launch, both with the greedy comparison row as their `same-input-greedy` reference
-(`working_golden.record_greedy_pick`; the pipeline ARCHITECTURE's golden-record Part has the spelling and the
-pricing). Recording a set the file describes takes `--pin-route` beside it: a routing row's own time prices nothing,
-so without the pin the greedy row is the compiler's own pick, whole, and the receipts this writes are what price the
-decision for a compile nothing pins. That is how a pick the prior made becomes rows a strict-evidence compile of
-the file deploys from without a prior. Under `EMMY_KNOBS` the recorded pick IS the pin, so the recording refuses, and
-the run exits nonzero, when the env pin did not realize (`greedy_record_refusal`): the row would file the planner's own schedule
-under the pin's name and lane. It refuses a pick whose answer `--strict` rejected for the same reason. Independently of both, every clean pinned row and the greedy isolated re-bench are written into
+`--record` (with `--golden PATH --bench`) attributes that latency to the measured row by exact name, pins, and knobs;
+a repeated name alone is never enough to choose a row. `--record-greedy` (with `--golden PATH --realization NAME
+--bench`) records the OTHER side of the table — the kernel set the greedy row picked — as the DB holds it: the kernels
+it minted, one routing row per kernel-set decision the compile took, and one measured row per kernel at its own
+isolated launch, with the greedy comparison row as its `same-input-greedy` reference (`golden.record_greedy_pick`; the
+pipeline ARCHITECTURE's Part 7 has the spelling). Recording a set the file describes takes `--pin-route` beside it: a routing row's own time prices nothing,
+so without the pin the greedy row is the compiler's own pick, whole, and the rows this writes are what price the
+decision for a compile nothing pins. `--record-greedy` turns on strict evidence, so a golden never holds a schedule the
+prior chose as if it were measured. A new candidate is therefore measured first with `--bench`, which writes its
+per-kernel rows into the tune DB, and is then recorded with that same DB in scope. This includes a fresh whole-file
+walk with no measured rows: its successful greedy comparison is re-benched in isolation to record each kernel. A
+`run --golden PATH` bench also writes, as tune-DB routing rows, the kernel-set decisions its greedy compile took,
+when the same bench measured every piece of the decision; a piece that is itself cut again counts as measured when
+the decision that cuts it is written too. It writes none under `--no-record-evidence`, outside the deployable
+regime, or when the greedy isolated re-bench is not clean or records no perf rows. A `--tune N` run also freezes
+the rows it recorded into one file beside the card's in the freeze directory `EMMY_FREEZE_DIR` names (the repository
+freeze of an editable checkout by default; README "Keep what a tune measured"), off with the same opt-out and never
+a reason for a tune to fail. In a nested cut (a cut one of whose pieces is cut again) the piece cut again never runs
+as a kernel, so only the decision that cuts it gives it a
+price. A cut route no golden stores is therefore recorded with no pinned decisions or schedules: `--bench`, then
+`--record-greedy`. A `--record-greedy` run benches no proposal (a row with no schedule and no measurement, such as a
+trace inventory's seed) as a pinned comparison: beside the pick it would compile the arm its route spells (on a
+whole-target row, the fused kernel) with nothing measured to schedule it, and strict evidence refuses that.
+Both recording modes refuse any integrity flag on a pinned comparison or the greedy isolated re-bench, a rejected
+strict answer, or an unrealized env pin (`record_refusal`). The run reports the reason and exits nonzero before writing
+golden rows, target latency, or bench evidence; its diagnostic JSON is preserved. Under `EMMY_KNOBS` the recorded pick
+is the pin, so an unrealized pin would file the planner's own schedule under the pin's name and lane.
+Outside a refused recording, every clean pinned row and the greedy isolated re-bench are written into
 the tune DB by default: per-kernel `perf` rows through `search/bench_record.py` —
 the deploy evidence the next `compile` / `run` / `serve` picks from, which is how a replayed golden or a hand-pinned
 `--ab` row becomes what the compiler chooses. An
@@ -324,28 +373,48 @@ the watchdog — and a pinned row that pins no knobs beyond the greedy compile's
 rather than re-elected and re-failed identically; a pinned row carrying its own knobs (a genuinely different config,
 or an `--ab` row) still benches.
 
+**Autotuning one kernel.** `run --bench --tune N` measures N schedule rows of the program's one scheduled kernel
+(`search/autotune.py`): the schedule prior's ten best first, then batches of eight Bayesian optimization proposes from
+the log latencies measured so far. Each row benches exactly as an `--ab` row does, so its clean rows land in the tune DB
+through the same recording and the next compile picks the fastest; a row that fails, does not realize, or is flagged
+counts as a failure, never as a time. A program with several scheduled kernels is refused, because a bare pin reaches
+them all. `--kernel NAME` (with `--golden PATH`) selects a file-local kernel reference (`Kernel.ref`, which
+can distinguish kernels sharing one C name) and runs that kernel alone. A formed kernel uses its stored body
+(`GoldenFile.executable`). A derived cut piece replays its recorded parent decisions through the shared golden
+restamp replay, then takes a single-node slice of the exact live TileOp. Missing or stale routes and missing or
+ambiguous exact identities are refused; relifting a derived body could tune a different kernel. The isolated rows
+file under the identity the layer's compile reads. Adding `--realization NAME` selects an exact row owned by that
+kernel and pins its sizes, input regime and schedule. Explicit regime or schedule pins may disambiguate repeated
+names; unresolved ambiguity is refused. `--record-greedy` then refreshes that proposal through the same guarded
+writer, preserving its name and equivalent stored precision pins. It records only the kernel measurement, never a
+whole-target latency; `--record` is refused for an isolated kernel. Unless evidence recording is off
+(`--no-record-evidence`, a non-deployable regime, a bench below the tune bench standard), its `--bench` re-benches
+the greedy pick in isolation, even with no pinned row beside it, and stores the kernel-set decisions the compile took
+into the tune DB, as a realization's bench does: a cut or split of the kernel itself, pinned with `EMMY_KNOBS`, becomes a
+routing row whose parent is that kernel, and a strict compile of its layer prices the kernel through it. A kernel can
+time differently alone than inside its layer, so a winner still needs a whole-target re-bench to qualify its effect
+and record the target's comparison with `torch.compile`.
+
 `emmy eval golden --golden GOLDEN_FILE --serving-config PATH` is the release audit. The env must name that exact
 canonical file. The command validates the nested schema and model provenance, requires the live GPU to match both the
-config and the golden file, proves that every structural target has every config-derived realization its twin reaches (the width
-rows of a static twin, the dynamic rows of a symbolic one), validates the recorded rows, and re-traces the exact
+config and the golden file, proves that every twin's kernels carry a row at every size and regime the config reaches the twin at (the width rows
+of a static twin, the dynamic rows of a symbolic one), and re-traces the exact
 static/symbolic precision matrix. A warm shape names its lane (the ``:fm`` suffix), so a served process in a lane
 compiles the static twins of that lane's widths and nothing else; the serving-matrix compile asks the same of each
-lane's rows — a symbolic twin in every lane, a static twin where its width is warmed. Any missing realization,
-unrealized entry, or twin the
+lane's rows — a symbolic twin in every lane, a static twin where its width is warmed. Any missing row or twin the
 golden rows do not decide is a non-zero release failure. Model, revision, GPU, and serving widths therefore have no
 independent audit flags.
 
-Both halves are strict evidence, asked twice. The **offer audit** is the strict decode per entry
-(`golden.decode_record`): each record's own persisted program is replayed under its input pins, with the target's
-other entries walking the same path, and the spelled row must equal one of that kernel's enumerated leaves —
-`UNREALIZED` names the entries that do not, and any one fails the gate, since a row no leaf equals is no evidence
-a deploy can use. The **serving-matrix compile** then lowers each precision lane's serving twins inside
-`golden.sole_evidence` — only that lane's records as golden evidence, the machine-local prior and tune DB out of the
-way, strict evidence on — on the live card the golden names and under the regime the environment spells, the one
-`serve` deploys under: a fork no golden row decides is an `EvidenceError` naming the kernel and the fork, and the
-gate reports it per twin. A kernel whose lowering stops
-forking, or a schedule that stops being offered, therefore fails loudly here instead of silently deploying from
-the prior.
+The gate is strict evidence: the **serving-matrix compile** lowers each precision lane's serving twins inside
+`golden.sole_evidence` — only that lane's rows as golden evidence, the machine-local prior and tune DB out of the way,
+strict evidence on — on the live card the golden names and under the precision regime the environment spells, the one
+`serve` deploys under: a fork no golden row decides is an `EvidenceError` naming the kernel and the fork, and the gate
+reports it per twin. A kernel whose lowering stops forking, or a schedule that stops being offered, therefore fails
+loudly here instead of silently deploying from the prior.
+
+Each twin compiles in the cache regime the serving config declares (`EMMY_COLD_CACHE` in `SERVE_ENV`), the
+`COLD_CACHE` pin every lane's rows then carry, under the context `serve` probes under that lane's pins. The coverage
+check matches rows on their full pins, so a row recorded in the other cache regime is a missing row, never evidence.
 
 **Command modules:** `commands/bench/`, `commands/deploy/{ssh,local,cloud}.py` (`deploy ssh` auto-detects the remote GPU
 via SSH, `deploy local` the local GPU
@@ -448,7 +517,7 @@ emmy
 +-- teardown     -- clean up VMs left by bench --no-teardown
 +-- publish      -- validate, tag, and push the canonical image named by one recipe
 +-- db
-|   +-- import    -- fill a DB instance from golden files, freezes and tune DBs, every kernel re-lowered
+|   +-- import    -- fill a DB instance from golden files, freezes and tune DBs, each file's tables row for row
 |   +-- export    -- write a DB instance's rows as a dataset directory: golden pools, measured pools, provenance
 |   +-- freeze    -- write a DB instance's admitted rows as a measurement freeze, a golden file per card
 |   +-- check     -- count the rows of a DB instance whose tables disagree with themselves
@@ -604,8 +673,9 @@ bundle and executes a prebuilt binary. Native arguments are validated separately
 See the [native serving contract](../serving/native/ARCHITECTURE.md) for supported options and preparation controls.
 
 
-Serves an embedding model (or a generative chat model via `EmmyGenModel` with `--runner generate`, in
-fp16) through vLLM with the emmy plugin flags baked in (`serving/` plugin; needs the `serving` extra). Without `--runner` the
+Serves an embedding model (or a generative chat model via `EmmyGenModel` with `--runner generate`, defaulting to
+fp16 and accepting explicit `--dtype bfloat16`) through vLLM with the emmy plugin flags baked in (`serving/` plugin;
+needs the `serving` extra). Without `--runner` the
 runner is resolved the way vLLM resolves `--runner auto`, from the checkpoint's config and a Sentence Transformers
 `modules.json`, cached or fetched, so a bare `emmy serve MODEL` needs no flag. Unrecognized flags forward to `vllm serve`; tokens after a literal `--` forward verbatim (emmy's
 own flags are otherwise extracted wherever they appear — argparse REMAINDER swallows everything after MODEL, so the
@@ -625,19 +695,30 @@ defaults to **whole-step CUDA graphs for decode AND chunk/mixed steps** (a `--co
 `--max-model-len` — the rider-top rung — are made safe by the plugin's dummy-run seq-lens clamp
 (`serving/vllm_patches.py`); see
 `serving/ARCHITECTURE.md`); pass vLLM's own `--enforce-eager` to opt out (forced automatically when
-`EMMY_GEN_DECODE_BUCKET=0`, and for MoE models — the routed expert dispatch host-syncs, which a whole-step capture
-cannot record; `_is_moe_model` probes the LOCAL config cache as UX, a caller-supplied `--compilation-config` on an
-MoE model is rejected with the reason, and `EmmyGenModel.__init__` carries the authoritative boot guard for probe
-misses). Under `--speculative-config` the ladder is derived from the resulting
+`EMMY_GEN_DECODE_BUCKET=0`). An MoE model's ladder is capped at capture size 1: single-token decode rides the
+fixed-slot expert tier, while wider steps ride the routed expert dispatch, which host-syncs and a whole-step capture
+cannot record (a tensor-parallel boot, whose ranks each hold a slice of every expert, serves batches up to the decode
+bucket through the slots, and a caller's ladder may then reach that width); `_is_moe_model` probes the LOCAL config
+cache as UX, a caller-supplied `--compilation-config` on an MoE model is checked at boot, and `EmmyGenModel.__init__`
+carries the authoritative guard for probe misses). A checkpoint with GDN layers (`linear_attention` in its
+`layer_types`: Qwen3.5 / Qwen3.8) boots the `EmmyGenHybridModel` architecture and captures decode steps only
+(`FULL_DECODE_ONLY`, no chunk capture), because a GDN layer runs over per-request token ranges read on the host, which
+only a uniform decode step repeats from its capture; `_has_gdn_layers` probes the local config
+the same way, and `EmmyGenModel.__init__` refuses such a checkpoint by name when the probe missed (see
+`serving/ARCHITECTURE.md`).
+With `--enable-lora`, the generative arm selects the LoRA model and defaults to eager execution while mixed
+base/adapter CUDA graph replay remains unqualified. An explicit vLLM compilation setting is forwarded unchanged.
+Under `--speculative-config` the ladder is derived from the resulting
 `query_len = num_speculative_tokens + 1`: dense candidates, each floored to a multiple of `query_len`, so that vLLM's
 round-up to that multiple cannot push a step's padded width past the decode bucket and off the static decode twin
 (`serving/ARCHITECTURE.md` carries the rule and its invariant). The emmy generative arm also defaults
 `--gpu-memory-utilization` to **0.97** (its
 runtime residents are invisible to vLLM's torch-only profiler, so the 0.90 line can fail the min-KV fit at long
 model lens; stock keeps 0.90) and `--max-num-batched-tokens` to **the runner's prefill capacity + the decode
-bucket** — the bucket-sized rider headroom is covered by the chunk+decode twin row split
+bucket** for the base path — the bucket-sized rider headroom is covered by the chunk+decode twin row split
 (`serving/ARCHITECTURE.md`), so full chunk steps keep carrying their decode riders; an explicit value past that cap
-is rejected. Capacity is the dynamic-dim cap unless `EMMY_GEN_PREFILL_CAPACITY` pins it lower (the activation-arena
+is rejected. The LoRA path uses the prefill capacity without rider headroom and chunks wider steps. Capacity is the
+dynamic-dim cap unless `EMMY_GEN_PREFILL_CAPACITY` pins it lower (the activation-arena
 lever for a card the weights nearly fill), and the default follows it down. `EMMY_SERVING_BATCHED=1`
 embedding serving defaults `--max-num-batched-tokens` to `max_num_seqs × max_model_len` so scheduler steps can fill
 the batch. A checkpoint whose compressed weights emmy's loader owns end to end (**EXL3**, **AWQ**, **MXFP4** and **NVFP4**)
@@ -721,7 +802,7 @@ deduplicates shared VMs, and atomically updates their state after deletion.
 emmy teardown <experiment_dir> [--ssh-key ~/.ssh/id_ed25519]
 ```
 
-### `emmy vm create / delete / audit`
+### `emmy vm create / delete / audit / available`
 
 Manages cloud GPU VM lifecycles directly. Instances are ephemeral — `delete` removes them entirely. Run `emmy vm create {gpu,gcp,cloudrift} --help` for full flag lists.
 
@@ -741,7 +822,15 @@ emmy vm delete gcp --instance my-vm --zone us-central1-a
 
 emmy vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
 emmy vm delete cloudrift --instance-id <id>
+emmy vm delete cloudrift --tag "$EMMY_RENTAL_TAGS"     # every active VM carrying all the tags, verified stopping
+
+# Which of these GPUs CloudRift can rent right now, as a JSON list (one exact single-GPU instance type each)
+emmy vm available "NVIDIA GeForce RTX 5090" "NVIDIA Tesla V100 SXM3 32GB"
 ```
+
+`available` reads the same availability `emmy recipe query`'s `deployment.availability.cloudrift` reads
+(`candidates.rentable`). The tag form of `delete` is the cleanup every renting workflow runs: a VM a dead run left
+behind carries the workflow's tags, so it is found without a lease.
 
 Automated jobs can require an exact physical GPU count and persist an interrupt-safe ownership lease:
 
@@ -796,50 +885,66 @@ candidates from `hardware.GPU_INSTANCE_TYPES` and fans GCP entries across `GPU_G
 `SAME_CANDIDATE_RETRIES` transient attempts. `CapacityExhausted` advances; `TerminalProvisionError` aborts. Without a
 filter, fallback can cross providers in hardware-table order; `--provider` restricts the complete search.
 
-Capacity-class signals recognized today: CloudRift HTTP 503/429 on rent, CloudRift `Inactive` terminal status / readiness timeout, GCP `ZONE_RESOURCE_POOL_EXHAUSTED` / `QUOTA_EXCEEDED` / `STOCKOUT` in `gcloud` stderr, and GCP `RUNNING`-status timeout. Both providers terminate VMs they created but couldn't bring to readiness, so orchestrator fallback does not leak orphan instances.
+Capacity-class signals recognized today: CloudRift HTTP 503/429 on rent, CloudRift `Inactive` terminal status /
+readiness timeout, GCP `ZONE_RESOURCE_POOL_EXHAUSTED` / `QUOTA_EXCEEDED` / `STOCKOUT` in `gcloud` stderr, and GCP
+`RUNNING`-status timeout. Both providers terminate VMs they created but couldn't bring to readiness, so orchestrator
+fallback does not leak orphan instances.
 
-GCP project is inferred from `gcloud` config. CloudRift reads `CLOUDRIFT_API_KEY` and `CLOUDRIFT_API_URL` from the environment by default. **H200 on CloudRift** is only available on on-prem clusters — set `CLOUDRIFT_API_URL` to the on-prem endpoint (the public `api.cloudrift.ai` does not offer H200).
- ### `emmy db` The dataset DB is the tune DB's tables in a file of their own, never read by a compile: the file `--db
-PATH` names on every subcommand — never a default, so nothing here can touch the tune DB (`_data/dataset.db` in the
-examples, under the ignored `_data/`). `import SOURCES… --db PATH [--fresh]` fills it, and nothing else does: a source
-is a measurement freeze directory, a golden file, or a tune DB file, which is frozen first — for the offline prior,
-the hardware goldens `search/golden/records/*.json` under `--fresh` (README, "Fit the offline prior"); the recipe
-goldens and a tune DB are the sources to add when the fit needs more. Every kernel is re-lowered from its definition
-through the lowering passes by the current compiler (`golden.evidence.import_goldens`), once per precision regime the
-file's rows record, and its rows are sourced by the file's kind and digest — `freeze:` for a freeze directory's files,
-`golden:` for a golden file; a source the instance already holds is skipped, and `--fresh` rebuilds from nothing. A
-held file is recorded in the `source` table whatever became of its rows, so naming a file again is a no-op and a
-report can list its sources. `export --db PATH OUT [--pool-sample N] [--seed N]` writes the instance's rows as the
-dataset at `OUT` (`search/dataset/document.py` owns the format): every golden pool enumerated from its kernel's
-definition and packed (`db/export.py` over `ranking.build_golden_groups`; the pipeline ARCHITECTURE's Part 8 owns the
-pool), every measured pool labelled with its microseconds, and the provenance — the DB, its sources by digest, the
-sample and seed, the featurizer version and the compiler commit. `emmy fit` and `eval prior` read that directory and
-never the DB; exporting the same instance twice writes the same bytes. `freeze --db PATH --out DIR` writes an
-instance's admitted rows (`db/freeze.freeze_reason`) as a golden file per card — the artifact that gets checked in.
-`check [--db PATH]` counts the rows of an instance whose tables disagree with themselves (`SearchDB.drift`) and exits
-non-zero when any do. Every subcommand resolves its instance through `commands/db.db_path`, which refuses a missing
-one with the command that fills it.
+GCP project is inferred from `gcloud` config. CloudRift reads `CLOUDRIFT_API_KEY` and `CLOUDRIFT_API_URL` from the
+environment by default. **H200 on CloudRift** is only available on on-prem clusters — set `CLOUDRIFT_API_URL` to the
+on-prem endpoint (the public `api.cloudrift.ai` does not offer H200).
+
+### `emmy db`
+
+The dataset DB is the tune DB's tables in a file of their own, never read by a compile: the file `--db PATH` names on
+every subcommand — never a default, so nothing here can touch the tune DB (`_data/dataset.db` in the examples, under
+the ignored `_data/`).
+`import [SOURCES…] --db PATH [--fresh] [--repository]` fills it, and nothing else does: a source is a measurement
+freeze directory, a golden file, or a tune DB file, which is frozen first; `--repository` adds every repository golden
+— the hardware goldens and each maintained recipe's, the set the priors are fit on under `--fresh` (README, "Fit the
+priors") — and the measurement freeze kept with the repository (`search/freezes/`) when it holds files, every
+`*.json` in it in name order: the card files, then the files tunes wrote beside them, whose rows therefore win at
+the same schedule; a tune DB is the source to add when the fit needs more, and merging it into that freeze is how
+it stays. A golden file is the DB's shape, so the import goes
+row for row (`golden.evidence.import_file`), each row under the context of its own regime and the exact identity
+computed from its stored kernel (one whose body no longer lowers is skipped with a warning), and its rows are sourced
+by the file's kind and digest — `freeze:` for a freeze directory's files, `golden:` for a golden file; a source the
+instance already holds is skipped, and `--fresh` rebuilds from nothing. A held file is recorded in the `source` table
+whatever became of its rows, so naming a file again is a no-op and a report can list its sources. `export --db PATH OUT
+[--space {schedule,placement}] [--pool-sample N] [--seed N] [--jobs N]` writes the instance's rows as the dataset of
+one space at `OUT` (`search/dataset/document.py` owns the format): the schedule space is every golden pool enumerated
+from its kernel's definition and packed (`db/export.py` over `ranking.build_golden_groups`; the pipeline
+ARCHITECTURE's Part 8 owns the pool) and every measured pool labelled with its microseconds; the placement space is
+every golden kernel's placement forks, each the arms the cut pass offers with the golden's arm marked
+(`ranking.build_placement_groups`); each pool carries the constant inputs its own file's program binds, which the
+import filed beside the rows (the `constant` table), so the walk offers the forks a deploy sees, the layout fork of
+a transposed weight among them, and the export opens no golden file. Both spaces carry the provenance — the DB, its
+sources by digest, the space, the sample and seed, the featurizer version and the compiler commit. `emmy fit` and
+`eval prior` read that directory and never
+the DB; exporting the same instance twice writes the same bytes. The schedule space's pools are enumerated `--jobs` at
+a time, one pool per worker process (default: `EMMY_WORKERS`, one per core) — the export's whole cost; the pools are independent and
+the draw is seeded, so the dataset is the same at any count. `freeze --db PATH --out DIR` writes an instance's
+admitted rows (`db/freeze.freeze_reason`) as a golden file per card — the artifact that gets checked in. `check [--db
+PATH]` counts the rows of an instance whose tables disagree with themselves (`SearchDB.drift`) and exits non-zero when
+any do. Every subcommand resolves its instance through `commands/db.db_path`, which refuses a missing one with the
+command that fills it.
 
 ### `emmy fit`
- Fit an offline-prior weights artifact and cross-validate it, GPU-free, over the golden groups of a dataset `emmy db
+Fit an offline-prior weights artifact and cross-validate it, GPU-free, over the golden groups of a dataset `emmy db
 export` wrote — the directory the positional argument names — the same groups `eval prior` reads (`Dataset.load`; the
-pipeline ARCHITECTURE's Part 8 owns the pool). The trainer's feature view (`--features`) is a projection of the
-dataset's full featurization, taken at fit time. One switch, `--trainer {linear,catboost}`; the two trainers write the
-same artifact shape, distinguished by its `kind` field, so either can be pointed at with `EMMY_OFFLINE_FILE` and A/B'd
-against the other.
+pipeline ARCHITECTURE's Part 8 owns the pool). The fit reads every feature the dataset holds; there is no feature view
+to leave a computed feature out of. The artifact is one JSON file — the trees in CatBoost's own JSON model format —
+and any written one can be pointed at with `EMMY_OFFLINE_FILE` and A/B'd against the shipped one.
 
-`linear` fits weights by random search + coordinate descent: `--samples N` (default 0: coordinate-descent-from-seed,
-the incumbent practice) and `--l2 λ` (the raw-space L2 penalty strength in the fit loss — default the declared
-tie-breaker strength `fit/linear.DEFAULT_L2`, `0` disables; keeps a rank-flat weight magnitude identified, the
-D_pow2_threads 686 incident). `catboost` fits a `QuerySoftMax` ranker, one group per candidate pool with every
-golden matched into that pool as a positive: `--iterations N`, `--negatives K` (sampled negatives per pool per round,
-drawn from the unpinned rows — the full corpus is ~38 M rows, so training samples while the rank metric still covers
-whole pools) and `--rounds R` (the first draws negatives uniformly, each further one mines hard negatives from what
-the current model ranks near the golden — **default 1, so mining is off**: the one measurement of it moved top-1
+The fit is a `QuerySoftMax` CatBoost ranker, one group per candidate pool with every golden matched into that pool as
+a positive: `--iterations N` (trees; 200 by default, 500 for the placement space — `fit/catboost.PLACEMENT_ITERATIONS`
+records the cross-validation behind it), `--depth D`, `--learning-rate η`, `--negatives K` (sampled negatives per pool per
+round, drawn from the unpinned rows — the full corpus is ~38 M rows, so training samples while the rank metric still
+covers whole pools) and `--rounds R` (the first draws negatives uniformly, each further one mines hard negatives from
+what the current model ranks near the golden — **default 1, so mining is off**: the one measurement of it moved top-1
 from 545 to 517 over the 1278-group golden dataset, in-sample, and `fit/catboost.DEFAULT_ROUNDS` records why that is
-the expected direction when the negatives are unlabeled rather than known-bad). Its fits are not byte-reproducible
-— CatBoost's histogram build is threaded — so two fits are compared by their metrics files rather than by a
-checksum.
+the expected direction when the negatives are unlabeled rather than known-bad). Fits are not byte-reproducible —
+CatBoost's histogram build is threaded — so two fits are compared by their metrics files rather than by a checksum.
 
 **A group is a candidate pool, not a golden.** A pool is one kernel on one card, in one precision regime, at one
 set of sizes — every golden row measured on it pins a row of that ONE group, whatever name or file recorded it, and
@@ -852,12 +957,11 @@ instead of looking like lost data. A golden row whose signature matches no candi
 counted per card as `unranked`; a kernel formed from no loop op (a piece carved from a twisted tree, which only its
 parent's program reaches) is skipped the same way.
 
-**Pools are SAMPLED during enumeration.** `--pool-sample N` (default 2000; `0` enumerates every row) draws
-that many candidates per pool by single-pass reservoir sampling over the schedule walk's leaf stream — each
-candidate dict exists only for the moment it passes the draw — because the corpus is millions of rows and tens
-of gigabytes otherwise, and one golden's pool alone is past the scheduler's materialization budget, so an
-unsampled fit does not finish. The draw is a pure function of the stream and `(N, --seed)` and
-never reads a row, so a refit of the same corpus is byte-identical
+**Pools are SAMPLED during enumeration.** `--pool-sample N` (default 2000; `0` walks every row) draws that
+many complete rows per pool by seeded random descents through the pool's lazy schedule tree, a child at random
+at every branch, with every golden row reached by its own directed descent — because the corpus is millions of
+rows and tens of gigabytes otherwise, and a walk that visits every leaf takes an hour over the hardware goldens
+alone. The draw is a pure function of the tree and `(N, --seed)`, so a refit of the same corpus is byte-identical
 and two goldens over one pool still retain identical rows and still merge into one group. Every recorded
 config survives the draw wherever it sits in its pool, so a golden that misses its pool still means what it
 always meant — a pin or dtype mismatch — rather than an unlucky draw. Reported ranks are RAW ranks within the
@@ -867,16 +971,8 @@ provenance, so two fits are only comparable when it matches. `catboost`'s `--neg
 draw from whatever pool it is handed, and a uniform draw from a uniform draw is a uniform draw from the
 original — the two nest by construction, and the trainer warns when `--negatives` reaches the size of the
 pools it is given and therefore selects nothing.
- Shared: `--seed`, `--folds N` (default 5; `0` skips cross-validation), `--out DIR`, and `--features SPEC` — the
-feature view, comma-separated names with a trailing `*` for a prefix glob and a leading `-` to exclude, recorded in
-the metrics header and artifact provenance so two fits are only compared under matching views. **The default view is
-the trainer's own**: `search/dataset/group.DEFAULT_FEATURES` (`D_*,MMA_tier,MMA_acc_bits`) for `linear`, and
-`prior/fit/catboost.TREE_FEATURES` for `catboost` — that set minus every feature that exists only because an additive
-model cannot form it (monotone duplicates, `-|x - target|` folds, threshold flags, the `D_tma_*` interaction mirrors),
-each of which a tree re-derives by splitting on columns the view keeps. `search/dataset/group.MATMUL_FEATURES` is a
-third ready spec, holding just the 53 features that can move a matmul ranking — the rest are either constant within
-every pool or affine copies of a kept feature, so excluding them is expressiveness-neutral. `--out DIR` defaults to
-`_tune/fits/<timestamp>-<trainer>/`. A run writes `metrics.json` — the per-run record two fits are diffed by:
+Shared: `--seed`, `--folds N` (default 5; `0` skips cross-validation) and `--out DIR`. `--out DIR` defaults
+to `_tune/fits/<timestamp>/`. A run writes `metrics.json` — the per-run record two fits are diffed by:
 `full_train` (per-golden dual ranks plus per-card **summaries**) and the `cv` block (holdout and train summaries,
 per-card gap, per-fold detail); folds group by shape, so goldens sharing a candidate pool are held out together rather
 than scored by a model trained on that pool. The per-card blocks are the same `Summary` `emmy eval prior` emits — same
@@ -885,9 +981,8 @@ screen identically rather than agreeing by coincidence; each summary's `axes` ca
 `holdout` / `train`) beside the card, because one file holds all three. Goldens that never produced a candidate pool
 sit BESIDE the summaries in `full_train.skipped`, keyed by card: they have no pool and no rank, so they are a fact
 about the corpus rather than about a scored card, and keeping them out preserves the shared summary shape. The
-full-train artifact is written at `WEIGHTS`, the second positional argument, in the shipped format (a `catboost` fit
-also writes the booster as a `.cbm` sidecar beside it, named after its own JSON so several artifacts can share a
-directory): `prior/weights/offline.json` when a refit rewrites the shipped weights, any other path for a candidate to
+full-train artifact is written at `WEIGHTS`, the second positional argument, in the shipped format:
+`prior/weights/schedule.json` when a refit rewrites the shipped weights, any other path for a candidate to
 A/B through `EMMY_OFFLINE_FILE` (the flow that replaced the retired `scripts/golden_knob_heuristics.py`). The header
 names the dataset it read and the dataset's provenance — the DB, the golden files (by source digest) the pools were
 read from: two fits are comparable only when they were computed over the same rows. `emmy/commands/fit.py` owns the
@@ -896,20 +991,29 @@ trainer wiring, the artifact assembly and the file writing; the pool builder is
 `emmy/compiler/pipeline/search/prior/fit/` (`run.py` / `cv.py`), documented there and in the pipeline ARCHITECTURE's
 prior sections.
 
-The command layer builds two `LinearTrainer` objects from these flags — the full-train one, warm-started from the
-incumbent artifact, and the fold one derived as `replace(trainer, warm_start=False)` so no held-out golden leaks
-into the model that is supposed to have never seen it. `run_fit` returns the fit rather than an artifact, because
-deciding what a fit with no dynamic cases ships with (it carries the incumbent's dynamic weight set forward, and
-says so in the provenance notes) is a shipping choice, not part of the shape of a run. The metrics header records
-both seeding policies and the ranking loss the fit ran under; two fits are only comparable when those match, the
-same way they must match on `--features`.
+The command layer builds one `CatBoostTrainer` from these flags; it serves the full-train fit and every fold, since a
+tree ensemble has no warm start through which a held-out golden could leak. The metrics header records its
+hyperparameters; two fits are only comparable when those match.
+
+The dataset's space selects the rest: a placement dataset writes `space` into the artifact,
+which the loader checks against the fork it is asked at.
 
 ```bash
 emmy db import --db _data/dataset.db --fresh emmy/compiler/pipeline/search/golden/records/*.json   # the rows
-emmy db export --db _data/dataset.db _data/dataset     # the dataset the fit reads
-emmy fit _data/dataset emmy/compiler/pipeline/search/prior/weights/offline.json   # the shipped weights, 5 shape folds
-emmy fit _data/dataset _tune/fits/ab/offline.json --folds 0 --out _tune/fits/ab     # full-train only, a candidate to A/B
+emmy db export --db _data/dataset.db _data/schedule --space schedule     # the dataset the schedule fit reads
+emmy db export --db _data/dataset.db _data/placement --space placement   # the dataset the placement fit reads
+emmy fit _data/schedule emmy/compiler/pipeline/search/prior/weights/schedule.json     # the shipped weights, 5 shape folds
+emmy fit _data/placement emmy/compiler/pipeline/search/prior/weights/placement.json
+emmy fit _data/schedule _tune/fits/ab/offline.json --folds 0 --out _tune/fits/ab     # full-train only, a candidate to A/B
 ```
+
+The greedy reproduction walk compiles one matmul pool per worker process (`EMMY_WORKERS`, one per core); each worker
+draws its cold pools in-process. `emmy eval prior --rank-only --json PATH` writes the same golden rank report while
+skipping that walk. `emmy eval prior DATASET --offline-file CURRENT --compare-to CANDIDATE --json PATH` scores both
+weights over the same golden pools and writes their summaries and a comparison decision to one report. It requires a
+5% lower median golden rank in at least one GPU/tier/pool-size group, no higher median in any group, and unchanged
+coverage. `--min-rank-improvement` changes the threshold. The nightly CI optimization workflow uses this mode before
+running the reproduction gate for a candidate it would commit.
 
 ## Experiments
 

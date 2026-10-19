@@ -1,6 +1,7 @@
 # Native cached generation
 
-Python prepares a standalone dense Qwen3 generation artifact with FP16 weights, projection inputs, and KV cache.
+Python prepares a standalone generation artifact for a dense Qwen3 or Qwen3.5 text model with FP16 or FP8 weights,
+projection inputs, a KV cache for its full-attention layers and carried state for its Gated DeltaNet layers.
 The output head retains FP32 logits through sampling so FP16 rounding cannot create a false maximum tie.
 The Rust runtime submits the exported launches and retains the KV cache. Compiled GPU reductions select greedy
 tokens; positive-temperature sampling runs on the CPU. No Python model operation runs after preparation. The
@@ -11,16 +12,16 @@ experimental native HTTP adapter serves one active request; this is not a perfor
 `prepare.export_model` traces the existing attention-split wrappers and final normalization/output head. It uses the
 compiler's plan-template cache to reuse identical layer structure. The compiled plans are joined into one ordinary
 static plan for each width: seams refer to the same named allocation, and internal names are scoped by layer.
-There is no new compiler or runtime alias format. Unsupported symbolic, indirect, and descriptor arguments are rejected.
+There is no new compiler or runtime alias format. Unsupported symbolic and descriptor arguments are rejected.
 Cache buffers use the persistent output role, without joining the public logits/token output list. Custom launches
 identify their writes so Python scratch allocation preserves the same dependencies as native execution.
 
 The glue between the projections is compiled too, from three small traced modules in `prepare.py`: the embedding
 gathers the prompt's token at this position while the prompt lasts and the previous step's selection after it, the
-rotary module rotates q and k at this position and hands k and v to the cache pages, and attention runs causal
-grouped-query attention over the whole cache with every position past this one masked. All three read the position
-from device memory, including the cache write, whose paged start is the `position` input rather than a host symbol, so
-a token step is one launch sequence at every position and replays as one graph. Nothing the device runs is
+rotary module rotates q and k at this position and scatters k and v into the cache pages at that position, and attention
+runs causal grouped-query attention over the whole cache with every position past this one masked. All three read the
+position from device memory, including the cache write, whose rows land at an index computed from the `position` input
+rather than a host symbol, so a token step is one launch sequence at every position and replays as one graph. Nothing the device runs is
 hand-written: the step ends at the FP32 logits and the greedy token, a compiled reduction over them, and the runtime
 samples on the host only at positive temperature (below), so the same export serves any device the compiler targets.
 Attention keeps dot products, scores, probabilities, and value accumulation in FP32, rounding only its output to FP16.
@@ -30,8 +31,24 @@ checkpoint's own module in FP32. Rotation also uses FP32 intermediates and round
 The existing standalone exporter bundles all binaries and weight bytes. Generation metadata lives in the pack key and
 has its own version.
 
-Preparation rejects other model families, quantization, sliding attention, non-default rotary schemes, training mode,
-and non-FP16 or non-CPU parameters. Context capacity must fit both the model and the current 4,096-token limit.
+A Qwen3.5 text decoder is found with `find_text_decoder`, since those checkpoints wrap it beside a vision tower native
+never loads. Its full-attention layers add two things to the Qwen3 path: the rotary module rotates only the leading
+part of each head (the family's partial rotary embedding), and the attention split carries the fused output gate as a
+fourth `pre` output and third `post` input. Its Gated DeltaNet layers run whole, through the GDN state wrapper in the
+same FP32-residual form the attention split has, so both layer types meet at one seam dtype. Such a layer reads its
+FP32 recurrent state and FP16 convolution history and writes the next ones over them: each output is spelled as the
+input with every row replaced (a scatter), which the compiler stores into the input's memory. The pack key lists
+these buffers under `state` (below).
+
+A quantized checkpoint loads through the serving runner's checkpoint-sourced lane (`load_model`). Its twin is built
+from the config with the trunk's coded linears left as placeholders; each program's trace is re-addressed to the
+checkpoint's keys, the loader's spellers put the decode algebra in the graph, and the constants bind from the shards.
+An FP8 trunk therefore stays at its stored size, weight-only under FP16 activations, and nothing past the loader
+knows the format. Transformers' quantizer never runs: a module that still carries its checkpoint's quantization
+declaration is rejected.
+
+Preparation rejects other model families, sliding attention, non-default rotary schemes, training mode, and
+non-FP16 or non-CPU parameters. Context capacity must fit both the model and the current 4,096-token limit.
 Compiler evidence uses the existing golden and strict-evidence controls. A successfully exported artifact has not,
 by itself, established numerical correctness or fast schedules.
 
@@ -61,6 +78,18 @@ before the owner. Loading allocates and uploads both programs before replacing d
 borrowed ones, so peak load memory exceeds resident memory. The embedding and tied output-head copies within decode
 remain separate.
 
+The state is updated in place. The next state reads whole columns of the old one, so the kernel that stores it over
+the old state must not also compute it: fusion keeps a kernel stored over a buffer apart from every loop that
+computes from that buffer's old cells, and the store becomes a copy of the next state, computed by an earlier kernel
+into scratch. A new request zeroes every state buffer. Prefill borrows them as it borrows the other outputs decode
+owns, so decode reads what prefill last wrote.
+
+A prefill chunk may hold rows past the prompt's end, which decode repairs by overwriting their cache rows. The
+state has no such repair — those rows would be folded into the request — so an artifact that declares state takes a
+chunk only where every row is a prompt token before the last, and the one-token program covers the rest. The
+prefill shortcut that skips the last layer's attention and post-attention fragment applies only when that layer is an
+attention layer; a Gated DeltaNet layer always runs whole, since its state must advance.
+
 Each program has its own graph capture, recorded without executing a warmup. Replaying the graph advances the model
 exactly once,
 including when capture is first enabled during decode. All addresses remain stable across positions and requests.
@@ -77,8 +106,9 @@ returns the advanced position; intermediate chunks return no token or logits.
 
 ## Sampling contract
 
-Generation artifact version 5 ends the decode step at the FP32 logits and the greedy token, and adds the prefill
-width, with a separate prefill program when that width exceeds one. The decode program's inputs are the prompt, its
+Generation artifact version 6 ends the decode step at the FP32 logits and the greedy token, adds the prefill width,
+with a separate prefill program when that width exceeds one, and lists the carried `(read, write)` buffer pairs,
+empty for dense Qwen3. The decode program's inputs are the prompt, its
 length, the position and the previous step's token; its outputs are the logits and the lowest token ID among their
 maxima, which a compiled reduction selects on the device. At temperature zero the runtime downloads that token alone;
 at positive temperature it downloads the logits — one vocabulary-sized FP32 transfer per generated token, none during
@@ -165,12 +195,34 @@ continuous batching, and prefix reuse are not implemented. The
 Performance and production concurrency are separate qualifications; these reports establish no general native
 serving advantage over stock vLLM.
 
+The first FP8 export, Qwen3.8-27B-FP8 on one H100 (context 256, prefill 16, `EMMY_POOL_DRAW=2048`), produced a 53 GB
+pack whose trunk is e4m3 codes, replayed launch by launch and answered greedy prompts coherently through the native
+worker. What it established ends there; the gaps, in the order they should close:
+
+- **No parity against the Transformers reference.** The checkpoint qualification above needs a 4,096-token artifact
+  and a checkpoint `from_pretrained` loads in FP16, neither of which an FP8 checkpoint gives; the native logits of the
+  27B export were compared with nothing but their own replay.
+- **No speed number.** `emmy generate --native-pack` prints no per-step time, and the pack load (53 GB) dominates a
+  wall clock; a timing flag is the missing piece, not a script.
+- **The native HTTP server has not served it.** `emmy serve --native --native-pack DIR` reads the tokenizer, the
+  chat template and `serving.json` that `launch.prepare` bundles, which `generate --export-native` does not write.
+- **The Gated DeltaNet gate lowers through the generic path.** Its fold multiplies `W[k, h]` projections and a
+  per-head `X[h, d, k]` by one row; those channels read different B spaces, so it is no contraction and takes no
+  tensor-core tile. A per-channel orientation would give it one back.
+- **Compiling is slow and mostly unmeasured.** The decode GDN kernel alone took ~20 minutes on the H100 and the
+  whole export ~80 minutes: the layer fuses into one kernel offering dozens of cut seams, and the placement
+  decision builds every arm to rank it, down a chain of such decisions (the schedule draw is seconds). The
+  pricing shortcuts and the parallel arm build cut the dev-box compile of that kernel from 327 s to 115 s; the
+  export has not been re-timed. The H100 hardware golden holds 24 rows, so nearly every pick is the prior's. A
+  record run on the card is what turns those picks into evidence.
+
 ## Native HTTP launcher
 
 `emmy serve MODEL --runner generate --native` prepares the artifact in a fresh temporary directory and executes a
-prebuilt `emmy-server`. Preparation uses FP16 checkpoint weights, the requested revision, and the existing golden and
-strict compiler-evidence controls. `--native-pack DIR` reuses an already prepared serving bundle; its recorded model,
-revision, and context must match. Preparation-only evidence flags are rejected when reusing a bundle.
+prebuilt `emmy-server`. Preparation uses the checkpoint's weights in FP16, or coded for a quantized checkpoint, at the
+requested revision, with the existing golden and strict compiler-evidence controls. `--native-pack DIR` reuses an
+already prepared serving bundle; its recorded model, revision, and context must match. Preparation-only evidence flags
+are rejected when reusing a bundle.
 
 Native options are `--host`, `--port`, `--revision`, `--max-model-len`, `--page-tokens`, and `--native-pack`, plus the
 existing Emmy preparation, dry-run, and benchmark controls. Context defaults to 4,096; the page size defaults to one

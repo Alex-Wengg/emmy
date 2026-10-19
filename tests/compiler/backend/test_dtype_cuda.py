@@ -23,6 +23,34 @@ from tests.compiler.helpers import requires_cuda
 
 
 @requires_cuda
+def test_f16_to_bf16_intermediate_rounds_before_multiply():
+    """A fused kernel must keep the BF16 cast between an FP16 scale and its use."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.numpy import NumpyBackend
+
+    graph = Graph()
+    graph.add_node(InputOp(), [], Tensor("scale", (16,), dt.F16), node_id="scale")
+    graph.add_node(InputOp(), [], Tensor("code", (16,), dt.BF16), node_id="code")
+    graph.add_node(ElementwiseOp("copy"), ["scale"], Tensor("rounded", (16,), dt.BF16), node_id="rounded")
+    graph.add_node(ElementwiseOp("multiply"), ["rounded", "code"], Tensor("out", (16,), dt.BF16), node_id="out")
+    graph.inputs, graph.outputs = ["scale", "code"], ["out"]
+
+    scale = np.array([1.00390625, -1.00390625] * 8, dtype=np.float16)
+    code = dt.encode_bf16(np.array([3.0, -3.0] * 8, dtype=np.float32))
+    feed = {"scale": scale, "code": code}
+    expected, _ = NumpyBackend().run(graph, input_data=feed)
+    shortcut = dt.encode_bf16(scale.astype(np.float32) * dt.decode_bf16(code))
+    assert np.any(expected.outputs["out"] != shortcut), "fixture must distinguish the intermediate BF16 round"
+
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if hasattr(n.op, "kernel_source"))
+    assert "__float2bfloat16" in sources
+    actual, _ = backend.run(compiled, input_data=feed)
+    np.testing.assert_array_equal(actual.outputs["out"], expected.outputs["out"])
+
+
+@requires_cuda
 @pytest.mark.parametrize(("dtype", "delta"), [(dt.F16, 2**-10), (dt.F32, 2**-13)])
 def test_separate_multiply_and_add_preserve_rounding(dtype, delta):
     """A multiply and an add round separately, as eager does. f16 needs no flag: its ops are spelled
@@ -350,3 +378,22 @@ def test_fp16_max_reduction_stays_in_fp16():
     assert "__half acc" in sources, f"expected fp16 accumulator for max, got:\n{sources}"
     # The combine uses __hmax (native fp16 max), not fmaxf.
     assert "__hmax" in sources, f"expected __hmax intrinsic for fp16 max, got:\n{sources}"
+
+
+@requires_cuda
+def test_f32_floor_renders_and_rounds_down():
+    """``floor`` (Ministral 3's position-dependent query scale) renders as ``floorf``."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda import CudaOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1024,), dt.F32), node_id="x")
+    g.add_node(op=ElementwiseOp("floor"), inputs=["x"], output=Tensor("y", (1024,), dt.F32), node_id="y")
+    g.inputs, g.outputs = ["x"], ["y"]
+    compiled = CudaBackend().compile(Pipeline.build(LOOP_PASSES).run(g))
+    sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
+    assert "floorf" in sources, sources
+
+    x_data = (np.random.default_rng(2).standard_normal(1024) * 8).astype(np.float32)
+    result, _ = CudaBackend().run(compiled, input_data={"x": x_data})
+    np.testing.assert_array_equal(next(iter(result.outputs.values())).reshape(-1), np.floor(x_data))

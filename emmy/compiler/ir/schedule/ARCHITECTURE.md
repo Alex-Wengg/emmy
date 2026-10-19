@@ -6,10 +6,11 @@ lowering facts. A concrete schedule family may carry derived lowering facts in a
 
 A schedule enumeration has two terms, and the interface names both. A `ScheduleProblem` is the problem and the
 target factored into `Site`s — one per node in composition order, the kernel site last — beside the knob row it was
-built with. A site answers `options`: the values it may take on its own, with no other site in view. That is the
-SOURCE of every candidate. A site the row names offers the row's value alone, parsed and checked with the same
-per-choice rules a catalog value passes through; a site the row leaves free offers its catalog. Nothing downstream
-generates a candidate, so nothing has to filter one away.
+built with. A site offers the values it may take on its own, with no other site in view, as its own factors; the
+interface names no option product, because a product object is the one thing every eager table is built from. That
+is the SOURCE of every candidate. A site the row names offers the row's value alone, parsed and checked with the
+same per-choice rules a catalog value passes through; a site the row leaves free offers its catalog. Nothing
+downstream generates a candidate, so nothing has to filter one away.
 
 `ScheduleContext` is the immutable compatibility prefix `c`: what earlier sites decided. It owns the compatibility
 between sites and nothing else. Its defining operations are a lazy frontier and composition:
@@ -19,23 +20,27 @@ between sites and nothing else. Its defining operations are a lazy frontier and 
 
 Every context prefix and extension is a `Schedule[KernelT, NodeT, EdgeT]`; a non-`None` kernel marks completion.
 `extensions` yields the next site's options that compose with the prefix; `extend` composes one and returns a context
-containing the composed facts, leaving the original unchanged, or raises `ScheduleRefused`. `extend` is also the
-validation boundary for a complete classic schedule supplied directly by a pinned golden, even when that assignment
-was not emitted by `extensions`. The generic `schedule(context)` recursively composes those lazy frontiers and yields
-only complete schedules. Recursion is the generic Algorithm 1 traversal; consumers do not write a family-specific
-visitor or feed contexts back themselves. The driver knows no concrete family, pipeline fork type, site order, or
-enumeration slice. `narrowed(row)` is the one way a row enters after construction: an EMPTY prefix over the same
-problem with the row installed, which is what a descent that already holds a row asks for before expanding anything.
-Strict narrowing marks only the supplied codec keys as exact; inherited peer-kernel pins keep their ordinary tolerant
-reading. A row narrows WITHIN the live hand pins and never lifts one: where an evidence row and an environment pin name
-the same site with different values the site keeps the pin's, no leaf equals the row, and the descent that followed
-the row re-decides. A recorded receipt of the same kernel used to win that disagreement, so an `EMMY_KNOBS` fast-math
-pin silently deployed the standard receipt.
-The pipeline's generic schedule-fork adapter preserves the same contexts as deferred search branches without adding
-compatibility logic.
+containing the composed facts, leaving the original unchanged, or raises `ScheduleRefused`. `random_step(rng)` is
+the third operation, one option `extensions` would yield, already composed, or `None`: the step of a random descent.
+It costs what it touches: the default materializes the frontier and extends one pick, which is right only where the
+frontier is small by construction (the cut pass's structural choices, the register tier's one kernel choice), and a
+family whose frontier is a product of factors draws factor by factor, deriving only what the draw reaches and never a
+site's product.
+`extend` is also the validation boundary for a complete classic schedule supplied directly by a pinned golden, even
+when that assignment was not emitted by `extensions`. The generic `schedule(context)` recursively composes those lazy
+frontiers and yields only complete schedules. Recursion is the generic Algorithm 1 traversal; consumers do not write a
+family-specific visitor or feed contexts back themselves. The driver knows no concrete family, pipeline fork type,
+site order, or enumeration slice. `narrowed(row)` is the one way a row enters after construction: an EMPTY prefix over
+the same problem with the row installed, which is what a descent that already holds a row asks for before expanding
+anything. Strict narrowing marks only the supplied codec keys as exact; inherited peer-kernel pins keep their ordinary
+tolerant reading. A row narrows WITHIN the live hand pins and never lifts one: where an evidence row and an
+environment pin name the same site with different values the site keeps the pin's, no leaf equals the row, and the
+descent that followed the row re-decides. A recorded receipt of the same kernel used to win that disagreement, so an
+`EMMY_KNOBS` fast-math pin silently deployed the standard receipt. The pipeline's generic schedule-fork adapter
+preserves the same contexts as deferred search branches without adding compatibility logic.
 
 Classic sites additionally expose their independent factors — a node site's `nodes` and `edges`, the kernel site's
-`kernels` — and `ClassicProblem.bounds` reports the size of their product without building it. There is no product
+`kernels` — and `ClassicProblem.bound` reports the size of their product without building it. There is no product
 OBJECT: the sites are the factors, so a type holding a copy of them would be a second answer to one question. Tests
 build the literal product themselves, and a bounded test hands the sites hand-written factors by subclassing them
 (`tests/compiler/helpers.literal_classic_context`), which is the only way to offer a site values it did not project:
@@ -60,8 +65,9 @@ operand-edge sites, each site's projection or reduction view, and each contracti
 (`cone_seam`) splits the cone's edges at the K axis into a row-invariant prologue, a per-chunk statistic (a reduce
 that reads K only through one block guard, such as a grouped activation scale's maximum) and a per-cell body. Only
 external reads cross these parts; a value defined inside the consuming body is not bridged. Equal folds shared by
-cell edges lower once through `Body.coalesce`, so attention's output and row sum do not redeclare the same states in
-a replicated fill.
+the edges of one part lower once through `Body.coalesce`: attention's output and row sum do not redeclare the same
+states in a replicated fill, and two row-invariant edges over one norm statistic do not fold it twice in the stat
+prologue.
 `ir/schedule/views` supplies the vocabulary (`node_view`, `Projection`, `Reduction`, `Contraction`,
 `ContractionFacts`) and the one derivation that is not a projection of the site table, `contraction_facts`; the tile
 layer reads through them. The composition context publishes the schedule-facing API (`node`, `site`, `operand`,
@@ -92,15 +98,34 @@ the choice types and key spellings through the package.
 whose values its sites offer where it names them. `ClassicScheduleContext` is the immutable `c + p + t` prefix over
 that problem. Everything a schedule choice cannot change is derived from the tile and the target and memoized on the
 term it derives from — a contraction's `ContractionFacts` on the Fold root (`TileOp.contractions`), the packed operand
-readings and the placement on the TileOp, and the per-target support tables on the TileOp beside their target. The
-context owns all classic compatibility: worker inventory, physical-axis agreement, fragment seams, raster eligibility,
-resource limits, producer-band/TMA agreement, target availability. A site's tuples hold choices only; an expensive
-local support record is derived lazily, once per site object, after the context has selected one node and its
-incident edge values. This node-plus-incident-edges frontier is granular enough to reject mixed transport and
-fragment-seam combinations before they create subtrees, without materializing the full node × edge product.
-`extensions` emits partial schedules at that granularity; `extend` derives and composes their support. Kernel picks
-form the final frontier: the kernel site's catalog is what the node sites' choices imply, so it is the last site. The
-fragment-seam relation has no pipeline-side copy.
+readings, the placement and the three site relations the binder dictates (`shared_roots`, `chain_pairs`,
+`nested_tiles`) on the TileOp, and a node choice's supports on the site that offers it. The compatibility rules —
+worker inventory, physical-axis agreement, fragment seams, the shared-root, chain and nested-tile rules — are stated
+in `refusals` beside the
+per-choice ones, as one function of a pick and a RELATION: what a prefix has decided that those rules read (the
+inventory it claimed, its axis and fragment agreements, and the decided nodes only where a rule reads them — every
+one while no inventory is claimed, all of them at a shared root, a chain member or either end of a nested tile).
+The context carries that
+relation and composes it; the kernel-level rules (raster eligibility, resource limits, the producer band) stay with
+it. A node site holds one record per node choice with the facts that are the tile's alone — the inventory it
+claims, its placed geometry and axis agreements, the seam claims that read no transport — and, derived only when
+asked, the choice's supports: the choice paired with each transport its own catalog offers (`stage_candidates`)
+that resolves (the stage resolver, the plan and budget refusals). The site's edge catalog is the union over its
+choices, so a row can name any of them, but a choice never takes a transport another choice brought: the 8-deep
+ring is wgmma's alone, and an mma tile that drew it made a leaf the row-narrowed descent could not rebuild. A
+transport that takes an operand's base address never feeds a paged one (`ClassicProblem.paged`, the graph's
+`cuda.paged_buffers` hint): TMA encodes the address on the host, and cp.async's per-thread addresses cannot
+resolve a page per element, so a buffer of several pages loses both. A prefix filters the site's choices by those
+tile-level facts, one
+filter per relation kept on the site, so prefixes that decided different nodes but agree on the facts read one
+answer; on the kernels measured that filter alone finds every dead prefix. The supports of the choices it admits
+are then filtered by the one claim a support completes, its transport's K slab at an ordinary seam. `extensions`
+reads that whole frontier; `random_step` never does — it draws an admitted choice, keeps it as often as it has
+admitted supports and takes one of those, so the draw is uniform over the frontier's (choice, transport) pairs while a
+descent derives supports only for the choices it touched; a choice with none leaves the draw. It composes the drawn
+support without `extend`'s re-check, which would repeat the admission the draw just made. A hand-pinned transport no choice resolves raises with the rule's message the first time
+a prefix reads the site. Kernel picks form the final frontier: the kernel site's catalog is what the node sites'
+choices imply, so it is the last site. The fragment-seam relation has no pipeline-side copy.
 
 A pointwise map's site reads a catalog of its own (`map_tile_moves`): the per-cell form and the register strips that
 hand one thread 2, 3, 4 or 8 contiguous inner-axis elements, each offered when it divides a static inner extent. It
@@ -113,6 +138,16 @@ inventory `t<coop>x<cells>` (`packed_works`), a 128-thread CTA holding several c
 hands consecutive cells to consecutive lane groups. `REDUCE=coop` reads its width off the inventory's first unit.
 Packing needs every operand read straight from gmem: a staged row is one CTA-wide slab per cell. A node prefix spells
 `t<coop>` and the packed leaf grows it at an `x` boundary, which `Fork.admits` accepts for `WORK`.
+
+The native block-scaled FP4 stage copies codes and scales in complete K-contiguous rows. A runtime activation
+row extent is legal for cp.async: the shared-memory fill clamps both copies to the last valid row, and output
+stores mask padded rows. The row count does not change a copy's K-inner stride or alignment. TMA requires a static
+row extent because its box transport does not use that clamp. Runtime row counts must be positive. With a static
+unit N, the shared-memory fill clamps every padded row to the sole input row, and the output stores mask the padded
+columns. This masked N is legal for cp.async: padding never changes a K-contiguous copy's address or alignment.
+Other masked N extents and masked TMA boxes remain unsupported. K and the code/scale spans must still satisfy the
+stage's divisibility and 16-byte copy alignment rules; the ring may finish after any whole K tile, including a partial
+cycle of its depth.
 
 Classic domain projection, move catalogs, packed-operand readings, staging resolution, materialization, and
 compatibility all live in `ir/schedule`. The sites are the only source of choices; pipeline search neither defines
@@ -129,14 +164,18 @@ decided once, at the offer, and never dropped from a priced row later. The parti
 nodes the binder builds the kernel around — the roots it peels from the root projection (`ops.kernel_roots`: a tiled
 contraction's root, every one of them for a multi-output kernel, else the first operand) and the folds those roots'
 cones close over (`ops.chain_members`, which the binder's chain arm strides around one shared lane axis). A reduce
-NESTED under one of those lowers serially inside its reader, so it carries the serial fold only, as does an observed
-node and one whose reduce reads a boundary store's output sweep. Whether a fill takes a root's cone over is the
+NESTED under one of those lowers serially inside its reader, so it carries the serial fold only, as does a node whose
+reduce reads a boundary store's output sweep. An observed root without a provider chain also offers cooperative
+widths up to one warp, with no register partials or transposition: the materializer retains every inclusive prefix.
+Whether a fill takes a root's cone over is the
 SCHEDULE's answer and not the term's, so a contraction a tier could fold whole still offers its own row statistic the
 member catalog: the untiled tiers bind it as a fold beside the root, and reading the tier off the term left a
 cooperative reduce evaluating a 16384-wide statistic once per thread. The contraction per-cell tier reads that same
-projection, so a contraction inherits those readings rather than restating them.
+projection, so a contraction inherits those readings rather than restating them. A deferred split's finalizer is
+another root fold: it offers the same legal serial, register-partial and cooperative choices over its workspace
+states. Their cost is measured; the number of partial states does not restrict the legal domain.
 
-Two binder facts are relations between sites rather than node domains, so they compose in `extend` beside the worker
+Three binder facts are relations between sites rather than node domains, so they compose in `extend` beside the worker
 and physical-axis agreements. The binder builds a kernel around several scheduled roots only where the projection
 partitions its outputs by root (`ops.projection_regions` — each store reads exactly one root's region); where it does
 not, one root is the kernel's root and every other reduce lowers serially, so the context refuses a second scheduled
@@ -147,7 +186,15 @@ used to be offered, ranked first, and refused at materialize; the row that coope
 And a chain binds only in the binder's
 untiled arm, so the context refuses a partitioned chain member beside an output-tiled root: there the fill evaluates
 the cone per cell, statistic included, and the member's partition would realize as nothing — an unreproducible pin
-rather than a refusal.
+rather than a refusal. And the binder lowers a `TILE` below a kernel root (a node the binder builds the kernel
+around, `ops.kernel_roots`) only inside a root it output-tiles, that is, lowers through the tier that tiles its
+`(m, n)` output — and even there only where that tier folds the nested site (the chunked carrier's score). Any other
+root lowers its subtree serially, which would drop the tile, so the context refuses a tiled site below a root that is
+not output-tiled (`nested_tiles`), checked at whichever site of the pair is decided second. The NVFP4 scale — the
+maximum over each 16-element NVFP4 scale group of the gate/up contraction's output — used to be offered such rows,
+the prior ranked one tiled variant after another first, and the greedy compile spent a whole resolve (one pipeline
+pass over the whole program under the current blocklist) on each refusal at materialize until its retry budget ran
+out.
 
 A CHUNKED carrier's seam is stricter than an ordinary consumer's. The ordinary need tolerates an untiled producer;
 this one is built on the fragment, since the chunk's score IS the producer's tile — so the producer must be
@@ -191,6 +238,11 @@ refuse that kernel.
 8-deep ring to `wgmma` tiles, the only ones it has paid on; elsewhere it would only multiply the candidates every
 compile prices.
 
+The synchronous fill checks copied-operand cover when constructing its slabs, including materialized multi-channel
+contractions. A copied N-contiguous slab needs complete N tiles: clamping a vector's start to the last scalar breaks
+alignment and crosses the row. A transposed B copies along K and can clamp whole outer N rows. Dividing tiles remain
+available on the same fused contraction.
+
 `TileOp.stage_edges` offers a transport at every operand of every contracting site, a chunked carrier's included —
 which tier then puts which operand on a slab is the tier's own business. The chunked site used to be excluded on the
 reading that it "takes its chunk off the `TILE`, so a transport spelling there would decide nothing"; a `Stage` never
@@ -209,6 +261,11 @@ the card cannot run, and a hand-pinned transport no support resolves raise with 
 (`loud_pins`), which the descent's `with_row` turns off: a stale row is answered by an empty site and the caller
 re-decides. Strict complete-row decode does not take that tolerant catalog fallback: once parsing or an intrinsic
 check fails, the empty site is returned without walking the catalog.
+
+A kernel-scoped hand pin remains partial: every named value must realize, while unnamed families retain their
+catalogs. Exact replay applies to the supplied keys of a complete row followed from evidence, not to an ordinary
+hand pin merely because it names one kernel. Omitting `WORK` from a reduction pin therefore leaves worker selection
+open; an impossible named worker or reduction still refuses.
 
 A bare pin on a kernel that spells its family per site is a DISJUNCTION over those sites: one carries the value and
 every other is OFF. That is the reading `unreproducible_pin_flag` and `evidence_row_vouches` already give a bare key,
@@ -229,6 +286,18 @@ one `ClassicScheduleContext`; private syntax-only parsing and encoding let graph
 before the `TileOp` constructor performs that same validation once. It owns canonical complete-row and prefix-delta
 encoding for `WORK`, `TILE`, `REDUCE`, `STAGE`, and `RASTER`. There is no codec base class: a second schedule family
 should demonstrate any shared codec contract before one is extracted.
+
+A complete classic hand pin is decoded through that same codec before the compatibility frontier is traversed.
+Pins addressing a peer kernel's sites do not prevent direct decoding. A refused row keeps the ordinary peer fallback.
+
+Transposed cooperative reductions use 32 output lanes by default. Volta's catalog also offers `coop-t/n8`: eight
+output lanes, with the remaining threads partitioning the reduction. `/v<n>` still names adjacent columns per lane.
+On an ordinary `coop` band, `/v<n>` names the adjacent reduce elements a lane reads per step, so a contiguous operand
+reads as one vector; the lane strides by `coop · n`. A prefix scan does not take it: the scan keeps one inclusive
+state per lane. The catalog does not offer `coop/v<n>` itself, since the prior cannot tell it from the plain band; a
+row or a pin names it.
+Both layouts use the same reduction choice, codec and materializer. The worker count is divisible by the output lane
+count.
 
 The structural cut phase runs before any schedule is composed. The single `030_cut` pass reaches a fixpoint over two
 ordered domains: stored-Fold-edge placement first, then cross-CTA reduction splitting. Every successful choice and
@@ -264,3 +333,18 @@ The catalog offers FP32 accumulation and FP16 partial accumulation under `F16_MM
 `TILE`'s K chunk is the promotion interval in atom steps: `k4` promotes and clears the partial accumulator every
 64 products on m16n8k16 or 16 on Volta m8n8k4, including a shorter final chunk. An explicit tile row can select
 the arithmetic directly. Register pressure and numerical error depend on the shape and inputs.
+
+## The CPU schedule
+
+On a context whose backend is `cpu` (`Context.for_cpu`), `040_schedule` offers the CPU family (`ir/schedule/cpu.py`)
+in place of the classic and register ones: the same problem, site, codec and lazy enumeration interfaces, one kernel
+site, and knobs of its own — no CUDA knob takes a CPU meaning, so CUDA evidence and priors never see a CPU decision.
+Its rows are filed under the CPU's context in the tune DB and picked as CUDA rows are; with no CPU prior, a fork
+nothing measured takes the catalog's first leaf. A choice joins the family only once a measurement shows each of its
+values winning somewhere.
+
+`CPU_TILE=<rows>x<columns>` is a projection's register tile, read by the CPU code generator: the output cells one
+pass of the reduce loop accumulates together. A kernel with two free loops and a reduction offers every tile whose
+accumulators (the kernel's running sums times the tile's cells) fit half the vector registers, largest and squarest
+first; any other kernel offers `1x1`. A measured row narrows the problem within the hand pins and never over them, as
+`ClassicProblem.with_row` does. The materialized tile keeps its loop body; the schedule rides beside it.

@@ -8,6 +8,7 @@ These tests require PyTorch.
 import pytest
 
 from emmy.compiler.trace.torch import has_torch
+from tests.compiler.helpers import requires_cuda
 
 pytestmark = pytest.mark.skipif(not has_torch(), reason="PyTorch not available")
 
@@ -413,17 +414,15 @@ def test_trace_copy_uses_broadcast_source_values_and_matches_eager():
     np.testing.assert_array_equal(got, Copy()(template, source).numpy())
 
 
-def test_trace_reassembles_static_local_slice_copies_observed_through_base():
-    """Sequential writes through static slices version and reassemble a local base."""
+def test_trace_static_local_slice_copies_reach_reads_of_the_base():
+    """Sequential writes through static slices of a local tensor reach its later reads, as in eager."""
     import numpy as np
     import torch
     import torch.nn as nn
 
     from emmy.compiler.backend.numpy import NumpyBackend
     from emmy.compiler.ir.base import ConstantOp, InputOp
-    from emmy.compiler.ir.expr import BinaryExpr, Literal
     from emmy.compiler.ir.loop import LoopOp
-    from emmy.compiler.ir.tensor.ir import IndexMapOp
     from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
     from emmy.compiler.trace.torch import trace_module
 
@@ -444,15 +443,6 @@ def test_trace_reassembles_static_local_slice_copies_observed_through_base():
     shifted_gate = torch.randn(1, 2, 4, 16)
     values = (template, right_kv, right_gate, shifted_kv, shifted_gate)
     graph = trace_module(CopyThenReadBase(), values)
-    updates = [
-        node for node in graph.nodes.values() if isinstance(node.op, IndexMapOp) and len(node.op.sources) == 2 and node.id.endswith("_base")
-    ]
-    assert len(updates) == 4
-    for update in updates:
-        select = update.op.sources[0].select
-        while isinstance(select, BinaryExpr) and select.op == "&&":
-            select = select.left
-        assert select == Literal(True, "bool")
 
     backend = NumpyBackend()
     result, _ = backend.run(
@@ -465,8 +455,8 @@ def test_trace_reassembles_static_local_slice_copies_observed_through_base():
     assert all(isinstance(node.op, (InputOp, ConstantOp, LoopOp)) for node in lowered.nodes.values())
 
 
-def test_trace_reassembles_qwen_chunk_recurrence_on_computed_local_base():
-    """Sequential select/slice writes version Qwen's computed attention matrix and local output."""
+def test_trace_qwen_chunk_recurrence_writes_reach_its_local_bases():
+    """Sequential select/slice writes into Qwen's computed attention matrix and local output reach their later reads."""
     import numpy as np
     import torch
     import torch.nn as nn
@@ -527,11 +517,13 @@ def test_trace_treats_empty_static_local_slice_copy_as_noop():
     assert all(isinstance(node.op, (InputOp, ConstantOp, LoopOp)) for node in lowered.nodes.values())
 
 
-def test_trace_rejects_copy_mutation_observed_through_preexisting_alias():
-    """A view made before the write cannot be rebound by local base versioning."""
+def test_trace_copy_observed_through_preexisting_alias_matches_eager():
+    """A view made before the write sees the write, as in eager: functionalization regenerates it from the base."""
+    import numpy as np
     import torch
     import torch.nn as nn
 
+    from emmy.compiler.backend.numpy import NumpyBackend
     from emmy.compiler.trace.torch import trace_module
 
     class CopyThenReadOldView(nn.Module):
@@ -541,10 +533,10 @@ def test_trace_rejects_copy_mutation_observed_through_preexisting_alias():
             base[:, 1:].copy_(source)
             return old_view + 1.0
 
-    template = torch.randn(1, 3, 4, 32)
-    source = torch.randn(1, 2, 8, 16)
-    with pytest.raises(NotImplementedError, match="observable alias mutation.*original destination"):
-        trace_module(CopyThenReadOldView(), (template, source))
+    values = (torch.randn(1, 3, 4, 32), torch.randn(1, 2, 8, 16))
+    graph = trace_module(CopyThenReadOldView(), values)
+    result, _ = NumpyBackend().run(graph, input_data={name: v.numpy() for name, v in zip(graph.inputs, values, strict=True)})
+    np.testing.assert_allclose(result.outputs[graph.outputs[0]], CopyThenReadOldView()(*values).numpy(), rtol=1e-6)
 
 
 def test_trace_rejects_copy_mutation_through_nonunit_slice():
@@ -560,7 +552,7 @@ def test_trace_rejects_copy_mutation_through_nonunit_slice():
             base[:, ::2].copy_(source)
             return base
 
-    with pytest.raises(NotImplementedError, match="observable alias mutation.*original destination"):
+    with pytest.raises(NotImplementedError, match="slice_scatter requires .* step 1"):
         trace_module(StridedCopy(), (torch.randn(1), torch.randn(1, 2, 8)))
 
 
@@ -764,8 +756,8 @@ def test_trace_eye_rejects_unrepresented_constructor_semantics(target_name, kwar
     assert not graph.nodes
 
 
-def test_trace_reassembles_ling_mtp_roll_select_fill_observed_through_base():
-    """Ling's exact MTP token shift versions the rolled base through its selected view."""
+def test_trace_ling_mtp_roll_select_fill_reaches_the_rolled_base():
+    """Ling's exact MTP token shift: a fill through a select of the rolled base reaches the base."""
     import numpy as np
     import torch
     import torch.nn as nn
@@ -793,11 +785,13 @@ def test_trace_reassembles_ling_mtp_roll_select_fill_observed_through_base():
     assert all(isinstance(node.op, (InputOp, ConstantOp, LoopOp)) for node in lowered.nodes.values())
 
 
-def test_trace_rejects_fill_mutation_observed_through_input_or_preexisting_alias():
-    """The bounded local update must not silently functionalize external or stale storage."""
+def test_trace_fill_through_input_is_refused_and_through_preexisting_alias_matches_eager():
+    """A write into an input is refused; a view made before a local write sees it, as in eager."""
+    import numpy as np
     import torch
     import torch.nn as nn
 
+    from emmy.compiler.backend.numpy import NumpyBackend
     from emmy.compiler.trace.torch import trace_module
 
     class FillInput(nn.Module):
@@ -813,10 +807,100 @@ def test_trace_rejects_fill_mutation_observed_through_input_or_preexisting_alias
             return old_view
 
     x = torch.randn(2, 8)
-    with pytest.raises(NotImplementedError, match="aten.fill_ observable alias mutation is unsupported"):
+    with pytest.raises(NotImplementedError, match="writes an input, parameter or buffer in place"):
         trace_module(FillInput(), (x,))
-    with pytest.raises(NotImplementedError, match="aten.fill_ observable alias mutation is unsupported"):
-        trace_module(FillThenReadOldView(), (x,))
+    graph = trace_module(FillThenReadOldView(), (x,))
+    result, _ = NumpyBackend().run(graph, input_data={graph.inputs[0]: x.numpy()})
+    np.testing.assert_allclose(result.outputs[graph.outputs[0]], FillThenReadOldView()(x).numpy(), rtol=1e-6)
+
+
+def test_trace_rejects_in_place_write_to_input_parameter_or_buffer():
+    """The graph has no write-back, so a dropped in-place write would leave the caller's tensor unchanged."""
+    import torch
+    import torch.nn as nn
+
+    from emmy.compiler.trace.torch import trace_module
+
+    class AddInput(nn.Module):
+        def forward(self, x):
+            x.add_(1)
+            return x * 3
+
+    class ScaleBuffer(nn.Module):  # the write is never read back, and still changes the module
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("count", torch.zeros(8))
+
+        def forward(self, x):
+            self.count.view(2, 4).mul_(2)
+            return x + 1
+
+    for module in (AddInput(), ScaleBuffer()):
+        with pytest.raises(NotImplementedError, match="writes an input, parameter or buffer in place"):
+            trace_module(module, (torch.randn(8),))
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda x, cache: x.add_(1),
+        lambda x, cache: cache[:, 1:3].copy_(x[:, :2]),  # slice_scatter
+        lambda x, cache: cache[:, 2].copy_(x[:, 0]),  # select_scatter
+        lambda x, cache: (x.mul_(3), cache.mul_(2)),
+    ],
+    ids=["add_", "slice", "select", "two_writes"],
+)
+def test_trace_functional_returns_each_written_value_after_the_outputs(write):
+    """Each write becomes a graph output after the module's own, mapped to the input it updates."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    from emmy.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.trace.torch import trace_module_functional
+
+    class Write(nn.Module):
+        def forward(self, x, cache):
+            write(x, cache)
+            return x.sum(-1) + cache.sum(-1)
+
+    x, cache = torch.randn(4, 4), torch.randn(4, 4)
+    graph, writes = trace_module_functional(Write(), (x, cache))
+    expected_inputs = {"x": x.clone(), "cache": cache.clone()}
+    expected = Write()(*expected_inputs.values())
+
+    result, _ = NumpyBackend().run(graph, input_data={"x": x.numpy(), "cache": cache.numpy()})
+    np.testing.assert_allclose(result.outputs[graph.outputs[0]], expected.numpy(), rtol=1e-6)
+    assert set(writes.values()) <= {"x", "cache"} and writes
+    for output, name in writes.items():
+        assert graph.outputs.index(output) > 0
+        np.testing.assert_allclose(result.outputs[output], expected_inputs[name].numpy(), rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "write",
+    [lambda y: y[:, :2].add_(1), lambda y: y.masked_fill_(y > 0, 0.0)],
+    ids=["slice_add_", "masked_fill_"],
+)
+def test_trace_in_place_write_to_an_intermediate_reaches_its_later_reads(write):
+    """A write into the module's own tensor is functionalized like one into an input."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    from emmy.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.trace.torch import trace_module
+
+    class Write(nn.Module):
+        def forward(self, x):
+            y = x * 2
+            write(y)
+            return y
+
+    x = torch.randn(4, 4)
+    graph = trace_module(Write(), (x,))
+    result, _ = NumpyBackend().run(graph, input_data={graph.inputs[0]: x.numpy()})
+    np.testing.assert_allclose(result.outputs[graph.outputs[0]], Write()(x).numpy(), rtol=1e-6)
 
 
 def test_trace_exports_in_inference_grad_mode_without_higher_order_wrapper():
@@ -1242,6 +1326,41 @@ def test_trace_split_with_sizes_materializes_static_slices_and_matches_eager():
         np.testing.assert_array_equal(got, expected.numpy())
 
 
+def test_trace_split_by_size_matches_chunk_with_and_without_an_in_place_write():
+    """``torch.split`` by one size is the spelling functionalization gives ``chunk``; an in-place write upstream of
+    the split changes neither the output slices nor the values (functionalization may re-split per output)."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    from emmy.compiler.backend.loop.backend import LoopBackend
+    from emmy.compiler.ir.frontend.ir import SliceOp
+    from emmy.compiler.trace.torch import trace_module
+
+    class Split(nn.Module):
+        def forward(self, x):
+            return torch.split(x * 2, 3, dim=-1)
+
+    class WrittenThenChunked(nn.Module):
+        def forward(self, x):
+            y = x * 2
+            y.mul_(1)
+            return torch.chunk(y, 3, dim=-1)
+
+    x = torch.arange(14, dtype=torch.float32).reshape(2, 7)
+    for module in (Split(), WrittenThenChunked()):
+        graph = trace_module(module, (x,))
+        slices = [graph.nodes[name] for name in graph.outputs]
+        assert all(isinstance(node.op, SliceOp) for node in slices)
+        assert tuple(node.op.start for node in slices) == (0, 3, 6)
+        assert tuple(node.output.shape[-1].as_static() for node in slices) == (3, 3, 1)
+        backend = LoopBackend()
+        compiled = backend.compile(graph)
+        result, _ = backend.run(compiled, input_data={compiled.inputs[0]: x.numpy()})
+        for got, expected in zip(result.outputs.values(), torch.split(x * 2, 3, dim=-1), strict=True):
+            np.testing.assert_array_equal(got, expected.numpy())
+
+
 def test_trace_unbind_materializes_axis_index_maps_and_matches_eager():
     """Unbind results fix the removed input coordinate to each tuple index."""
     import numpy as np
@@ -1365,27 +1484,26 @@ def test_trace_max_dim_indices_rejected():
         trace_module(MaxIndices(), (torch.randn(2, 8),))
 
 
-@pytest.mark.parametrize(("chunks", "dim", "message"), [(object(), 1, "chunk count"), (3, object(), "dimension")])
-def test_trace_chunk_rejects_nonconstant_arguments(chunks, dim, message):
-    """Dynamic chunk counts and dimensions fail explicitly instead of producing a bad tuple alias."""
+def test_trace_split_rejects_a_nonconstant_dimension():
+    """A dynamic split dimension fails explicitly instead of producing a bad tuple alias."""
     from types import SimpleNamespace
 
     import torch
 
     from emmy.compiler.graph import Graph, Tensor
     from emmy.compiler.ir.base import InputOp
-    from emmy.compiler.trace.torch import _handle_chunk
+    from emmy.compiler.trace.torch import _handle_split
 
     graph = Graph()
     source_id = graph.add_node(InputOp(), [], Tensor("x", (2, 6)), node_id="x")
     source = SimpleNamespace(name="x")
     fx_node = SimpleNamespace(
         name="chunk",
-        args=(source, chunks, dim),
+        args=(source, 3, object()),
         meta={"val": [torch.empty(2, 2), torch.empty(2, 2), torch.empty(2, 2)]},
     )
-    with pytest.raises(NotImplementedError, match=message):
-        _handle_chunk(graph, fx_node, {"x": source_id})
+    with pytest.raises(NotImplementedError, match="dimension"):
+        _handle_split(graph, fx_node, {"x": source_id}, op_name="chunk")
 
 
 def test_trace_chunk_rejects_dynamic_chunked_extent():
@@ -1394,7 +1512,7 @@ def test_trace_chunk_rejects_dynamic_chunked_extent():
 
     from emmy.compiler.graph import Graph, Tensor
     from emmy.compiler.ir.base import InputOp
-    from emmy.compiler.trace.torch import _handle_chunk
+    from emmy.compiler.trace.torch import _handle_split
 
     graph = Graph()
     source_id = graph.add_node(InputOp(), [], Tensor("x", (2, "seq_len")), node_id="x")
@@ -1402,8 +1520,8 @@ def test_trace_chunk_rejects_dynamic_chunked_extent():
     symbolic_extent = object()
     value = SimpleNamespace(shape=(2, symbolic_extent), dtype="float32")
     fx_node = SimpleNamespace(name="chunk", args=(source, 3, 1), meta={"val": [value]})
-    with pytest.raises(NotImplementedError, match="dynamic chunked dimension"):
-        _handle_chunk(graph, fx_node, {"x": source_id})
+    with pytest.raises(NotImplementedError, match="dynamic split dimension"):
+        _handle_split(graph, fx_node, {"x": source_id}, op_name="chunk")
 
 
 def test_trace_rejects_unmapped_multi_output_op():
@@ -1426,7 +1544,7 @@ def test_trace_rejects_unmapped_multi_output_op():
 def test_trace_prunes_output_dead_local_mutation_before_unsupported_op_mapping():
     """An unobserved local scatter branch is not part of the exported function value.
 
-    FX retains the mutating branch as impure, but Emmy must walk only output-live nodes. A live
+    The export keeps the dead branch, but Emmy walks only output-live nodes. A live
     topk remains covered by ``test_trace_rejects_unmapped_multi_output_op`` above.
     """
     import numpy as np
@@ -1457,11 +1575,13 @@ def test_trace_prunes_output_dead_local_mutation_before_unsupported_op_mapping()
 
 
 def test_trace_keeps_a_mutation_through_a_view_of_the_output():
-    """A no-user write remains observable when its receiver aliases the returned tensor."""
+    """A write whose return is unused still reaches the output when its receiver aliases the returned tensor."""
+    import numpy as np
     import torch
     import torch.nn as nn
 
-    from emmy.compiler.trace.torch import _output_live_fx_nodes
+    from emmy.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.trace.torch import trace_module
 
     class ReturnedAliasMutation(nn.Module):
         def forward(self, x):
@@ -1469,10 +1589,10 @@ def test_trace_keeps_a_mutation_through_a_view_of_the_output():
             shifted[:, -1].fill_(0)
             return shifted
 
-    exported = torch.export.export(ReturnedAliasMutation(), (torch.arange(9).reshape(1, 9),))
-    nodes = list(exported.graph_module.graph.nodes)
-    live = _output_live_fx_nodes(nodes)
-    assert {node.name for node in live} == {"x", "roll", "select", "fill_", "output"}
+    x = torch.arange(9, dtype=torch.float32).reshape(1, 9)
+    graph = trace_module(ReturnedAliasMutation(), (x,))
+    result, _ = NumpyBackend().run(graph, input_data={graph.inputs[0]: x.numpy()})
+    np.testing.assert_array_equal(result.outputs[graph.outputs[0]], ReturnedAliasMutation()(x).numpy())
 
 
 def test_trace_chunk_rejects_invalid_tuple_index():
@@ -1535,12 +1655,9 @@ def test_trace_repeat_kv_correct():
     np.testing.assert_allclose(np.asarray(out).reshape(ref.shape), ref, rtol=1e-5, atol=1e-5)
 
 
-def test_dropout_traces_as_copy_passthrough():
-    """Inference dropout must trace as a ``copy`` no-op, not crash on an unknown op.
-
-    Phi3-family layers (Phi-4-mini) emit a ``dropout`` node; before the fix the trace
-    raised ``unknown elementwise op name: 'dropout'``.
-    """
+def test_inference_dropout_leaves_no_op():
+    """Inference dropout is the identity: functionalization drops it before the walker runs, so the graph holds
+    neither a ``dropout`` nor a passthrough ``copy``. Phi3-family layers (Phi-4-mini) emit such a node."""
     import torch
     import torch.nn as nn
 
@@ -1558,7 +1675,7 @@ def test_dropout_traces_as_copy_passthrough():
     g = trace_module(M().eval(), (torch.randn(2, 8),))
     ew_names = [n.op.op.name for n in g.nodes.values() if type(n.op).__name__ == "ElementwiseOp"]
     assert "dropout" not in ew_names
-    assert "copy" in ew_names
+    assert "copy" not in ew_names
 
 
 def test_dtype_changing_cast_is_a_real_node_not_an_alias():
@@ -1782,3 +1899,141 @@ def test_trace_factory_constructors_and_like_forms_match_eager():
     result, _ = backend.run(backend.compile(graph), input_data={graph.inputs[0]: x.numpy()})
     got = next(iter(result.outputs.values()))
     np.testing.assert_allclose(got, Factories()(x).numpy(), rtol=1e-5, atol=1e-5)
+
+
+def test_trace_keeps_a_dynamic_dim_symbolic_at_an_example_of_one():
+    """torch specializes a size-1 example dim to the constant 1; a dim marked dynamic stays symbolic, so one decode
+    row traces the same kernel as four."""
+    import torch
+    import torch.nn as nn
+
+    from emmy.compiler.trace.torch import trace_module
+
+    class Project(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.randn(8, 16))
+
+        def forward(self, x):
+            return torch.nn.functional.linear(x, self.w)
+
+    graph = trace_module(Project(), (torch.randn(1, 16),), dynamic_shapes={"x": {0: torch.export.Dim("rows", min=1, max=64)}})
+    rows = [graph.buffer(name).shape[0] for name in graph.inputs]
+    assert any(not dim.is_static and dim.expr.free_vars() == {"rows"} for dim in rows)
+
+
+def test_trace_index_copy_is_a_scatter_written_in_place():
+    """``x.index_copy(0, idx, v)`` is a ScatterOp; its kernel's output is stored over ``x`` and
+    never copies it."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    from emmy.compiler.backend.loop.backend import LoopBackend
+    from emmy.compiler.ir.tensor.ir import ScatterOp
+    from emmy.compiler.trace.torch import trace_module
+
+    class Rows(nn.Module):
+        def forward(self, x, idx, v):
+            return x.index_copy(0, idx, v)
+
+    x, idx, v = torch.randn(8, 4), torch.tensor([6, 1, 3]), torch.randn(3, 4)
+    graph = trace_module(Rows(), (x, idx, v))
+    (scatter,) = [node for node in graph.nodes.values() if isinstance(node.op, ScatterOp)]
+    assert scatter.op.axis == 0 and scatter.inputs == ["x", "idx", "v"]
+
+    backend = LoopBackend()
+    compiled = backend.compile(graph)
+    (kernel,) = [node for node in compiled.nodes.values() if node.op.__class__.__name__ == "LoopOp"]
+    assert kernel.output.alias == "x" and "x" in kernel.inputs
+    assert not any(load.input == "x" for load in kernel.op.loads), "the destination is never read"
+    result, _ = backend.run(compiled, input_data={"x": x.numpy(), "idx": idx.numpy(), "v": v.numpy()})
+    np.testing.assert_array_equal(next(iter(result.outputs.values())), x.index_copy(0, idx, v).numpy())
+
+
+def test_trace_index_put_on_a_fresh_tensor_lifts_its_scalar_constant():
+    """``m[idx] = 1.0`` on a tensor the forward built: the literal is a lifted tensor constant, which
+    traces as a scalar ConstantOp, and the scatter is stored over the zeros it fills."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    from emmy.compiler.backend.loop.backend import LoopBackend
+    from emmy.compiler.ir.base import ConstantOp, InputOp
+    from emmy.compiler.trace.torch import trace_module
+
+    class Marks(nn.Module):
+        def forward(self, idx):
+            marks = torch.zeros(16)
+            marks[idx] = 1.0
+            return marks
+
+    idx = torch.tensor([3, 1, 5])
+    graph = trace_module(Marks(), (idx,))
+    assert graph.inputs == ["idx"]
+    assert {node.op.value for node in graph.nodes.values() if isinstance(node.op, ConstantOp)} == {0.0, 1.0}
+    assert not any(isinstance(node.op, InputOp) for nid, node in graph.nodes.items() if nid != "idx")
+
+    backend = LoopBackend()
+    compiled = backend.compile(graph)
+    aliases = {node.output.alias for node in compiled.nodes.values() if node.output.alias is not None}
+    assert len(aliases) == 1, "the scatter is stored over the zeros kernel's buffer"
+    result, _ = backend.run(compiled, input_data={"idx": idx.numpy()})
+    np.testing.assert_array_equal(next(iter(result.outputs.values())), Marks()(idx).numpy())
+
+
+def test_trace_a_scatter_whose_index_is_computed_fuses_the_computation_and_keeps_its_guard():
+    """``x.index_copy(0, idx + 1, v)``: the index's producer fuses into the scatter kernel like any producer of
+    what it stores, the store still reads the fused value in its index, and its guard — a row past the end
+    stores nothing — survives the splice."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    from emmy.compiler.backend.loop.backend import LoopBackend
+    from emmy.compiler.ir.loop import Cond, LoopOp, Write
+    from emmy.compiler.trace.torch import trace_module
+
+    class Shifted(nn.Module):
+        def forward(self, x, idx, v):
+            return x.index_copy(0, idx + 1, v)
+
+    x, idx, v = torch.randn(8, 4), torch.tensor([5, 0, 2]), torch.randn(3, 4)
+    graph = trace_module(Shifted(), (x, idx, v))
+    backend = LoopBackend()
+    compiled = backend.compile(graph)
+    (kernel,) = [node for node in compiled.nodes.values() if isinstance(node.op, LoopOp)]
+    guards = [stmt for stmt in kernel.op.body.iter() if isinstance(stmt, Cond) and any(isinstance(s, Write) for s in stmt.body)]
+    assert len(guards) == 1 and "idx" in {load.input for load in kernel.op.loads}, kernel.op.pretty_body()
+    result, _ = backend.run(compiled, input_data={"x": x.numpy(), "idx": idx.numpy(), "v": v.numpy()})
+    np.testing.assert_array_equal(next(iter(result.outputs.values())), Shifted()(x, idx, v).numpy())
+
+
+@requires_cuda
+def test_a_symbolic_arange_is_a_loop_writing_each_index():
+    """``arange(n)`` over a symbolic length cannot fold to a constant: it traces as a range of that length and lowers
+    to a loop storing each element's index, so the program runs at whatever length the launch binds — its last index
+    read where no buffer of the kernel carries the length."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    from torch.export import Dim
+
+    from emmy import config
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.tensor.ir import RangeOp
+    from emmy.compiler.trace.torch import trace_module
+
+    class Ids(nn.Module):
+        def forward(self, x):
+            return x + torch.arange(x.shape[0]) + torch.arange(x.shape[0])[-1:]
+
+    graph = trace_module(Ids(), (torch.zeros(5, dtype=torch.int64),), dynamic_shapes={"x": {0: Dim("n")}})
+    (rng, *_) = [node.op for node in graph.nodes.values() if isinstance(node.op, RangeOp)]
+    assert rng.length is not None and not rng.length.is_static
+    x = np.arange(7, dtype=np.int64) * 10
+    with config.strict_evidence_override(False):
+        compiled = CudaBackend().compile(graph)
+    result, _ = CudaBackend().run(compiled, input_data={"x": x})
+    (got,) = result.outputs.values()
+    np.testing.assert_array_equal(np.asarray(got).reshape(-1), x + np.arange(7) + 6)

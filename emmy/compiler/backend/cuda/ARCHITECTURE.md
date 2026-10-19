@@ -12,6 +12,7 @@ cuda/
 ├── backend.py        # CudaBackend(Backend) — drives lowering + delegates execution
 ├── nvcc.py           # offline `nvcc --cubin` compile into the content-addressed cubin cache
 ├── device.py         # runtime contexts cached per logical GPU selected by the host
+├── cache.py          # same-stream L2 eviction outside cold benchmark event windows
 ├── program.py        # the facade over the runtime: plan + cubins + host bytes in, outputs and timings out
 └── _bench_worker.py  # the SIGKILL-able child that hosts benches and the torch comparison
 ```
@@ -131,7 +132,10 @@ are never read. This is what keeps all 28 layers' `[heads, S, S]` attention scra
 the card's memory. `build_from_plan` allocates one torch tensor per region — so vLLM's memory profiler counts every
 byte a program holds — and records each on the runtime's stream, so torch's caching allocator never recycles a block a
 launch still reads. A constant supplied as a CUDA tensor is lent as it is: the serving path uploads each weight once
-and shares it across twins. Without torch the runtime allocates for itself (the worker binary always does).
+and shares it across twins. Without torch the runtime allocates for itself (the worker binary always does). The
+layout depends on nothing but the environment, so a `CompiledProgram` keeps the ones it got for its most recently
+used environments: a routed MoE prefill asks for it on every weight swap and output view, and rebuilding it was over
+half that host time, while a server meets one environment per prompt length and must not keep them all.
 
 **Cross-program pooling (`BufferArena`).** The slab kills scratch duplication *within* a program; `BufferArena` kills
 it *across* programs that run sequentially (the serving runner builds 2–4 programs × `num_layers`, and without pooling
@@ -149,7 +153,10 @@ buffers re-upload, un-supplied buffers whose shape carries a symbolic dim (seq_l
 re-materialize under the same fill policy as `build`, static-shaped un-supplied buffers — the weights — keep their
 memory untouched, regions grow when the new layout needs more bytes, and the runtime drops captured graphs and
 re-encodes TMA descriptors, since both bake addresses. `run_once()` launches every kernel in program order with none
-of `iter_once`'s per-launch event record/sync/deadline; the caller's `outputs()` synchronizes. Both expect the caller to
+of `iter_once`'s per-launch event record/sync/deadline; the caller's `outputs()` synchronizes. `run_each(runs)` is the
+batched form for a program run many times back to back with different operands (the serving MoE expert loop): per
+entry the runtime binds the symbolic values, lends the listed buffers without draining the stream, copies the inputs
+into their prefixes, launches and copies the outputs' prefixes out, all in one host call. Each expects the caller to
 hold `gpu_lock()`. See `tests/compiler/e2e/test_program_rebind.py`.
 
 **Captured-graph replay over a capacity buffer set (`set_sym_values` / `upload_prefix` / `upload_prefix_device` /
@@ -178,10 +185,8 @@ work ordered with vLLM's, and how a program's raw launches are recorded into vLL
 `run_program` and `benchmark_program` bind to torch's stream the same way, so the eager reference and the interleaved
 torch benches stay ordered with the program's launches. Host uploads and descriptor encodes always go through the
 runtime's own stream and complete before they return, so an adopted stream mid-capture never sees a pageable copy or
-a synchronize. Operands a plan names but never declares as buffers — an indirect operand's pointer table and selector
-(the serving MoE fixed-slot dispatch), a paged buffer's page table (`<name>__pages`) — are bound by address with
-`alias_buffer` too; a buffer nobody reads (the direct per-expert input those tables replace) is handed back with
-`release_buffer`.
+a synchronize. An operand a plan names but never declares as a buffer — a paged buffer's page table (`<name>__pages`)
+— is bound by address too, by the runtime pager or `alias_buffer`.
 
 `benchmark_program(graph, input_data, warmup, num_iters)` adds a warmup loop + timed loop over the runtime's
 per-launch event windows (`Executor.time_launch`, one pair of events per launch index, reused across iterations) for
@@ -199,6 +204,13 @@ clean 9/9 with no wait ≥0.2 s at any deadline ≥2 s — a deadline-correlated
 unresolved; see the constant's note). This is the in-process timing core; both the pinned-row bench and the deployable
 comparison run it **inside the worker** (below), so a hung kernel hangs the child, not the parent.
 
+The `COLD_CACHE` measurement regime fixes every per-kernel batch at one replay. Before each launch's start event,
+`L2Eviction` queues a memset over a scratch allocation twice the live card's L2 size, on the same Torch/runtime
+stream. Allocation and eviction are outside the measured interval. Capture contains only the kernel replay;
+whole-program e2e windows are disabled because their internal reuse differs from the cold per-kernel sum. The
+worker request carries the regime on every job, including tuner candidates, so a persistent worker can switch
+between hot and cold jobs without inheriting the previous job's setting.
+
 `benchmark_program` captures each launch position's batch into a CUDA graph **by default**
 (`capture_graphs=True` → `CompiledProgram.capture_launch_graphs`, right after batch-size calibration),
 and the runtime replays that graph — one call per event window — instead of a launch loop. CUDA
@@ -206,11 +218,10 @@ events measure *stream elapsed* time, which only equals GPU time when the stream
 sub-10 µs kernels per-launch dispatch starves the stream and the events time the starvation. The graph
 replay keeps the stream dense, so the same event windows become pure-GPU measurements. The runtime owns
 a non-default stream, so capture and replay happen on the stream the program always runs on, and the
-deadline poll is unchanged (a hung kernel inside a graph still never completes its stop event). Warmup
-iters always run uncaptured, so the zero-elapsed degenerate-launch guard and the deadline probe real
-launches before any graph exists. Re-fires of the calibration branch (warmup extension) re-capture when
-batch sizes change. A capture failure (`GraphCaptureError`; the runtime ends the capture before
-reporting, so the stream is clean) is caught in place: the bench warns,
+deadline poll is unchanged (a hung kernel inside a graph still never completes its stop event). Initial warmup
+iters run uncaptured, so the zero-elapsed degenerate-launch guard and the deadline probe real launches before
+calibration. The extended warmup uses the calibrated batches. A capture failure (`GraphCaptureError`; the runtime
+ends the capture before reporting, so the stream is clean) is caught in place: the bench warns,
 continues uncaptured, and reports it via `BenchmarkResult.captured` — comparison callers
 (`bench_lowered_vs_torch` / `bench_full_model_real`) pair that flag with their torch-side capture and
 re-run all-or-nothing so one table never mixes semantics. The perf writer persists the flag per `perf`
@@ -222,16 +233,19 @@ in place as re-tunes measure them captured. See `tests/compiler/backend/test_gra
 their sum is not an end-to-end time: it misses cross-kernel cache effects and inter-kernel gaps, and on
 multi-kernel programs individual per-launch numbers can mis-attribute wildly (two identical-work gemms in
 the Qwen3 layer-0 assembly measured 5.2 µs vs 0.8 µs solo; NCU shows them equal). For any **multi-launch** program `benchmark_program`
-therefore also captures **one** CUDA graph holding every launch in program order
-(`CompiledProgram.capture_program_graph`) and, once per measured iter, times one event window around
-`replays` back-to-back whole-program replays (`time_program_window`, replays calibrated to
-`_BATCH_TARGET_MS`) — the same semantics the captured torch closures get in the interleaved bench, so the
-backend table compares like-for-like. Reported as `BenchmarkResult.e2e_ms`/`e2e_min_ms`; `run --bench`'s
-comparison table prefers `e2e_min_ms` for the Emmy row and the kernel table prints a
+therefore captures the calibrated batch of complete forwards into **one** CUDA graph, with every launch in
+program order (`CompiledProgram.capture_program_graph`). Each measured window submits that graph once
+(`time_program_window`) and divides elapsed time by its batch size. Capture happens before the start event.
+Torch peers likewise capture a full batch and submit one replay per window; no host replay loop lies between
+either pair of events. Single-launch peers use the same batch size. Multi-launch Torch batches use the largest
+per-launch batch, while Emmy calibrates its whole-program batch from the sum of per-launch times. Reference
+samples use the same measured suffix as Emmy, excluding dynamically extended warmup. Reported as
+`BenchmarkResult.e2e_ms`/`e2e_min_ms`; `run --bench`'s comparison table prefers `e2e_min_ms` for the Emmy row and prints a
 `whole-program (e2e)` footer beside the per-launch `TOTAL`. Automatic — no flag: a single-launch program's
 solo window already IS the program time (a single-kernel golden's slice — fields stay `None`,
 nothing is measured twice), and multi-launch programs get it whenever capture holds (a program-graph capture
-failure warns and skips, never fatal; uncaptured benches skip it too). The evidence pick still *ranks* rows on
+failure warns and skips; a paired comparison then re-runs all backends uncaptured, while an Emmy-only bench
+keeps its per-kernel capture verdict. Uncaptured benches skip it too). The evidence pick still *ranks* rows on
 the per-kernel `time_ms` by design — per-kernel results key structurally and transfer across graphs, which an
 e2e scalar can't — so for multi-launch slices (split-K fixups) the e2e fields are measured-but-unread
 (~1 ms/iter); pricing those rows by slice-e2e instead is a possible future change.

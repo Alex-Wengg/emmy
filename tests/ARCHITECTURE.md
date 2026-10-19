@@ -35,7 +35,11 @@ source lives outside the package:
 | `architecture/` | repository-wide dependency and layering invariants |
 
 The GitHub automation tests also pin workflow-level safety contracts that cannot be expressed inside a helper, such
-as loading discovery and onboarding control code from the exact workflow commit while editing the rolling branch.
+as loading onboarding control code from the exact workflow commit while editing the rolling branch, and the nightly
+jobs committing to `main` only from a run on `main`. Discovery tests check that the nightly task carries each
+recipe's `DISCOVERY.md`, that the agent can create or edit only those notes, and that unchanged notes need not be
+rewritten. One more guards the tracked pull-request template: outside its instruction comments it holds only the
+heading and the rule.
 
 Three small organizing directories are also intentional:
 
@@ -67,8 +71,8 @@ The standalone Rust runtime keeps unit tests beside its modules. `make test-nati
 Python parity and process-recovery tests against it; GPU cases skip when CUDA or the worker binary is unavailable.
 Native HTTP tests also verify checkpoint text parity, seeded streaming, stops, overload, cancellation recovery,
 and shutdown against a prepared artifact. Cargo tests cover transport semantics without GPU dependencies.
-The native generation tests pin serial reductions for bit-identical artifact replay, excluding atomic accumulation
-whose addition order can vary. They exercise cached tiny-Qwen3 logits, full and partial prefill chunks, EOS,
+Native generation and exact host/device parity fixtures pin serial reductions, excluding atomic accumulation whose
+addition order can vary. Native tests exercise cached tiny-Qwen3 logits, full and partial prefill chunks, EOS,
 seeded request reset, and exact-once
 graph replay, independent rotary rounding, and attention/cache boundaries, including near-tied scores checked against
 float64 attention. Local checkpoint qualification compares FP16
@@ -128,18 +132,17 @@ the shared module already provides.
   serving-twin matrix for a named checkpoint and GPU. The serving-image release workflow owns exact
   model/revision/card qualification. Retain a small model fixture only when it proves reusable behavior that a
   synthetic input cannot.
-- **Do not load checked-in golden files in the default suite — except the realization corpus.** Unit tests use
-  synthetic records and working files, and the nightly `onboard-model` workflow owns repository schema validation,
-  strict decode, and exact-GPU replay for `recipes/*/golden/*.json`. `tests/compiler/realization/cases/` differs on
-  both counts that motivated the rule: its files are hand-minimized reproducers or a small capability baseline from a
+- **Do not load checked-in golden files in the default suite — except to hold them to the fresh lowering, and except
+  the realization corpus.** Unit tests use synthetic documents and working files, and the nightly `onboard-model`
+  workflow owns exact-GPU replay for `recipes/*/golden/*.json`. `tests/compiler/realization/cases/` differs on both
+  counts that motivated the rule: its files are hand-minimized reproducers or a small capability baseline from a
   model-agnostic hardware golden, and they carry no measurement claim, so nothing about them is card-specific. They
   also target a **declared** capability rather than the live card — `Context.from_target(compute_cap)` — so the
-  enumeration and
-  lowering stages are machine-independent and an sm_70 lockout is exercised on a box that has no sm_70. Only the
-  build and accuracy stages consult the live card, and they gate on `device_compute_capability() == compute_cap`,
-  beside `requires_sm90` in spirit but keyed on equality rather than a floor. Golden decode is machine-independent
-  the same way: every repository golden is decoded row by row on the default lane, each record replayed at its
-  declared capability, so a stale row is detectable on any machine; re-recording one is what needs the card.
+  lowering stage is machine-independent and an sm_70 lockout is exercised on a box that has no sm_70. Only the build
+  and accuracy stages consult the live card, and they gate on `device_compute_capability() == compute_cap`, beside
+  `requires_sm90` in spirit but keyed on equality rather than a floor. The restamp check is machine-independent the
+  same way: every repository golden is held to the fresh lowering of its programs on the default lane, GPU-free, so a
+  stale golden is detectable on any machine; re-recording a row is what needs the card.
 - **Keep one subprocess smoke per report path.** Filtering, join, and presentation variants use small synthetic
   records at the owning unit layer instead of launching the CLI repeatedly over the full repository corpus.
 - **Async tests** — tests for async functions are plain `async def` (no decorator needed; `asyncio_mode = "auto"` handles it). Mock async callables with `AsyncMock`.
@@ -151,7 +154,9 @@ the shared module already provides.
   query-filtered inventory, the minimal installation-selected CLI, editable-versus-wheel catalog selection, recipe-name
   materialization, and validated shell creation. Repository-automation tests validate required lifecycle rationales
   and heat scores, the unbounded set of onboarding shells, each shell's one-to-three-entry deployment matrix, and the
-  bounded read-only source-agent configuration. Notification tests cover modified-model lifecycle groups with heat and
+  bounded read-only source-agent configuration, the research-only edit boundary, a changed research note even when no
+  recipe changes, and preservation of Emmy blocker tags. Onboarding-artifact tests check the blocker tag against the
+  agent's summary. Notification tests cover modified-model lifecycle groups with heat and
   validated deployment/performance summaries. Query tests cover constrained expression parsing, implicit deployment
   expansion, external candidates, heat ordering, lifecycle ordering, and the versioned row result.
   Discovery-filter tests pin deterministic recipe batching, exact score coverage, mechanically preserved onboarding
@@ -182,6 +187,11 @@ the shared module already provides.
   needs a reason that names the condition.
 
 ## Running
+
+Cold-cache coverage lives with backend program tests, CLI recording tests and the search DB/pin tests. CPU tests
+check both directions of regime isolation, freeze/export retention, worker propagation and eviction ordering.
+The CUDA program test streams float buffers smaller than L2 and compares hot timing against a single replay
+after eviction; its kernel processes every allocated element.
 
 While developing, run only the tests that cover the change, under a two-minute budget. The whole suite takes many
 minutes and belongs to the finalization stage of a PR — see the Contribution Instructions in `AGENTS.md`.
@@ -216,26 +226,23 @@ deferred deliberately, because dying mid-test leaves the controller re-queueing 
 and poisoning that one too. Under xdist the controller respawns the worker on a clean context and reschedules only
 what it had not reached, so the run still finishes and reports exactly one failure, named.
 
-Those costs come from `tests/durations.json` — a checked-in nodeid → seconds map — with the box's own pytest cache
-overlaid on top. The committed file exists because CI starts every job with an empty cache: without a baseline the
-bucketing never fired there and the long poles landed wherever chance put them. It records only entries at or above
-0.05 s (a few hundred lines rather than the full ~2600, and 99% of the suite's wall time); anything unlisted is
-assumed to cost 0.05 s. Regenerate it with `make test-durations` — which REPLACES the file with that run's timings, so
-renamed and deleted tests drop out instead of lingering as ghost slots the bucketer plans around. The refresh runs on
-one xdist loadgroup worker: execution stays serial, while CUDA node IDs keep the canonical ``@cuda`` / ``@cuda-cli``
-suffixes the parallel suite uses for lookup. Point it at the whole suite, never a subset.
+Those costs come from `tests/durations_cpu.json` and `tests/durations_gpu.json` — checked-in nodeid → seconds maps —
+with the box's own pytest cache overlaid on top. The files exist because CI starts every job with an empty cache:
+without a baseline the bucketing never fired there and the long poles landed wherever chance put them. They record
+only tests at or above 5 s, the few hundred that set the makespan; anything unlisted is noise to the bucketing and is
+assumed to cost 0.05 s. The **Nightly refresh** workflow runs `make test-durations` on the CPU runner, which measures
+on the machine the balance is for, replaces the CPU file with that run's timings, and commits a change directly to
+`main`. GPU rows remain in their own file. The refresh uses all available cores with xdist loadgroup. Point it at
+the whole suite, never a subset.
 
-Keep the JSON entries alphabetized by full node ID, one entry per line, so unrelated additions do not accumulate at
-the end of the file. `make format` restores this order without changing timings; `make lint` checks it. The duration
-writer uses the same format. Sorting reduces avoidable merge conflicts; edits to the same timing still need resolving.
+A recorded CPU timing holds through any measurement within 50% of its value, even one under 5 s, so a test near the
+floor does not flip in and out of the file night after night. Outside that band the measurement replaces it, and a
+row enters only at 5 s or more. Rows for tests no longer measured are removed.
 
-Two things keep it honest. `make test` passes `--durations=0 --durations-min=1`, so every run (CI included) prints every
-test that takes at least 1 s instead of only a fixed-size tail. And the session-end gate in `conftest.py` fails any run
-where a test took **5 s or more without being in the baseline**, naming the offenders and asking for
-`make test-durations`. Keeping the failure bar above the 0.05 s recording threshold lets the report expose differences
-between a development machine and CI without making worker-specific cold imports gate the run. It is a session hook
-rather than a test case because only the controller, and only after the last report, has every test's duration; an
-xdist worker sees just its own slice.
+Keep the JSON entries alphabetized by full node ID, one entry per line. `make format` restores this order without
+changing timings; `make lint` checks it. The duration writer uses the same format.
+
+Missing baseline rows do not fail the suite; the nightly run updates CPU rows.
 
 The `perf` marker gates **suite-wide**, not just `tests/perf/`: the root `tests/conftest.py` hook skips every
 perf-marked item unless `-m perf` was passed, and since the root conftest loads for any `tests/` collection the gate
@@ -248,25 +255,38 @@ large fraction of the card FREE at startup, plus checkpoint downloads and minute
 mark on anything else silently drops it from `make test` even on GPU machines (this hid the serving runner's GPU
 correctness pins for a while). GPU correctness tests guard themselves with `requires_cuda` / `importorskip` instead.
 
-`tests/compiler/pipeline/search/test_golden.py` strictly decodes every repository golden — the hardware goldens and
-each recipe's model golden — on the DEFAULT lane, one node per recorded row, so a failure names the row rather than a
-count. Every golden target is its kernel's stored Loop IR, so a row replays from that kernel and nothing re-lowers a
-traced program, and the replay leaves undecided every kernel of the set that cannot hold the row. Nothing is memoized
-across rows or runs: every node derives its row from the file. Collecting the rows parses every golden in each worker. The realization corpus's `offered` stage is this same decode (see
+A lane whose torch has no CUDA hides the device from the compiler as well (`tests/conftest.py` empties
+`CUDA_VISIBLE_DEVICES`). The CI runners carry a GTX 1080 Ti that CPU-only torch cannot use, yet the runtime reached
+it through the driver and the prior featured its SM count, so an unpinned pick there diverged from every other host.
+Hidden, the lane features the default card everywhere.
+
+For the same reason every session runs on its own tune DB: on import the root `conftest.py` points `EMMY_TUNE_DB` at
+a fresh file, removed at exit, unless the caller already names one. The default `~/.cache/emmy/autotune.db` is
+machine-local evidence a CLI compile picks from, and the CI runners keep their home directory between jobs. Set on
+import, the one file reaches every xdist worker and subprocess; a test that needs a DB of its own still sets one.
+
+`tests/compiler/pipeline/search/test_golden.py` holds every repository golden — the hardware goldens and each
+maintained recipe's model golden — to the fresh lowering of its own traced programs on the DEFAULT lane: a restamp
+(`golden.restamp`, the rewrite `emmy golden restamp` writes) must leave the file unchanged, one node per traced
+program so the work scatters over the workers and a failure names the kernels, decisions and rows the compiler now
+disagrees with. Neither this nor the import check has a list of expected failures: a golden the compiler re-keys is
+red until `emmy golden restamp` rewrites the file, which needs no card (the `refresh-golden` skill is the flow; rows of
+a re-keyed kernel keep their schedule and lose their microseconds until a record run on the card measures them again).
+Never re-record a row to make a red node green: a re-keyed kernel is a change in the lowering, and re-recording
+enshrines it. The realization corpus's staleness test is the same restamp (see
 `tests/compiler/realization/ARCHITECTURE.md`).
 
-The same file is also asked whether every stored target is still what the current compiler lowers the golden's own
-programs to (`emmy golden check`); a file that is not is stale — its rows decode, yet a deploy builds kernels none
-of them describe. Neither check has a list of expected failures: a row that stops decoding, or a file whose targets
-stop being the fresh lowering, is red until `emmy golden restamp` rewrites the file, which needs no card (the
-`refresh-golden` skill is the flow; rows measured on a kernel that now renders differently keep their schedule and
-lose their microseconds until a record run on the card measures them again). Never re-record a row to make a red
-node green: a recorded row that stops decoding is a regression in the enumeration, and re-recording enshrines it.
+A golden file and a corpus case store inputs only — no kernel identity, no `S_*` stamp — so a change to how
+identity is computed turns no golden red. What it does turn red is the pinned-identity test in
+`tests/compiler/pipeline/search/db/test_db.py`: the tune DB keys its `kernel` rows by that identity, and the fix is a
+bump of the DB's version. Two guards hold the rule itself: `tests/architecture/test_layering.py` pins the golden
+format's field lists, and `tests/compiler/pipeline/test_strategies.py` checks that every knob on every op of a
+lowered program is a registered decision knob.
 
 Repository golden *qualification* is intentionally outside pytest. Model goldens are GPU-specific qualification
-evidence, so the nightly `onboard-model` workflow validates the selected recipe-local file, strictly decodes every
-row, and replays it on the named GPU. This keeps expensive model/card qualification out of the default suite. The
-decode half needs no card and runs on the default lane (above); the measured replay is what the nightly's GPU is for.
+evidence, so the nightly `onboard-model` workflow validates the selected recipe-local file and replays it on the named
+GPU. This keeps expensive model/card qualification out of the default suite. The restamp half needs no card and runs on
+the default lane (above); the measured replay is what the nightly's GPU is for.
 
 Optional adapter tests use `pytest.importorskip` for their own dependency extras. The network-free tiny Diffusers DiT
 trace runs when the `image` extra is installed; the real checkpoint/CUDA comparison is additionally `perf`-marked and
@@ -296,7 +316,7 @@ anywhere: below sm_90 the pin refuses rather than selecting a different transpor
 TMA-staged flash cases carry `requires_sm90` (their `cp` siblings run on sm_80+). Golden-scoped CLI tests are the
 other environment trap: `--realization` without `--golden PATH`, and the deploy check `eval prior --pools golden` runs
 after its report, resolve against the **live card's** recordings (the report itself reads an exported dataset and has
-no such scope), so tests asserting specific golden names (or monkeypatching `GOLDEN_RECORDS` with card-less fakes)
+no such scope), so tests asserting specific golden names (or monkeypatching `repository_documents` with card-less fakes)
 must pin themselves off-GPU (`torch.cuda.is_available → False` in-process, `CUDA_VISIBLE_DEVICES=""` for `run_cli`
 subprocesses) to take the multi-card-union path — otherwise they pass or fail depending on which shapes the local card
 happens to have recorded.

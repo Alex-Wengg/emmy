@@ -9,9 +9,17 @@ model is, which is the failure this whole module exists to prevent.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from emmy.compiler.pipeline.search.dataset.group import GoldenGroup, MeasuredGroup
-from emmy.compiler.pipeline.search.prior.report import EvalReport, golden_summaries, measured_summaries, pool_bucket
+from emmy.compiler.pipeline.search.prior.report import (
+    EvalReport,
+    Summary,
+    compare_golden_ranks,
+    golden_summaries,
+    measured_summaries,
+    pool_bucket,
+)
 
 
 def _measured(key: str, latencies: list[float], *, gpu: str = "card-a", h_opt: float = 3.0) -> MeasuredGroup:
@@ -53,16 +61,6 @@ def test_a_pool_too_small_for_a_metric_is_excluded_and_the_count_says_so():
     assert summary.metrics["regret1"]["groups"] == 2  # the one-row pool has no second candidate to be wrong about
     assert summary.metrics["spearman"]["groups"] == 1  # needs five rows
     assert summary.metrics["regret10"]["groups"] == 1  # needs eleven — a top-10 over ten rows is the whole pool
-
-
-def test_a_pool_the_model_cannot_score_is_counted_not_dropped():
-    """A linear model with no dynamic weight set answers ``None`` for every symbolic-axis pool. Dropping
-    those silently would report a healthy static corpus with no sign that the rest is unmeasured."""
-    groups = [_measured("a", [20.0, 10.0]), _measured("b", [20.0, 10.0])]
-    summary = measured_summaries("offline", groups, lambda g: None if g.key == "b" else _by_d_a(g))[0]
-
-    assert (summary.groups, summary.unscored) == (2, 1)
-    assert summary.metrics["regret1"]["groups"] == 1
 
 
 def test_measured_summaries_key_on_card_and_compile_regime():
@@ -117,7 +115,7 @@ def test_the_report_serializes_to_a_diffable_schema():
 
     assert obj["header"] == {"dataset": "db", "source": "dataset.db"}
     assert obj["summaries"][0]["axes"] == {"half": "offline", "gpu": "card-a", "H_opt": "O3"}
-    assert obj["summaries"][0]["groups"] == 1 and obj["summaries"][0]["unscored"] == 0
+    assert obj["summaries"][0]["groups"] == 1
     assert EvalReport({"dataset": "db", "source": "dataset.db"}, summaries).to_json() == obj
 
 
@@ -150,3 +148,31 @@ def test_quality_is_negated_into_a_cost_exactly_once():
     (flipped,) = measured_summaries("offline", [group], lambda g: -_by_d_a(g))
     assert flipped.metrics["regret1"]["median"] == 1.0  # the flipped scorer agrees with the hardware
     assert np.isclose(summary.metrics["regret1"]["median"], 3.0)
+
+
+def _rank_comparison_report(current: list[float], candidate: list[float], *, candidate_groups: int = 10):
+    summaries = [
+        Summary(
+            axes={"half": half, "gpu": f"gpu{i}", "tier": "warp", "pool": "<1k"},
+            groups=candidate_groups if half == "candidate" else 10,
+            metrics={"rank": {"median": median}},
+        )
+        for half, medians in (("current", current), ("candidate", candidate))
+        for i, median in enumerate(medians)
+    ]
+    return EvalReport({"dataset": "golden"}, summaries)
+
+
+def test_comparison_requires_five_percent_gain_without_regression():
+    result = compare_golden_ranks(_rank_comparison_report([20, 4], [19, 4]), 0.05)
+    assert result["qualified"]
+    assert (result["compared"], result["improved"], result["regressed"]) == (2, 1, 0)
+    assert not compare_golden_ranks(_rank_comparison_report([20], [19.1]), 0.05)["qualified"]
+    assert not compare_golden_ranks(_rank_comparison_report([20, 4], [18, 4.1]), 0.05)["qualified"]
+
+
+def test_comparison_refuses_coverage_changes():
+    with pytest.raises(ValueError, match="coverage changed"):
+        compare_golden_ranks(_rank_comparison_report([20], [18], candidate_groups=9), 0.05)
+    with pytest.raises(ValueError, match="different or empty"):
+        compare_golden_ranks(_rank_comparison_report([20], [18, 4]), 0.05)

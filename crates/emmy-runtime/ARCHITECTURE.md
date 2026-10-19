@@ -1,7 +1,8 @@
 # Execution runtime
 
-`emmy-runtime` executes trusted Emmy execution plans through the CUDA driver. Python owns compilation and artifact
-preparation; the runtime owns the device — allocations, launches, graphs, events and the deadline on a hung launch.
+`emmy-runtime` executes trusted Emmy execution plans through the CUDA driver, or on the host CPU (CPU plans, below).
+Python owns compilation and artifact preparation; the runtime owns the device — allocations, launches, graphs, events
+and the deadline on a hung launch.
 The crate has no HTTP, tokenizer, model framework, compiler, or Python dependency.
 
 ## Two hosts, one library
@@ -9,13 +10,15 @@ The crate has no HTTP, tokenizer, model framework, compiler, or Python dependenc
 - **In-process** through `crates/emmy-runtime-py`, the `emmy.emmy_runtime` extension (PyO3, `abi3`) that
   `emmy/compiler/backend/cuda/program.py` imports. It exposes `Device` (one context and one stream per logical GPU, its
   properties, a context synchronize that surfaces a sticky error, kernel resource attributes read off a cubin, pointer
-  attributes), `Program` (a parsed plan and its layout per environment) and `Executor` (load with lent or owned
-  memory, bind by bytes or device address, rebind at a new environment, set the environment, adopt a host stream,
-  run once, time one launch's batch, capture per-launch and whole-program graphs, replay, time a whole-program
-  window, read any buffer), plus a DLPack capsule that lets torch address mapped host memory. Every method that
-  touches the device releases the interpreter lock. The runtime's hung-launch error surfaces as
-  `emmy_runtime.HungKernelError`, a `RuntimeError` subclass. This is the host behind `emmy run`, the accuracy check,
-  the realization corpus, the bench worker's jobs and the vLLM plugin's runners.
+  attributes), `Program` (a parsed plan and its layout per environment) and `Executor` (load with lent or owned memory,
+  bind by bytes or device address, rebind at a new environment, set the environment, adopt a host stream, run once, time
+  one launch's batch, capture per-launch and whole-program graphs, replay, time a whole-program window, read any
+  buffer), `CpuExecutor` (the same load, bind, rebind, set-environment, lent-region, run and read calls for a CPU plan,
+  and per-launch timing), plus a
+  DLPack capsule that lets torch address mapped host memory. Every method that touches the device releases the
+  interpreter lock. The runtime's hung-launch error surfaces as `emmy_runtime.HungKernelError`, a `RuntimeError`
+  subclass. This is the host behind `emmy run`, the accuracy check, the realization corpus, the bench worker's jobs and
+  the vLLM plugin's runners.
 - **As a process**, `emmy-runtime-worker`, for the Python-free cached-generation path (below).
 
 Process isolation is still the caller's contract: a synchronous call cannot end a hung kernel, only report it. The
@@ -30,22 +33,24 @@ plan's `source` field is ignored — the host compiled it. A standalone pack (be
 directory. The whole plan grammar is read: an `int` literal, a `"name"` variable, or `[op, lhs, rhs]` with `op` in
 `+ - * / // %` (Python's integer semantics), for buffer shapes, grid and block factors and runtime constants.
 
-- CUDA plan formats 1, 2 and 3. Every shape and launch factor resolves under a **symbol environment**: the plan's
-  hints, overridden by what the host binds (`rebind`, `set_env`). Runtime arguments append the environment's values
-  as `int` parameters; a runtime constant fills its buffer with its expression's value in the buffer's dtype; a
-  serial launch runs once per coordinate of its axes, in order, each step overriding that axis.
+- Plan formats 1 through 5; a CPU plan needs format 5. Every shape and launch factor resolves under a **symbol
+  environment**: the plan's hints, overridden by what the host binds (`rebind`, `set_env`). Runtime arguments append the
+  environment's values as `int` parameters; a runtime constant fills its buffer with its expression's value in the
+  buffer's dtype; a serial launch runs once per coordinate of its axes, in order, each step overriding that axis.
 - Contiguous little-endian f16, bf16, f32, f64, signed/unsigned integer storage, one-byte booleans, the one-byte fp8
   and packed fp4 carriers, and the packed f16 pair. bf16 payloads contain encoded uint16 bits.
 - Memory is a **layout** the runtime derives per environment (`Program::layout`): one region per input, constant and
   output buffer (`role:name`), and every scratch buffer packed by liveness into one `scratch` slab, 256-byte aligned,
   largest first, deterministically. The host lends memory for every region or the runtime allocates and zeroes its
   own; a region that survives a rebind keeps its contents. Empty buffers have an address but return zero bytes.
-- Ordered launch arguments follow `args`. An indirect operand expands in place to its table pointer, selector pointer
-  and slot — operands the host binds by address, which the plan never declares as buffers; a paged buffer's page
-  table (below) is bound the same way. A TMA descriptor is encoded per environment at the source buffer's resolved
-  shape (a prefix-packed symbolic source has the resolved strides, not the allocation's) and passed as a pointer to
-  its 128 bytes. `zero_outputs` clears a buffer before its launch; `zero_prologues` records zeroing performed inside
-  the kernel and adds no extra memset.
+- Ordered launch arguments follow `args`. A paged buffer (below) expands in place to its page table, an operand the
+  host binds by address, which the plan never declares as a buffer. A TMA descriptor is encoded per environment at
+  the source buffer's resolved shape (a prefix-packed symbolic source has the resolved strides, not the
+  allocation's) and passed as a pointer to its 128 bytes. `zero_outputs` clears a buffer before its launch;
+  `zero_prologues` records zeroing performed inside the kernel and adds no extra memset.
+- Whole-program CUDA graph capture prepares any TMA descriptors before entering capture, as per-launch capture
+  already does. Descriptor encoding and its stream synchronization cannot occur inside an active capture;
+  rebinding an environment invalidates descriptors and captured graphs together.
 - On sm_90 and later, a whole-program submission launches a kernel whose plan entry sets `dependent_launch` as a
   programmatic dependent launch: the kernel waits on the grid ahead of it (`griddepcontrol.wait`) before any memory
   access, so its launch overlaps that grid's drain. A launch behind a memset, and every launch of a single-launch
@@ -56,27 +61,108 @@ directory. The whole plan grammar is read: an `int` literal, a `"name"` variable
 - A timed launch whose completion event misses its deadline raises `HungKernel`; a launch that reports zero elapsed
   time is a degenerate no-op and raises, so it can never win a benchmark.
 
-## Paged buffers
+## Paging
 
-A KV cache stops being one allocation as soon as it belongs to a request rather than to a program. A plan may therefore
-declare an input or output buffer **paged** (`paged: {name: {axis, page}}`): cut along one axis every `page` elements.
-The compiler renames that buffer's launch argument to `<name>__pages`, so what the kernel receives is a table of page
-pointers rather than one base, and every read and write resolves its page before its offset inside one. Shapes are
-unchanged — the declaration says how the memory is reached, not what it holds. The position a step writes its rows at
-is an i64 scalar the kernel reads from device memory, bound like any input, so the step replays as one graph at every
-position.
+A **paged buffer** is a buffer reached through a page table instead of one base address: it is cut along one axis
+every `page` elements, and each page lives wherever the runtime put it. The mechanism knows nothing about what a
+buffer holds. A host program declares which buffers are paged, along which axis, at what page and with how many
+device slots. Everything else the compiler reads off the kernels — which pages a launch reads or writes, and how to
+compute that from the launch's inputs (backend `ARCHITECTURE.md`, "Paged buffers") — and the runtime's **pager** owns
+the pages and decides where they live. Nothing else — a runner, a model, a layer kind — takes part.
 
-A paged buffer has no place in the layout: no region, no placement, nothing to zero per launch, no host bytes in or
-out. Its table is an operand the plan names but never declares, bound like an indirect operand's. A load gives every
-paged buffer zeroed pages of the runtime's own spanning its declared shape — a cache covering the context — and binds
-their table; `page_table` hands that table to a host that lends the same pages to another executor, which is how the
-prefill program writes the decode program's cache. A host may instead bind a table of its own (`set_external`), and
-then owns the pages behind it — how the compiler's tests fill a cache chunk by chunk and read it back.
+**The pager** is one per device, shared by every executor on it: a prefill program writes the pages a decode program
+reads because both name the same buffer. Each paged buffer has its own pool of device slots, as many as the host
+declared; a pool whose slots cover every page never evicts, which is the KV cache today. A page lives in a device
+slot, in pinned host memory (mapped, so a kernel can read it in place over the link), or on disk (below). Moving a
+page is one copy and one page-table write; nothing a kernel, a plan or the compiler knows changes. Per pool the pager
+keeps, in device memory, the page table the kernels read, which page each slot holds and when each slot was last
+used. Host memory is pinned and mapped once at boot from a stated budget, and a boot that cannot get it fails. The
+host never touches a table or a page. Programs that run the same launches on the same inputs — tensor-parallel ranks —
+compute the same page lists and reach the same tables with no coordination.
 
-Residency is deliberately absent. Whether a page lives in device or host memory would be a property of a page, and
-nothing above it would change; which processor runs a launch is a separate axis again, and belongs on the launch, not
-on the buffer. Neither exists yet, and a host-resident page read by a CUDA kernel crosses PCIe per access, so neither
-is worth building before there is something to measure.
+**The paging program** moves pages ahead of the launches that read them. It is Emmy programs traced from torch
+modules and compiled once with every count a symbol each launch binds; the runtime compiles nothing. Its input is a
+launch's **page list**, the pages the launch touches, which a program the compiler emits per launch writes from the
+launch's own inputs. Consecutive launches whose lists' inputs are all written before the first of them share one run
+of the paging program over the union of their lists, placed right before the first of them; a list computed from a
+launch's output waits for that launch. For each listed page the program looks up the slot. A hit refreshes the slot's
+age. A miss takes the slot of the least recently used page not on the list, is copied there from host memory, and
+the page table swaps the two pages' addresses; a miss when every slot is on the list keeps its host address and is
+read in place. Hits write to a spare entry past the end of each array and the copy skips them, so the program is a
+fixed launch set at every list and a captured graph records it. A page a kernel writes (a `Write` to the buffer,
+known at compile time) is copied back before its slot is reused; a page never written is dropped; a page nothing has
+written yet has nothing to copy in. Everything runs on one stream in order, so no launch reads an entry or a slot
+while it changes. **Placement is this fixed rule**: a page a launch reads is copied into a slot when the pool has one
+to give, read in place from host memory when it does not, and never computed where it lies. The rate at which a
+kernel copies a page from mapped host memory is unmeasured.
+
+**Writes into a page.** A program that writes rows into a buffer it also holds — the KV cache at the step's position,
+a recurrent state carried from one step to the next — spells its output as the input with those rows replaced (a
+scatter), and the compiler stores it into the input's own pages: the output is stored over the input (`Tensor.alias`)
+and the two share one page table. A kernel stored over a buffer computes nothing from that buffer's old cells — fusion
+keeps them apart — so a state whose next value reads the old one elsewhere is computed into scratch and copied over.
+
+**Eviction is a fixed rule, not evidence.** Least recently used out. An offline replay of OLMoE's routing put
+Belady's bound at half to two thirds of LRU's host reads, and the best simple rule tried (a decayed count) saved only
+3–11% of them; a rule that measures better replaces LRU in the paging program.
+
+**The disk tier.** A buffer whose page bytes are the file's bytes — contiguous, laid out as the device reads them —
+keeps the pages host memory cannot hold in that file, read in place (O_DIRECT through io_uring), never copied to a
+second file; a buffer repacked at load ends at the host tier. A miss in host memory reads the page into a pinned host
+slot, evicting the least recently used host page and rewriting its entries, and then follows the rules above. A disk
+read takes milliseconds, and a captured program cannot wait for the host: the paging program writes its requests to
+mapped host memory, waits on a flag (`cuStreamWaitValue32`) a runtime thread raises once it has read what was
+missing, then copies; it raises the flag itself when nothing on its list is on disk, so only a disk miss pays the
+host round trip. The read rate and the wait's cost are unmeasured.
+
+**Two uses.** Both are declarations a host program makes; the mechanism does not tell them apart.
+
+- *A KV cache* is paged along its position axis, with a slot per page. A step writes its rows at the absolute position
+  its program indexes and replays as one graph. Spilling a cold request's pages to host is the same move, not built
+  until something measures it.
+- *A MoE layer's stacked expert weights* are paged along the expert axis, one expert per page, and read at the indices
+  the router produced; a quantized expert's codes and scales are two more paged buffers read at the same indices, so
+  their hits and misses coincide. The slots are then a cache of recently routed experts. The dispatch's own
+  pointer tables, resolved in-kernel, are gone: the gather by the router's picks is an index the program spells.
+
+**What stays out**, each measured on OLMoE on an RTX 5090 at PCIe 5.0 x16, under
+`experiments/OLMoE-1B-7B-0125-Instruct/`:
+
+- *A static set of resident pages* (`hot_set_rtx5090`): the cache beats it at every device budget and at eight
+  streams, so no page is fixed in a slot.
+- *Prediction* (`expert_cache_rtx5090`): copying the pages a predictor names ahead of time lost to the cache alone at
+  every budget, since one-stream decode is bound by link bytes and prediction adds bytes. It returns if a workload
+  leaves the link idle, or for the disk tier, where a miss costs milliseconds.
+- *Computing on the host where the page is* (`cpu_experts_rtx5090`): the cache won at one stream at every budget;
+  reading the page list to the host costs the decode graph, and a page computed on the host is never cached. It
+  returns on a host whose CPU reads memory several times faster than its link.
+- *A fetch inside the kernel*: a kernel cannot drive the copy engines, but it can read a missed page from mapped host
+  memory and write it into its slot as it computes. The bytes over the link are the same, the slot still has to be
+  chosen ahead of the launch from the whole page list, and what it saves is the kernel's second pass over the copied
+  page, which device memory serves in a few percent of the link's time. A variant of the paging program to measure
+  later, not the start. *A copy without a cache* moves no fewer bytes than a cache copy, and *a host-driven copy on
+  the captured path* serves only remote memory.
+
+## CPU plans
+
+A plan whose `backend` is `cpu` runs on `cpu::Executor`. Its kernels live in one shared library the compiler built
+ahead of time, each exporting `<kernel>_part(bufs, lo, hi, partial, sizes)` and, for a split reduction,
+`<kernel>_finish(bufs, partials, nchunks, sizes)`; `bufs` follows the launch's `args`, `sizes` its runtime arguments.
+Every launch carries a `cpu` section in place of the CUDA grid — the extent of the axis it splits, whether it is a
+reduction, the floats of partials one chunk writes, and whether it is worth more than one thread — and none of the
+CUDA-only launch fields (TMA, paged operands, serial axes) are accepted. The CUDA executor refuses a CPU plan and the
+CPU executor a CUDA one. Buffers, the layout, runtime constants and the symbol environment are exactly the CUDA
+executor's, in host memory the CPU executor allocates zeroed and aligned to 64 bytes, or that the host lends
+(`set_region`, as on CUDA: the buffers placed in the region read it in place from the next launch on, and count as
+bound). Paged buffers are not supported.
+
+Launches run in plan order on a persistent pool: the calling thread plus `threads - 1` workers that poll for work, then
+sleep, so an idle executor costs no CPU. Independent work splits into four chunks per thread, handed out from one
+counter, so an efficiency core holds a launch up by one small chunk. A split reduction always splits into the same
+number of chunks whatever the thread count, each writing its partials on its own cache line, and `finish` adds them in
+chunk order: its result is the same bits on one thread or eight. `time_launches` times each launch alone over a
+number of runs, optionally after every thread reads a buffer larger than the caches, so a launch reads its operands
+from memory.
 
 ## Artifact contract
 
@@ -97,12 +183,20 @@ compiler scheduling without changing those semantics does not require a new arti
 `Device` retains a context and one stream that every executor on it launches on and that is never destroyed: a host
 allocator that tracked lent memory against it may still record events on it while the process shuts down. `Executor`
 owns its modules, the regions it allocated, its timing events, its descriptors and its captured graphs — one per
-launch position holding that launch's batch, and one whole-program graph per symbol environment, least recently used
-out. Inputs update existing addresses, so a graph stays valid across input updates; a rebind, a lent region or a
-released one drops every graph and descriptor. A host may adopt its own stream for a call (`set_stream`): launches,
-device copies and memsets then go there, so a stream that is recording a graph records them, while host uploads and
-descriptor encodes always use the device's stream and complete before returning. Graph capture always happens on the
-device's stream. A load replaces the previous program; release drops it.
+launch position holding that launch's batch, and whole-program graphs keyed by symbol environment and batch size,
+least recently used out. Serving uses batch one. A benchmark captures its calibrated batch before timing, then
+submits one replay per event window and divides by the number of forwards. Inputs update existing addresses, so a
+graph stays valid across input updates; a rebind, a lent region or a released one drops every graph and descriptor.
+Lending a region drains the stream first, so the memory it pointed at
+is free once the call returns; a host that keeps that memory alive itself can skip the drain (`set_region` with `wait`
+off), because each launch reads its addresses when it is queued. The runtime drains anyway when the old memory is its
+own, which it frees, or a descriptor baked the address. `run_each` relies on that: it runs the program once per entry
+in one call, each entry binding its symbols, lending its buffers undrained, copying its inputs in and its outputs out.
+A runtime constant is rewritten in place when the symbols change, so `run_each` drains before an entry of a program
+that has one: the entries already queued read their own value first. A host may adopt its own stream for a call
+(`set_stream`): launches, device copies and memsets then go there, so a stream that is recording a graph records them,
+while host uploads and descriptor encodes always use the device's stream and complete before returning. Graph capture
+always happens on the device's stream. A load replaces the previous program; release drops it.
 
 All unsafe CUDA submission stays in `cuda`. Buffer pointers and the context are private. Executors have disjoint
 storage and synchronize before releasing it, so cudarc's cross-stream event tracking is disabled. Copies and launches
@@ -165,6 +259,11 @@ executor. The model remains compiler-prepared; the Rust library has no Qwen3 mat
 The native preparation and attention contract lives in
 [`serving/native/ARCHITECTURE.md`](../../emmy/serving/native/ARCHITECTURE.md).
 
+The pack key's `state` list names the buffers a step writes in place and carries to the next position — a Gated
+DeltaNet layer's recurrent state and convolution history. Each is a flat output of the decode program, which prefill
+borrows like the other outputs, and `start` zeroes it. With state a prefill chunk is taken only where every row is a
+prompt token before the last, since no later step overwrites what a row past the prompt folds into the state.
+
 `start` binds the prompt once, keeps the sampling controls and resets request state. `advance` processes one prefill
 chunk or one decode token at the current absolute position, leaving the final prompt token to decode and taking a
 chunk only where every one of its rows fits the context; the diagnostic `step` always processes one token. Before
@@ -186,6 +285,6 @@ controls select greedy decoding. The library validates them before binding or su
 
 The worker adds `load_generation`, `start_generation`, `generation_step`, and `generate`. Prompt and result token
 arrays are little-endian i64 binary files. Step responses contain a selected token or null during prefill; optional
-logits use a little-endian f32 binary output file under generation artifact version 5. Loading either a generation
+logits use a little-endian f32 binary output file under generation artifact version 6. Loading either a generation
 model or a benchmark program releases the previous
 object, and `release` handles both. These additive operations use the existing framed protocol and failure retirement.

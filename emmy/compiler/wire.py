@@ -332,20 +332,25 @@ def intern(pool: list[dict], graph) -> int:
 
 
 def kernel_tile(op):
-    """The tile kernel ``op`` lowered from — the ``TileOp`` on its source chain its ``I_kernel`` stamp
-    names, else the first — or ``None`` for a kernel no tile stands behind. The first is the scheduled
-    tile, which is the kernel unless its schedule realized it through another term (a carried state's
-    serial form): the stamp still names the tile the schedule fork was offered. Every kernel the tuner and
-    ``run --bench`` measure has one, the kernel-cache replay included (a cached kernel keeps its chain);
-    the deploy identity a golden receipt names and the definition a ``kernel`` row stores are both read
-    off it."""
+    """The kernel ``op`` realizes: the tile its schedule fork was offered — the nearest unscheduled ``TileOp`` on
+    its rewrite chain, ``op`` itself when it is one — else the first tile on the chain (a tile built scheduled, with
+    no fork behind it), or ``None`` for a kernel no tile stands behind. A schedule that realizes the kernel through
+    another term (a carried state's serial form) does not change which tile that is. Every fact about a kernel is
+    computed off this one tile: its exact identity (:func:`kernel_identity`), its ``S_*`` stamps, the definition a
+    ``kernel`` row stores. Every kernel the tuner and ``run --bench`` measure has one, the kernel-cache replay
+    included (a cached kernel keeps its chain)."""
     from emmy.compiler.ir.tile import TileOp  # noqa: PLC0415
-    from emmy.compiler.pipeline.knob import KERNEL_IDENTITY  # noqa: PLC0415
 
     tiles = [ancestor for ancestor in op.source_chain() if isinstance(ancestor, TileOp)]
-    stamp = (op.knobs or {}).get(KERNEL_IDENTITY)
-    named = (tile for tile in tiles if stamp is not None and tile.identity_key(structural=False, with_io=True) == stamp)
-    return next(named, tiles[0] if tiles else None)
+    return next((tile for tile in tiles if tile.schedule is None), tiles[0] if tiles else None)
+
+
+def kernel_identity(op) -> str | None:
+    """The exact identity of the kernel ``op`` realizes (:func:`kernel_tile`) — what measured evidence is keyed by:
+    a ``perf`` row, a routing row, a fork's offer and a golden's stored kernel name one kernel alike. ``None`` for a
+    kernel no tile stands behind, which nothing can name."""
+    tile = kernel_tile(op)
+    return tile.identity_key(structural=False, with_io=True) if tile is not None else None
 
 
 def formed_from(tile):
@@ -357,14 +362,43 @@ def formed_from(tile):
     return next((op for op in tile.source_chain() if isinstance(op, LoopOp)), None)
 
 
+def body_writes(body) -> frozenset[str]:
+    """The buffers a Loop IR ``body`` stores to."""
+    from emmy.compiler.ir.stmt import Body, Write  # noqa: PLC0415
+
+    return frozenset(write.output for write in Body.coerce(body).iter_of_type(Write))
+
+
+def wire_writes(wire: dict) -> frozenset[str]:
+    """The outputs of a kernel wire its loop node's body writes — the buffers a restamp matches the fresh kernel by
+    (:func:`declared_outputs` on the fresh side), whether or not the stored wire also declares a carried state's port."""
+    from emmy.compiler.graph import Graph  # noqa: PLC0415
+    from emmy.compiler.ir.loop import LoopOp  # noqa: PLC0415
+
+    graph = Graph.from_wire(wire)
+    written = frozenset().union(*(body_writes(node.op.body) for node in graph.nodes.values() if isinstance(node.op, LoopOp)))
+    return frozenset(name for name in graph.outputs if name in written)
+
+
+def declared_outputs(tile) -> tuple[str, ...]:
+    """The outputs a kernel's wire declares (:func:`kernel_wire`): the tile's outputs that the body it was formed from
+    writes. A kernel that carries a state also owns the buffer its serial realization keeps the state in — a port the
+    lift adds to the node it lifts — and the wire leaves that port to the lift: declared, the lift would add it a
+    second time, and the wire would not lower on its own."""
+    formed = formed_from(tile)
+    written = body_writes(formed.body if formed is not None else tile.loop_body)
+    return tuple(name for name in tile.outputs if name in written)
+
+
 def kernel_wire(tile) -> dict:
     """The Loop IR wire of one tile kernel: a one-node program holding the body the kernel was formed from
-    (:func:`formed_from`), bound to the tile's own buffers. The lowering passes take that body back to the
-    kernel — the lift, the twist and the identity strategy give it the same exact identity and ``S_*`` stamps
-    — so a kernel row's definition re-lowers on its own, a piece a cut minted included, rather than as "its
-    parent plus the route". A kernel formed from no loop op holds its derived ``loop_body`` instead: it
-    decodes to the kernel's identities, but the lift does not take it back and the Loop passes would normalize
-    a size-one axis away and mint another kernel — only its parent's program reaches such a kernel."""
+    (:func:`formed_from`), bound to the tile's own buffers. The tile lift takes that body back to the kernel —
+    the lift and the twist give the same tile, so the same exact identity and ``S_*`` stamps are computed from
+    it — so a kernel row's definition re-lowers on its own, a piece a cut minted included, rather than as "its
+    parent plus the route". A kernel formed from no loop op holds its derived ``loop_body`` instead: a loop op
+    over it has the kernel's identity and stamps as it stands, but the lift does not take it back and the Loop
+    passes would normalize a size-one axis away and mint another kernel — only its parent's program reaches
+    such a kernel."""
     from emmy.compiler.graph import Graph  # noqa: PLC0415
     from emmy.compiler.ir.base import InputOp  # noqa: PLC0415
     from emmy.compiler.ir.loop import LoopOp  # noqa: PLC0415
@@ -377,9 +411,10 @@ def kernel_wire(tile) -> dict:
     primary, *_ = tile.outputs
     formed = formed_from(tile)
     body = formed.body if formed is not None else tile.loop_body
-    graph.add_node(LoopOp(body=body, name=tile.name), list(tile.inputs), outputs=tuple(tile.outputs.values()), node_id=primary)
+    outputs = tuple(tile.outputs[name] for name in declared_outputs(tile))
+    graph.add_node(LoopOp(body=body, name=tile.name), list(tile.inputs), outputs=outputs, node_id=primary)
     graph.inputs = list(tile.inputs)
-    graph.outputs = list(tile.outputs)
+    graph.outputs = [tensor.name for tensor in outputs]
     return graph.to_wire()
 
 
@@ -390,7 +425,7 @@ def symbolic_vars(wire: dict) -> set[str]:
 
     out: set[str] = set()
     for node in wire["nodes"]:
-        for _name, _dtype, dims in node["outputs"]:
+        for _name, _dtype, dims, *_alias in node["outputs"]:
             for dim in dims:
                 if isinstance(dim, dict) and "sym" in dim:
                     out.add(str(dim["sym"]))
@@ -399,22 +434,22 @@ def symbolic_vars(wire: dict) -> set[str]:
     return out
 
 
-def symbolic_bindings(tensors: Iterable) -> dict[str, int]:
-    """Each symbolic dim var of ``tensors`` bound to the size a bench runs it at: the dim's hint
+def symbolic_bindings(tensors: Iterable, extents: Iterable = ()) -> dict[str, int]:
+    """Each symbolic dim var of ``tensors`` and ``extents`` bound to the size a bench runs it at: the dim's hint
     (``DEFAULT_SEQ_HINT`` for a bare seq axis), which is what the backend binds when no input is
     supplied. The first hint a var is seen with wins."""
     from emmy.compiler.dim import DEFAULT_SEQ_HINT, Dim  # noqa: PLC0415
 
     bindings: dict[str, int] = {}
-    for tensor in tensors:
-        for dim in tensor.shape:
-            if isinstance(dim, Dim) and not dim.is_static:
-                for var in dim.expr.free_vars():
-                    bindings.setdefault(var, dim.hint or DEFAULT_SEQ_HINT)
+    for dim in (*(dim for tensor in tensors for dim in tensor.shape), *extents):
+        if isinstance(dim, Dim) and not dim.is_static:
+            for var in dim.expr.free_vars():
+                bindings.setdefault(var, dim.hint or DEFAULT_SEQ_HINT)
     return bindings
 
 
 def kernel_bindings(op) -> dict[str, int]:
     """The sizes a bench of ``op`` binds its symbolic dims to (:func:`symbolic_bindings` over its
-    buffers) — what a ``perf`` row of a dynamic kernel records so rows at two sizes stay apart."""
-    return symbolic_bindings((*op.inputs.values(), *op.outputs.values()))
+    buffers and its axes: a loop may run over a size no buffer carries) — what a ``perf`` row of a
+    dynamic kernel records so rows at two sizes stay apart."""
+    return symbolic_bindings((*op.inputs.values(), *op.outputs.values()), (axis.extent for axis in getattr(op, "axes", ())))

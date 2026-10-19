@@ -23,7 +23,7 @@ const MAX_BLOCK_DIMENSIONS: (u32, u32, u32) = (1024, 1024, 64);
 const MAX_GRID_DIMENSIONS: (u32, u32, u32) = (i32::MAX as u32, 65535, 65535);
 const DEFAULT_SHARED_MEMORY_BYTES: u32 = 48 * 1024;
 const MAX_RUN_ITERATIONS: u32 = 1_000_000;
-const MILLISECONDS_PER_SECOND: f64 = 1000.0;
+pub(crate) const MILLISECONDS_PER_SECOND: f64 = 1000.0;
 /// How long an event wait spins before it starts sleeping between driver queries.
 const SPIN_BEFORE_SLEEP_MS: f64 = 2.0;
 const SLEEP_BETWEEN_QUERIES: Duration = Duration::from_micros(200);
@@ -296,6 +296,49 @@ impl Drop for Region {
     }
 }
 
+/// Zeroed device memory a host fills by address and never launches on: a pager's slots and tables.
+pub struct DeviceMemory {
+    context: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    region: Region,
+}
+
+impl DeviceMemory {
+    pub fn zeroed(device: &Device, len: usize) -> Result<Self> {
+        device.context.bind_to_thread()?;
+        let region = Region::allocate(len, device.stream.cu_stream())?;
+        device.stream.synchronize()?;
+        Ok(Self {
+            context: device.context.clone(),
+            stream: Arc::clone(&device.stream),
+            region,
+        })
+    }
+
+    pub fn ptr(&self) -> u64 {
+        self.region.ptr
+    }
+
+    /// Overwrite the allocation's prefix from host bytes. The copy goes on the device's stream,
+    /// behind every launch queued there, and completes before returning; a graph that baked the
+    /// address reads the new contents on its next replay.
+    pub fn write(&self, bytes: &[u8]) -> Result<()> {
+        self.context.bind_to_thread()?;
+        ensure!(
+            bytes.len() <= self.region.len,
+            "{} bytes exceed the allocation ({} bytes)",
+            bytes.len(),
+            self.region.len
+        );
+        let stream = self.stream.cu_stream();
+        unsafe {
+            result::memcpy_htod_async(self.region.ptr, bytes, stream)?;
+            result::stream::synchronize(stream)?;
+        }
+        Ok(())
+    }
+}
+
 /// An encoded TMA descriptor living in device memory (the kernel takes a pointer to it).
 struct Descriptor {
     ptr: u64,
@@ -501,6 +544,18 @@ pub struct BufferView {
     pub shape: Vec<i64>,
 }
 
+/// A buffer and the device memory one run pairs it with: (buffer, device address, bytes).
+pub type Operand = (String, u64, usize);
+
+/// One entry of [`Executor::run_each`]: the symbols it binds, and the buffers it lends, copies in
+/// and copies out.
+pub struct Run {
+    pub env: Env,
+    pub lent: Vec<Operand>,
+    pub inputs: Vec<Operand>,
+    pub outputs: Vec<Operand>,
+}
+
 pub struct Executor {
     pub load_times_ms: BTreeMap<&'static str, f64>,
     context: Arc<CudaContext>,
@@ -512,16 +567,15 @@ pub struct Executor {
     env: Env,
     layout: Layout,
     regions: BTreeMap<String, Region>,
-    /// Operands the plan names but never declares as buffers — an indirect operand's pointer
-    /// table and selector, a paged buffer's page table — bound by the host by address, or
-    /// filled here from pages of the runtime's own.
+    /// Operands the plan names but never declares as buffers — a paged buffer's page table — bound
+    /// by the host by address, or filled here from pages of the runtime's own.
     externals: BTreeMap<String, Region>,
     /// The pages the runtime allocated for a paged buffer, kept alive for its table.
     pages: BTreeMap<String, Vec<Region>>,
     bound: BTreeSet<String>,
     descriptors: BTreeMap<EnvKey, BTreeMap<(usize, String), Descriptor>>,
-    /// Whole-program graphs by symbol environment, most recently used last.
-    graphs: Vec<(EnvKey, CudaGraph)>,
+    /// Whole-program graphs by symbol environment and batch, most recently used last.
+    graphs: Vec<((EnvKey, u32), CudaGraph)>,
     /// One graph per launch position, each holding that launch's batch, at the current env.
     launch_graphs: Option<(Vec<u32>, Vec<CudaGraph>)>,
     /// Per-launch timing events, created once and reused across iterations.
@@ -554,6 +608,11 @@ impl Executor {
         env: Option<Env>,
         regions: Option<BTreeMap<String, (u64, usize)>>,
     ) -> Result<Self> {
+        ensure!(
+            artifact.program.backend == "cuda",
+            "a {} plan cannot run on the CUDA executor",
+            artifact.program.backend
+        );
         let context = device.context.clone();
         context.bind_to_thread()?;
         if let Some(arch) = &artifact.arch {
@@ -605,9 +664,14 @@ impl Executor {
         };
         executor.provision(layout, regions.as_ref())?;
         // A paged buffer starts with pages of the runtime's own spanning its declared shape —
-        // a KV cache covering the context — until a host binds a table of its own.
+        // a KV cache covering the context — until a host binds a table of its own. One with
+        // slots is the pager's: its pages stay where the host keeps them.
         for name in executor.program.paged.keys().cloned().collect::<Vec<_>>() {
-            executor.alloc_pages(&name)?;
+            if executor.program.paged_root(&name) == name.as_str()
+                && executor.program.paged[&name].slots.is_none()
+            {
+                executor.alloc_pages(&name)?;
+            }
         }
         executor.own_stream.synchronize()?;
         let allocation_ms = started.elapsed().as_secs_f64() * MILLISECONDS_PER_SECOND;
@@ -703,7 +767,7 @@ impl Executor {
     }
 
     fn address(&self, name: &str) -> Result<u64> {
-        if let Some(external) = self.externals.get(name) {
+        if let Some(external) = self.externals.get(&self.external_name(name)) {
             return Ok(external.ptr);
         }
         let placement = self.placement(name)?;
@@ -714,19 +778,24 @@ impl Executor {
         Ok(region.ptr + placement.offset as u64)
     }
 
-    /// Bind an operand the plan never declares as a buffer (an indirect operand's table or
-    /// selector, a paged buffer's page table) to memory the host lends.
+    /// An external operand's own name: a paged buffer stored over another shares that buffer's
+    /// table, so its `<name>__pages` is the root's.
+    fn external_name(&self, name: &str) -> String {
+        match self.paged_table(name) {
+            Some(paged) => Paging::table(self.program.paged_root(paged)),
+            None => name.to_owned(),
+        }
+    }
+
+    /// Bind an operand the plan never declares as a buffer (a paged buffer's page table) to memory
+    /// the host lends.
     pub fn set_external(&mut self, name: &str, ptr: u64, len: usize) -> Result<()> {
         self.context.bind_to_thread()?;
+        let own = self.external_name(name);
+        let name = own.as_str();
         let paged = self.paged_table(name).map(str::to_owned);
         ensure!(
-            self.layout.buffers.contains_key(name)
-                || paged.is_some()
-                || self
-                    .program
-                    .launches
-                    .iter()
-                    .any(|l| l.indirect.iter().any(|i| i.table == name || i.sel == name)),
+            self.layout.buffers.contains_key(name) || paged.is_some(),
             "unknown operand {name}"
         );
         if let Some(paged) = &paged {
@@ -761,7 +830,7 @@ impl Executor {
         );
         let table = self
             .externals
-            .get(&Paging::table(name))
+            .get(&Paging::table(self.program.paged_root(name)))
             .with_context(|| format!("paged buffer {name} has no page table bound"))?;
         Ok((table.ptr, table.len))
     }
@@ -806,6 +875,10 @@ impl Executor {
         &self.env
     }
 
+    pub fn program(&self) -> &Program {
+        &self.program
+    }
+
     /// The stream the executor launches on when no host stream is adopted: its device's.
     pub fn stream_handle(&self) -> u64 {
         self.own_stream.cu_stream() as u64
@@ -816,6 +889,9 @@ impl Executor {
     }
 
     fn upload(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        if self.pages.contains_key(name) {
+            return self.upload_pages(name, bytes);
+        }
         let placement = self.placement(name)?;
         ensure!(
             bytes.len() <= placement.bytes,
@@ -841,6 +917,43 @@ impl Executor {
         Ok(())
     }
 
+    /// Upload a paged buffer's host bytes, in its declared layout, into the pages the runtime allocated for it: each
+    /// page takes its rows along the paged axis under every outer index. A table the host bound points at memory the
+    /// host owns, which it fills itself.
+    fn upload_pages(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let (paging, buffer) = (&self.program.paged[name], self.program.buffer(name)?);
+        let (outer, extent, row) = paging.geometry(buffer, &self.env)?;
+        let page = usize::try_from(paging.page)?;
+        ensure!(
+            bytes.len() <= outer * extent * row,
+            "{} bytes exceed paged buffer {name} ({} bytes)",
+            bytes.len(),
+            outer * extent * row
+        );
+        let stream = self.own_stream.cu_stream();
+        for (index, region) in self.pages[name].iter().enumerate() {
+            let rows = page.min(extent - index * page);
+            for o in 0..outer {
+                let start = (o * extent + index * page) * row;
+                let end = (start + rows * row).min(bytes.len());
+                if start < end {
+                    unsafe {
+                        result::memcpy_htod_async(
+                            region.ptr + (o * page * row) as u64,
+                            &bytes[start..end],
+                            stream,
+                        )?;
+                    }
+                }
+            }
+        }
+        unsafe {
+            result::stream::synchronize(stream)?;
+        }
+        self.bound.insert(name.into());
+        Ok(())
+    }
+
     /// Upload host bytes into a program input's prefix.
     pub fn bind(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         self.context.bind_to_thread()?;
@@ -849,6 +962,25 @@ impl Executor {
             "only program inputs may be updated"
         );
         self.upload(name, bytes)
+    }
+
+    /// Zero a buffer on the current stream: the state a step writes in place, at a request's start.
+    pub fn zero(&mut self, name: &str) -> Result<()> {
+        self.context.bind_to_thread()?;
+        ensure!(
+            !self.program.paged.contains_key(name),
+            "paged buffer {name} has no memory of its own to zero"
+        );
+        let placement = self.placement(name)?;
+        unsafe {
+            result::memset_d8_async(
+                self.address(name)?,
+                0,
+                placement.bytes.max(1),
+                self.stream(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Copy device memory into a buffer's prefix on the current stream. A source that already
@@ -921,25 +1053,13 @@ impl Executor {
         self.apply_runtime_constants()
     }
 
-    /// Drop a region nobody reads (an operand the kernel resolves through a table instead):
-    /// its memory goes back to the host; the buffer keeps a valid one-byte address.
-    pub fn release_region(&mut self, name: &str) -> Result<()> {
-        self.context.bind_to_thread()?;
-        ensure!(
-            self.layout.regions.contains_key(name),
-            "unknown region {name}"
-        );
-        self.synchronize()?;
-        self.graphs.clear();
-        self.launch_graphs = None;
-        self.descriptors.clear();
-        let dummy = Region::allocate(1, self.stream())?;
-        self.regions.insert(name.to_owned(), dummy);
-        Ok(())
-    }
-
     /// Point one region at memory the host lends (a buffer chained onto another program's).
-    pub fn set_region(&mut self, name: &str, ptr: u64, len: usize) -> Result<()> {
+    /// `wait` drains the stream first, so the memory the region pointed at is free for the host to
+    /// reuse the moment this returns. Without it, launches already queued keep reading that memory,
+    /// and the host keeps it alive until they finish (a resident weight slice swapped per launch).
+    /// The stream is drained anyway when that memory is the runtime's own, which it frees here, or
+    /// when a descriptor baked its address.
+    pub fn set_region(&mut self, name: &str, ptr: u64, len: usize, wait: bool) -> Result<()> {
         self.context.bind_to_thread()?;
         let size = *self
             .layout
@@ -950,7 +1070,11 @@ impl Executor {
             len >= size,
             "region {name} needs {size} bytes, host lent {len}"
         );
-        self.synchronize()?;
+        let owned = self.regions.get(name).is_some_and(|region| region.owned);
+        let baked = self.descriptors.values().any(|encoded| !encoded.is_empty());
+        if wait || owned || baked {
+            self.synchronize()?;
+        }
         self.graphs.clear();
         self.launch_graphs = None;
         self.descriptors.clear();
@@ -1053,11 +1177,6 @@ impl Executor {
         for name in &launch.args {
             if let Some(descriptor) = descriptors.get(&(index, name.clone())) {
                 params.push(Param::Ptr(descriptor.ptr));
-            } else if let Some(indirect) = launch.indirect.iter().find(|i| &i.arg == name) {
-                // The kernel resolves ``table[sel[slot]]`` in its body preamble.
-                params.push(Param::Ptr(self.address(&indirect.table)?));
-                params.push(Param::Ptr(self.address(&indirect.sel)?));
-                params.push(Param::Int(i32::try_from(indirect.slot)?));
             } else {
                 params.push(Param::Ptr(self.address(name)?));
             }
@@ -1153,6 +1272,49 @@ impl Executor {
     pub fn run_once(&mut self) -> Result<()> {
         self.context.bind_to_thread()?;
         self.submit()
+    }
+
+    /// Run the program once per entry, in order, on the current stream: bind the entry's symbols,
+    /// lend its buffers without draining (the host keeps that memory alive until the runs finish),
+    /// copy its inputs into their prefixes, launch every kernel and copy its outputs' prefixes out.
+    /// One call for what a host would otherwise issue as a dozen per run: a routed MoE layer runs
+    /// every hit expert this way. The runs queue back to back; the stream is drained between two
+    /// only where the next would change what the queued one reads, a runtime constant or a
+    /// descriptor.
+    pub fn run_each(&mut self, runs: &[Run]) -> Result<()> {
+        self.context.bind_to_thread()?;
+        for run in runs {
+            if !run.env.is_empty() {
+                // A runtime constant is rewritten in place: the runs already queued read it first.
+                if !self.program.runtime_constants.is_empty() {
+                    self.synchronize()?;
+                }
+                self.set_env(run.env.clone())?;
+            }
+            for (name, ptr, len) in &run.lent {
+                let region = self.placement(name)?.region.clone();
+                self.set_region(&region, *ptr, *len, false)?;
+            }
+            for (name, src, len) in &run.inputs {
+                self.bind_device(name, *src, *len)?;
+            }
+            self.submit()?;
+            for (name, dst, len) in &run.outputs {
+                let placement = self.placement(name)?;
+                ensure!(
+                    *len <= placement.bytes,
+                    "{len} bytes exceed buffer {name} ({} bytes)",
+                    placement.bytes
+                );
+                let src = self.address(name)?;
+                if *len > 0 {
+                    unsafe {
+                        result::memcpy_dtod_async(*dst, src, *len, self.stream())?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn event(&self) -> Result<CudaEvent> {
@@ -1263,14 +1425,27 @@ impl Executor {
     /// graph captured at an env replays only at that env (grids, runtime arguments and
     /// descriptors are baked), so one graph is kept per env, least recently used out.
     pub fn capture_program_graph(&mut self) -> Result<()> {
+        self.capture_program_batch(1)
+    }
+
+    pub fn capture_program_batch(&mut self, batch: u32) -> Result<()> {
+        ensure!(batch > 0, "batch must be positive");
         self.context.bind_to_thread()?;
-        let key = env_key(&self.env);
+        let key = (env_key(&self.env), batch);
         if let Some(position) = self.graphs.iter().position(|(k, _)| *k == key) {
             let entry = self.graphs.remove(position);
             self.graphs.push(entry);
             return Ok(());
         }
-        let graph = self.capture(|executor| executor.submit())?;
+        // Encoding TMA descriptors uploads bytes and synchronizes the stream. Finish that
+        // before capture begins, including the first capture at a new symbolic environment.
+        self.ensure_descriptors()?;
+        let graph = self.capture(|executor| {
+            for _ in 0..batch {
+                executor.submit()?;
+            }
+            Ok(())
+        })?;
         self.graphs.push((key, graph));
         if self.graphs.len() > GRAPH_CACHE_MAX {
             self.graphs.remove(0);
@@ -1285,13 +1460,17 @@ impl Executor {
 
     /// Whether a graph exists for the current environment.
     pub fn has_program_graph(&self) -> bool {
-        let key = env_key(&self.env);
+        let key = (env_key(&self.env), 1);
         self.graphs.iter().any(|(k, _)| *k == key)
     }
 
     pub fn replay_program_graph(&mut self) -> Result<()> {
+        self.replay_program_batch(1)
+    }
+
+    fn replay_program_batch(&mut self, batch: u32) -> Result<()> {
         self.context.bind_to_thread()?;
-        let key = env_key(&self.env);
+        let key = (env_key(&self.env), batch);
         let graph = self
             .graphs
             .iter()
@@ -1304,10 +1483,10 @@ impl Executor {
         Ok(())
     }
 
-    /// Time `replays` back-to-back replays of the program graph, per replay in milliseconds.
+    /// Time one captured batch of `replays` whole-program forwards, per forward in milliseconds.
     pub fn time_program_window(&mut self, replays: u32, deadline_ms: f64) -> Result<f32> {
         ensure!(replays > 0, "replays must be positive");
-        self.capture_program_graph()?;
+        self.capture_program_batch(replays)?;
         if self.window.is_none() {
             self.window = Some((self.event()?, self.event()?));
         }
@@ -1316,9 +1495,7 @@ impl Executor {
         unsafe {
             result::event::record(start.cu_event(), stream)?;
         }
-        for _ in 0..replays {
-            self.replay_program_graph()?;
-        }
+        self.replay_program_batch(replays)?;
         let (start, stop) = self.window.as_ref().unwrap();
         unsafe {
             result::event::record(stop.cu_event(), stream)?;

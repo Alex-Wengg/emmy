@@ -1,7 +1,28 @@
 """Recipe dataclass types."""
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class LoRAAdapterConfig:
+    """One pinned adapter that vLLM loads alongside its base model."""
+
+    name: str
+    huggingface: str
+    revision: str
+    rank: int
+
+    def __post_init__(self):
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", self.name):
+            raise ValueError("LoRA adapter name must contain only letters, digits, dots, underscores, or hyphens")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", self.huggingface):
+            raise ValueError("LoRA adapter huggingface must be an organization/model ID")
+        if not re.fullmatch(r"[0-9a-f]{40}", self.revision):
+            raise ValueError("LoRA adapter revision must be a 40-character commit hash")
+        if self.rank <= 0:
+            raise ValueError("LoRA adapter rank must be positive")
 
 
 @dataclass
@@ -12,6 +33,7 @@ class VllmConfig:
     entrypoint: str | None = None
     extra_args: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
+    lora_adapter: LoRAAdapterConfig | None = None
 
 
 @dataclass
@@ -102,6 +124,9 @@ class ModelConfig:
     """Model configuration."""
 
     huggingface: str = ""
+    # Model name sent to the serving API. A LoRA adapter can have its own name while
+    # huggingface remains the base checkpoint downloaded and loaded by the engine.
+    request_name: str | None = None
     # Why this model belongs in the recipe inventory at its current lifecycle level.
     rationale: str | None = None
     # Current discovery priority on a 0-100 scale. It does not affect serving behavior.
@@ -114,6 +139,10 @@ class ModelConfig:
     # Generative checkpoints default to the semantic chat smoke test. Base models that
     # are not instruction-tuned use the completion endpoint instead.
     smoke_test: str = "chat"
+    # Input modalities the served engine accepts: "text" always, plus "image" for a
+    # vision-language recipe whose engine flags keep image input enabled. Exported in
+    # the catalog so Relay can advertise and gate image parts per model.
+    input_modalities: tuple[str, ...] = ("text",)
 
 
 @dataclass
@@ -130,17 +159,29 @@ class BenchmarkConfig:
     contaminate the first repeat. ``repeats`` reruns the measured workload N times against the
     one deployed server, repeat ``i`` drawing its prompts from ``seed + i`` so the server's
     prefix cache cannot carry one repeat's prompts into the next; lengths and concurrency are
-    unchanged, so the spread is run-to-run noise."""
+    unchanged, so the spread is run-to-run noise.
+
+    ``random_prefix_len`` prepends that many tokens, the same for every request of one client run,
+    to each ``random_input_len`` random tokens: the shared prefix a prefix cache can serve.
+
+    ``transcription_dataset`` replaces the random text prompts with the clips of a Hugging Face speech
+    dataset the client reads (``openslr/librispeech_asr``), sent to ``/v1/audio/transcriptions``;
+    ``transcription_subset`` / ``transcription_split`` name its configuration and split. The random
+    lengths and ``ignore_eos`` do not apply: each clip decides its own input and transcript length."""
 
     max_concurrency: int = 128
     num_prompts: int = 256
     random_input_len: int = 8000
+    random_prefix_len: int = 0
     random_output_len: int = 8000
     seed: int | None = None
     temperature: float | None = None
     ignore_eos: bool = False
     num_warmups: int = 0
     repeats: int = 1
+    transcription_dataset: str | None = None
+    transcription_subset: str | None = None
+    transcription_split: str | None = None
 
 
 @dataclass
@@ -207,18 +248,26 @@ class Recipe:
         model_dict = d.get("model", {})
         model = ModelConfig(
             huggingface=model_dict.get("huggingface", ""),
+            request_name=model_dict.get("request_name"),
             rationale=model_dict.get("rationale"),
             heat=model_dict.get("heat"),
             revision=model_dict.get("revision"),
             task=model_dict.get("task", "generate"),
             smoke_test=model_dict.get("smoke_test", "chat"),
+            input_modalities=tuple(model_dict.get("input_modalities") or ("text",)),
         )
 
         engine_dict = d.get("engine", {})
         llm_dict = engine_dict.get("llm", {})
 
         vllm_dict = llm_dict.get("vllm")
-        vllm = VllmConfig(**vllm_dict) if vllm_dict is not None else None
+        if vllm_dict is None:
+            vllm = None
+        else:
+            vllm_fields = dict(vllm_dict)
+            if "lora_adapter" in vllm_fields:
+                vllm_fields["lora_adapter"] = LoRAAdapterConfig(**vllm_fields["lora_adapter"])
+            vllm = VllmConfig(**vllm_fields)
 
         sglang_dict = llm_dict.get("sglang")
         sglang = SglangConfig(**sglang_dict) if sglang_dict is not None else None
@@ -240,12 +289,16 @@ class Recipe:
             "max_concurrency",
             "num_prompts",
             "random_input_len",
+            "random_prefix_len",
             "random_output_len",
             "seed",
             "temperature",
             "ignore_eos",
             "num_warmups",
             "repeats",
+            "transcription_dataset",
+            "transcription_subset",
+            "transcription_split",
         }
         unsupported_benchmark_fields = set(bench_dict) - workload_fields
         if unsupported_benchmark_fields:
@@ -255,12 +308,16 @@ class Recipe:
             max_concurrency=bench_dict.get("max_concurrency", 128),
             num_prompts=bench_dict.get("num_prompts", 256),
             random_input_len=bench_dict.get("random_input_len", 8000),
+            random_prefix_len=bench_dict.get("random_prefix_len", 0),
             random_output_len=bench_dict.get("random_output_len", 8000),
             seed=bench_dict.get("seed"),
             temperature=bench_dict.get("temperature"),
             ignore_eos=bench_dict.get("ignore_eos", False),
             num_warmups=bench_dict.get("num_warmups", 0),
             repeats=bench_dict.get("repeats", 1),
+            transcription_dataset=bench_dict.get("transcription_dataset"),
+            transcription_subset=bench_dict.get("transcription_subset"),
+            transcription_split=bench_dict.get("transcription_split"),
         )
 
         deploy_dict = d.get("deploy", {})
@@ -296,6 +353,12 @@ class Recipe:
     def model_name(self) -> str:
         """Shortcut for model.huggingface."""
         return self.model.huggingface
+
+    @property
+    def request_model_name(self) -> str:
+        """The base model or named adapter selected by smoke tests and benchmarks."""
+        adapter = self.engine.llm.vllm.lora_adapter if self.engine.llm.vllm else None
+        return self.model.request_name or (adapter.name if adapter else self.model_name)
 
     @property
     def is_embedding(self) -> bool:

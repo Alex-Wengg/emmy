@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::path::Path;
 
-const GENERATION_FORMAT: u32 = 5;
+const GENERATION_FORMAT: u32 = 7;
 const DEFAULT_TEMPERATURE: f64 = 0.0;
 const DEFAULT_TOP_P: f64 = 1.0;
 const DEFAULT_SEED: u64 = 0;
@@ -116,6 +116,24 @@ pub struct Config {
     pub vocab_size: usize,
     pub prefill_size: usize,
     pub eos_ids: Vec<i64>,
+    pub state: Vec<String>,
+}
+
+/// Whether the prefill program may take the chunk at `position`. A chunk's rows past the
+/// prompt embed the previous selection and write cache rows the decode step overwrites, so it
+/// is taken wherever the whole chunk fits the context and the prompt's last token stays for
+/// decode. Carried state has no such repair: a row past the prompt would be folded into the
+/// request, so then every row of the chunk must be a prompt token before the last.
+fn chunk_fits(
+    position: usize,
+    prompt_length: usize,
+    prefill_size: usize,
+    context_length: usize,
+    carried: bool,
+) -> bool {
+    position + 1 < prompt_length
+        && position + prefill_size <= context_length
+        && (!carried || position + prefill_size < prompt_length)
 }
 
 impl Config {
@@ -141,6 +159,11 @@ impl Config {
                 .iter()
                 .all(|&id| id >= 0 && (id as usize) < self.vocab_size),
             "invalid EOS token"
+        );
+        let mut names = std::collections::BTreeSet::new();
+        ensure!(
+            self.state.iter().all(|name| names.insert(name)),
+            "a state buffer is named twice"
         );
         Ok(())
     }
@@ -255,13 +278,23 @@ impl Generator {
                 }
             }
         }
+        for name in &config.state {
+            let buffer = artifact
+                .program
+                .buffer(name)
+                .context("missing state buffer")?;
+            ensure!(
+                buffer.role == "output" && !artifact.program.paged.contains_key(name),
+                "state buffer {name} is not a flat output the step writes in place"
+            );
+        }
         let executor = Executor::load(device, artifact)?;
         let prefill = if let Some(artifact) = prefill_artifact {
             let mut prefill = Executor::load(device, artifact)?;
             for name in shared {
                 let view = executor.buffer(&name)?;
                 let region = prefill.layout().buffers[&name].region.clone();
-                prefill.set_region(&region, view.ptr, view.bytes)?;
+                prefill.set_region(&region, view.ptr, view.bytes, true)?;
             }
             for name in shared_tables {
                 let (ptr, len) = executor.page_table(&name)?;
@@ -282,12 +315,16 @@ impl Generator {
         })
     }
 
-    /// Reset request state. Old cache entries are invisible until overwritten at their absolute positions.
+    /// Reset request state. Old cache entries are invisible until overwritten at their absolute
+    /// positions, and the state a step carries starts at zero.
     pub fn start(&mut self, prompt: &[i64], sampling: Sampling) -> Result<()> {
         self.config.validate_prompt(prompt)?;
         sampling.validate()?;
         self.stopped = true;
         self.sampling = sampling;
+        for name in &self.config.state {
+            self.executor.zero(name)?;
+        }
         self.executor.bind("next_token", &0i64.to_le_bytes())?;
         let mut bytes = vec![0; self.config.context_length * TOKEN_BYTES];
         for (slot, token) in bytes
@@ -315,14 +352,17 @@ impl Generator {
         Ok(())
     }
 
-    /// Consume a prefill chunk, or one token on the unchanged decode program. A chunk writes
-    /// every one of its rows to the cache, the ones past the prompt included, so it is taken
-    /// only where the whole chunk fits the context; the decode step covers the rest.
+    /// Consume a prefill chunk, or one token on the unchanged decode program. The chunk rule
+    /// (`chunk_fits`) says which; the decode step covers the rest.
     pub fn advance(&mut self, capture: bool, ignore_eos: bool) -> Result<Option<i64>> {
         ensure!(!self.stopped, "generation is stopped");
-        if self.position + 1 < self.prompt_length
-            && self.position + self.config.prefill_size <= self.config.context_length
-            && let Some(prefill) = &mut self.prefill
+        if chunk_fits(
+            self.position,
+            self.prompt_length,
+            self.config.prefill_size,
+            self.config.context_length,
+            !self.config.state.is_empty(),
+        ) && let Some(prefill) = &mut self.prefill
         {
             self.stopped = true;
             prefill.bind("position", &(self.position as i64).to_le_bytes())?;
@@ -565,6 +605,22 @@ mod tests {
     }
 
     #[test]
+    fn carried_state_takes_a_chunk_only_inside_the_prompt() {
+        // Dense: a chunk is taken while the prompt's last token stays for decode and the chunk
+        // fits the context, rows past the prompt included.
+        assert!(chunk_fits(0, 2, 4, 8, false));
+        assert!(chunk_fits(4, 8, 4, 8, false));
+        assert!(!chunk_fits(5, 8, 4, 8, false));
+        assert!(!chunk_fits(7, 8, 4, 8, false));
+        // Carried: every row must be a prompt token before the last.
+        assert!(!chunk_fits(0, 2, 4, 8, true));
+        assert!(chunk_fits(0, 5, 4, 8, true));
+        assert!(!chunk_fits(0, 4, 4, 8, true));
+        assert!(chunk_fits(4, 9, 4, 16, true));
+        assert!(!chunk_fits(4, 8, 4, 16, true));
+    }
+
+    #[test]
     fn reject_invalid_geometry_and_prompt_before_submission() {
         let mut config = Config {
             version: GENERATION_FORMAT,
@@ -572,8 +628,12 @@ mod tests {
             vocab_size: 32,
             prefill_size: 1,
             eos_ids: vec![31],
+            state: vec!["state".into(), "history".into()],
         };
         config.validate().unwrap();
+        config.state.push("state".into());
+        assert!(config.validate().is_err());
+        config.state.clear();
         config.validate_prompt(&[0, 31]).unwrap();
         for prompt in [vec![], vec![-1], vec![32], vec![1; 9]] {
             assert!(config.validate_prompt(&prompt).is_err());

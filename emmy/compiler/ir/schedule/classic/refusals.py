@@ -5,14 +5,16 @@ here too, so the context composes without owning legality."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from functools import cache
 from typing import TYPE_CHECKING
 
+from frozendict import frozendict
+
 from emmy.compiler.ir.address import gmem_axis_step, split_addressable
 from emmy.compiler.ir.atom import ATOM_REGISTRY, AtomKind, atoms_for, wide_accumulate
-from emmy.compiler.ir.pure.fold import Fold
+from emmy.compiler.ir.pure.fold import Fold, binding_extents
 from emmy.compiler.ir.schedule.catalog import (
     WARP_LANES,
     coop_reduce_moves,
@@ -21,13 +23,13 @@ from emmy.compiler.ir.schedule.catalog import (
     warp_tile_in_catalog,
     warp_tile_moves,
 )
-from emmy.compiler.ir.schedule.choices import PlacedTile, Reduce, ResolvedStage, Stage, Tile
+from emmy.compiler.ir.schedule.choices import PlacedTile, Reduce, ResolvedStage, Stage, Tile, Work
 from emmy.compiler.ir.schedule.packing import block_scaled_atom
 from emmy.compiler.ir.schedule.views import ContractionFacts, NodeId
-from emmy.compiler.ir.stmt import Assign, Body, Load, Loop, Select, Write, mask_select_predicate
+from emmy.compiler.ir.stmt import Affine, Assign, Body, Load, Loop, Select, Stmt, Write, mask_select_predicate
 from emmy.compiler.ir.stmt.passes import has_contraction_tail
 
-from .schedule import NodeSchedule, node_id_spelling
+from .schedule import NodeSchedule, binds_root, node_id_spelling, packed_works
 
 if TYPE_CHECKING:
     from emmy.compiler.ir.tile import TileOp
@@ -49,7 +51,7 @@ def _transposed_reduction_ok(tile: TileOp) -> bool:
     return _inner_free(tile) is not None and not any(isinstance(stmt, Loop) for stmt in tail) and not has_contraction_tail(tail)
 
 
-def _reduction_domain(tile: TileOp, node) -> tuple[Reduce, ...]:
+def _reduction_domain(tile: TileOp, node, target) -> tuple[Reduce, ...]:
     """Project one plain reduction's legal choices from node and kernel facts only.
 
     The catalog is not capped by the axis extent: an over-wide band is legal and idles its extra
@@ -64,34 +66,47 @@ def _reduction_domain(tile: TileOp, node) -> tuple[Reduce, ...]:
         chain_form,
         chain_members,
         kernel_roots,
-        merges_partition,
     )
 
     roots = kernel_roots(tile.op)
     is_root = any(node is root for root in roots)
     owner = node if is_root else next((root for root in roots if any(node is member for member in chain_members(root))), None)
-    if node.observe is not None or node.carries or owner is None:
+    if node.carries or owner is None:
         return (Reduce(),)  # the binder partitions the roots it peels and their chain members; any other reduce lowers serially
     # A sweep the member's own ROOT is evaluated over wraps the whole chain, members included, and
     # only the serial fold spells that: the chain arm closes one grid cell.
     if {axis.name for spec in tile.output_specs for axis in spec.sweep} & (node.free_axes | owner.free_axes):
         return (Reduce(),)
-    if is_root and merges_partition(tile):
-        # A split's deferred finalize: one partial per split per cell, the parallelism is the cells,
-        # and a band over the few partials pays a barrier per cell.
-        return (Reduce(),)
-    transposed_ok = _transposed_reduction_ok(tile) and is_root and not chain_form(node)
+    if node.observe is not None:
+        # A prefix scan keeps every lane's inclusive state. Ordinary register partials, ``coop/v<n>`` runs,
+        # transposed bands and cross-warp trees do not preserve those states.
+        if not is_root or chain_form(node):
+            return (Reduce(),)
+        return (
+            Reduce(),
+            *(
+                choice
+                for choice in coop_reduce_moves()
+                if 1 < choice.coop <= WARP_LANES and choice.reg == choice.coop_columns == 1 and not choice.coop_transposed
+            ),
+        )
+    transposed_ok = _transposed_reduction_ok(tile) and is_root
+    lanes = (32, 8) if target.compute_capability == (7, 0) else (32,)
     return (
         Reduce(),
-        *(choice for choice in coop_reduce_moves() if not choice.coop_transposed or (choice.coop % WARP_LANES == 0 and transposed_ok)),
+        *(
+            choice
+            for choice in coop_reduce_moves(transposed_lanes=lanes)
+            if not choice.coop_transposed or (choice.coop % WARP_LANES == 0 and transposed_ok)
+        ),
     )
 
 
-def _contraction_reductions(tile: TileOp, node, facts: ContractionFacts) -> tuple[Reduce, ...]:
+def _contraction_reductions(tile: TileOp, node, facts: ContractionFacts, target) -> tuple[Reduce, ...]:
     """The per-cell tier's reductions of a contraction: the plain-reduction catalog, since a
     contraction is a monoid with a ⊗ lift and inherits the same serial-only exclusions with no
     carve-out of its own; the serial fold alone over a symbolic contraction extent."""
-    return _reduction_domain(tile, node) if facts.k_axis.extent.is_static else (Reduce(),)
+    return _reduction_domain(tile, node, target) if facts.k_axis.extent.is_static else (Reduce(),)
 
 
 def _fragment_projection(tile: TileOp) -> tuple[list, frozenset[str]]:
@@ -100,8 +115,9 @@ def _fragment_projection(tile: TileOp) -> tuple[list, frozenset[str]]:
 
     roots = () if refused_roots(tile.op, tuple(tile.output_specs)) else kernel_roots(tile.op)
     bound = frozenset(axis.name for axis in tile.place.free)
-    computed = {stmt for root in roots for stmt in root.lower(bound, axes=tile.axes)}
-    tail = [stmt for stmt in tile.op.lower(bound, tuple(tile.output_specs), tile.axes) if stmt not in computed]
+    with binding_extents(tile.extents):
+        computed = {stmt for root in roots for stmt in root.lower(bound, axes=tile.axes)}
+        tail = [stmt for stmt in tile.op.lower(bound, tuple(tile.output_specs), tile.axes) if stmt not in computed]
     return tail, frozenset(name for root in roots for name in root.exposes)
 
 
@@ -217,8 +233,6 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
 
     Stated at the enumeration, not at the binder: a row nothing realizes costs the greedy a
     blocklist retry per rank, and there are more ranked rows than the retry budget."""
-    from emmy.compiler.ir.tile.ops import projection_tail  # noqa: PLC0415 — tile.ops reads this package; module level would cycle
-
     facts = tile.contractions.get(tile.node_id(node))
     score = facts.producer if facts is not None else None
     # The chunk's score is CONTRACTED into its fragments when a nested contraction supplies it, and
@@ -238,16 +252,12 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
     # contraction, and what scales its raw accumulator lives in the lift above it. Its leaves past
     # the producer are read once ahead of the chunk, so none of them may vary over the chunk.
     prefix = node.applied.cone(node.roles[0])
-    if any(not isinstance(stmt, (Assign, Load, Select)) for stmt in prefix.body):
+    if any(not isinstance(stmt, (Affine, Assign, Load, Select)) for stmt in prefix.body):
         return "the score's own prefix holds more than a straight-line program"
     coord_axes = {node.axis, *node.as_contraction().left_axes}
     uniform = {name for edge in node.operands if not edge.free_axes for name in edge.exposes}
     for stmt in (stmt for stmt in prefix.body if isinstance(stmt, Select)):
-        consumers = [
-            consumer
-            for consumer in prefix.body
-            if isinstance(consumer, Assign) and consumer.op.name == "add" and stmt.name in consumer.args
-        ]
+        consumers = [consumer for consumer in prefix.body if _adds(consumer, stmt.name)]
         if (
             mask_select_predicate(stmt) is None
             or len(consumers) != 1
@@ -262,7 +272,7 @@ def _chunk_refusal(tile: TileOp, node) -> str | None:
     # register. A projection may read those registers, and a cross-CTA split's partial stores each
     # of them WHOLE to its workspace (broadcast per row into a fragment); what the tier cannot write
     # is a per-row state computed into an output of its own beside the expectation.
-    tail = projection_tail(tile)
+    tail, _ = _fragment_projection(tile)
     body = Body(tail)
     states = set(node.base.results)
     cell = {axis.name for axis in tile.place.free}
@@ -385,12 +395,10 @@ def _warp_plan_ok(node, facts: ContractionFacts, plan: Tile) -> bool:
 def _uniform_extras(node) -> bool:
     # The scalar register tier replicates the TERM's own step per cell, so a recipe folds there
     # like any other algebra — three states under their own ops, seeded by the ⊕'s identities.
-    # What it has no residence for is an operand past the streamed one that VARIES: those are read
-    # once, ahead of the cells, so every one of them must be uniform across the tile (attention's
-    # scale and its mask fills are; a second streamed B is not, and rides the warp compute fill).
-    # The same holds for a second channel on ONE edge — a packed gate/up weight exposes both
-    # projections from a single operand, so the channel count, not the operand count, decides.
-    return len(node.operands) >= 2 and len(node.bilinear_channels()) <= 1 and not any(edge.free_axes for edge in node.operands[2:])
+    # Product channels read their streamed edges per register column. Any remaining operand is
+    # read once ahead of the cells, so it must be uniform across the tile.
+    streamed = {id(edge) for _, edge in node.bilinear_channels()}
+    return len(node.operands) >= 2 and not any(edge.free_axes for edge in node.operands[1:] if id(edge) not in streamed)
 
 
 def _warp_plans(node, facts: ContractionFacts, atoms: tuple[str, ...]) -> Iterator[Tile]:
@@ -456,8 +464,14 @@ def fill_tma_moves(ctx) -> tuple[Stage, ...]:
     return tuple(stage for stage in stage_moves(warp=True, ctx=ctx) if stage.transport == "smem-tma" and stage.depth in depths)
 
 
-def _stage_candidates(tile: TileOp, target, node, choice: NodeSchedule) -> tuple[Stage, ...]:
-    """The transports one node choice can be fed by — the independent edge catalog."""
+def _stage_candidates(tile: TileOp, target, node, choice: NodeSchedule, paged: Mapping = frozendict()) -> tuple[Stage, ...]:
+    """The transports one node choice can be fed by — the independent edge catalog.
+
+    ``paged`` is the kernel's paged buffers (``ClassicProblem.paged``): a transport that takes an
+    operand's base address cannot feed a paged one. A TMA descriptor encodes the address on the host,
+    so TMA never reads a page; a buffer of several pages resolves a page per element, which a cp.async
+    copy's per-thread addresses cannot either. The lowering refuses what the catalog would otherwise
+    let the search pick."""
     direct = Stage.direct()
     if not choice.tile.is_tiled or (node.chunked() and not choice.tile.is_warp):
         # A chunked carrier's transport belongs to its own tier, which is the tensor-core one.
@@ -484,14 +498,23 @@ def _stage_candidates(tile: TileOp, target, node, choice: NodeSchedule) -> tuple
         candidates = (*fill_stage_moves(), *stage_moves(warp=True, ctx=target))
     else:
         candidates = (direct, *stage_moves(warp=choice.tile.is_warp, ctx=target))
-    # The per-cell tier has neither a multi-slab drain nor a fill to fall back to, so a prefetching
-    # transport there would name a deposit its materializer cannot emit.
+    # Scalar multi-channel staging uses the blocking fill; the byte-copy catalogs below
+    # keep their single-channel scalar geometry.
     if len(node.bilinear_channels()) > 1 and not choice.tile.is_warp:
         candidates = tuple(stage for stage in candidates if stage.transport not in ("smem-async", "smem-tma"))
     if not (choice.tile.is_warp and choice.tile.atom.is_wgmma):
         # An 8-deep ring has paid only on wgmma (the H100 down projection; depth 6 lost to 4 and 8).
         # Elsewhere it only multiplies the stage space every compile prices.
         candidates = tuple(stage for stage in candidates if stage.depth < 8)
+    if paged:
+        from emmy.compiler.dim import spans_one_page  # noqa: PLC0415
+        from emmy.compiler.ir.tile.ir import loaded_buffers  # noqa: PLC0415 — the tile IR imports this package
+
+        read = {load.input for load in loaded_buffers(node)} & paged.keys()
+        if read:
+            split = any(not spans_one_page(tile.inputs[n].shape, axis, page) for n, (axis, page) in paged.items() if n in read)
+            banned = {"smem-tma", "smem-async"} if split else {"smem-tma"}
+            candidates = tuple(stage for stage in candidates if stage.transport not in banned)
     return candidates
 
 
@@ -542,6 +565,15 @@ def _multi_channel_cell(tile_op, node: Fold, plan: Tile) -> bool:
 
 
 def _needs_fill(tile_op, node: Fold, plan: Tile) -> bool:
+    # Asked per transport and per refusal of one choice: kept on the kernel, keyed like its packed readings.
+    memo = tile_op.__dict__.setdefault("_needs_fill_memo", {})
+    key = (id(node), plan)
+    if key not in memo:
+        memo[key] = _derive_needs_fill(tile_op, node, plan)
+    return memo[key]
+
+
+def _derive_needs_fill(tile_op, node: Fold, plan: Tile) -> bool:
     from emmy.compiler.ir.schedule import staging  # noqa: PLC0415
 
     if _multi_channel_cell(tile_op, node, plan):
@@ -617,12 +649,21 @@ def _wgmma_register_refusal(node: Fold, plan: Tile) -> str | None:
     )
 
 
+def _adds(consumer: Stmt, name: str) -> bool:
+    """Whether ``consumer`` adds the value ``name`` to something: a sum with it as a unit term."""
+    if isinstance(consumer, Affine):
+        return any(arg == name and coefficient == 1 for coefficient, arg in consumer.terms)
+    return isinstance(consumer, Assign) and consumer.op.name == "add" and name in consumer.args
+
+
 def _plan_node_refusal(tile_op, node: Fold, plan: Tile, placed: PlacedTile, facts: ContractionFacts) -> str | None:
     from emmy.compiler.ir.schedule import staging  # noqa: PLC0415
 
     refusal = _kstep_refusal(facts.k_axis, plan) or _wgmma_refusal(plan) or _wgmma_register_refusal(node, plan)
     if refusal is not None or not _needs_fill(tile_op, node, plan):
         return refusal
+    if tile_op.packed_reading(node)[0] is None and (refusal := staging.fill_chunk_refusal(plan, facts.k_axis)) is not None:
+        return refusal  # every transport of a fill choice reaches the fill resolver, which refuses it there
     converting = staging.converting_a(node, plan.atom, tile_op.inputs)
     return staging.computed_operand_cover(
         node, placed, converting=converting, k_axis=facts.k_axis, inputs=tile_op.inputs
@@ -631,6 +672,25 @@ def _plan_node_refusal(tile_op, node: Fold, plan: Tile, placed: PlacedTile, fact
         placed,
         tile_op.inputs,
         converting=converting,
+    )
+
+
+def _fill_budget_refusal(tile_op, target, node: Fold, plan: Tile, placed: PlacedTile, facts: ContractionFacts) -> str | None:
+    """Why a fill choice's slabs exceed ``target``'s smem whatever transport feeds them, or ``None``."""
+    from emmy.compiler.ir.schedule import staging  # noqa: PLC0415
+
+    if tile_op.packed_reading(node)[0] is not None or not _needs_fill(tile_op, node, plan):
+        return None
+    return staging.fill_slab_refusal(
+        node,
+        placed,
+        target.max_dynamic_smem,
+        inputs=tile_op.inputs,
+        seam=facts.seam,
+        k_axis=facts.k_axis,
+        producer=facts.producer,
+        producer_k=tile_op.axis_of(facts.producer.axis) if facts.producer is not None else None,
+        axes=tile_op.axes,
     )
 
 
@@ -677,10 +737,12 @@ def _resolve_stage(
             producer=facts.producer,
             producer_k=tile_op.axis_of(facts.producer.axis) if facts.producer is not None else None,
         )
-    return staging.resolve_scalar_stage(node, placed, choice, tile_op.inputs, target.max_dynamic_smem, facts.k_axis)
+    return staging.resolve_scalar_stage(
+        node, placed, choice, tile_op.inputs, target.max_dynamic_smem, facts.k_axis, tile_op.axes, seam=facts.seam
+    )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _AxisAgreement:
     """One physical-axis geometry claim carried by a local schedule offer."""
 
@@ -689,7 +751,7 @@ class _AxisAgreement:
     units: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _FragmentAgreement:
     """One producer or consumer claim at a fragment seam."""
 
@@ -700,6 +762,111 @@ class _FragmentAgreement:
     def __post_init__(self) -> None:
         if self.role not in ("need", "offer"):
             raise ValueError(f"fragment agreement role must be need or offer, got {self.role!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class _Relation:
+    """What a prefix has decided that the compatibility of a later pick reads — the worker inventory it
+    claimed, its physical-axis and fragment-seam agreements, and the decided nodes where a rule reads them:
+    every one while no inventory is claimed (the canonical-form check runs over them), and all of them at a
+    site that is a shared root, a chain member, or either end of a nested tile. Two prefixes equal here admit the same picks at a site,
+    whatever else they decided, which is what lets a site keep one filtered answer per relation."""
+
+    work: Work | None = None
+    axes: Mapping[str, tuple[int, int]] = field(default_factory=frozendict)
+    fragments: Mapping[tuple[str, str], tuple] = field(default_factory=frozendict)
+    nodes: Mapping[NodeId, NodeSchedule] = field(default_factory=frozendict)
+
+    def __post_init__(self) -> None:
+        for name in ("axes", "fragments", "nodes"):
+            object.__setattr__(self, name, frozendict(getattr(self, name)))
+
+
+def _relation_refusal(site: NodeId, pick, relation: _Relation, *, roots, pairs, nests, allowed_works) -> str | None:
+    """Why ``pick`` cannot extend a prefix whose compatibility facts are ``relation``, or ``None``.
+
+    ``pick`` is a site's tile choice or one of its supports; both carry ``node``, ``work``, ``axes`` and
+    ``fragments``, and the rules read nothing else. The shared-root, chain and nested-tile rules (``roots``,
+    ``pairs``, ``nests``: the kernel's) are the binder's dispatch applied at the offer; the inventory, canonical-form and physical-axis
+    rules read the tile; the seam rule reads the claims, which only a support completes with its transport's K
+    slab — so a choice passing here may still have no support that does."""
+    node = pick.node
+    if site in roots and binds_root(node) and any(binds_root(relation.nodes[other]) for other in roots if other in relation.nodes):
+        return "a second scheduled root on a projection its outputs do not partition by root"
+    for root, member in pairs:
+        if site not in (root, member):
+            continue
+        picks = {**relation.nodes, site: node}
+        if root not in picks or member not in picks or picks[member].reduce == Reduce():
+            continue
+        if picks[root].tile.is_tiled:
+            return "a partitioned chain member under an output-tiled root, whose fill owns its cone"
+        if picks[root].reduce.coop_transposed:
+            return "a partitioned chain member under a transposed band, which binds its fold alone"
+    for root, nested in nests:
+        if site not in (root, nested):
+            continue
+        picks = {**relation.nodes, site: node}
+        if root in picks and nested in picks and picks[nested].tile.is_tiled and not picks[root].tile.is_tiled:
+            return "a contraction tile under a root that is not output-tiled, whose serial lowering would drop it"
+    work = relation.work
+    if work is not None and pick.work is not None and pick.work != work:
+        return "pick requires a different worker inventory"
+    resolved = pick.work or work
+    if (
+        allowed_works is not None
+        and resolved is not None
+        and (resolved.kind, resolved.units) not in allowed_works
+        and not any((packed.kind, packed.units) in allowed_works for packed in packed_works(resolved))
+    ):
+        return "pick cannot reach a kernel allowed by the schedule restriction"
+    if work is None and resolved is not None:
+        if not all(choice.tile.is_canonical_for(resolved) for choice in (*relation.nodes.values(), node)):
+            return "pick is not canonical for the worker inventory"
+    elif not node.tile.is_canonical_for(resolved):
+        return "pick is not canonical for the worker inventory"
+    axis_values = dict(relation.axes)
+    for claim in pick.axes:
+        value = (claim.tile, claim.units)
+        if axis_values.get(claim.name, value) != value:
+            return "pick disagrees on physical-axis geometry"
+    fragment_values = dict(relation.fragments)
+    for claim in pick.fragments:
+        key = (claim.role, claim.edge)
+        if fragment_values.setdefault(key, claim.value) != claim.value:
+            return "pick repeats a fragment endpoint inconsistently"
+        other_role = "need" if claim.role == "offer" else "offer"
+        other = fragment_values.get((other_role, claim.edge))
+        if other is None:
+            continue
+        need, offer = (claim.value, other) if claim.role == "need" else (other, claim.value)
+        if need[0] == "chunk":
+            rows, keys = offer[5] if offer[0] == "warp" else ((), ())
+            if offer[0] != "warp":
+                return "the chunk tier's score must be warp-tiled"
+            if need[1:3] != offer[1:3]:
+                return f"the score's cell {offer[1]} {offer[2]} is not the carrier's {need[1]} {need[2]}"
+            if keys[0] != need[5]:  # the producer's N is the carrier's key: a (row, chunk) tile
+                return "the score's N tile is not the carrier's key axis"
+            if keys[1:3] != (1, need[3]):  # one warp column, and that column IS the chunk
+                return f"the score's N tile ({keys[1]} warp columns, {keys[2]} wide) is not the carrier's chunk ({need[3]} wide)"
+            if rows[3] != need[4]:  # the same register rows the carrier holds
+                return f"the score holds {rows[3]} register rows where the carrier holds {need[4]}"
+            compatible = True
+        elif offer[0] == "free":
+            compatible = need[0] != "step"
+        else:
+            compatible = (
+                need[0] in ("warp", "step")
+                and offer[0] == "warp"
+                and need[1] == offer[1]
+                and need[2] == offer[2]
+                and offer[3] == 1
+                and offer[4] == need[3]
+            )
+        if not compatible:
+            return "pick is incompatible at a fragment seam"
+    return None
 
 
 def _fragment_agreements(

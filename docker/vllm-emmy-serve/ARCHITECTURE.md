@@ -40,6 +40,13 @@ human approval, `--yes` may tag a `--source-image` and push; a different digest 
 failure, while the same digest is idempotent success. Direct `make serve-push` is disabled so naming and collision
 rules cannot drift between release paths.
 
+Two things a first release of an image needs before the dry run can pass. The Docker Hub repository must already
+exist, empty and public: an anonymous lookup cannot tell a missing repository from a private one, and the command
+does not read that answer as a free tag. And the recipe must have exactly one variant. The catalog holds one recipe
+per model, so while the model's recipe under `recipes/` keeps another image, the publication input is a
+single-variant recipe under `experiments/<model>/`. DeepSeek V4 Flash 0731 was published that way, before its recipe
+took the Emmy image.
+
 **The slug does not encode the checkpoint revision.** An HF id that publishes several variants under one repo — an
 EXL3 checkpoint carries one branch per bit rate, a base-model repo carries training-checkpoint branches — maps every
 one of them to the same slug, the same config file and the same image name. `SERVE_REVISION` is what separates them, and
@@ -144,7 +151,8 @@ the same cubins and the standard-lane pack never exists.
   `SERVE_CAPTURE_SIZES`, `SERVE_EXTRA_ARGS`, plus the runner memory/shape lane
   (`SERVE_EMBED_HOST`, `SERVE_PREFILL_CAPACITY`, `SERVE_PREFILL_BUCKET`, `SERVE_M1_TIER`), the qualified vLLM runner
   opt-in `SERVE_V2_MODEL_RUNNER`, the release-gate scope opt-in `SERVE_STATIC_ONLY`, `SERVE_ENV` (word-split
-  `NAME=value` pairs `serve.sh` exports before the exec: a fork's own switches, `EMMY_STRICT_EVIDENCE=1`), and
+  `NAME=value` pairs `serve.sh` exports before the exec: a fork's own switches, `EMMY_STRICT_EVIDENCE=1`;
+  `EMMY_COLD_CACHE=1` among them declares the cache regime every lane compiles in and records its rows under), and
   `SERVE_BASE_IMAGE` / `SERVE_RUNTIME_VERSION` for a model served on a runtime other than stock vLLM (DeepSeek V4 on
   the 1Cat Volta fork, by digest): the plain image then builds FROM it under a model-scoped `-base` tag, and the
   serving tag carries the runtime's version. The runner shape fields map immutably to their `EMMY_GEN_*` variables in
@@ -163,7 +171,8 @@ the same cubins and the standard-lane pack never exists.
   seals: `SERVE_QUANT=exl3` adds `"quantization_config": null` beside the architectures override (vLLM has no EXL3
   quantization method and refuses the boot at config parsing, though nothing in the engine needs one — emmy owns
   every coded weight), and `SERVE_CAPTURE_SIZES` replaces the power-of-two capture ladder, which an **MoE model must
-  cap at `[1]`**: single-token steps ride the runner's fixed-slot expert dispatch (fixed launch set, capture-legal)
+  cap**: at `[1]` on a rank holding whole experts, at the decode bucket where tensor parallelism gives each rank a
+  slice of every expert. Those steps ride the runner's fixed-slot expert dispatch (fixed launch set, capture-legal)
   while wider decode steps keep the routed dispatch, which host-syncs and stays eager. `SERVE_V2_MODEL_RUNNER=1`
   opts a qualified dense model into vLLM's V2 runner; it executes real prefill/decode warmups before enabling vLLM's
   request-time JIT monitor. An `--enforce-eager` in `SERVE_EXTRA_ARGS` drops the capture config, as a caller's does in
@@ -188,9 +197,11 @@ the same cubins and the standard-lane pack never exists.
   prebuilt image was possible. `emmy bench` runs its client in the same image and, for a recipe that pins a revision,
   names that snapshot as the client's tokenizer: the baked cache holds no branch ref, so a lookup by repo id finds
   nothing offline.
-- `verify.sh` — compares the image's baked `SERVE_REVISION` against the config's (a tag built from an older config
-  serves different weights and still passes every check below), then cold-starts the **baked** image with no token,
-  issues one completion, and diffs the cubin file set before/after: an empty diff proves 100% Emmy cache hit. It
+- `verify.sh` — compares the image's baked `SERVE_REVISION`, serving environment, capture ladder and pinned flags
+  against the config's (a tag built from an older config serves different weights, replays graphs for other decode
+  widths, or runs another command line, and can still pass every check below), then cold-starts the **baked** image
+  with no token, issues one completion, and diffs the cubin file set before/after: an empty diff proves 100% Emmy
+  cache hit. It
   also fails when the boot or the request writes a new entry into the baked Triton cache, which every Triton compile
   does. It does not read vLLM's JIT-monitor warning: that one also fires on a kernel's first launch in a process when
   the binary loads straight from the cache, which the 1Cat fork's first request does for its attention kernels with

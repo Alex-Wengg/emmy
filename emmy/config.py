@@ -33,6 +33,7 @@ from pathlib import Path
 
 PREFIX = "EMMY_"
 TUNE_DB = "EMMY_TUNE_DB"
+FREEZE_DIR = "EMMY_FREEZE_DIR"
 OFFLINE_FILE = "EMMY_OFFLINE_FILE"
 GOLDEN_FILE = "EMMY_GOLDEN_FILE"
 STRICT_EVIDENCE = "EMMY_STRICT_EVIDENCE"
@@ -48,7 +49,6 @@ KERNEL_TIMEOUT_MS = "EMMY_KERNEL_TIMEOUT_MS"
 FIRST_ITER_TIMEOUT_MS = "EMMY_FIRST_ITER_TIMEOUT_MS"
 BENCH_COMPILE_TIMEOUT_S = "EMMY_BENCH_COMPILE_TIMEOUT_S"
 BENCH_RUN_TIMEOUT_S = "EMMY_BENCH_RUN_TIMEOUT_S"
-PRICE_BUDGET_S = "EMMY_PRICE_BUDGET_S"
 GPU_LOCK = "EMMY_GPU_LOCK"
 NCU_CHILD = "EMMY_NCU_CHILD"
 SERVING_STATIC = "EMMY_SERVING_STATIC"
@@ -60,9 +60,12 @@ GEN_PREFILL_BUCKET = "EMMY_GEN_PREFILL_BUCKET"
 GEN_PREFILL_CAPACITY = "EMMY_GEN_PREFILL_CAPACITY"
 GEN_CHUNK_CAPTURE = "EMMY_GEN_CHUNK_CAPTURE"
 GEN_EMBED_HOST = "EMMY_GEN_EMBED_HOST"
+GEN_EXPERTS_GPU = "EMMY_GEN_EXPERTS_GPU"
 GEN_ROUTING_HISTOGRAM_INTERVAL = "EMMY_GEN_ROUTING_HISTOGRAM_INTERVAL"
 READABLE = "EMMY_READABLE"
 RENTAL_TAGS = "EMMY_RENTAL_TAGS"
+WORKERS = "EMMY_WORKERS"
+POOL_DRAW = "EMMY_POOL_DRAW"
 
 _CACHE_ROOT = Path.home() / ".cache" / "emmy"
 
@@ -169,21 +172,26 @@ def tune_db_path() -> Path:
     return Path(override) if override else _CACHE_ROOT / "autotune.db"
 
 
+def freeze_dir(default: Path | None) -> Path | None:
+    """The directory a tune writes the freeze of its run into, ``EMMY_FREEZE_DIR``: a path; ``""`` — set but
+    empty — for none, which the test suite sets as it points ``EMMY_TUNE_DB`` at a fresh DB; unset → ``default``,
+    the repository freeze when the checkout holds one (``search.db.freeze.run_freeze_dir``)."""
+    raw = os.environ.get(FREEZE_DIR)
+    if raw is None:
+        return default
+    return Path(raw).expanduser() if raw else None
+
+
 def golden_scope() -> str | None:
     """The golden evidence scope ``EMMY_GOLDEN_FILE`` names: ``None`` when unset (the repository's
-    per-card goldens), a path (that file's measured rows instead), or ``""`` — set but empty — for
+    per-card goldens), paths joined by ``os.pathsep`` (those files' measured rows instead — a model
+    golden beside its card's hardware golden), or ``""`` — set but empty — for
     NO golden evidence at all. The empty form mirrors ``EMMY_NVCC_FLAGS=``: ``make test`` sets it,
     because the correctness lane never asks how fast a pick is and importing a card's goldens is
     work every worker process would repeat. Set by ``emmy serve --golden PATH`` for the vLLM child
     it spawns; ``run`` / ``compile`` scope the same evidence in-process through
-    ``search.golden.records_override``, which takes precedence."""
+    ``search.golden.evidence_scope``, which takes precedence."""
     return os.environ.get(GOLDEN_FILE)
-
-
-def golden_file() -> Path | None:
-    """The golden file ``EMMY_GOLDEN_FILE`` names, or ``None`` (see :func:`golden_scope`)."""
-    override = golden_scope()
-    return Path(override) if override else None
 
 
 @contextmanager
@@ -231,7 +239,7 @@ def strict_evidence_override(flag: bool | None):
 def offline_path() -> Path | None:
     """Offline-prior weights artifact override: ``EMMY_OFFLINE_FILE`` → ``None``.
 
-    ``None`` means the repo-checked default (``weights/offline.json`` next to
+    ``None`` means the repo-checked default (``weights/schedule.json`` next to
     ``search/prior/offline.py`` — package-relative, so it resolves there, not
     here). Swap in a candidate fit for an A/B by pointing this at another
     artifact; a version-mismatched or missing file is a hard error, never a
@@ -384,6 +392,17 @@ def gen_embed_host(default: int = 0) -> int:
     return int_env(GEN_EMBED_HOST, default)
 
 
+def gen_experts_gpu() -> int | None:
+    """``EMMY_GEN_EXPERTS_GPU`` — how many routed experts per MoE layer the generative runner holds in
+    device memory at once (default: all). Below the layer's expert count the experts are paged: every
+    expert lives in pinned host memory and the device holds that many pages as a cache of the most
+    recently routed ones, refilled by the paging program ahead of each step's expert launches, with the
+    same programs, the same schedules and the same tokens. A budget for host-resident experts. See
+    `serving/ARCHITECTURE.md`."""
+    raw = _str(GEN_EXPERTS_GPU)
+    return int(raw) if raw else None
+
+
 def gen_routing_histogram_interval(default: int = 0) -> int:
     """``EMMY_GEN_ROUTING_HISTOGRAM_INTERVAL`` — emit a cumulative routed-buffer
     selection histogram every N uncaptured generative-model forwards (default 0 = off).
@@ -428,17 +447,22 @@ def gen_decode_bucket(default: int = 16) -> int:
     return int_env(GEN_DECODE_BUCKET, default)
 
 
-def bench_backends_raw(cli_value: str | None) -> str:
+def bench_backends_raw(cli_value: str | None, *, default: str = "eager,emmy") -> str:
     """Raw comma-separated bench-backend selection. Precedence: ``cli_value`` >
-    ``EMMY_BENCH_BACKENDS`` > ``"eager,emmy"``. Backend-key
+    ``EMMY_BENCH_BACKENDS`` > ``default`` (normally ``"eager,emmy"``). Backend-key
     normalization stays at the call site (``run.py:_resolve_backends``)."""
-    return cli_value or os.environ.get(BENCH_BACKENDS) or "eager,emmy"
+    return cli_value or os.environ.get(BENCH_BACKENDS) or default
 
 
 def cubin_cache_dir() -> Path:
     """Content-addressed cubin cache dir: ``EMMY_CUBIN_CACHE`` → ``~/.cache/emmy/cubin``."""
     override = os.environ.get(CUBIN_CACHE)
     return Path(override) if override else _CACHE_ROOT / "cubin"
+
+
+def cpu_kernel_cache_dir() -> Path:
+    """Content-addressed cache of CPU kernel libraries: ``~/.cache/emmy/cpu``."""
+    return _CACHE_ROOT / "cpu"
 
 
 def pack_dir() -> Path | None:
@@ -452,6 +476,29 @@ def pack_dir() -> Path | None:
 def nvcc_disabled() -> bool:
     """``EMMY_NO_NVCC`` — declare nvcc unavailable (every kernel compile then fails loudly)."""
     return _bool(NO_NVCC)
+
+
+def pool_draw() -> int:
+    """``EMMY_POOL_DRAW`` — the complete rows a greedy compile draws from a schedule pool too large to walk
+    (default 8192). Seeded uniform descents cover every level's values, unlike an emission-order prefix; a descent
+    costs its depth, never a frontier. On two 5090 matmul pieces the prior's best drawn score stopped improving
+    near 8K rows; the test suite sets 512, which its prior reproduction gate draws too."""
+    return max(1, int_env(POOL_DRAW, 8192))
+
+
+def set_workers(count: int) -> None:
+    """Set ``EMMY_WORKERS`` for this process and its children: a worker process of a parallel loop sets ``1``, so
+    the compiles it runs draw in-process instead of multiplying the workers."""
+    os.environ[WORKERS] = str(count)
+
+
+def workers() -> int:
+    """``EMMY_WORKERS`` — the processes Emmy's CPU-parallel work runs on: a greedy compile's cold-pool draw and
+    ``emmy db export``'s pool enumeration and ``emmy eval prior``'s schedule reproduction (default: one per CPU this
+    process may use; ``1`` runs in this process).
+    Their results are the same at any count."""
+    default = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+    return max(1, int_env(WORKERS, default))
 
 
 def kernel_timeout_ms() -> float:
@@ -479,18 +526,6 @@ def bench_compile_timeout_s(default: float = 30.0) -> float:
     the env var, when set,
     overrides every caller uniformly. Semantics live on ``Backend.bench_compile_timeout_s``."""
     return float_env(BENCH_COMPILE_TIMEOUT_S, default)
-
-
-def price_budget_s() -> float | None:
-    """``EMMY_PRICE_BUDGET_S`` — optional wall-clock budget for the greedy compile's kernel-set
-    pricing: the nested resolutions that price every cut arm of a placement fork. Unset (the
-    default) means NO budget — pricing runs to completion, which is deterministic and independent
-    of machine speed, so it is what every test and recipe path uses. Set it only to bound a
-    pathological manual compile whose pricing explodes (the fused decode-tail offered more cut
-    arms than a compile could price in half an hour); past the budget an arm prices as unpriceable
-    and the fork falls to the ordinary ranking, the same contract a failed nested resolve has."""
-    raw = os.environ.get(PRICE_BUDGET_S)
-    return float(raw) if raw else None
 
 
 def bench_run_timeout_s(default: float = 10.0) -> float:

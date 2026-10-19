@@ -3,7 +3,7 @@ tags:
   - untested
 model:
   huggingface: zai-org/GLM-5.2
-  rationale: "BF16 753B unservable in fleet; attention shifted to GLM-5.3."
+  rationale: "BF16 753B unservable in fleet; community attention has definitively shifted to the newer, more efficient GLM-5.3 releases."
   heat: 25
   task: generate
 matrices:

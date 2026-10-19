@@ -9,15 +9,16 @@ commit away from the repository. No compile ever reads it, so what is imported i
 
 - ``import SOURCES…`` loads golden-shaped sources: measurement freeze directories, golden files, and tune DB files,
   which are frozen first (the way a card's measurements from a rented GPU reach the dataset). Nothing is loaded by
-  default: the sources are named on the command line — for the offline prior, the hardware goldens
-  (``search/golden/records/*.json``) under ``--fresh``, the README's "Fit the offline prior" workflow. Every kernel is
-  re-lowered from its definition by the current compiler (``golden.evidence.import_goldens``), so the instance holds
-  today's identities and stamps whatever compiler wrote the source. A file's rows are sourced by its kind and digest
+  default: the sources are named on the command line, or ``--repository`` names the repository goldens and the
+  freeze kept with the repository (``search/freezes/``), the README's "Fit the priors" workflow. A golden file is
+  the DB's shape, so the import is a copy (``golden.evidence.import_file``); a stale file is what ``emmy golden
+  check`` names. A file's rows are sourced by its kind and digest
   (``freeze:`` for a freeze directory's files, ``golden:`` for a golden file), and a file the instance already holds
   is skipped: ``--fresh`` rebuilds from nothing.
 - ``export OUT`` writes the instance's rows as a dataset directory (``search/dataset``): every golden pool
-  enumerated from its kernel's definition and packed, every measured pool, and the provenance. ``emmy fit`` and
-  ``emmy eval prior`` read that directory, never the DB.
+  enumerated from its kernel's definition and packed, every measured pool, and the provenance; the placement space
+  reads the constants the import filed beside the rows, so it opens no golden file. ``emmy fit`` and ``emmy eval
+  prior`` read the dataset directory, never the DB.
 - ``freeze`` writes an instance's admitted rows as a directory of golden files, one per card — the artifact that
   gets checked in, so a reported number is one anyone can reproduce.
 - ``check`` counts the rows of an instance whose tables disagree with themselves (a knob row's digest, a reference,
@@ -48,14 +49,16 @@ def register_db_command(subparsers) -> None:
     db_help = "DB instance file, e.g. _data/dataset.db (git ignores _data/); never the tune DB a compile reads."
 
     pi = sub.add_parser("import", help="Import golden files, measurement freezes and tune DBs into a DB instance")
-    pi.add_argument(
-        "sources",
-        nargs="+",
-        help="Freeze directories, golden files and tune DB files to import — for the offline prior, the hardware goldens "
-        "emmy/compiler/pipeline/search/golden/records/*.json (README, 'Fit the offline prior'). Nothing is imported by default.",
-    )
+    pi.add_argument("sources", nargs="*", help="Freeze directories, golden files and tune DB files to import; nothing by default.")
     pi.add_argument("--db", required=True, help=db_help)
     pi.add_argument("--fresh", action="store_true", help="Delete the DB first, so it holds exactly these sources.")
+    pi.add_argument(
+        "--repository",
+        action="store_true",
+        help="Also import every repository golden — the hardware goldens and each maintained recipe's — the set the priors are "
+        "fit on and the reproduction gate holds them to, and the measurement freeze kept with the repository "
+        "(README, 'Fit the priors').",
+    )
     pi.set_defaults(func=handle_db_import)
 
     pe = sub.add_parser("export", help="Write a DB instance's rows as a dataset directory: golden pools, measured pools, provenance")
@@ -65,10 +68,25 @@ def register_db_command(subparsers) -> None:
         "--pool-sample",
         type=int,
         default=DEFAULT_SAMPLE,
-        help=f"Candidates drawn per golden pool during enumeration (default {DEFAULT_SAMPLE}; 0 enumerates every row). "
+        help=f"Complete rows drawn per golden pool by seeded descents through its schedule tree (default {DEFAULT_SAMPLE}; "
+        "0 walks every row). "
         "Recorded in the dataset's provenance — two datasets are comparable only when it matches.",
     )
     pe.add_argument("--seed", type=int, default=0, help="Seed of the per-pool draw (default: 0).")
+    pe.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="Worker processes enumerating golden pools side by side (default: EMMY_WORKERS, one per core). The pools are independent "
+        "and the draw is seeded, so the dataset is the same at any count.",
+    )
+    pe.add_argument(
+        "--space",
+        choices=("schedule", "placement"),
+        default="schedule",
+        help="Which forks the dataset ranks: the schedule space (default: one kernel's schedule rows, the golden and "
+        "measured pools) or the placement space (one kernel's placement arms — keep fused, cut a seam — the golden's marked).",
+    )
     pe.set_defaults(func=handle_db_export)
 
     pf = sub.add_parser("freeze", help="Write a DB instance's admitted rows as a measurement freeze: a golden file per card")
@@ -88,6 +106,17 @@ def handle_db_import(args) -> None:
 
     path = Path(args.db).expanduser()
     sources = [Path(s).expanduser() for s in args.sources]
+    if getattr(args, "repository", False):
+        from emmy.compiler.pipeline.search.db.freeze import REPOSITORY_FREEZE  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.golden.repository import repository_golden_paths  # noqa: PLC0415
+
+        with repository_golden_paths() as paths:
+            sources.extend(sorted(paths))
+        if any(REPOSITORY_FREEZE.glob("*.json")):  # nothing where no freeze is checked in
+            sources.append(REPOSITORY_FREEZE)
+    if not sources:
+        logger.error("nothing to import: name a source, or --repository")
+        sys.exit(2)
     for src in sources:
         if not src.exists():
             logger.error("no freeze directory, golden file or tune DB at %s", src)
@@ -130,7 +159,7 @@ def handle_db_export(args) -> None:
     path = db_path(args.db)
     db = SearchDB.open_readonly(path)
     try:
-        dataset = export_dataset(db, source=str(path), pool_sample=args.pool_sample, seed=args.seed)
+        dataset = export_dataset(db, source=str(path), pool_sample=args.pool_sample, seed=args.seed, space=args.space, jobs=args.jobs)
     finally:
         db.close()
     try:

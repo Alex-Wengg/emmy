@@ -14,9 +14,10 @@ models are filtered to the ones with real demand and mapped to the GPU platforms
 heat score for current onboarding priority; the maintained set stays small and focused, other useful recipes stay
 best-effort, and only technically superseded or unusable models become obsolete.
 
-Everything here is keyless and read-only: public OpenRouter and Hugging Face endpoints plus web search. No server is
-touched and no recipe is edited — the workflow applies a validated lifecycle manifest, and `onboard-model` owns
-deployment and qualification.
+Research is keyless and read-only: public OpenRouter and Hugging Face endpoints plus web search. No server is touched
+and no recipe is edited — the workflow applies a validated lifecycle manifest, and `onboard-model` owns deployment
+and qualification. In automated mode, the agent may create or edit only recipe-local `DISCOVERY.md` notes to retain
+research behind its decisions.
 
 ```
 HF/OpenRouter data ─┐
@@ -27,11 +28,12 @@ OpenRouter/Arena ───┘
 ## Choose the mode
 
 **Automated lifecycle mode** (GitHub Actions): read `prompts/discover-models/lifecycle.md` and
-`prompts/discover-models/score-recipes.md` completely before research. `lifecycle.md` is the whole contract — task
-payload, delegation to the source, scorer, and fit subagents, selection rules, and output JSON — and this skill adds
-only the background below. Ask no questions, never rebuild the inventory the task supplies, and return the selection
-as soon as the evidence supports it. The rolling discovery branch is rebased by the workflow before the agent starts;
-the agent never touches git.
+`prompts/discover-models/score-recipes.md` and the recipe-local `DISCOVERY.md` notes supplied in the task before
+research. `lifecycle.md` is the whole contract — task payload, delegation to the source, scorer, and fit subagents,
+selection rules, and output JSON — and this skill adds only the background below. Ask no questions, never rebuild the
+inventory the task supplies, and return the selection as soon as the evidence supports it. The workflow runs the agent
+on a checkout of `main` and commits the validated manifest and any changed research note itself; the agent never
+touches git.
 
 **Survey mode** (interactive): produce a shortlist and a hardware/model matrix. Ask only what the user has not
 implied:
@@ -47,6 +49,9 @@ implied:
 - `best-effort` — runnable and useful, outside the periodic set;
 - `obsolete` — kept for history but disabled;
 - `onboarding` + `untested` — a shell not yet onboarded; scored, never classified.
+
+A person can add `lifecycle-locked` beside any lifecycle tag. The workflow then leaves the recipe out entirely: it is
+not scored, not classified, and not counted against the maintained set.
 
 Untagged complete recipes are classified on the first lifecycle run. Obsolete is a conservative, tradeoff-free
 decision: a named replacement for the same task whose smallest deployment uses no more total GPU memory than the old

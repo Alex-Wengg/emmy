@@ -30,7 +30,6 @@ import os as _os
 import pickle
 import sys as _sys
 import time as _time_module
-import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,12 +38,12 @@ import numpy as np
 
 from emmy import config, emmy_runtime
 from emmy.compiler.backend import BenchmarkResult, LaunchTime, RunResult
+from emmy.compiler.backend.binding import host_bindings, is_device_tensor, resolve_symbolic, with_generated_constants
 from emmy.compiler.backend.cuda import nvcc
 from emmy.compiler.backend.cuda.device import device, torch_module
 from emmy.compiler.backend.plan import BufferSpec as _Buffer
-from emmy.compiler.backend.plan import ExecutionPlan, KernelSpec, apply_weight_loads, plan_from_graph, plan_to_dict
+from emmy.compiler.backend.plan import ExecutionPlan, KernelSpec, plan_from_graph, plan_to_dict
 from emmy.compiler.backend.plan import LaunchSpec as _Launch
-from emmy.compiler.dtype import encode_bf16
 from emmy.compiler.graph import Graph
 
 logger = logging.getLogger(__name__)
@@ -106,126 +105,6 @@ def _compile_kernels(plan: ExecutionPlan, *, deadline: float | None = None, cubi
 def kernel_attributes(name: str, spec: KernelSpec) -> dict[str, int]:
     """Register count and local / static shared bytes of one kernel, read off its cubin."""
     return device().kernel_attributes(str(_cubin_path(name, spec)), name)
-
-
-# ---------------------------------------------------------------------------
-# Host bytes: the single fill policy every bound buffer starts from
-# ---------------------------------------------------------------------------
-
-
-def _is_device_tensor(value) -> bool:
-    """A torch CUDA tensor — bound by address, never copied through the host."""
-    return hasattr(value, "data_ptr") and hasattr(value, "is_cuda") and bool(value.is_cuda)
-
-
-def _numpy_storage(src, dtype) -> np.ndarray:
-    """Return a contiguous host array in one buffer's physical storage dtype."""
-    arr = np.asarray(src)
-    if getattr(dtype, "name", dtype) == "bf16":
-        return np.ascontiguousarray(arr) if arr.dtype == np.uint16 else encode_bf16(arr)
-    return np.ascontiguousarray(arr, dtype=dtype.np)
-
-
-def _host_bytes(buf: _Buffer, shape: tuple[int, ...], src, constants: dict[str, float]) -> bytes:
-    """The bytes one input or constant buffer starts from: the supplied array, the plan's scalar
-    constant, seeded normal values for an unsupplied input, zeros otherwise."""
-    np_dtype = buf.dtype.np
-    is_bf16 = getattr(buf.dtype, "name", buf.dtype) == "bf16"
-    n = math.prod(shape)
-    if src is not None:
-        arr = _numpy_storage(src, buf.dtype)
-        if arr.size != n:
-            raise ValueError(f"buffer {buf.name!r}: {arr.size} element(s) supplied for shape {shape}")
-        return arr.reshape(shape).tobytes()
-    if buf.role == "constant" and buf.name in constants:
-        v = float(constants[buf.name])
-        if is_bf16:
-            # bf16 buffers ride as uint16 BITS (``BF16.np``) — casting the float would zero it;
-            # encode the value to bf16 bits (round-to-nearest-even on the dropped mantissa half).
-            bits = int(np.float32(v).view(np.uint32))
-            return np.full(shape, np.uint16((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16), dtype=np.uint16).tobytes()
-        return np.full(shape, v, dtype=np_dtype).tobytes()
-    if buf.role == "input":
-        # Seeded normal values for an un-supplied input, one stream per buffer name — what the
-        # reference path draws (``standard_normal``). A kernel's cost can depend on its values
-        # (an IEEE division's slow path, an exp near overflow): the index ramp this replaced
-        # repeats every 101 elements, and through a whole layer it drove softmax rows into
-        # that slow path, so a timing on it was not the timing on real data. Integer carriers
-        # keep a small ramp: their codes are data, not magnitudes.
-        if not is_bf16 and np.issubdtype(np_dtype, np.integer):
-            return (np.arange(n, dtype=np.int64) % 101).astype(np_dtype).tobytes()
-        vals = np.random.default_rng(zlib.crc32(buf.name.encode())).standard_normal(n, dtype=np.float32)
-        vals = encode_bf16(vals) if is_bf16 else vals.astype(np_dtype)
-        return vals.tobytes()
-    return np.zeros(shape, dtype=np_dtype).tobytes()
-
-
-def _host_bindings(plan: ExecutionPlan, input_data: dict, sym_values: dict[str, int], *, only=None) -> dict[str, bytes]:
-    """Starting bytes for input and constant buffers (``only`` narrows the set). A buffer bound
-    to a device tensor is skipped: its memory is lent to the runtime instead; so is a paged one,
-    which has no slab to fill and takes its page table instead. Output and scratch buffers start
-    zeroed inside the runtime. Saturating casts here are intended, not bugs: an
-    SDPA mask-fill constant (``-1e9``) is meant to become ``-inf`` in fp16 (masked → 0 after
-    softmax)."""
-    out: dict[str, bytes] = {}
-    with np.errstate(over="ignore", invalid="ignore"):
-        for buf in plan.buffers:
-            if buf.role not in ("input", "constant") or (only is not None and buf.name not in only) or buf.name in plan.paged:
-                continue
-            src = input_data.get(buf.name)
-            if _is_device_tensor(src):
-                continue
-            out[buf.name] = _host_bytes(buf, buf.resolve_shape(sym_values) or (1,), src, plan.constants)
-    return out
-
-
-def _with_generated_constants(plan: ExecutionPlan, input_data: dict) -> dict:
-    """Add the plan's SELF-CONTAINED constants that ``input_data`` does not already carry.
-
-    A deterministic source-free bind record is evaluated once while the graph is projected and
-    its bytes ride the plan (``PLAN_FORMAT_GENERATED``) — a coded linear's Hadamard factor and
-    its coordinate tables are exactly that. Nothing outside the plan can supply them, and an
-    unsupplied constant buffer starts as ZEROS, so the runtime must read them here.
-    Caller-supplied arrays win: serving binds the same specs through ``assemble_source`` and
-    shares one device copy across its twins.
-    """
-    from emmy.compiler.loader.binder import assemble_source  # noqa: PLC0415
-
-    feed = dict(input_data)
-    for nid, w in plan.weights.items():
-        # ``load_ops is None`` marks a weight the plan cannot rebind at all (see ``WeightSpec``).
-        if w.generated is None or w.load_ops is None or nid in feed:
-            continue
-        feed[nid] = apply_weight_loads(assemble_source(w, {}), w.load_ops)
-    return feed
-
-
-def _resolve_symbolic(plan: ExecutionPlan, input_data: dict) -> dict[str, int]:
-    """Bind every symbolic axis name to a concrete ``int``. Reads the runtime value from the
-    supplied input array shape (``plan.symbolic_bindings`` says which input + dim each name
-    reads from). When no array is supplied for that input — the autotuner benches without real
-    inputs — falls back to the ``Dim`` hint so the graph runs at its expected (tuned) size. A
-    capacity-capped kernel bakes its smem slab at the hint and is only correct up to that cap,
-    so a larger supplied extent is an error rather than an out-of-bounds read."""
-    env: dict[str, int] = {}
-    for name, (buf, dim_idx) in plan.symbolic_bindings.items():
-        arr = input_data.get(buf)
-        if arr is not None:
-            env[name] = int(arr.shape[dim_idx])
-            cap = plan.symbolic_caps.get(name)
-            if cap is not None and env[name] > cap:
-                raise ValueError(
-                    f"symbolic dim {name!r} = {env[name]} exceeds the capacity-capped kernel's hint ({cap}); "
-                    f"this build bakes its smem slab at {cap} and cannot run a larger extent — "
-                    f"re-trace with a larger --seq-len hint or use the ceil-div (uncapped) lowering"
-                )
-        elif name in plan.symbolic_hints:
-            env[name] = plan.symbolic_hints[name]
-        else:
-            raise ValueError(
-                f"symbolic dim {name!r} reads from input {buf!r}.shape[{dim_idx}] but no array was supplied and the dim carries no hint"
-            )
-    return env
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +219,11 @@ class GraphCaptureError(RuntimeError):
     this can't be misclassified as a ``bench_fail`` there."""
 
 
+# Environments a program keeps the layout of. A symbolic serving program meets one per step width, so
+# a long-lived server would otherwise hold one entry per prompt length it ever served (kilobytes each,
+# per program, per worker). Measured on DeepSeek V4's shared expert program, which met 1,248 widths
+# over 22 prompts: at 256, one launch in eight rebuilds its layout once instead of five times.
+_LAYOUT_MEMO = 256
 _AUTO_BUDGET_MS = 100.0
 # Iter-count cap on ``num_iters="auto"``. Combined with the GPU-time
 # target above: whichever fires first wins. The cap is the binding
@@ -408,10 +292,26 @@ class CompiledProgram:
     # Number of completed ``iter_once`` calls — iter 0 runs under the first-iteration watchdog
     # deadline (first-launch lazy-load / carveout stalls are not hangs; see ``_launch_deadline_ms``).
     _iters_done: int = field(default=0, repr=False)
+    # Symbolic environment → the runtime's layout there (see :meth:`_layout`).
+    _layouts: dict[tuple, dict] = field(default_factory=dict, repr=False)
 
     @property
     def launches(self) -> list[_Launch]:
         return self.plan.launches
+
+    def _layout(self, sym_values: dict[str, int]) -> dict:
+        """The runtime's layout at ``sym_values``, memoized: the runtime plans every scratch offset
+        and builds the dict anew on each call, and a routed MoE layer asks once per weight swap
+        and output view of each expert launch — over half of a prefill's host time when it did.
+        The ``_LAYOUT_MEMO`` most recently used environments are kept, the dict's order being
+        their age."""
+        key = tuple(sorted(sym_values.items()))
+        if (layout := self._layouts.pop(key, None)) is None:
+            if len(self._layouts) >= _LAYOUT_MEMO:
+                del self._layouts[next(iter(self._layouts))]
+            layout = self.program.layout(sym_values)
+        self._layouts[key] = layout
+        return layout
 
     def _buffer(self, name: str) -> _Buffer:
         return next(b for b in self.plan.buffers if b.name == name)
@@ -443,7 +343,7 @@ class CompiledProgram:
         """Compile every kernel (cubin-by-key or source-via-cache), resolve the symbolic
         environment from the supplied input shapes, allocate every region of the runtime's
         layout, then load the program: the runtime uploads the input and constant bytes (the
-        plan's generated constants fill themselves — see :func:`_with_generated_constants`) and
+        plan's generated constants fill themselves — see :func:`with_generated_constants`) and
         fills the runtime constants. A constant supplied as a device tensor is lent to the
         runtime as it is — the serving path's weights, uploaded once and shared across twins.
 
@@ -458,12 +358,12 @@ class CompiledProgram:
         t0 = _time_module.monotonic()
         binaries = _compile_kernels(plan, deadline=None if compile_timeout_s is None else t0 + compile_timeout_s, cubin_dir=cubin_dir)
         compiled = _time_module.monotonic()
-        input_data = _with_generated_constants(plan, input_data or {})
-        sym_values = _resolve_symbolic(plan, input_data)
+        input_data = with_generated_constants(plan, input_data or {})
+        sym_values = resolve_symbolic(plan, input_data)
         program = emmy_runtime.Program(json.dumps(plan_to_dict(plan)))
         self = cls(plan=plan, program=program, executor=None, sym_values=sym_values, arena=arena)
         regions = self._provision(sym_values, input_data)
-        bindings = _host_bindings(plan, input_data, sym_values)
+        bindings = host_bindings(plan, input_data, sym_values)
         self.executor = emmy_runtime.Executor(device(), program, binaries, bindings, sym_values, regions)
         self._bind_lent_inputs(input_data)
         elapsed = _time_module.monotonic() - t0
@@ -486,13 +386,13 @@ class CompiledProgram:
         is that tensor."""
         if torch_module() is None:
             return None
-        layout = self.program.layout(sym_values)
+        layout = self._layout(sym_values)
         regions: dict[str, tuple[int, int]] = {}
         fresh = False
         for name, nbytes in layout["regions"].items():
             role, _, buffer = name.partition(":")
             src = input_data.get(buffer) if buffer else None
-            if _is_device_tensor(src):
+            if is_device_tensor(src):
                 if not src.is_contiguous() or src.numel() * src.element_size() < nbytes:
                     raise ValueError(f"buffer {buffer!r}: device tensor must be contiguous and hold {nbytes} bytes")
                 tensor = _flat_bytes(src)
@@ -522,10 +422,10 @@ class CompiledProgram:
         memory untouched. Regions grow when the new layout needs more bytes (the arena keeps the
         older generation alive); captured graphs and descriptors are dropped by the runtime,
         since they bake addresses. Caller must hold ``gpu_lock()``."""
-        new_sym = _resolve_symbolic(self.plan, input_data)
-        touched = {name for name, value in input_data.items() if not _is_device_tensor(value)}
+        new_sym = resolve_symbolic(self.plan, input_data)
+        touched = {name for name, value in input_data.items() if not is_device_tensor(value)}
         touched |= {b.name for b in self.plan.buffers if b.role in ("input", "constant") and b.is_symbolic}
-        bindings = _host_bindings(self.plan, input_data, new_sym, only=touched)
+        bindings = host_bindings(self.plan, input_data, new_sym, only=touched)
         regions = self._provision(new_sym, input_data)
         self.executor.rebind(new_sym, bindings, regions)
         self._bind_lent_inputs(input_data)
@@ -571,6 +471,20 @@ class CompiledProgram:
         caller's subsequent ``outputs()`` synchronizes."""
         self.executor.run_once()
 
+    def run_each(self, runs) -> None:
+        """Run the program once per ``(sym_values, lent, inputs, outputs)`` entry of ``runs``, in
+        order, on the current stream; the last three list ``(buffer, device address, bytes)``. A run
+        binds its symbolic values, points each lent buffer at that memory without waiting (the
+        caller keeps it alive and unwritten until the runs finish, as with ``alias_buffer(...,
+        wait=False)``; :meth:`buffer_view` keeps showing the buffer's earlier memory), copies its
+        inputs into their prefixes, launches every kernel and copies its outputs' prefixes out. One
+        runtime call for the whole batch: a routed MoE layer runs every hit expert this way instead
+        of a dozen Python calls per expert. Caller holds the GPU lock."""
+        try:
+            self.executor.run_each(runs)
+        finally:  # a refused entry leaves the runtime at the last width it bound
+            self.sym_values = self.executor.env()
+
     def capture_launch_graphs(self, batch_sizes: list[int]) -> None:
         """Capture each launch position's batch into one CUDA graph, so :meth:`iter_once` replays
         it with one call and the event window measures dense GPU work. Unchanged batch sizes are
@@ -582,15 +496,13 @@ class CompiledProgram:
         except RuntimeError as exc:
             raise GraphCaptureError(f"per-launch CUDA graph capture failed: {exc}") from exc
 
-    def capture_program_graph(self) -> None:
-        """Capture EVERY launch in program order into one CUDA graph at the current symbolic
-        environment — the emmy analogue of timing a captured torch forward, and the serving
-        replay unit. The runtime keeps one graph per environment (a graph baked at seq_len S
-        only replays at S: every kernel's grid and by-value seq_len are frozen by capture),
-        least recently used out; a repeated environment is a no-op. A failure raises
-        :class:`GraphCaptureError`."""
+    def capture_program_graph(self, batch_size: int = 1) -> None:
+        """Capture ``batch_size`` forwards into one graph at the current symbolic environment.
+        Serving uses the default single forward. The runtime caches by environment and batch size,
+        with least-recently-used eviction: captured grids and by-value arguments cannot change.
+        A repeated key is a no-op; a capture failure raises :class:`GraphCaptureError`."""
         try:
-            self.executor.capture_program_graph()
+            self.executor.capture_program_graph(batch_size)
         except HungKernelError:
             raise
         except RuntimeError as exc:
@@ -602,7 +514,7 @@ class CompiledProgram:
     def upload_prefix(self, input_data: dict) -> None:
         """H2D each supplied input into the contiguous prefix of its capacity buffer: a
         logically ``(1, S, …)`` tensor occupies the first ``S·…`` elements."""
-        bindings = _host_bindings(self.plan, input_data, self.sym_values, only=set(input_data))
+        bindings = host_bindings(self.plan, input_data, self.sym_values, only=set(input_data))
         for name, data in bindings.items():
             self.executor.bind(name, data)
 
@@ -614,7 +526,7 @@ class CompiledProgram:
         lent = {
             buffer.name: input_data[buffer.name]
             for buffer in self.plan.buffers
-            if buffer.role == "input" and buffer.name not in self.plan.paged and _is_device_tensor(input_data.get(buffer.name))
+            if buffer.role == "input" and buffer.name not in self.plan.paged and is_device_tensor(input_data.get(buffer.name))
         }
         if lent:
             self.upload_prefix_device(lent)
@@ -624,14 +536,14 @@ class CompiledProgram:
         prefix device-to-device on the current stream — no host hop. A tensor that already IS
         the buffer (a producer's output chained onto this input) is skipped."""
         for name, tensor in input_data.items():
-            if not _is_device_tensor(tensor):
+            if not is_device_tensor(tensor):
                 raise TypeError(f"buffer {name!r}: expected a CUDA tensor, got {type(tensor).__name__}")
             tensor = tensor.contiguous()
             self.executor.bind_device(name, tensor.data_ptr(), tensor.numel() * tensor.element_size())
 
     def time_program_window(self, replays: int) -> float:
-        """Per-replay ms of ``replays`` back-to-back whole-program graph replays in one event
-        window (:meth:`capture_program_graph` must have run)."""
+        """Per-forward ms of one graph replay containing ``replays`` complete forwards.
+        :meth:`capture_program_graph` prepares that batch before the event window."""
         return float(self.executor.time_program_window(int(replays), _launch_deadline_ms(self._iters_done, replays)))
 
     def iter_once(
@@ -639,6 +551,7 @@ class CompiledProgram:
         *,
         batch_sizes: list[int] | None = None,
         pre_iter=None,
+        pre_launch=None,
         per_launch_hook=None,
     ) -> list[float]:
         """Run every launch once. Returns per-launch time in ms, already event-synced before
@@ -656,6 +569,8 @@ class CompiledProgram:
         ``per_launch_hook(i, launch)`` runs after each launch's stop event has synced.
         :func:`run_program_debug` uses it to snapshot every non-input buffer after each launch.
 
+        ``pre_launch()`` queues untimed work before each launch's start event, on this program's stream.
+
         The runtime syncs per launch, which makes per-launch attribution accurate — without it,
         one kernel's stop event can slide into a downstream kernel's scheduling window — and
         polls each stop event against the watchdog deadline, so a hung kernel raises
@@ -670,6 +585,8 @@ class CompiledProgram:
         dts = [0.0] * n
         for i, launch in enumerate(self.plan.launches):
             b = int(batch_sizes[i])
+            if pre_launch is not None:
+                pre_launch()
             dts[i] = float(self.executor.time_launch(i, b, _launch_deadline_ms(self._iters_done, b)))
             if per_launch_hook is not None:
                 per_launch_hook(i, launch)
@@ -691,8 +608,9 @@ class CompiledProgram:
 
         ``sym_values`` (serving's capture path) slices each output to its real-S shape — the
         buffer is allocated at capacity but only the ``resolve_shape(sym_values)`` prefix holds
-        the request's result; the rest is unmasked garbage from the oversized allocation."""
-        return {name: self._read(name, sym_values) for name in self.plan.outputs}
+        the request's result; the rest is unmasked garbage from the oversized allocation. A paged
+        output has no bytes of its own to copy: its pages are the caller's, who reads them."""
+        return {name: self._read(name, sym_values) for name in self.plan.outputs if name not in self.plan.paged}
 
     def buffer_view(self, name: str, sym_values: dict[str, int] | None = None):
         """A torch view of one buffer's real-shape prefix in its lent memory — no copy. The
@@ -700,14 +618,17 @@ class CompiledProgram:
         result clones it. Requires the program's memory to be torch's (it is whenever torch sees
         the device)."""
         buf = self._buffer(name)
-        placement = self.program.layout(self.sym_values)["buffers"][name]
+        placement = self._layout(self.sym_values)["buffers"][name]
         backing = self._tensors.get(placement["region"])
         if backing is None:
             raise RuntimeError(f"buffer {name!r} lives in runtime-owned memory; device views need torch")
         shape = self._shape(name, sym_values)
         n = math.prod(shape) if shape else 1
         start = placement["offset"]
-        flat = backing[start : start + placement["bytes"]].view(_torch_dtype(buf.dtype.np))
+        import torch
+
+        logical_dtype = torch.bfloat16 if buf.dtype.name == "bf16" else _torch_dtype(buf.dtype.np)
+        flat = backing[start : start + placement["bytes"]].view(logical_dtype)
         return flat[:n].reshape(shape)
 
     def output_prefix_device(self, sym_values: dict[str, int] | None = None) -> dict:
@@ -716,31 +637,30 @@ class CompiledProgram:
         exactly like :meth:`outputs`; without it the whole buffer view is returned."""
         return {name: self.buffer_view(name, sym_values) for name in self.plan.outputs}
 
-    def alias_buffer(self, name: str, tensor) -> None:
+    def alias_buffer(self, name: str, tensor, *, wait: bool = True) -> None:
         """Point one operand at ``tensor``'s memory: a buffer chained onto another program's (a
         producer's output onto a consumer's input, so the consumer's device upload becomes a
-        self-copy skip), or an operand the plan never declares as a buffer — an indirect
-        operand's pointer table or selector, or a paged buffer's page table (``<name>__pages``,
-        the device addresses of its pages), which only the caller can supply. A buffer's
+        self-copy skip), or an operand the plan never declares as a buffer — a paged buffer's
+        page table (``<name>__pages``, the device addresses of its pages), which only the caller
+        can supply. A buffer's
         tensor must be contiguous and at least as large as its region; the runtime drops any
-        captured graph, since it baked the old address."""
-        if not _is_device_tensor(tensor) or not tensor.is_contiguous():
+        captured graph, since it baked the old address.
+
+        By default the swap waits for the program's queued work, so the memory the buffer
+        pointed at is free to reuse on return. ``wait=False`` skips that host wait: launches
+        already queued keep reading the old memory, so the caller must keep it alive and
+        unwritten until they finish — as with resident weight slices, which is what makes
+        swapping them before every expert launch cheap."""
+        if not is_device_tensor(tensor) or not tensor.is_contiguous():
             raise TypeError(f"operand {name!r}: expected a contiguous CUDA tensor")
         flat = _flat_bytes(tensor)
-        placement = self.program.layout(self.sym_values)["buffers"].get(name)
+        placement = self._layout(self.sym_values)["buffers"].get(name)
         if placement is None:
             self.executor.set_external(name, flat.data_ptr(), flat.numel())
             self._tensors[f"external:{name}"] = flat
         else:
-            self.executor.set_region(placement["region"], flat.data_ptr(), flat.numel())
+            self.executor.set_region(placement["region"], flat.data_ptr(), flat.numel(), wait)
             self._tensors[placement["region"]] = flat
-
-    def release_buffer(self, name: str) -> None:
-        """Give a buffer's memory back: an operand the kernels resolve through an indirect table
-        and never read directly. The buffer keeps a valid one-byte address."""
-        region = self.program.layout(self.sym_values)["buffers"][name]["region"]
-        self.executor.release_region(region)
-        self._tensors.pop(region, None)
 
     def regions(self) -> dict[str, tuple[int, int]]:
         """Every region's ``(address, bytes)`` as lent to the runtime (empty when the runtime
@@ -769,8 +689,12 @@ def run_program(
     input_data: dict | None = None,
     *,
     pre_run=None,
+    taps: tuple[str, ...] = (),
 ) -> tuple[RunResult, Any]:
     """Run the lowered graph once, return ``(RunResult, pre_run_result)``.
+
+    ``taps`` names intermediate buffers to copy to host, each right after the launch that writes it: scratch buffers
+    share one slab, so by the time the program finishes a slot may hold a later buffer.
 
     ``pre_run`` runs once inside the GPU lock, before emmy's
     kernel launches. Its return value flows through as the tuple's
@@ -783,10 +707,15 @@ def run_program(
     with gpu_lock():
         pre_result = pre_run() if pre_run is not None else None
         prog = CompiledProgram.build(graph, input_data)
+        tapped: dict[str, np.ndarray] = {}
+
+        def read_taps(_index, launch):
+            tapped.update((name, prog._read(name)) for name in launch.writes or (launch.node_id,) if name in taps)
+
         with prog.on_torch_stream():
-            dts = prog.iter_once()
+            dts = prog.iter_once(per_launch_hook=read_taps if taps else None)
             outputs = prog.outputs()
-    return RunResult(outputs=outputs, time_ms=sum(dts)), pre_result
+    return RunResult(outputs=outputs, time_ms=sum(dts), taps=tapped), pre_result
 
 
 @dataclass
@@ -879,8 +808,8 @@ def benchmark_program(
     supersede wall-semantics ones on write — see ``SearchDB.record_perf``).
 
     Multi-launch programs additionally get a WHOLE-program time per measured
-    iter — one event window around back-to-back replays of a single CUDA
-    graph holding every launch in program order
+    iter — one event window around one replay of a CUDA graph holding the
+    calibrated batch of forwards, every launch in program order
     (:meth:`CompiledProgram.time_program_window`) — reported as
     ``BenchmarkResult.e2e_ms`` / ``e2e_min_ms``. The per-launch windows each
     replay one kernel solo, so their sum misses cross-kernel cache effects;
@@ -889,14 +818,24 @@ def benchmark_program(
     launch (for a single launch the solo window IS the program time, so the
     fields stay ``None`` and nothing is measured twice — the common case for
     the autotune sweep's single-node slices); also ``None`` when capture is
-    off or fell back."""
+    off or fell back. The cold-cache regime evicts L2 outside every per-kernel event window and fixes
+    batches at one replay; it reports no whole-program time, whose internal cache reuse differs."""
     from emmy.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     target_total_ms, max_measured, auto = _resolve_iter_budget(num_iters)
 
+    from emmy.compiler.pipeline.search.space import cold_cache  # noqa: PLC0415
+
+    cold = cold_cache()
+
     with gpu_lock(), contextlib.ExitStack() as stack:
         prog = CompiledProgram.build(graph, input_data, compile_timeout_s=compile_timeout_s)
         stack.enter_context(prog.on_torch_stream())
+        eviction = None
+        if cold:
+            from emmy.compiler.backend.cuda.cache import L2Eviction  # noqa: PLC0415
+
+            eviction = L2Eviction()
         n = len(prog.plan.launches)
         batch_sizes = [1] * n
         # Per-launch sample list — kept around to compute the median
@@ -905,7 +844,7 @@ def benchmark_program(
         # one-off outliers the autotune's variant ranking previously
         # got confused by; see ``project_..._noise`` write-ups).
         samples: list[list[float]] = [[] for _ in range(n)]
-        measure_e2e = n > 1  # single launch: the solo window IS the program time
+        measure_e2e = n > 1 and not cold  # cold sums evict per kernel, not just before a whole-program replay
         e2e_samples: list[float] = []
         e2e_replays = 0  # calibrated lazily on the first measured iter
         iters_run = 0
@@ -928,8 +867,9 @@ def benchmark_program(
             # No warmup → the calibration below never fires; capture the
             # uncalibrated all-1 batches so measurement is still dense.
             capture_graphs = _try_capture(batch_sizes)
+        launch_options = {"pre_launch": eviction} if eviction is not None else {}
         while True:
-            iter_dts = prog.iter_once(batch_sizes=batch_sizes, pre_iter=on_iter)
+            iter_dts = prog.iter_once(batch_sizes=batch_sizes, pre_iter=on_iter, **launch_options)
             iters_run += 1
             total_gpu_ms += sum(iter_dts[i] * batch_sizes[i] for i in range(n))
             # GPU-time run budget: bail if the cumulative GPU time
@@ -950,7 +890,7 @@ def benchmark_program(
             prev_call_ms = call_ms
             if iters_run == warmup and not calibrated:
                 calibrated = True
-                batch_sizes = _calibrate_batch_sizes(iter_dts)
+                batch_sizes = [1] * n if cold else _calibrate_batch_sizes(iter_dts)
                 if capture_graphs:
                     # Capture at the calibrated batch sizes, which hold from here on.
                     capture_graphs = _try_capture(batch_sizes)
@@ -979,14 +919,13 @@ def benchmark_program(
             # the auto-stop target, so it never starves per-launch sampling.
             if measure_e2e and capture_graphs:
                 if e2e_replays == 0:
+                    iter_ms = sum(iter_dts)
+                    e2e_replays = max(1, int(round(_BATCH_TARGET_MS / iter_ms))) if 0 < iter_ms < _BATCH_TARGET_MS else 1
                     try:
-                        prog.capture_program_graph()
+                        prog.capture_program_graph(e2e_replays)
                     except GraphCaptureError as exc:
                         logger.warning("[cuda] %s — skipping whole-program e2e timing", exc)
                         measure_e2e = False
-                    else:
-                        iter_ms = sum(iter_dts)
-                        e2e_replays = max(1, int(round(_BATCH_TARGET_MS / iter_ms))) if 0 < iter_ms < _BATCH_TARGET_MS else 1
                 if measure_e2e:
                     e2e_dt = prog.time_program_window(e2e_replays)
                     e2e_samples.append(e2e_dt)
@@ -1096,9 +1035,11 @@ class _AsyncBenchWorker:
 
     @staticmethod
     def _encode(request: dict) -> bytes:
-        from emmy.compiler.pipeline.search.space import FAST_MATH, precision_pin  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.space import FAST_MATH, cold_cache, precision_pin  # noqa: PLC0415
 
-        return pickle.dumps({**request, "fast_math": precision_pin(FAST_MATH)}, protocol=pickle.HIGHEST_PROTOCOL)
+        return pickle.dumps(
+            {**request, "fast_math": precision_pin(FAST_MATH), "cold_cache": cold_cache()}, protocol=pickle.HIGHEST_PROTOCOL
+        )
 
     @staticmethod
     def _decode(body: bytes) -> dict:

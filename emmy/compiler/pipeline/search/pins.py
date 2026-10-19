@@ -5,19 +5,13 @@ from __future__ import annotations
 import contextlib
 import os
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
 
 from emmy import config
 from emmy.compiler.ir.schedule import Level, Reduce, Tile, Work
-from emmy.compiler.ir.schedule.classic import CLASSIC_FAMILIES
-
-if TYPE_CHECKING:
-    from emmy.compiler.pipeline.search.golden import GoldenRecord
-
 from emmy.compiler.ir.schedule.base import pin_refusal
+from emmy.compiler.ir.schedule.classic import CLASSIC_FAMILIES
 from emmy.compiler.pipeline.knob import (
     KERNEL_DECISION_FAMILIES,
-    KnobType,
     axis_of,
     family_of,
     family_pins,
@@ -27,7 +21,6 @@ from emmy.compiler.pipeline.knob import (
     parse_knob_spec,
     pin_key_matches,
     reaches,
-    registry,
     values_equal,
 )
 
@@ -40,6 +33,12 @@ _ANY_THREAD_WORK = Work(kind="thread", units=(32, 1))
 #: Graph hint carrying the final greedy resolution's placement receipts. Placement is consumed by
 #: a graph splice before CUDA kernels exist, so this is the realized side of a PLACE pin check.
 PLACEMENT_DECISIONS_HINT = "search.placement_decisions"
+PLACEMENT_APPLIED_PINS_HINT = "search.placement_applied_pins"
+
+#: The cut pass's kernel-set fork domains — a placement cut, a cross-CTA or carry split, a storage layout — each to
+#: the tier its forks land in in the placement space. One rule decides all of them: a measured arm, else the
+#: placement prior over the arms, else the first arm.
+KERNEL_SET_DOMAINS = {("PLACE",): "place", ("REDUCE",): "split", ("LAYOUT",): "layout"}
 
 
 def parse_reduce(spec: str) -> Reduce | None:
@@ -49,6 +48,27 @@ def parse_reduce(spec: str) -> Reduce | None:
         return Reduce.parse(str(spec), _ANY_THREAD_WORK)
     except ValueError:
         return None
+
+
+def fork_ahead(tile, decision: Mapping) -> bool:
+    """Whether the kernel-set fork a stored decision (a routing row's arm) was taken at still lies ahead of ``tile``,
+    which is when the decision's price is a price of ``tile``. A decision ``tile`` has taken already — a placement
+    once its placement is decided, the layout of a constant it already reads folded, a split once it declined the
+    split — left another kernel and prices that one; so does the other arm of a fork ``tile`` is the kept arm of."""
+    for key in decision:
+        family = family_of(str(key))
+        if (family == "PLACE" and tile.placement_decided) or (family == "REDUCE" and tile.split_consumed):
+            return False
+        if family == "LAYOUT" and str(key).partition("@")[2] in tile.layout_decided:
+            return False
+    return True
+
+
+def seam_aliases(options) -> dict[str, str]:
+    """Every other spelling of a seam a cut-pass fork's ``options`` offer, mapped to the seam's own
+    spelling: the places a kernel reads one value at (a clustered value), whose cut is one decision under any of them.
+    A row's key and an arm's key name the same seam when both map to one spelling through it."""
+    return {str(alias): str(seam) for option in options for alias, seam in (getattr(option, "aliases", None) or {}).items()}
 
 
 def spelled_arm(options, row) -> tuple[object, dict[str, str]] | None:
@@ -72,10 +92,16 @@ def spelled_arm(options, row) -> tuple[object, dict[str, str]] | None:
 
     arms = [(option, {str(key): str(value) for key, value in leaf_knobs(option).items()}) for option in options]
     keys = {key for _, knobs in arms for key in knobs}
+    if any(family_of(key) == "LAYOUT" for key in keys):
+        offered = {key for key in keys if family_of(key) == "LAYOUT"}
+        want = {str(key): str(value) for key, value in row.items() if key in offered}
+        if want:
+            return next(((option, knobs) for option, knobs in arms if knobs == want), None)
+        return next(((option, knobs) for option, knobs in arms if all(value == "folded" for value in knobs.values())), None)
     if any(family_of(key) == "PLACE" for key in keys):
         # Every spelling of a clustered value names the seam it stands for: the row's keys and
         # each arm's are read as those seams, so a row recorded at any occurrence spells the arm.
-        aliases = {str(alias): str(seam) for option in options for alias, seam in (getattr(option, "aliases", None) or {}).items()}
+        aliases = seam_aliases(options)
         route = {aliases.get(str(key), str(key)): str(value) for key, value in row.items() if family_of(str(key)) == "PLACE"}
         cuts = {key for key, value in route.items() if value == "cut"}
         seams = [(option, knobs, {aliases.get(key, key) for key, value in knobs.items() if value == "cut"}) for option, knobs in arms]
@@ -143,12 +169,14 @@ def unreproducible_pin_flag(
     placement_knobs: list[dict] | None = None,
     reject_conflicts: bool = False,
     kernel_names: list[tuple[str, ...]] | None = None,
+    applied_place_pins: dict[str, str] | None = None,
 ) -> str | None:
     """Describe pins not realized by any compiled CUDA kernel, or return ``None``.
 
     A registered family with no realized key is ungateable because serialized IR
     can omit knob stamps. Declared OFF values mean not-applicable rather than a
-    conflicting realization; a bare fuse pin also accepts an empty placement trace.
+    conflicting realization; a bare fuse pin also accepts a placement trace that
+    records no cut (a kernel with no seam stamps only its layout receipts).
     ``reject_conflicts`` additionally rejects any matching child scope that decided
     a different non-OFF value, even when another child realized the requested pin.
     """
@@ -160,19 +188,37 @@ def unreproducible_pin_flag(
         # A kernel pin is its family's bare pin, asked of the kernels it names (``kernel_names``, launch
         # order beside ``kernel_knobs``: each kernel's name and graph node id, the two names the compile's
         # ``kernel_pin`` reads -- a cut piece's node id carries its ordinal, its kernel name does not);
-        # without names, of every kernel, as a bare pin is. A placement
-        # receipt names a seam, never a kernel, so a kernel-scoped PLACE pin keeps its scope and matches none.
+        # without names, of every kernel, as a bare pin is. A placement receipt names a local seam;
+        # a kernel-scoped PLACE pin instead needs the exact source-key receipt from the cut pass.
         name = fam if kernel_scoped(label) and fam != "PLACE" else label
-        if fam == "PLACE":
+        if fam in {"PLACE", "LAYOUT"}:
             if placement_knobs is None:
                 continue  # callers without a resolution trace cannot gate a splice receipt
             realized_knobs = placement_knobs
+            # A child-site pin addresses a named piece, while the structural
+            # receipt uses a site name local to that piece. The cut pass records
+            # an exact source-key/value receipt only after applying its choice.
+            if fam == "PLACE" and label != "PLACE" and applied_place_pins is not None:
+                if label in applied_place_pins and values_equal(label, want, applied_place_pins[label]):
+                    continue
         elif kernel_scoped(label) and kernel_names is not None:
             realized_knobs = [
                 knobs for knobs, names in zip(kernel_knobs, kernel_names, strict=True) if any(reaches(label, name) for name in names)
             ]
         else:
             realized_knobs = kernel_knobs
+            if name == fam and kernel_names is not None:
+                # A kernel-scoped pin supersedes the bare family pin on that
+                # kernel, including when the scoped value is OFF. Other kernels
+                # remain subject to the bare pin and are still checked below.
+                scoped = [key for key in pinned if family_of(key) == fam and kernel_scoped(key)]
+                realized_knobs = [
+                    raw
+                    for raw, names in zip(kernel_knobs, kernel_names, strict=True)
+                    if not any(any(reaches(key, kernel) for kernel in names) for key in scoped)
+                ]
+                if not realized_knobs:
+                    continue
         probe = want
         if fam == "REDUCE":
             # Likewise a realized cross-CTA split — but only its ``g<n>`` stage is structural,
@@ -205,11 +251,11 @@ def unreproducible_pin_flag(
                 break
         if hit and (not reject_conflicts or not conflicts):
             continue
-        if not conflicts and (is_off_value(fam, probe) or (name == "PLACE" and probe == "fuse" and not realized_knobs)):
+        if not conflicts and (is_off_value(fam, probe) or (name == "PLACE" and probe == "fuse" and not others)):
             continue  # a family pinned OFF is what a kernel that never stamps it realizes
         # An unstamped registered family is ungateable, except PLACE beside a resolution trace: the trace
         # records every placement decision, so a pinned cut it does not carry was not taken.
-        if not others and not saw_off and get(fam) is not None and fam not in CLASSIC_FAMILIES and fam != "PLACE":
+        if not others and not saw_off and get(fam) is not None and fam not in CLASSIC_FAMILIES and fam not in {"PLACE", "LAYOUT"}:
             continue
         ran_values = conflicts if reject_conflicts and conflicts else others
         ran = "/".join(ran_values) if ran_values else ("(off)" if saw_off else "(unset)")
@@ -218,10 +264,10 @@ def unreproducible_pin_flag(
     return f"unreproducible pin: {'; '.join(misses)}" if misses else None
 
 
-#: Measured composed routes the cut pass offers beside its single seams: ``(signature, cut keys)``
-#: entries — the signature a kernel's ``S_*`` stamps (``None``: every kernel of the compile, a record
+#: Measured composed routes the cut pass offers beside its single seams: ``(kernel, cut keys)``
+#: entries — the kernel's exact identity (``None``: every kernel of the compile, a record
 #: replaying its own target), the keys the ``PLACE@…`` seams one measured row marks ``cut`` together.
-_COMPOSED_ROUTES: list[tuple[frozenset | None, tuple[str, ...]]] = []
+_COMPOSED_ROUTES: list[tuple[str | None, tuple[str, ...]]] = []
 _RESOLVED_PLACE_KEYS: list[set[str]] = []
 
 
@@ -246,7 +292,9 @@ def place_keys_tracked() -> bool:
 
 def unmatched_place_pins(resolved: set[str]) -> list[str]:
     """The live scoped ``PLACE`` pins no kernel of a compile resolved (:func:`tracking_place_keys`)."""
-    return sorted(name for name, _ in family_pins("PLACE") if family_of(name) == "PLACE" and name != "PLACE" and name not in resolved)
+    return sorted(
+        name for name, _ in family_pins("PLACE", kernels=True) if family_of(name) == "PLACE" and name != "PLACE" and name not in resolved
+    )
 
 
 def note_place_key(key: str) -> None:
@@ -257,7 +305,7 @@ def note_place_key(key: str) -> None:
 
 @contextlib.contextmanager
 def composed_routes(entries):
-    """Temporarily register measured composed routes for the cut pass (:func:`composed_cuts_for`)."""
+    """Register measured placement routes for composed offers and child continuation."""
     saved = list(_COMPOSED_ROUTES)
     _COMPOSED_ROUTES.extend(entries)
     try:
@@ -266,29 +314,33 @@ def composed_routes(entries):
         _COMPOSED_ROUTES[:] = saved
 
 
-def composed_cuts_for(signature: frozenset) -> list[tuple[str, ...]]:
-    """The registered composed routes that describe a kernel of ``signature`` — every key the route's
-    signature has, with the same value (the rule the evidence index matches rows by), or a route
-    registered for every kernel."""
-    candidate = dict(signature)
+def composed_cuts_for(kernel: str | None) -> list[tuple[str, ...]]:
+    """The registered composed routes recorded on the kernel of exact identity ``kernel``, or registered for
+    every kernel."""
     out: list[tuple[str, ...]] = []
-    for sig, keys in _COMPOSED_ROUTES:
-        if (sig is None or (sig and all(candidate.get(key) == value for key, value in sig))) and keys not in out:
+    for recorded, keys in _COMPOSED_ROUTES:
+        if (recorded is None or recorded == kernel) and keys not in out:
             out.append(keys)
     return out
 
 
-def measured_precision_pins() -> dict[str, bool]:
-    """The effective precision gates, including the default umbrella, recorded as golden input pins.
+def measured_regime_pins() -> dict[str, bool]:
+    """The effective regime, recorded as golden input pins: the umbrella always, a precision-trading knob when it is
+    pinned on its own, any other regime knob when it is off its default — the spelling ``space.regime_pins`` reads
+    back as the live regime.
 
     A recorded row's ``pins`` is the regime a replay republishes (:func:`pinned_knobs`), so a row
     measured under one of these has to carry it: the reduced-accumulate and native-fp8 cells are
     not offered without it, and the row would otherwise name a candidate no later compile enumerates
     — measured evidence for a pick nothing can take again."""
-    from emmy.compiler.pipeline.search.space import F16_MMA_F32_ACC, FAST_MATH, FP8_MMA, precision_pin  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.space import FAST_MATH, PRECISION_KNOBS, REGIME_KNOBS, regime_pin  # noqa: PLC0415
 
-    live = ((knob, knob.raw()) for knob in (FAST_MATH, F16_MMA_F32_ACC, FP8_MMA))
-    return {FAST_MATH.name: precision_pin(FAST_MATH), **{knob.name: knob.parse(raw) for knob, raw in live if raw is not None}}
+    def recorded(knob) -> bool:
+        if knob in PRECISION_KNOBS:
+            return knob is FAST_MATH or knob.raw() is not None
+        return regime_pin(knob) != knob.hints[0]
+
+    return {knob.name: regime_pin(knob) for knob in REGIME_KNOBS if recorded(knob)}
 
 
 @contextlib.contextmanager
@@ -372,44 +424,3 @@ def precision_trading_pins(pins: Mapping) -> bool:
 
     umbrella = bool(pins.get(FAST_MATH.name, False))
     return umbrella or any(bool(pins.get(knob.name, False)) for knob in PRECISION_KNOBS if knob is not FAST_MATH)
-
-
-def pins_freeze_cut(pins: Mapping) -> bool:
-    """Whether the input pins freeze any placement cut (a ``PLACE…=cut`` pin) — the ONE spelling
-    of the predicate behind both the loader's receipt validation and :attr:`GoldenRecord.is_receipt`."""
-
-    return any(family_of(str(name)) == "PLACE" and str(value) == "cut" for name, value in pins.items())
-
-
-def regime_live(record: GoldenRecord) -> bool:
-    """Whether the record's input-pin regime IS the live one — exact per pin: a BOOL pin compares
-    against its effective precision policy (other BOOLs default off), anything else against the raw env
-    string. Strict BOTH ways: a record measured under FAST_MATH is no evidence for a standard
-    deploy, and a standard record none under a live precision-trading pin — the precision universe
-    (``space.PRECISION_KNOBS``, umbrella semantics per ``space.precision_pin``) is compared even for
-    pins the record omits (omitted = measured OFF). ``PLACE`` pins are the record's route, not a
-    regime."""
-    from emmy.compiler.pipeline.search.space import PRECISION_KNOBS, precision_pin  # noqa: PLC0415
-
-    precision = {knob.name for knob in PRECISION_KNOBS}
-    knobs = registry()
-    pins = record.pin_map
-    for name, value in pins.items():
-        if family_of(str(name)) == "PLACE":
-            continue
-        kn = knobs.get(str(name))
-        raw = kn.raw() if kn is not None else config.knob_raw(str(name))
-        if kn is not None and kn.type is KnobType.BOOL:
-            live = precision_pin(kn) if name in precision else kn.parse(raw) if raw is not None else False
-            if bool(value) != live:
-                return False
-        elif (raw or "") != str(value):
-            return False
-    umbrella = bool(pins.get("FAST_MATH", False))
-    for name in precision:
-        recorded = bool(pins.get(name, umbrella))
-        kn = knobs.get(name)
-        live = bool(precision_pin(kn)) if kn is not None else False
-        if recorded != live:
-            return False
-    return True

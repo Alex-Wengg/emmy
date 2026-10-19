@@ -14,10 +14,9 @@ import numpy as np
 import pytest
 
 from emmy.compiler.backend.plan import (
+    PLAN_FORMAT_CPU,
     PLAN_FORMAT_GENERATED,
-    PLAN_FORMAT_INDIRECT,
     PLAN_FORMAT_PAGED,
-    PLAN_FORMAT_VERSION,
     WeightSpec,
     _encode_load_ops,
     apply_weight_loads,
@@ -30,6 +29,7 @@ from emmy.compiler.ir.base import ConstantOp, InputOp
 from emmy.compiler.ir.cuda import CudaOp, TmaDescMeta
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.frontend.ir import ReshapeOp, TransposeOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 from emmy.compiler.loader.binder import apply_load_ops
 
 
@@ -87,6 +87,44 @@ def test_plan_projection():
 def test_plan_json_round_trip():
     plan = plan_from_graph(_sample_graph())
     wire = json.loads(json.dumps(plan_to_dict(plan)))
+    assert plan_from_dict(wire) == plan
+
+
+def test_a_buffer_stored_over_another_rides_the_plan():
+    """An output written in place (``Tensor.alias``) is declared on its buffer and survives the JSON."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (8, 4)), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("idx", (3,), "i64"), node_id="idx")
+    g.add_node(
+        op=CudaOp(kernel_source="__global__ void k_scatter() {}", kernel_name="k_scatter", arg_order=("idx", "y")),
+        inputs=["idx", "x"],
+        output=Tensor("y", (8, 4), alias="x"),
+        node_id="y",
+    )
+    g.inputs, g.outputs = ["x", "idx"], ["y"]
+    plan = plan_from_graph(g)
+    assert {b.name: b.alias for b in plan.buffers} == {"x": None, "idx": None, "y": "x"}
+    again = plan_from_dict(json.loads(json.dumps(plan_to_dict(plan))))
+    assert [dataclasses.asdict(b) for b in again.buffers] == [dataclasses.asdict(b) for b in plan.buffers]
+    assert all("alias" not in b for b in plan_to_dict(plan)["buffers"] if b["name"] != "y")
+
+
+def test_plan_json_spells_a_non_finite_constant_as_a_string():
+    """JSON has no number for infinity; the runtime reads ``"-inf"`` where Python would write ``-Infinity``."""
+    plan = dataclasses.replace(plan_from_graph(_sample_graph()), constants={"fill": float("-inf")})
+    wire = json.loads(json.dumps(plan_to_dict(plan), allow_nan=False))
+    assert wire["constants"] == {"fill": "-inf"}
+    assert plan_from_dict(wire) == plan
+
+
+def test_cpu_plan_round_trips_with_its_thread_split_in_place_of_the_cuda_grid():
+    cuda = plan_from_graph(_sample_graph())
+    split = {"mode": "reduce", "extent": 64, "partial_floats": 32, "parallel": True}
+    launches = [dataclasses.replace(lc, grid=(), block=(), smem_bytes=0, tma_descriptors=(), cpu=split) for lc in cuda.launches]
+    plan = dataclasses.replace(cuda, backend="cpu", launches=launches)
+    wire = json.loads(json.dumps(plan_to_dict(plan)))
+    assert wire["format"] == PLAN_FORMAT_CPU
+    assert all(lc["cpu"] == split and "cuda" not in lc for lc in wire["launches"])
     assert plan_from_dict(wire) == plan
 
 
@@ -156,48 +194,10 @@ def test_plan_round_trip_preserves_binary_key():
 
 def test_plan_format_version_gate():
     d = plan_to_dict(plan_from_graph(_sample_graph()))
-    d["format"] = max(PLAN_FORMAT_INDIRECT, PLAN_FORMAT_GENERATED, PLAN_FORMAT_PAGED) + 1  # past every format the runtime speaks
+    # past every format the runtime speaks
+    d["format"] = max(PLAN_FORMAT_GENERATED, PLAN_FORMAT_PAGED, PLAN_FORMAT_CPU) + 1
     with pytest.raises(ValueError, match="format"):
         plan_from_dict(d)
-
-
-def _indirect_graph() -> Graph:
-    """One launch whose weight input is an indirect operand (table + selector + slot)."""
-    g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, 64)), node_id="x")
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("w", (128, 64)), node_id="w")
-    g.add_node(
-        op=CudaOp(
-            kernel_source="__global__ void k_ind() {}",
-            kernel_name="k_ind",
-            arg_order=("x", "w", "y"),
-            grid=((1,), (1,), (1,)),
-            block=((128,), (1,), (1,)),
-            indirect_args=(("w", "w__table", "w__sel", 0),),
-        ),
-        inputs=["x", "w"],
-        output=Tensor("y", (1, 128)),
-        node_id="y",
-    )
-    g.inputs, g.outputs = ["x", "w"], ["y"]
-    return g
-
-
-def test_plan_indirect_operand_projection_and_round_trip():
-    """An indirect operand projects off the CudaOp, serializes the plan as
-    ``PLAN_FORMAT_INDIRECT`` (a runtime ignoring the field would pass the wrong arg pack —
-    old readers must reject and fall back to the full compile), and survives the JSON round
-    trip; a plan without the field keeps format ``PLAN_FORMAT_VERSION`` byte-compatibly."""
-    plan = plan_from_graph(_indirect_graph())
-    (launch,) = plan.launches
-    assert launch.indirect_args == (("w", "w__table", "w__sel", 0),)
-    d = plan_to_dict(plan)
-    assert d["format"] == PLAN_FORMAT_INDIRECT
-    restored = plan_from_dict(json.loads(json.dumps(d)))
-    assert restored == plan
-    # A plan with no indirect operands stays on the original format — existing packs and
-    # readers are untouched.
-    assert plan_to_dict(plan_from_graph(_sample_graph()))["format"] == PLAN_FORMAT_VERSION
 
 
 def test_grid_expr_survives_round_trip():
@@ -218,6 +218,8 @@ def test_grid_expr_survives_round_trip():
         (TransposeOp(axes=(2, 0, 1)),),
         (ReshapeOp(shape=(6, -1)),),
         (TransposeOp(axes=(1, 0, 2)), ReshapeOp(shape=(4, 6))),
+        (ElementwiseOp(op="reciprocal"),),
+        (ElementwiseOp(op="reciprocal"), ReshapeOp(shape=(4, 6))),
     ],
 )
 def test_apply_weight_loads_matches_binder(load_ops):
@@ -300,6 +302,18 @@ def _one_weight_plan(op, nid="w"):
     return plan_from_graph(g)
 
 
+def test_reciprocal_load_op_rebinds_after_plan_json_round_trip():
+    """A saved plan replays the same f32 reciprocal as direct constant binding."""
+    source = np.array([[0.1, 0.03, 2.0, 4.0]] * 4, dtype=np.float32)
+    ops = (ElementwiseOp(op="reciprocal"),)
+    plan = _one_weight_plan(ConstantOp(name="w", source_path="model.w", source_shape=(4, 4), source_dtype="f32", load_ops=ops))
+    wire = json.loads(json.dumps(plan_to_dict(plan)))
+    assert wire["weights"]["w"]["ops"] == [["reciprocal", []]]
+    restored = plan_from_dict(wire)
+    assert restored.weights["w"].load_ops == (("reciprocal", ()),)
+    np.testing.assert_array_equal(apply_weight_loads(source, restored.weights["w"].load_ops), apply_load_ops(source, ops))
+
+
 def _slice_index_map(out_shape, spans):
     """A single-source ``IndexMapOp`` reading ``spans`` (per-axis ``(start, step)``)."""
     from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
@@ -335,19 +349,23 @@ def test_non_affine_index_map_stays_outside_the_vocabulary():
 
 
 def test_unreproducible_bind_record_marks_the_weight_unbindable(caplog):
-    """A record the plan cannot reproduce (leaves it would have to read from the checkpoint)
-    must mark the weight ``load_ops=None`` — the pack save then refuses, rather than writing a
-    pack whose boot silently drops the weight."""
+    """A record the plan cannot reproduce (more than one leaf it would have to read from the
+    checkpoint) must mark the weight ``load_ops=None`` — the pack save then refuses, and the
+    serving runner's binding raises, rather than a boot that silently drops the weight."""
     import logging
 
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+
     record = Graph()
-    record.add_node(
-        op=ConstantOp(name="leaf", source_path="model.external", source_shape=(4, 4), source_dtype="f32"),
-        inputs=[],
-        output=Tensor("leaf", (4, 4)),
-        node_id="leaf",
-    )
-    record.outputs = ["leaf"]
+    for leaf in ("a", "b"):
+        record.add_node(
+            op=ConstantOp(name=leaf, source_path=f"model.{leaf}", source_shape=(4, 4), source_dtype="f32"),
+            inputs=[],
+            output=Tensor(leaf, (4, 4)),
+            node_id=leaf,
+        )
+    record.add_node(op=ElementwiseOp(op="add"), inputs=["a", "b"], output=Tensor("sum", (4, 4)), node_id="sum")
+    record.outputs = ["sum"]
     with caplog.at_level(logging.WARNING, logger="emmy.compiler.backend.plan"):
         plan = _one_weight_plan(ConstantOp(name="h", source_graph=record, source_shape=(4, 4)))
     assert plan.weights["w"].load_ops is None

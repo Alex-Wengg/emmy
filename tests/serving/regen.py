@@ -1,9 +1,9 @@
 """Regenerate the serving-generation lane's golden — ``python -m tests.serving.regen``.
 
 Builds every runner in :data:`helpers.RUNNERS` once, capturing the graph handed to each plan
-compile, and writes them as one inventory completed to **one entry per kernel of the set** — the
-same ``helpers.complete`` the realization corpus authors its cases with, reading the replay's
-realized row per kernel.
+compile, and writes them as one inventory completed to **one row per kernel of the set** — the
+same ``helpers.complete`` the realization corpus authors its cases with, reading the compile's
+realized row per kernel — into the live card's capability file (:func:`helpers.golden_path`).
 
 Run it when a runner shape changes, when a new one joins the table, or when strict evidence starts
 reporting a kernel the golden does not decide (a kernel identity or schedule codec moved). Those
@@ -15,14 +15,12 @@ from __future__ import annotations
 
 import logging
 import sys
-from dataclasses import replace
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 def _captured_graphs() -> dict:
-    """Every distinct graph this lane compiles, keyed by a readable name.
+    """Every distinct graph this lane compiles, keyed by a readable name, and the weight layouts each compiled under.
 
     The runner shapes come through the plan cache — ``PlanTemplateCache.resolve`` sees each graph on
     its way to the compiler, the one seam every split's plan passes through — and the attention-split
@@ -34,13 +32,16 @@ def _captured_graphs() -> dict:
     from tests.serving import helpers
 
     graphs: dict = {}
+    settled: dict = {}
 
     class _Capturing(PlanTemplateCache):
-        def resolve(self, graph, compile_plan):
+        def resolve(self, graph, compile_plan, settled_layouts=()):
             missed = self.misses
-            plan = super().resolve(graph, compile_plan)
+            plan = super().resolve(graph, compile_plan, settled_layouts)
             if self.misses > missed:  # a hit is the same binding-neutral graph, already recorded
-                graphs[f"g{len(graphs):03d}"] = graph.copy()
+                name = f"g{len(graphs):03d}"
+                graphs[name] = graph.copy()
+                settled[name] = dict(settled_layouts)  # the weight layouts the runner compiled it with
             return plan
 
     # ONE cache across every runner, the way the lane's session fixture shares it: two shapes with
@@ -54,20 +55,18 @@ def _captured_graphs() -> dict:
     for case_id in helpers.WRAPPERS:
         logger.info("[regen] tracing wrapper %s ...", case_id)
         graphs[f"w-{case_id}"] = helpers.wrapper_graph(case_id)
-    return graphs
+    return graphs, settled
 
 
 def main(argv: list[str] | None = None) -> int:
-    from emmy.compiler.pipeline.search.golden import GoldenFile  # noqa: PLC0415
-
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     from emmy.compiler.context import Context
-    from emmy.compiler.pipeline.search.working_golden import write_trace_inventories
+    from emmy.compiler.pipeline.search.golden import GoldenFile, write_trace_inventories
     from tests.compiler.realization import helpers as corpus
     from tests.serving import helpers
 
-    destination = Path(helpers.GOLDEN)
-    graphs = _captured_graphs()
+    destination = helpers.golden_path()
+    graphs, settled = _captured_graphs()
     logger.info("[regen] %d distinct graph(s); writing the inventory", len(graphs))
     destination.parent.mkdir(parents=True, exist_ok=True)
     scratch = destination.with_suffix(".inventory.tmp")
@@ -75,10 +74,8 @@ def main(argv: list[str] | None = None) -> int:
     write_trace_inventories(graphs, scratch, ctx=Context.probe())
     document = GoldenFile.load(scratch)
     scratch.unlink(missing_ok=True)
-
-    for index, entry in enumerate(document.configs):
-        document.configs[index] = corpus.complete(replace(document, configs=[entry])).configs[0]
-        logger.info("[regen]   target %d: %d realization(s)", index, len(document.configs[index].realizations))
+    document = corpus.complete(document, settled)
+    logger.info("[regen]   %d kernel(s), %d row(s), %d decision(s)", len(document.kernels), len(document.rows), len(document.routing))
     document.dump(destination, overwrite=True)
     logger.info("[regen] wrote %s", destination)
     return 0

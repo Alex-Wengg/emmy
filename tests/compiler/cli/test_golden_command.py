@@ -1,18 +1,20 @@
-"""``emmy golden check`` — the stored targets a fresh lowering of a golden's own programs no longer
-writes — and ``emmy golden restamp``, the rewrite onto that lowering: a target takes the fresh Loop
-IR, a row measured on a kernel the fresh Loop IR does not render keeps its schedule and loses its
-microseconds, and a target no fresh kernel writes is dropped with its rows."""
+"""``emmy golden check`` — what a restamp onto the fresh lowering of a golden's own programs would change — and
+``emmy golden restamp``, the rewrite: a kernel takes the fresh identity and body, a row measured on a kernel whose
+body changed keeps its schedule and loses its microseconds, a kernel no fresh kernel writes is dropped with its
+rows, a decision the fresh parent no longer takes the same way goes with its pieces' rows."""
 
 from __future__ import annotations
 
 import json
 import shutil
 from argparse import Namespace
+from dataclasses import replace
 
 import pytest
 
 from emmy.commands.golden import handle_golden_check, handle_golden_restamp
-from emmy.compiler.pipeline.search.golden import GoldenEntryState, GoldenFile
+from emmy.compiler.pipeline.search.db import RoutingRow
+from emmy.compiler.pipeline.search.golden import GoldenFile, restamp
 from emmy.compiler.pipeline.search.golden.repository import _RECORDS_DIR
 
 #: Eight square matmuls with one measured row each — the smallest repository golden, and current.
@@ -34,31 +36,53 @@ def _check(path) -> int:
     return 0
 
 
-def _rename_output(document, index: int) -> None:
-    """Rename program ``index``'s traced output, so its fresh kernel writes an output set no stored loop names."""
-    program = document["programs"][index]
-    program["outputs"] = ["product"]
-    node = next(node for node in program["nodes"] if node["id"] == "matmul")
-    node["id"] = "product"
-    node["outputs"][0][0] = "product"
-    document["configs"][index]["target"]["origins"] = ["product"]
+def _rename_output(document: GoldenFile, index: int) -> GoldenFile:
+    """Program ``index``'s traced output under another name: its fresh kernel writes an output set no stored kernel names."""
+    program = {**document.programs[index], "outputs": ["product"], "nodes": [dict(node) for node in document.programs[index]["nodes"]]}
+    for node in program["nodes"]:
+        if node["id"] == "matmul":
+            node["id"] = "product"
+            node["outputs"] = [["product", *node["outputs"][0][1:]]]
+    programs = [program if i == index else stored for i, stored in enumerate(document.programs)]
+    kernels = [replace(kernel, origins=("product",)) if kernel.traced == index else kernel for kernel in document.kernels]
+    return replace(document, programs=programs, kernels=kernels)
+
+
+def _shrink(document: GoldenFile, index: int) -> GoldenFile:
+    """Program ``index`` at half its sizes: the fresh kernel writes the stored output set from another body."""
+    program = {**document.programs[index], "nodes": [dict(node) for node in document.programs[index]["nodes"]]}
+    for node in program["nodes"]:
+        node["outputs"] = [[name, dtype, [dim // 2 for dim in dims]] for name, dtype, dims in node["outputs"]]
+    return replace(document, programs=[program if i == index else stored for i, stored in enumerate(document.programs)])
+
+
+def _one_program(document: GoldenFile, index: int) -> GoldenFile:
+    """Program ``index`` alone, as program 0: its target kernels, the decisions below them and their rows."""
+    targets = [replace(kernel, traced=0) for kernel in document.targets() if kernel.traced == index]
+    scope = {kernel.ref for kernel in targets}
+    routing = []
+    for route in document.routing:
+        if route.parent in scope:
+            routing.append(route)
+            scope.update(route.children)
+    pieces = [kernel for kernel in document.kernels if kernel.ref in scope and kernel.traced is None]
+    rows = [row for row in document.rows if row.kernel in scope]
+    return replace(document, programs=[document.programs[index]], kernels=targets + pieces, routing=routing, rows=rows)
 
 
 def _make_stale(path) -> None:
-    document = json.loads(path.read_text())
-    document["configs"][0]["target"]["loop"] = 1  # the 512 target claims the 1024 kernel's Loop IR
-    _rename_output(document, 2)  # the 2048 target's stored loop writes an output no fresh kernel does
-    path.write_text(json.dumps(document))
+    document = GoldenFile.load(path)
+    _rename_output(_shrink(document, 0), 2).dump(path, overwrite=True)
 
 
-def test_check_passes_a_current_golden_and_names_each_stale_target(golden, caplog):
+def test_check_passes_a_current_golden_and_names_what_a_restamp_changes(golden, caplog):
     assert _check(golden) == 0
     _make_stale(golden)
     with caplog.at_level("ERROR"):
         assert _check(golden) == 1
-    assert "2 of 8 stored targets are not the fresh lowering" in caplog.text
-    assert "matmul.square.512: the fresh kernel's Loop IR differs" in caplog.text
-    assert "matmul.square.2048: no fresh kernel writes its outputs" in caplog.text
+    assert "not the fresh lowering" in caplog.text
+    assert "re-keyed k_matmul" in caplog.text and "no fresh kernel writes its outputs" in caplog.text
+    assert "demoted to a proposal matmul.square.512" in caplog.text
 
 
 def test_restamp_rewrites_the_golden_onto_the_fresh_lowering(golden, caplog):
@@ -68,13 +92,12 @@ def test_restamp_rewrites_the_golden_onto_the_fresh_lowering(golden, caplog):
     assert _check(golden) == 0, "the restamped file is the fresh lowering"
 
     document = GoldenFile.load(golden)
-    rows = {entry.realizations[0].name: entry.realizations[0] for entry in document.configs}
-    assert "matmul.square.2048" not in rows, "a target no fresh kernel writes is dropped"
-    assert len(rows) == 7 and len(document.loops) == 7 and len(document.programs) == 7, "and its pools go with it"
-    states = {name: row.state for name, row in rows.items()}
-    assert states.pop("matmul.square.512") is GoldenEntryState.PROPOSAL, "measured on another kernel: the row keeps its schedule only"
-    assert set(states.values()) == {GoldenEntryState.VERIFIED}, "a target that was already the fresh lowering keeps its measurement"
-    assert "1 of 8 targets restamped, 1 dropped; 7 rows kept" in caplog.text  # nine rows: one target holds two
+    names = {row.name for row in document.rows}
+    assert "matmul.square.2048" not in names, "a target no fresh kernel writes is dropped with its rows"
+    assert len(document.kernels) == 7 and len(document.programs) == 8, "the kernel goes; the traced program is provenance"
+    proposals = {row.name for row in document.rows if not row.measured}
+    assert proposals == {"matmul.square.512"}, "measured on another kernel: the row keeps its schedule only"
+    assert "1 of 8 kernels re-keyed, 1 dropped" in caplog.text
 
     caplog.clear()
     with caplog.at_level("INFO"):
@@ -82,109 +105,172 @@ def test_restamp_rewrites_the_golden_onto_the_fresh_lowering(golden, caplog):
     assert "already the fresh lowering" in caplog.text
 
 
-def test_restamp_demotes_a_measurement_when_source_compile_fails(golden, monkeypatch):
-    _make_stale(golden)
-    monkeypatch.setattr("emmy.compiler.pipeline.search.restamp._kernel_sources", lambda *_: None)
-    handle_golden_restamp(Namespace(paths=[str(golden)]))
-    document = GoldenFile.load(golden)
-    row = next(row for entry in document.configs for row in entry.realizations if row.name == "matmul.square.512")
-    assert row.state is GoldenEntryState.PROPOSAL
-
-
-def test_restamp_drops_a_kernel_set_row_whose_members_lose_their_measurements(golden, caplog):
-    """A kernel-set row carries no schedule of its own; once its member is demoted it spells nothing."""
-    _make_stale(golden)
-    document = json.loads(golden.read_text())
-    realizations = document["configs"][0]["realizations"]
-    lead = {key: value for key, value in realizations[0].items() if key not in ("knobs", "measurements", "identity")}
-    realizations.append({**lead, "name": "matmul.square.512.set", "kernel_set": [realizations[0]["name"]]})
-    golden.write_text(json.dumps(document))
-    with caplog.at_level("INFO"):
-        handle_golden_restamp(Namespace(paths=[str(golden)]))
-    assert "matmul.square.512.set: its kernel set lost its measurements" in caplog.text
-    names = [row.name for row in GoldenFile.load(golden).configs[0].realizations]
-    assert names == ["matmul.square.512"], "the file stays a valid repository golden"
-
-
-def test_restamp_keeps_the_piece_rows_of_a_kernel_set_whose_target_only_reordered_its_inputs(tmp_path, caplog):
-    """A piece row names a kernel of its set, not the target: re-keying it to the fresh target's
-    identity made it decode against the whole kernel, and every piece of a cut or split set was lost."""
-    document = json.loads((_RECORDS_DIR / "rtx5090_sm120.json").read_text())
-    entry = next(entry for entry in document["configs"] if entry["realizations"][0]["name"] == "attention.hd128.gqa.decode.split")
-    loop = document["loops"][entry["target"]["loop"]]
-    loop["inputs"] = loop["inputs"][::-1]  # the stale lowering: the same kernel with its inputs in another order
-    document.update(programs=[document["programs"][entry["program"]]], loops=[loop])
-    document["configs"] = [{**entry, "program": 0, "target": {**entry["target"], "loop": 0}}]
+def test_restamp_takes_a_decision_again_on_the_re_keyed_parent(tmp_path, caplog):
+    """A routing row's parent re-keyed by a program change: the decision is taken again on the fresh parent, the
+    pieces take the identities the fresh splice mints, and their rows follow — each row keeps its measurement only
+    while its kernel kept its body."""
+    full = GoldenFile.load(_RECORDS_DIR / "rtx5090_sm120.json")
+    route = next(route for route in full.routing if full.kernel(route.parent).traced is not None)
+    document = _one_program(full, full.kernel(route.parent).traced)
+    parent = document.kernel(route.parent)
+    stale = _shrink(document, 0)
     path = tmp_path / "golden.json"
-    path.write_text(json.dumps(document))
+    stale.dump(path, overwrite=True)
     assert _check(path) == 1
     with caplog.at_level("INFO"):
         handle_golden_restamp(Namespace(paths=[str(path)]))
-    assert "1 of 1 targets restamped, 0 dropped; 3 rows kept" in caplog.text
-    rows = GoldenFile.load(path).configs[0].realizations
-    assert [row.identity for row in rows] == [row.get("identity") for row in entry["realizations"]], "each piece keeps its own"
-
-
-def test_restamp_rekeys_a_mixed_set_lead_without_dropping_its_pieces(tmp_path):
-    document = json.loads((_RECORDS_DIR / "rtx5090_sm120.json").read_text())
-    entry = next(entry for entry in document["configs"] if entry["realizations"][0]["name"] == "attention.hd128.gqa.decode.split")
-    loop = document["loops"][entry["target"]["loop"]]
-    loop["inputs"] = loop["inputs"][::-1]
-    document.update(programs=[document["programs"][entry["program"]]], loops=[loop])
-    document["configs"] = [{**entry, "program": 0, "target": {**entry["target"], "loop": 0}}]
-    lead, *pieces = document["configs"][0]["realizations"]
-    lead["identity"] = "0" * len(lead["identity"])
-    path = tmp_path / "golden.json"
-    path.write_text(json.dumps(document))
-
-    handle_golden_restamp(Namespace(paths=[str(path)]))
-
-    rows = GoldenFile.load(path).configs[0].realizations
-    assert len(rows) == 1 + len(pieces)
-    assert rows[0].identity != lead["identity"]
-    assert [row.identity for row in rows[1:]] == [piece["identity"] for piece in pieces]
-
-
-def test_restamp_drops_a_piece_row_the_fresh_set_no_longer_mints_under_a_current_target(tmp_path, caplog):
-    """A cut can re-form a piece while the target's own Loop IR stays the same: the piece row then names no
-    kernel, and restamp drops it though the target is already the fresh lowering."""
-    document = json.loads((_RECORDS_DIR / "rtx5090_sm120.json").read_text())
-    entry = next(entry for entry in document["configs"] if entry["realizations"][0]["name"] == "attention.hd128.gqa.decode.split")
-    piece = next(row for row in entry["realizations"][1:] if row.get("identity"))
-    piece["identity"] = "0" * len(piece["identity"])
-    document.update(programs=[document["programs"][entry["program"]]], loops=[document["loops"][entry["target"]["loop"]]])
-    document["configs"] = [{**entry, "program": 0, "target": {**entry["target"], "loop": 0}}]
-    path = tmp_path / "golden.json"
-    path.write_text(json.dumps(document))
+    fresh = GoldenFile.load(path)
     assert _check(path) == 0
+    assert len(fresh.routing) == len(document.routing) and len(fresh.kernels) == len(document.kernels)
+    moved = {kernel.ref for kernel in document.kernels if fresh.kernel(kernel.ref).exact_identity != kernel.exact_identity}
+    assert route.parent in moved and set(route.children) <= moved, "the parent and the pieces it mints are re-keyed"
+    assert {kernel.ref for kernel in fresh.kernels} == {kernel.ref for kernel in document.kernels}, "a re-keyed kernel keeps its ref"
+    assert f"re-keyed {parent.name}" in caplog.text
+    assert len(fresh.rows) == len(document.rows)
+
+
+def _beside_its_half(document: GoldenFile) -> GoldenFile:
+    """``document``'s one program, and as traced program 1 the same program at half its sizes (``_shrink``): both
+    current, the second's kernels, decisions and rows those of a restamp of the shrunk copy, each ref and row name
+    suffixed ``@half``."""
+    half, _ = restamp(_shrink(document, 0))
+
+    def ref(name: str) -> str:
+        return f"{name}@half"
+
+    kernels = [replace(kernel, key=ref(kernel.ref), traced=None if kernel.traced is None else 1) for kernel in half.kernels]
+    routing = [RoutingRow(ref(route.parent), route.arm, tuple(ref(child) for child in route.children)) for route in half.routing]
+    rows = [replace(row, name=ref(row.name), kernel=ref(row.kernel)) for row in half.rows]
+    return replace(
+        document,
+        programs=[*document.programs, *half.programs],
+        kernels=[*document.kernels, *kernels],
+        routing=[*document.routing, *routing],
+        rows=[*document.rows, *rows],
+    )
+
+
+@pytest.mark.parametrize("half_first", [False, True])
+def test_restamp_keeps_a_shared_piece_with_the_decision_that_still_mints_it(half_first):
+    """Two programs' decisions name one stored piece, but the fresh lowering mints it as two kernels: the decision
+    that still mints the stored kernel keeps the piece and its measurement, whatever order the file stores the
+    decisions in, and the other is re-pointed to the kernel it mints. A whole-file restamp and a restamp of each
+    program alone agree on which program's kernel set is stale."""
+    full = GoldenFile.load(_RECORDS_DIR / "rtx5090_sm120.json")
+    route = next(route for route in full.routing if full.kernel(route.parent).traced is not None)
+    one = _one_program(full, full.kernel(route.parent).traced)
+    piece = route.children[0]
+    measured = next(row for row in one.rows if row.kernel == route.parent and row.measured)
+    current = _beside_its_half(replace(one, rows=[*one.rows, replace(measured, name="piece", kernel=piece)]))
+    assert restamp(current)[0] == current
+    assert current.kernel(f"{piece}@half").exact_identity != current.kernel(piece).exact_identity
+
+    # The file a lowering that minted one kernel for both programs' piece wrote: program 1's decision names program 0's.
+    halved = next(stored for stored in current.routing if stored.parent == f"{route.parent}@half")
+    shared = replace(halved, children=tuple(piece if child == f"{piece}@half" else child for child in halved.children))
+    routing = [stored for stored in current.routing if stored != halved]
+    stale = replace(
+        current,
+        kernels=[kernel for kernel in current.kernels if kernel.ref != f"{piece}@half"],
+        routing=[shared, *routing] if half_first else [*routing, shared],
+        rows=[row for row in current.rows if row.kernel != f"{piece}@half"],
+    )
+
+    fresh, report = restamp(stale)
+    [split] = {kernel.ref for kernel in fresh.kernels} - {kernel.ref for kernel in stale.kernels}
+    assert report.repointed == [f"{route.parent}@half {piece} -> {split}: this decision mints another kernel now"], report.lines()
+    assert fresh.kernel(split).exact_identity == current.kernel(f"{piece}@half").exact_identity
+    assert fresh.kernel(piece) == stale.kernel(piece), "the decision that still mints the stored kernel keeps it"
+    children = {stored.parent: stored.children for stored in fresh.routing}
+    assert piece in children[route.parent] and split in children[f"{route.parent}@half"]
+    # The piece sat in both programs' kernel sets, one of which changed; its whole-target latency names program 0's
+    # set, every kernel of which is current, so it stays beside the piece's own measurement.
+    stored_row = next(row for row in stale.rows if row.name == "piece")
+    assert next(row for row in fresh.rows if row.name == "piece") == stored_row
+
+    assert restamp(stale, traced=0)[0] == stale, "program 0's kernel set is current"
+    assert restamp(stale, traced=1)[1].changed, "program 1's decision mints another kernel"
+    for traced in (None, 0, 1):
+        assert restamp(fresh, traced=traced)[0] == fresh, "the split file is current, as a whole and per program"
+
+
+def test_restamp_drops_a_decision_the_fresh_parent_does_not_take(golden, caplog):
+    """A decision whose arm names no seam of the fresh parent mints nothing: it is dropped with the rows of its pieces."""
+    from emmy.compiler.pipeline.search.db import RoutingRow
+    from emmy.compiler.pipeline.search.golden import Row
+
+    document = GoldenFile.load(golden)
+    parent = document.kernels[0]
+    orphan = replace(document.kernels[1], key="orphan", traced=None, origins=(), bindings={})
+    document.kernels.append(orphan)
+    document.routing.append(RoutingRow(parent.ref, {"PLACE@missing": "cut"}, (orphan.ref,)))
+    document.rows.append(Row(name="orphan", kernel=orphan.ref, pins={"FAST_MATH": False}, knobs={"WORK": "t16x8"}))
+    document.dump(golden, overwrite=True)
     with caplog.at_level("INFO"):
-        handle_golden_restamp(Namespace(paths=[str(path)]))
-    assert f"dropped row {piece['name']}: stored identity equals none" in caplog.text
-    assert piece["identity"] not in [row.identity for row in GoldenFile.load(path).configs[0].realizations]
+        handle_golden_restamp(Namespace(paths=[str(golden)]))
+    assert "dropped decision" in caplog.text
+    fresh = GoldenFile.load(golden)
+    assert fresh.routing == [] and len(fresh.kernels) == len(document.kernels) - 1
+    assert all(row.kernel != orphan.ref for row in fresh.rows), "the piece's rows go with the decision"
 
 
 def test_restamp_refuses_to_write_a_golden_nothing_survives_in(golden, caplog):
-    document = json.loads(golden.read_text())
-    for index in range(len(document["programs"])):
-        _rename_output(document, index)
-    golden.write_text(json.dumps(document))
+    document = GoldenFile.load(golden)
+    for index in range(len(document.programs)):
+        document = _rename_output(document, index)
+    document.dump(golden, overwrite=True)
     before = golden.read_bytes()
     with caplog.at_level("ERROR"), pytest.raises(SystemExit):
         handle_golden_restamp(Namespace(paths=[str(golden)]))
-    assert "no target survives" in caplog.text
+    assert "no kernel survives" in caplog.text
     assert golden.read_bytes() == before, "deleting or re-recording the file is a decision, not a restamp"
 
 
-def test_kernels_and_a_json_compile_output_are_the_same_pool_for_a_current_golden(golden, run_cli, tmp_path):
-    """``emmy golden check`` in two commands: the stored pool and the fresh lowering's pool are one text
-    while the file is current, and they part once a stored target is not the fresh lowering."""
-    fresh = tmp_path / "fresh.json"
-    compiled = run_cli("compile", "--golden", str(golden), "--program", "0", "--ir", "loop", "-o", str(fresh))
-    stored = run_cli("golden", "kernels", str(golden), "--program", "0")
-    assert compiled[0] == 0 and stored[0] == 0, (compiled[2], stored[2])
-    assert stored[1] == fresh.read_text() and '"op":"loop"' in stored[1]
-    program = tmp_path / "program.json"
-    assert run_cli("compile", "--golden", str(golden), "--program", "0", "--ir", "torch", "-o", str(program))[0] == 0
-    assert json.loads(program.read_text()) == json.loads(golden.read_text())["programs"][0], "the torch stage is the stored program"
-    _make_stale(golden)
-    assert run_cli("golden", "kernels", str(golden), "--program", "0")[1] != fresh.read_text(), "the 512 target now claims the 1024 kernel"
+def test_list_reads_each_measured_row_beside_torch_compile(golden, capsys):
+    from emmy.commands.golden import handle_golden_list
+    from emmy.compiler.pipeline.search.golden import Latency
+
+    with GoldenFile.edit(golden) as document:
+        first, second = document.rows[0], document.rows[1]
+        document.rows[0] = replace(
+            first,
+            latency={"NVIDIA GeForce RTX 4080": Latency(emmy_us=30.0, tcompile_us=10.0, kernels=(first.kernel,))},
+            note="needs a wider tile",
+        )
+        document.rows[1] = replace(second, measurements=replace(second.measurements, tried=12))
+
+    def listed(**options) -> list[dict]:
+        handle_golden_list(
+            Namespace(
+                **{"paths": [str(golden)], "gpu": None, "kernel": None, "behind": False, "missing": False, "json_out": "-", **options}
+            )
+        )
+        return json.loads(capsys.readouterr().out)
+
+    entries = listed()
+    assert len(entries) == len(GoldenFile.load(golden).rows), "one entry per measured row, the timed card merged in"
+    assert entries[0]["row"] == first.name and entries[0]["vs_tcompile"] == 3.0 and entries[0]["note"] == "needs a wider tile"
+    assert next(entry for entry in entries if entry["row"] == second.name)["tried"] == 12
+    assert [entry["row"] for entry in listed(behind=True)] == [first.name]
+    assert listed(gpu="H100") == []
+
+
+def test_list_missing_names_each_proposal_and_each_target_with_no_torch_compile_time(golden, capsys):
+    from emmy.commands.golden import handle_golden_list
+    from emmy.compiler.pipeline.search.golden import Latency
+
+    with GoldenFile.edit(golden) as document:
+        proposal, timed = document.rows[0], document.rows[1]
+        document.rows[0] = replace(proposal, measurements=None)
+        document.rows[1] = replace(
+            timed, latency={"NVIDIA GeForce RTX 4080": Latency(emmy_us=3.0, tcompile_us=2.0, kernels=(timed.kernel,))}
+        )
+    targets = len(GoldenFile.load(golden).target_rows())
+
+    handle_golden_list(Namespace(paths=[str(golden)], gpu=None, kernel=None, behind=False, missing=True, json_out="-"))
+    entries = json.loads(capsys.readouterr().out)
+
+    assert [(entry["row"], entry["missing"]) for entry in entries if entry["missing"] == "emmy"] == [(proposal.name, "emmy")]
+    tcompile = {entry["row"] for entry in entries if entry["missing"] == "tcompile"}
+    assert len(tcompile) == targets - 2, "the proposal's target is measured by its record, the timed target needs nothing"
+    assert proposal.name not in tcompile and timed.name not in tcompile

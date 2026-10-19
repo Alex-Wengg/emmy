@@ -1,4 +1,4 @@
-"""Symbolic-extent ``Dim`` round-trips through trace → lift → ``LoopOp.forward``.
+"""Symbolic-extent ``Dim`` round-trips through trace → loop lowering → ``LoopOp.forward``.
 
 Tests cover the position-based dynamic
 shape flow: ``torch.export(..., dynamic_shapes={input: {axis: Dim(name)}})``
@@ -58,20 +58,20 @@ def _symbolic_reduce_graph() -> Graph:
     return g
 
 
-def test_lift_elementwise_preserves_symbolic_free_axes():
+def test_lower_elementwise_preserves_symbolic_free_axes():
     graph = _symbolic_elementwise_graph()
-    lifted = Pipeline.build(["loop/lifting"]).run(graph)
-    loop_nodes = [n for n in lifted.nodes.values() if isinstance(n.op, LoopOp)]
-    assert loop_nodes, "expected at least one LoopOp after lifting"
+    lowered = Pipeline.build(["loop/lowering"]).run(graph)
+    loop_nodes = [n for n in lowered.nodes.values() if isinstance(n.op, LoopOp)]
+    assert loop_nodes, "expected at least one LoopOp after lowering"
     extents = {ax.name: ax.extent for n in loop_nodes for ax in n.op.axes}
     assert Dim("seq_len") in extents.values(), f"symbolic seq_len axis lost: {extents}"
 
 
-def test_lift_reduce_allows_symbolic_free_axis_static_reduce():
+def test_lower_reduce_allows_symbolic_free_axis_static_reduce():
     graph = _symbolic_reduce_graph()
-    lifted = Pipeline.build(["loop/lifting"]).run(graph)
-    loop_nodes = [n for n in lifted.nodes.values() if isinstance(n.op, LoopOp)]
-    assert loop_nodes, "expected at least one LoopOp after lifting"
+    lowered = Pipeline.build(["loop/lowering"]).run(graph)
+    loop_nodes = [n for n in lowered.nodes.values() if isinstance(n.op, LoopOp)]
+    assert loop_nodes, "expected at least one LoopOp after lowering"
     extents = {ax.name: ax.extent for n in loop_nodes for ax in n.op.axes}
     assert Dim("seq_len") in extents.values(), f"free symbolic axis lost: {extents}"
     assert Dim(2048) in extents.values(), f"static reduce axis missing: {extents}"
@@ -79,8 +79,8 @@ def test_lift_reduce_allows_symbolic_free_axis_static_reduce():
 
 def test_loop_forward_binds_symbolic_axis_from_input_shape():
     graph = _symbolic_elementwise_graph()
-    lifted = Pipeline.build(["loop/lifting"]).run(graph)
-    loop_node = next(n for n in lifted.nodes.values() if isinstance(n.op, LoopOp))
+    lowered = Pipeline.build(["loop/lowering"]).run(graph)
+    loop_node = next(n for n in lowered.nodes.values() if isinstance(n.op, LoopOp))
     x = np.random.RandomState(0).standard_normal((1, 7, 2048)).astype(np.float32)
     out = loop_node.op.forward(x)
     assert out.shape == (1, 7, 2048)
@@ -90,8 +90,8 @@ def test_loop_forward_binds_symbolic_axis_from_input_shape():
 def test_loop_forward_same_kernel_different_seq_lens():
     """Same symbolic LoopOp, two distinct runtime ``seq_len`` values both run cleanly."""
     graph = _symbolic_elementwise_graph()
-    lifted = Pipeline.build(["loop/lifting"]).run(graph)
-    loop_op = next(n.op for n in lifted.nodes.values() if isinstance(n.op, LoopOp))
+    lowered = Pipeline.build(["loop/lowering"]).run(graph)
+    loop_op = next(n.op for n in lowered.nodes.values() if isinstance(n.op, LoopOp))
     for s in (3, 11):
         x = np.random.RandomState(s).standard_normal((1, s, 2048)).astype(np.float32)
         out = loop_op.forward(x)
@@ -130,8 +130,8 @@ def test_cuda_symbolic_elementwise_one_kernel_multiple_seq_lens():
 
 def test_symbolic_sdpa_traces_and_decomposes():
     """A single-layer causal SDPA + reshape traced with
-    ``dynamic_shapes={"q","k","v" → {2: Dim("seq_len")}}`` decomposes + lifts
-    cleanly. Stops at the loop-lifted graph and asserts the surviving op
+    ``dynamic_shapes={"q","k","v" → {2: Dim("seq_len")}}`` decomposes and lowers
+    cleanly. Stops after loop lowering and asserts the surviving op
     shapes carry symbolic dims end-to-end."""
     import torch
 
@@ -154,9 +154,9 @@ def test_symbolic_sdpa_traces_and_decomposes():
     assert any(Dim("seq_len") in n.output.shape for n in decomp.nodes.values()), (
         "expected at least one node to carry symbolic seq_len after decomposition"
     )
-    lifted = Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lifting"]).run(graph)
-    loop_op_count = sum(1 for n in lifted.nodes.values() if isinstance(n.op, LoopOp))
-    assert loop_op_count >= 1, "expected at least one LoopOp after lifting"
+    lowered = Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lowering"]).run(graph)
+    loop_op_count = sum(1 for n in lowered.nodes.values() if isinstance(n.op, LoopOp))
+    assert loop_op_count >= 1, "expected at least one LoopOp after lowering"
 
 
 @requires_cuda
@@ -263,9 +263,9 @@ def test_reshape_negative_one_infers_through_symbolic_dim():
             return x.reshape(b, s, 4, -1)
 
     graph = trace_module(ReshapeWithMinusOne(), (torch.randn(1, 16, 128),), dynamic_shapes={"x": {1: _seq_len_dim()}})
-    out = Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lifting"]).run(graph)
+    out = Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lowering"]).run(graph)
     loops = [n for n in out.nodes.values() if isinstance(n.op, LoopOp)]
-    assert loops, "expected at least one LoopOp after lifting"
+    assert loops, "expected at least one LoopOp after lowering"
     # The reshape's inferred -1 is the static 32 (128 / 4); seq_len threads through unchanged.
     extents = {(ax.name, ax.extent) for n in loops for ax in n.op.axes}
     assert any(e == Dim("seq_len") for _, e in extents), f"seq_len axis dropped: {extents}"
@@ -775,6 +775,94 @@ def test_capture_replay_device_io_matches_eager():
                 ref = torch.nn.functional.rms_norm(torch.from_numpy(x), (1024,), m.weight, eps=m.eps).numpy()
             assert out.shape == (1, s, 1024)
             np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
+        assert sorted(prog._layouts) == [(("seq_len", s),) for s in (7, 32, 48)]  # one layout per seq_len, reused
+
+
+@requires_cuda
+def test_run_each_binds_width_weight_and_rows_per_run():
+    """``run_each`` runs a symbolic program once per entry in ONE runtime call — the routed MoE
+    expert loop's shape: each run binds its width, lends its own weight, copies its rows in and its
+    output rows out into one shared tensor, all queued with no host wait between runs. Every run
+    must match torch eager with its own weight."""
+    import torch
+
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.trace.torch import trace_module
+
+    cap, h, widths = 48, 1024, (5, 33, 12)
+    m = torch.nn.RMSNorm(h)
+    compiled = CudaBackend().compile(trace_module(m, (torch.randn(1, 32, h),), dynamic_shapes={"x": {1: _seq_len_dim()}}))
+    x = torch.randn(sum(widths), h, device="cuda")
+    weights = [torch.randn(h, device="cuda") for _ in widths]
+    out = torch.empty_like(x)
+    row = h * x.element_size()
+    runs, start = [], 0
+    for s, w in zip(widths, weights, strict=True):
+        lent = [("p_weight", w.data_ptr(), w.numel() * w.element_size())]
+        runs.append(
+            (
+                {"seq_len": s},
+                lent,
+                [("x", x.data_ptr() + start * row, s * row)],
+                [(compiled.outputs[0], out.data_ptr() + start * row, s * row)],
+            )
+        )
+        start += s
+
+    with gpu_lock():
+        prog = CompiledProgram.build(compiled, {"x": np.zeros((1, cap, h), np.float32), "p_weight": np.ones(h, np.float32)})
+        with prog.on_stream(torch.cuda.current_stream()):
+            prog.run_each(runs)
+        torch.cuda.synchronize()
+    start = 0
+    for s, w in zip(widths, weights, strict=True):
+        ref = torch.nn.functional.rms_norm(x[start : start + s], (h,), w, eps=m.eps)
+        torch.testing.assert_close(out[start : start + s], ref, rtol=1e-4, atol=1e-4)
+        start += s
+    assert prog.sym_values["seq_len"] == widths[-1]
+
+
+@requires_cuda
+def test_run_each_lets_a_queued_run_read_its_own_runtime_constant():
+    """A mean over the symbolic width divides by a runtime constant, which the runtime rewrites in
+    place when the width changes. ``run_each`` queues its runs with no wait between them, so before
+    it binds the next width it must let the queued run read its own value: wide runs followed at
+    once by narrow ones still match eager at every width."""
+    import torch
+
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.trace.torch import trace_module
+
+    class MeanOverWidth(torch.nn.Module):
+        def forward(self, x):
+            return x.mean(dim=1)
+
+    cap, h, widths = 4096, 512, (4096, 5, 4096, 12)
+    compiled = CudaBackend().compile(trace_module(MeanOverWidth(), (torch.randn(1, 32, h),), dynamic_shapes={"x": {1: _seq_len_dim()}}))
+    x = torch.randn(sum(widths), h, device="cuda")
+    out = torch.empty(len(widths), h, device="cuda")
+    row = h * x.element_size()
+    runs, start = [], 0
+    for i, s in enumerate(widths):
+        runs.append(
+            ({"seq_len": s}, [], [("x", x.data_ptr() + start * row, s * row)], [(compiled.outputs[0], out.data_ptr() + i * row, row)])
+        )
+        start += s
+
+    with gpu_lock():
+        prog = CompiledProgram.build(compiled, {"x": np.zeros((1, cap, h), np.float32)})
+        assert prog.plan.runtime_constants, "the mean must divide by a width-dependent runtime constant"
+        with prog.on_stream(torch.cuda.current_stream()):
+            prog.run_each(runs)
+        torch.cuda.synchronize()
+    start = 0
+    for i, s in enumerate(widths):
+        torch.testing.assert_close(out[i], x[start : start + s].mean(dim=0), rtol=1e-4, atol=1e-5)
+        start += s
 
 
 @requires_cuda

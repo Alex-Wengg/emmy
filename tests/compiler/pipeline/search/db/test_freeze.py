@@ -1,27 +1,27 @@
 """The measurement freeze — the admission filter, the golden file per card a DB instance freezes to, and the
-round trip: a freeze re-lowered by ``emmy db import`` is the rows it was written from.
+round trip: a freeze imported by ``emmy db import`` is the rows it was written from.
 
 The DB a freeze is written from is what a tune of the realization corpus leaves behind (``helpers.tuned_db``),
 so every kind of kernel the compiler mints is on the way: a fused kernel, a twisted attention kernel, cut
-pieces formed as kernels of their own, and the pieces of an attention split, which no body of their own
-re-lowers and which the freeze reaches through their parent's program. These tests never touch a GPU."""
+pieces formed as kernels of their own, and the pieces of an attention split, which the freeze reaches through the
+decision that minted them. These tests never touch a GPU."""
 
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import pytest
 
-from emmy.compiler.pipeline.knob import METADATA_PREFIXES
 from emmy.compiler.pipeline.search.dataset import REGIME_PINS, regime_of
-from emmy.compiler.pipeline.search.db import SearchDB, knobs_json
-from emmy.compiler.pipeline.search.db.freeze import freeze_documents, freeze_reason, write_freeze
+from emmy.compiler.pipeline.search.db import SearchDB, freeze, knobs_json
+from emmy.compiler.pipeline.search.db.freeze import freeze_documents, freeze_reason, run_freeze_dir, write_freeze, write_run_freeze
 from emmy.compiler.pipeline.search.golden import GoldenFile
 from emmy.compiler.pipeline.search.golden.evidence import file_source, import_file
-from tests.compiler.pipeline.search.helpers import F16_MATMUL_FEATS, impossible_staged_feats, tuned_db
+from tests.compiler.pipeline.search.helpers import F16_MATMUL_STAMPS, SQUARE_512_STAMPS, impossible_staged_row, tuned_db
 from tests.compiler.pipeline.search.helpers import perf_row as _row
 
-# A small fp32 matmul's stamps, plausible at a few hundred µs.
+# A small fp32 matmul's stamps — what ``features.stamps`` computes from such a kernel — plausible at a few hundred µs.
 _STAMPS = {
     "S_ext_free_prod": 4096.0,
     "S_ext_free_max": 64.0,
@@ -41,8 +41,8 @@ CASES = (
 )
 
 
-def _feats(**knobs) -> dict:
-    return {**_STAMPS, "TILE": "f2x2", "WORK": "t16x16", **knobs}
+#: Its schedule row.
+_ROW = {"TILE": "f2x2", "WORK": "t16x16"}
 
 
 # ---------------------------------------------------------------------------
@@ -51,42 +51,101 @@ def _feats(**knobs) -> dict:
 
 
 def test_reason_keeps_a_row_of_either_precision_regime(monkeypatch) -> None:
-    """The fast-math flag alone decides a row's regime, spelled once and not read off this shell: any other flag
-    a row was compiled with, and whatever ``EMMY_NVCC_FLAGS`` holds when the freeze runs, leave it where its
-    context put it."""
+    """A row's precision decisions alone decide its regime, spelled once and not read off this shell: the flags a
+    row was compiled with, and whatever ``EMMY_NVCC_FLAGS`` holds when the freeze runs, leave it where its context
+    put it."""
     monkeypatch.setenv("EMMY_NVCC_FLAGS", "-lineinfo")
-    assert freeze_reason(_row("k", us=500.0, knobs=_feats())) is None
-    assert freeze_reason(_row("k", us=500.0, knobs=_feats(), flags="--use_fast_math")) is None
-    assert freeze_reason(_row("k", us=500.0, knobs=_feats(), flags="-lineinfo --use_fast_math")) is None
-    assert REGIME_PINS == {"": {"FAST_MATH": False}, "--use_fast_math": {"FAST_MATH": True}}
-    assert regime_of("-lineinfo --use_fast_math") == "--use_fast_math" and regime_of("-lineinfo") == ""
+    assert freeze_reason(_row("k", us=500.0, knobs=_ROW), _STAMPS) is None
+    assert freeze_reason(_row("k", us=500.0, knobs=_ROW, flags="--use_fast_math"), _STAMPS) is None
+    assert freeze_reason(_row("k", us=500.0, knobs=_ROW, flags="-lineinfo --use_fast_math"), _STAMPS) is None
+    assert REGIME_PINS[""] == dict.fromkeys(("FAST_MATH", "FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA", "COLD_CACHE"), False)
+    assert REGIME_PINS["--use_fast_math"] == {
+        **dict.fromkeys(("FAST_MATH", "FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA"), True),
+        "COLD_CACHE": False,
+    }
+    assert regime_of(False, {"FAST_MATH": True}) == "--use_fast_math" and regime_of() == ""
+
+
+def test_freeze_preserves_cold_and_hot_rows_of_the_same_kernel(tmp_path):
+    from emmy.compiler.pipeline.search.golden import import_file
+
+    path = tmp_path / "source.db"
+    source = tuned_db(path, CASES[:1], us=500.0)
+    hot_rows = list(source.iter_perf_rows())
+    for row in hot_rows:
+        source.record_perf_row(dataclasses.replace(row, cold_cache=True, stats=dataclasses.replace(row.stats, median=700.0)))
+    source.close()
+    directory = tmp_path / "freeze"
+    write_freeze(path, directory)
+    restored = SearchDB()
+    for file in directory.glob("*.json"):
+        import_file(restored, file, source=f"freeze:{file.name}")
+    rows = list(restored.iter_perf_rows())
+    assert len(rows) == 2 * len(hot_rows)
+    assert {r.stats.median for r in rows if r.cold_cache} == {700.0}
+    assert {r.stats.median for r in rows if not r.cold_cache} == {500.0}
+
+
+@pytest.mark.parametrize("name", ["FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA"])
+def test_freeze_and_offline_pools_preserve_independent_precision(tmp_path, monkeypatch, name):
+    from emmy.compiler.pipeline.search.db.export import golden_pools
+    from emmy.compiler.pipeline.search.ranking import pool_context
+    from emmy.compiler.pipeline.search.space import precision_pins
+
+    # Ambient policy must not become a recorded row's context during import or reconstruction.
+    monkeypatch.setenv("EMMY_FAST_MATH", "1")
+    monkeypatch.setenv(f"EMMY_{name}", "0")
+    source = tuned_db(None, CASES[:1], us=500.0)
+    original = list(source.iter_perf_rows())
+    for row in original:
+        source.record_perf_row(dataclasses.replace(row, precision={"FAST_MATH": False, name: True}))
+    [document] = freeze_documents(source)[0].values()
+    path = tmp_path / "freeze.json"
+    document.dump(path)
+    restored = SearchDB()
+    import_file(restored, path, source="golden:freeze")
+    rows = list(restored.iter_perf_rows())
+    assert len(rows) == 2 * len(original)
+    assert {row.precision[name] for row in rows} == {False, True}
+    pools, dropped = golden_pools(restored)
+    assert not dropped and len(pools) == len(rows)
+    for pool in pools:
+        ctx = pool_context(pool)
+        assert ctx.precision_pins() == precision_pins(pool.pins)
+        assert len(list(restored.iter_perf(ctx))) == len(original)
+        assert pool.regime == regime_of(ctx.cold_cache, ctx.precision_pins())
 
 
 def test_reason_drops_a_failed_bench() -> None:
     # A fail's median is the watchdog sentinel, not a measurement; the tune DB keeps the failure.
-    assert freeze_reason(_row("k", us=9.17, knobs=_feats(), status="bench_fail")) == "bench_fail: not a measurement"
+    assert freeze_reason(_row("k", us=9.17, knobs=_ROW, status="bench_fail"), _STAMPS) == "bench_fail: not a measurement"
 
 
 def test_reason_drops_a_card_the_registry_does_not_know() -> None:
     # Its H_* features cannot be derived, so no reader could featurize it.
-    row = dataclasses.replace(_row("k", us=500.0, knobs=_feats()), gpu="Mystery GPU")
-    assert freeze_reason(row).startswith("unknown card")
+    row = dataclasses.replace(_row("k", us=500.0, knobs=_ROW), gpu="Mystery GPU")
+    assert freeze_reason(row, _STAMPS).startswith("unknown card")
 
 
 def test_reason_drops_a_non_deployable_regime() -> None:
-    assert freeze_reason(_row("k", us=500.0, knobs=_feats(), opt=1)) == "non-deployable regime (H_opt=1)"
+    assert freeze_reason(_row("k", us=500.0, knobs=_ROW, opt=1), _STAMPS) == "non-deployable regime (H_opt=1)"
+
+
+def test_reason_drops_a_row_whose_kernel_no_longer_lowers() -> None:
+    # A row's shape is computed from its kernel's definition; a definition the compiler stopped taking back has none.
+    assert freeze_reason(_row("k", us=500.0, knobs=_ROW), None) == "stale kernel: its definition no longer lowers"
 
 
 def test_reason_drops_implausible_value() -> None:
     # The shared f16 mlp_down extents at 9.17 µs imply ~6500 TFLOP/s at the default hint of its
     # symbolic axis — and an honest 13 TFLOP/s when the row says it was benched at one token.
-    assert "implausible value" in freeze_reason(_row("k", us=9.17, knobs=F16_MATMUL_FEATS))
-    assert freeze_reason(_row("k", us=9.17, knobs=F16_MATMUL_FEATS, bindings={"m": 1})) is None
+    assert "implausible value" in freeze_reason(_row("k", us=9.17), F16_MATMUL_STAMPS)
+    assert freeze_reason(_row("k", us=9.17, bindings={"m": 1}), F16_MATMUL_STAMPS) is None
 
 
 def test_reason_drops_impossible_kernel() -> None:
     # The square.512 residue: over-cap cp.async slab -> legal-looking latency, invalid kernel.
-    assert "impossible kernel" in freeze_reason(_row("k", us=2.02, knobs=impossible_staged_feats()))
+    assert "impossible kernel" in freeze_reason(_row("k", us=2.02, knobs=impossible_staged_row()), SQUARE_512_STAMPS)
 
 
 # ---------------------------------------------------------------------------
@@ -97,64 +156,93 @@ def test_reason_drops_impossible_kernel() -> None:
 def _measured(db: SearchDB) -> set[tuple]:
     """Every row as a freeze carries it: the kernel, its bindings, its schedule row, its median and its regime."""
 
-    def schedule(row):
-        return knobs_json({k: v for k, v in row.knobs.items() if not k.startswith(METADATA_PREFIXES)})
+    return {
+        (r.kernel, knobs_json(r.bindings), knobs_json(r.knobs), r.stats.median, r.flags) for r in db.iter_perf_rows() if r.status == "ok"
+    }
 
-    return {(r.kernel, knobs_json(r.bindings), schedule(r), r.stats.median, r.flags) for r in db.iter_perf_rows() if r.status == "ok"}
 
-
-def _definitions(db: SearchDB) -> dict[str, tuple]:
+def _definitions(db: SearchDB) -> dict[str, bool]:
+    """Each measured kernel's identity — the key the import computed from its stored body — and whether it is formed."""
     measured = {r.kernel for r in db.iter_perf_rows()}
-    return {k.exact_identity: (k.structural_identity, k.stamps, k.formed) for k in db.iter_kernels() if k.exact_identity in measured}
+    return {k.exact_identity: k.formed for k in db.iter_kernels() if k.exact_identity in measured}
 
 
 @pytest.fixture(scope="module")
 def tuned(tmp_path_factory):
     """The tune DB the freeze tests are written from, and its path."""
     path = tmp_path_factory.mktemp("tune") / "autotune.db"
-    db = tuned_db(path, CASES)
+    # A time every one of these kernels could run in: the plausibility gate reads each kernel's own shape.
+    db = tuned_db(path, CASES, us=500.0)
     yield db, path
     db.close()
 
 
 def test_a_freeze_is_a_golden_file_per_card_that_re_lowers_to_the_rows_it_was_written_from(tuned, tmp_path) -> None:
     tuned, tuned_path = tuned
-    """One document per card, valid as a golden file; every formed kernel a config of its own; the attention
-    split's pieces, formed from no loop op, under their parent's program with the split as a routing entry and
-    their rows as receipts. Imported into a fresh instance, the rows come back with the same kernels, schedule
-    rows, medians and regimes, the kernels with the same identities and stamps — the current compiler's, since
-    the file stores neither."""
+    """One document per card, valid as a golden file: the kernels the rows measured, every decision that reaches one
+    of them (the attention split's pieces, formed from no loop op, through the split on their parent) and a row per
+    measurement. Imported into a fresh instance, the rows come back with the same kernels, schedule rows, medians
+    and regimes: a freeze names its kernels by a ref of its own, and the import computes each one's identity from
+    the body the file stores, which is the identity the tune filed it under."""
 
     documents, dropped = freeze_documents(tuned)
     assert dropped == {} and set(documents) == {"nvidia_geforce_rtx_5090_sm120.json", "nvidia_tesla_v100_sxm2_16gb_sm70.json"}
     for document in documents.values():
-        GoldenFile.from_wire(document).check()
+        document.check()
     definitions = _definitions(tuned)
-    unformed = {identity for identity, (_deploy, _stamps, formed) in definitions.items() if not formed}
+    unformed = {identity for identity, formed in definitions.items() if not formed}
     assert unformed, "the attention split mints pieces no loop op forms"
     rtx = documents["nvidia_geforce_rtx_5090_sm120.json"]
-    routes = [config for config in rtx["configs"] if any("kernel_set" in entry for entry in config["realizations"])]
-    [route] = routes
-    [decision] = [entry for entry in route["realizations"] if "measurements" not in entry]
-    receipts = [entry for entry in route["realizations"] if "measurements" in entry]
     kernels = {kernel.exact_identity: kernel for kernel in tuned.iter_kernels()}
     [split] = [decision_row for decision_row in tuned.iter_routing() if set(decision_row.children) & unformed]
-    assert kernels[split.parent].formed and decision["identity"] == kernels[split.parent].structural_identity
-    assert decision["knobs"] == split.arm
-    assert all(entry["kernel_set"] == [decision["name"]] for entry in receipts)
-    assert {entry["identity"] for entry in receipts} == {definitions[identity][0] for identity in unformed}
-    assert all("kernel_set" not in entry for config in rtx["configs"] if config is not route for entry in config["realizations"])
+    ref = {identity: ref for ref, identity in rtx.identities().items()}
+    assert {split.parent, *split.children} <= set(ref) and kernels[split.parent].formed
+    assert dataclasses.replace(split, parent=ref[split.parent], children=tuple(ref[child] for child in split.children)) in rtx.routing
+    assert all(row.measured for row in rtx.rows)
 
     digests = write_freeze(tuned_path, tmp_path / "freeze")
     assert set(digests) == set(documents)
     again = SearchDB()
     for name in sorted(digests):
-        counts = import_file(again, tmp_path / "freeze" / name, file_source("freeze", tmp_path / "freeze" / name))
-        assert not counts["did not lower"] and not counts["identities no kernel carries"], (name, counts)
+        import_file(again, tmp_path / "freeze" / name, file_source("freeze", tmp_path / "freeze" / name))
     assert _measured(again) == _measured(tuned)
     assert _definitions(again) == definitions
     assert set(again.perf_sources()) == {file_source("freeze", tmp_path / "freeze" / name) for name in digests}
     assert all(source.startswith("freeze:") for source in again.perf_sources())
+
+
+def test_a_tunes_freeze_file_is_the_cards_file_under_a_name_that_sorts_after_it(tuned, tmp_path) -> None:
+    """What a tune writes beside each card's file is the card's file byte for byte, named by card, UTC stamp and the
+    digest the import sources it under, and sorting after ``<card>.json`` so the import reads it last."""
+    _db, tuned_path = tuned
+    cards = write_freeze(tuned_path, tmp_path / "cards")
+    runs = write_run_freeze(tuned_path, tmp_path / "freezes")
+    assert [run.parent for run in runs] == [tmp_path / "freezes"] * len(cards) and len(cards) == 2
+    for name, run in zip(sorted(cards), runs, strict=True):
+        assert run.read_bytes() == (tmp_path / "cards" / name).read_bytes()
+        assert re.fullmatch(rf"{re.escape(name[:-5])}\.r\d{{8}}T\d{{6}}Z\.([0-9a-f]{{12}})\.json", run.name)
+        assert run.name.rsplit(".", 2)[1] == file_source("freeze", run).removeprefix("freeze:")
+        assert sorted([name, run.name]) == [name, run.name]
+
+
+def test_a_tune_with_no_admitted_row_freezes_nothing(tmp_path) -> None:
+    """Rows a compile imported from a golden are the file's, not a tune's: nothing is written, not even the directory."""
+    tuned_db(tmp_path / "golden.db", CASES[:1], source="golden:abcdef012345", us=500.0).close()
+    assert write_run_freeze(tmp_path / "golden.db", tmp_path / "freezes") == []
+    assert not (tmp_path / "freezes").exists()
+
+
+def test_the_directory_a_tune_writes_follows_the_freeze_dir_variable(tmp_path, monkeypatch) -> None:
+    """Unset, the repository freeze of a checkout that holds one, else none; set empty, none; set, that path."""
+    monkeypatch.delenv("EMMY_FREEZE_DIR", raising=False)
+    monkeypatch.setattr(freeze, "REPOSITORY_FREEZE", tmp_path / "freezes")
+    assert run_freeze_dir() is None  # a wheel leaves the directory out
+    (tmp_path / "freezes").mkdir()
+    assert run_freeze_dir() == tmp_path / "freezes"
+    monkeypatch.setenv("EMMY_FREEZE_DIR", "")
+    assert run_freeze_dir() is None
+    monkeypatch.setenv("EMMY_FREEZE_DIR", str(tmp_path / "elsewhere"))
+    assert run_freeze_dir() == tmp_path / "elsewhere"
 
 
 def test_freezing_the_same_rows_twice_yields_the_same_bytes(tuned, tmp_path) -> None:
@@ -177,14 +265,15 @@ def test_both_precision_lanes_freeze_as_pinned_rows_and_import_apart(tmp_path) -
     [row] = list(db.iter_perf_rows())
     with pinned_knobs({"FAST_MATH": True}):
         ctx = Context.from_target((12, 0), gpu_name=CARDS[(12, 0)], compile_flags="--use_fast_math")
-        db.record_perf(ctx, row.kernel, bindings=row.bindings, knobs=row.knobs, backend="cuda", status="ok", stats=row.stats)
+        db.record_perf(ctx, row.kernel, bindings=row.bindings, knobs=row.knobs, status="ok", stats=row.stats)
     assert {r.flags for r in db.iter_perf_rows()} == {"", "--use_fast_math"}
     documents, _dropped = freeze_documents(db)
     [document] = documents.values()
-    entries = [entry for config in document["configs"] for entry in config["realizations"]]
-    assert sorted(entry["pins"]["FAST_MATH"] for entry in entries) == [False, True]
-    records = GoldenFile.from_wire(document).records()
-    assert {tuple(name for name, _value in record.pins) for record in records} == {("FAST_MATH",)}
+    assert sorted(row.pins["FAST_MATH"] for row in document.rows) == [False, True]
+    assert all(
+        row.pins == dict.fromkeys(("FAST_MATH", "FAST_EXP", "F16_MMA_F32_ACC", "FP8_MMA"), row.pins["FAST_MATH"]) | {"COLD_CACHE": False}
+        for row in document.rows
+    )
     write_freeze(path, tmp_path / "freeze")
     db.close()
     again = SearchDB()
@@ -193,10 +282,9 @@ def test_both_precision_lanes_freeze_as_pinned_rows_and_import_apart(tmp_path) -
     assert lanes == [("", row.stats.median), ("--use_fast_math", row.stats.median)]
 
 
-def test_a_kernel_benched_at_two_sizes_freezes_as_two_programs(tmp_path) -> None:
-    """A row's sizes travel as the program's hints, never as golden ``bindings``, which would make the dims static
-    and name another kernel: the same symbolic kernel benched at two sizes is two loop programs, and each row comes
-    back at the size it was benched at."""
+def test_a_kernel_benched_at_two_sizes_freezes_as_two_rows_of_one_kernel(tmp_path) -> None:
+    """A row's sizes are the row's ``bindings``, the sizes its symbolic dims were benched at: the same symbolic kernel
+    benched at two sizes is one kernel with two rows, and each row comes back at the size it was benched at."""
     from emmy.compiler.context import Context
     from emmy.compiler.pipeline.search.pins import pinned_knobs
     from emmy.compiler.wire import symbolic_vars
@@ -208,14 +296,12 @@ def test_a_kernel_benched_at_two_sizes_freezes_as_two_programs(tmp_path) -> None
     assert row.bindings == {"seq_len": 512}
     with pinned_knobs({"FAST_MATH": row.flags != ""}):
         ctx = Context.from_target((12, 0), gpu_name=CARDS[(12, 0)], compile_flags=row.flags)
-        db.record_perf(ctx, row.kernel, bindings={"seq_len": 128}, knobs=row.knobs, backend="cuda", status="ok", stats=row.stats)
+        db.record_perf(ctx, row.kernel, bindings={"seq_len": 128}, knobs=row.knobs, status="ok", stats=row.stats)
     documents, _dropped = freeze_documents(db)
     [document] = documents.values()
-    assert all(entry["bindings"] == {} for config in document["configs"] for entry in config["realizations"])
-    assert [symbolic_vars(wire) for wire in document["loops"]] == [{"seq_len"}, {"seq_len"}]
-    dims = [dim for wire in document["loops"] for node in wire["nodes"] for _n, _d, shape in node["outputs"] for dim in shape]
-    hints = sorted(dim["hint"] for dim in dims if isinstance(dim, dict))
-    assert hints[0] == 128 and hints[-1] == 512
+    assert sorted(row.bindings["seq_len"] for row in document.rows) == [128, 512]
+    [kernel] = document.kernels
+    assert symbolic_vars(kernel.loop_ir) == {"seq_len"}
     write_freeze(path, tmp_path / "freeze")
     db.close()
     again = SearchDB()
@@ -268,34 +354,32 @@ def test_an_lfs_pointer_is_named_rather_than_parsed(tmp_path) -> None:
 
 @pytest.mark.xdist_group("golden_import_rtx5090")
 def test_the_rtx_5090_hardware_goldens_rows_round_trip_through_a_freeze(tmp_path) -> None:
-    """A card's recorded rows — attention and softmax kernels, split winners' routing rows, cut receipts — imported
-    as a tune of that card would leave them, freeze to one file that re-lowers to the same rows and kernels. The
-    same file imported straight from the repository, its traced slices entering at the lowering passes, files the
-    same rows too: a golden file is a source ``emmy db import`` accepts."""
+    """A card's recorded rows — attention and softmax kernels, split winners' routing rows, cut pieces — imported as a
+    tune of that card would leave them, freeze to one file that imports to the same rows and kernels. The same file
+    imported straight from the repository files the same rows too: a golden file is a source ``emmy db import``
+    accepts."""
     from emmy.compiler.context import Context
-    from emmy.compiler.pipeline.search.golden.evidence import import_goldens
+    from emmy.compiler.pipeline.search.dataset.pool import regime_of
+    from emmy.compiler.pipeline.search.golden import import_rows
     from emmy.compiler.pipeline.search.golden.repository import _RECORDS_DIR
-    from emmy.compiler.pipeline.search.pins import pinned_knobs
     from tests.compiler.pipeline.search.helpers import GPU_5090
 
     path = _RECORDS_DIR / "rtx5090_sm120.json"
-    records = GoldenFile.load(path).records()
+    document = GoldenFile.load(path)
     tuned_path = tmp_path / "autotune.db"
     tuned = SearchDB(tuned_path)
-    with pinned_knobs({"FAST_MATH": False}):
-        counts = import_goldens(tuned, Context.from_target((12, 0), gpu_name=GPU_5090, compile_flags=""), records, source="measured")
-    assert counts["perf rows"] >= 30
+    standard = [row for row in document.rows if regime_of(precision=row.pins) == ""]  # every spelling of the plain lane
+    ctx = Context.from_target((12, 0), gpu_name=GPU_5090, compile_flags="")
+    assert import_rows(tuned, ctx, document, standard, source="measured") >= 30
     documents, dropped = freeze_documents(tuned)
     assert dropped == {} and list(documents) == ["nvidia_geforce_rtx_5090_sm120.json"]
     [name] = write_freeze(tuned_path, tmp_path / "freeze")
     again = SearchDB()
-    counts = import_file(again, tmp_path / "freeze" / name, file_source("freeze", tmp_path / "freeze" / name))
-    assert not counts["did not lower"] and not counts["identities no kernel carries"], counts
+    import_file(again, tmp_path / "freeze" / name, file_source("freeze", tmp_path / "freeze" / name))
     assert _measured(again) == _measured(tuned)
     assert _definitions(again) == _definitions(tuned)
     straight = SearchDB()
-    counts = import_file(straight, path, file_source("freeze", path))
-    assert not counts["did not lower"] and not counts["identities no kernel carries"], counts
+    import_file(straight, path, file_source("freeze", path))
     # The file records both precision lanes; the tune above ran in one.
     assert {row for row in _measured(straight) if row[-1] == ""} == _measured(tuned)
     tuned.close()

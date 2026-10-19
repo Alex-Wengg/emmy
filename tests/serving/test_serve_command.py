@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import types
 from pathlib import Path
 
 import pytest
@@ -204,6 +203,14 @@ def test_serve_cmd_generate_branch():
     assert "--attention-backend" not in stock_cmd
 
 
+def test_serve_cmd_generate_lora_uses_adapter_model_and_symbolic_capacity():
+    cmd = build_serve_cmd(MODEL, stock=False, vllm_args=["--enable-lora"], generate=True)
+    assert json.loads(cmd[cmd.index("--hf-overrides") + 1])["architectures"] == ["EmmyGenLoRAModel"]
+    assert "--enforce-eager" in cmd
+    assert cmd[cmd.index("--max-num-batched-tokens") + 1] == "4096"
+    assert cmd[-1] == "--enable-lora"
+
+
 def test_serve_cmd_generate_capture_sizes_follow_max_num_seqs():
     cmd = build_serve_cmd(MODEL, stock=False, vllm_args=["--max-num-seqs", "48"], generate=True)
     # The decode bucket (16) and the cap itself always ride the list; the dense ladder fills between.
@@ -339,16 +346,6 @@ def test_serve_cmd_generate_moe_captures_at_size_one(monkeypatch):
     assert '"cudagraph_capture_sizes": [1]' in cfg
 
 
-def test_serve_cmd_generate_hyper_connection_moe_serves_eager(monkeypatch):
-    """A hyper-connection MoE has no fixed-slot tier — its routed combine host-syncs every step —
-    so the serve default is eager, not the capture-size-1 ladder (the boot guard rejects capture)."""
-    _force_moe_probe(monkeypatch)
-    monkeypatch.setattr("emmy.commands.serve._hf_config", lambda model, vllm_args, local=True: types.SimpleNamespace(hc_mult=2))
-    cmd = build_serve_cmd(MODEL, stock=False, vllm_args=[], generate=True)
-    assert "--enforce-eager" in cmd
-    assert "--compilation-config" not in cmd
-
-
 def test_serve_cmd_generate_moe_enforce_eager_forwards(monkeypatch):
     _force_moe_probe(monkeypatch)
     cmd = build_serve_cmd(MODEL, stock=False, vllm_args=["--enforce-eager"], generate=True)
@@ -374,8 +371,13 @@ def test_serve_cmd_generate_moe_bucket_off_forces_eager(monkeypatch):
 
 
 def test_serve_cmd_generate_rejects_incompatible_dtype():
-    with pytest.raises(ValueError, match="fp16"):
-        build_serve_cmd(MODEL, stock=False, vllm_args=["--dtype", "bfloat16"], generate=True)
+    with pytest.raises(ValueError, match="fp16, bf16, or fp32"):
+        build_serve_cmd(MODEL, stock=False, vllm_args=["--dtype", "float64"], generate=True)
+
+
+def test_serve_cmd_generate_accepts_bfloat16_dtype():
+    cmd = build_serve_cmd(MODEL, stock=False, vllm_args=["--dtype", "bfloat16"], generate=True)
+    assert cmd[cmd.index("--dtype") + 1] == "bfloat16"
 
 
 def test_serve_cmd_generate_rejects_oversized_batched_tokens():
@@ -420,6 +422,27 @@ def test_serve_cmd_generate_nulls_the_quantization_config_for_exl3(tmp_path, mon
     (tmp_path / "config.json").write_text(json.dumps({k: v for k, v in cfg.items() if k != "quantization_config"}))
     cmd = build_serve_cmd(str(tmp_path), stock=False, vllm_args=[], generate=True)
     assert json.loads(cmd[cmd.index("--hf-overrides") + 1]) == {"architectures": ["EmmyGenModel"]}
+
+
+def test_serve_cmd_generate_boots_the_hybrid_class_with_decode_capture_for_gdn_layers(tmp_path):
+    """A checkpoint with GDN layers (``linear_attention`` in ``layer_types``) boots ``EmmyGenHybridModel``, the
+    class that declares the layers' per-request state to vLLM, and captures decode steps only: a GDN layer runs
+    over per-request token ranges read on the host, which only a uniform decode step repeats from its capture."""
+    pytest.importorskip("transformers.models.qwen3_5")
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    from tests.serving.helpers import QWEN3_5_TINY
+
+    Qwen3_5TextConfig(**QWEN3_5_TINY).save_pretrained(tmp_path)
+    cmd = build_serve_cmd(str(tmp_path), stock=False, vllm_args=[], generate=True)
+    assert json.loads(cmd[cmd.index("--hf-overrides") + 1])["architectures"] == ["EmmyGenHybridModel"]
+    assert "--enforce-eager" not in cmd and "--attention-backend" not in cmd
+    assert json.loads(cmd[cmd.index("--compilation-config") + 1])["cudagraph_mode"] == "FULL_DECODE_ONLY"
+    # Without GDN layers the same family keeps the plain class and its capture config.
+    Qwen3_5TextConfig(**(QWEN3_5_TINY | {"layer_types": ["full_attention", "full_attention"]})).save_pretrained(tmp_path)
+    cmd = build_serve_cmd(str(tmp_path), stock=False, vllm_args=[], generate=True)
+    assert json.loads(cmd[cmd.index("--hf-overrides") + 1])["architectures"] == ["EmmyGenModel"]
+    assert "--enforce-eager" not in cmd
 
 
 def test_serve_cmd_generate_nulls_the_quantization_config_for_nvfp4(tmp_path):

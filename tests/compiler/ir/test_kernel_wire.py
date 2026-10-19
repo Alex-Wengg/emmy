@@ -17,8 +17,6 @@ import pytest
 
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.cuda.ir import CudaOp
-from emmy.compiler.pipeline.search.golden import lead_of, siblings_of
-from emmy.compiler.pipeline.search.golden.decode import _replay
 from emmy.compiler.wire import formed_from, kernel_bindings, kernel_tile, kernel_wire, symbolic_vars
 from tests.compiler.realization import helpers as corpus
 
@@ -50,7 +48,9 @@ def _relowered(wire: dict, ctx):
 
 
 def _stamps(tile) -> dict[str, float]:
-    return {k: float(v) for k, v in (tile.knobs or {}).items() if k.startswith("S_")}
+    from emmy.compiler.pipeline.search.features import stamps
+
+    return stamps(tile)
 
 
 def _identities(op) -> tuple[str, str]:
@@ -64,7 +64,7 @@ def test_every_kernel_of_a_set_re_lowers_from_its_wire_to_itself(case_path):
     graph, taken = corpus.lowered(case, ctx)
     kernels = [node.op for node in graph.nodes.values() if isinstance(node.op, CudaOp)]
     assert kernels
-    deploy = set()
+    exact = set()
     for cuda in kernels:
         tile = kernel_tile(cuda)
         assert tile is not None and formed_from(tile) is not None, cuda.kernel_name
@@ -72,16 +72,12 @@ def test_every_kernel_of_a_set_re_lowers_from_its_wire_to_itself(case_path):
         assert symbolic_vars(wire) == set(kernel_bindings(tile)), cuda.kernel_name
         [again] = _relowered(wire, ctx)
         assert _identities(again) == _identities(tile), cuda.kernel_name
-        assert _stamps(again) == _stamps(tile), cuda.kernel_name
-        deploy.add(_identities(tile)[1])
-    # The clustered flavour read off the same tile is the deploy identity the golden side mints for
-    # the same kernels when it replays the case (what a receipt names, what an import computes). The
-    # replay may know more kernels — the arms it looked into and did not take.
-    primary = case.record
-    replay = _replay(primary, siblings=siblings_of(primary, case.records), lead=lead_of(primary, case.records))
-    assert deploy <= set(replay.kernels)
+        assert _stamps(again) == _stamps(tile) and _stamps(tile), cuda.kernel_name
+        exact.add(_identities(tile)[0])
+    # The identity read off the tile is the one each of the case's stored kernels computes from its own Loop IR.
+    assert exact <= set(case.document.identities().values())
     if not any(taken):
-        assert primary.kernel_identity in deploy
+        assert case.target.exact_identity in exact
 
 
 @pytest.mark.parametrize("case_path", UNFORMED_CASES)
@@ -108,3 +104,30 @@ def test_bindings_are_the_hints_a_bench_sizes_a_symbolic_kernel_by():
     static = corpus.load_case(corpus.CASES_DIR / "fused/norm-linear-f16-scalar-reduce.json")
     static_graph, _taken = corpus.lowered(static, static.context())
     assert all(kernel_bindings(kernel_tile(node.op)) == {} for node in static_graph.nodes.values() if isinstance(node.op, CudaOp))
+
+
+@pytest.mark.parametrize("program", ["root", "under-an-outer-loop"])
+def test_a_kernel_that_carries_a_state_re_lowers_from_its_wire_to_itself(program):
+    """A carried state reaches the lifted kernel as an extra port, the buffer its classic (serial) realization owns,
+    which the lift adds on its own. The wire spells only what the body writes, so lowering the wire alone adds that
+    port once, as the kernel's own program did, and comes back as the same kernel."""
+    from emmy.compiler.context import Context
+    from emmy.compiler.ir.loop import LoopOp
+    from emmy.compiler.ir.stmt import Body, Write
+    from tests.compiler.ir.test_carried_state import _batched_graph, _graph
+
+    ctx = Context.from_target((12, 0))
+    [tile] = _relowered((_graph() if program == "root" else _batched_graph()).to_wire(), ctx)
+    assert tile.carries
+    wire = kernel_wire(tile)
+    [node] = (node for node in Graph.from_wire(wire).nodes.values() if isinstance(node.op, LoopOp))
+    assert [tensor.name for tensor in node.outputs] == [write.output for write in Body(node.op.body).iter_of_type(Write)]
+    [again] = _relowered(wire, ctx)
+    assert _identities(again) == _identities(tile)
+    assert _stamps(again) == _stamps(tile)
+    # A restamp finds the stored kernel again by the same buffers: the ones its body writes.
+    from emmy.compiler.pipeline.search.golden.restamp import lift_targets
+    from emmy.compiler.wire import wire_writes
+
+    program = _graph() if program == "root" else _batched_graph()
+    assert wire_writes(wire) in lift_targets(program, ctx)

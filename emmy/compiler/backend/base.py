@@ -30,25 +30,48 @@ from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from emmy import config
+from emmy.compiler.dtype import BF16, DataType, decode_bf16, encode_bf16
 from emmy.compiler.ir.base import ConstantOp, InputOp
-from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.ir.tensor.ir import BitcastOp, CastOp, ElementwiseOp
+from emmy.compiler.loader.binder import apply_load_ops, evaluate_source_graph
 
 if TYPE_CHECKING:
     from emmy.compiler.graph import Graph
 
 
+def resolve_tune_db(value: Path | str | None) -> Path | None:
+    """Resolve the ``tune_db=`` constructor argument.
+
+    - ``None`` → ``None`` (no DB; test-isolation default).
+    - ``"auto"`` → ``EMMY_TUNE_DB`` env → ``~/.cache/emmy/autotune.db``
+      (shared resolution in :func:`emmy.config.tune_db_path`). The result
+      is returned regardless of whether the file exists; ``compile()`` skips
+      opening it when missing.
+    - Explicit ``Path`` / ``str`` → that path (no env lookup).
+    """
+    if value is None:
+        return None
+    if value == "auto":
+        return config.tune_db_path()
+    return Path(value)
+
+
 @dataclass
 class RunResult:
-    """Result of running a program: outputs as ndarrays + optional wall-time."""
+    """Result of running a program: outputs as ndarrays + optional wall-time. ``taps`` holds the intermediate buffers
+    the caller named in ``Backend.run``'s ``taps``, as the program computed them."""
 
     outputs: dict[str, Any]  # actually dict[str, np.ndarray] at runtime
     time_ms: float | None = None
+    taps: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass
@@ -144,8 +167,9 @@ class Backend(ABC):
         *,
         input_data: dict[str, np.ndarray] | None = None,
         pre_run: Callable[[], Any] | None = None,
+        taps: tuple[str, ...] = (),
     ) -> tuple[RunResult, Any]:
-        """Execute; return ``(RunResult, pre_run_result)``.
+        """Execute; return ``(RunResult, pre_run_result)``, plus the intermediate buffers named in ``taps``.
 
         ``pre_run`` runs once before the backend executes the graph and
         inside whatever serialization the backend uses (the GPU lock on
@@ -155,9 +179,10 @@ class Backend(ABC):
 
         Default implementation walks ``compiled`` (a ``Graph``) in topological
         order and dispatches every compute node through ``op.forward``. Inputs
-        and ``ConstantOp`` overrides come from ``input_data``; scalar
-        ``ConstantOp``s without overrides materialize as single-element float32
-        arrays. ``LoopOp.forward`` plugs into this same walk, so post-fusion
+        and externally bound ``ConstantOp``s (``value=None``) come from
+        ``input_data``. A ``ConstantOp.value`` is fixed at compile time; changing
+        it requires recompilation, since lowering may already have consumed it.
+        ``LoopOp.forward`` plugs into this same walk, so post-fusion
         graphs interpret identically — used by ``NumpyBackend`` and
         ``LoopBackend``. Backends with native runtimes (e.g. CUDA) override.
         """
@@ -188,14 +213,17 @@ class Backend(ABC):
                 for buf, t in zip(node.buffer_names(), node.outputs, strict=True):
                     if buf not in input_data:
                         raise KeyError(f"Missing input for node {nid!r}")
-                    values[buf] = _coerce(input_data[buf], _shape_of(t), t.dtype.np)
+                    values[buf] = _coerce(input_data[buf], _shape_of(t), t.dtype)
                 continue
 
             if isinstance(node.op, ConstantOp):
                 if nid in input_data:
-                    values[nid] = _coerce(input_data[nid], shape, dtype_np)
+                    values[nid] = _coerce(input_data[nid], shape, node.output.dtype)
                 elif node.op.value is not None:
-                    values[nid] = np.array([node.op.value], dtype=dtype_np)
+                    values[nid] = _coerce([node.op.value], shape, node.output.dtype)
+                elif node.op.source_graph is not None and (generated := evaluate_source_graph(node.op.source_graph, {})) is not None:
+                    # A self-contained constant — an ``arange`` the program built — is its own source.
+                    values[nid] = _coerce(apply_load_ops(generated, node.op.load_ops), shape, node.output.dtype)
                 else:
                     raise KeyError(f"ConstantOp {nid!r} has no value and was not supplied in input_data")
                 continue
@@ -203,10 +231,25 @@ class Backend(ABC):
             if isinstance(node.op, InputOp):
                 continue
 
-            args = [values[inp] for inp in node.inputs]
+            # A body op's ``forward`` zips its arrays with its own input order, which a bare op derives from its body;
+            # the node's edge order is the same set, so bind by name. A buffer an output is stored over
+            # (``Tensor.alias``) is an edge the body never loads: it seeds the output instead.
+            aliased = {t.name: values[t.alias] for t in node.outputs if t.alias is not None}
+            op_inputs = set(getattr(node.op, "inputs", ()))
+            order = list(node.op.inputs) if op_inputs == set(node.inputs) - {t.alias for t in node.outputs} else list(node.inputs)
+            args = [
+                decode_bf16(values[inp]) if not isinstance(node.op, BitcastOp) and compiled.buffer(inp).dtype == BF16 else values[inp]
+                for inp in order
+            ]
             if isinstance(node.op, ElementwiseOp) and dtype_np.kind == "f":
                 args = [a.astype(np.promote_types(a.dtype, dtype_np), copy=False) if a.dtype.kind == "f" else a for a in args]
-            result = node.op.forward(*args)
+            # CastOp.forward sees BF16's uint16 carrier; numeric conversion belongs here.
+            if isinstance(node.op, CastOp) and node.op.dtype == "bf16":
+                result = args[0]
+            elif aliased and isinstance(node.op, LoopOp):
+                result = node.op.forward(*args, aliased=aliased)
+            else:
+                result = node.op.forward(*args)
             # A multi-output node's ``forward`` returns a tuple matched
             # positionally to ``node.outputs``; values store per BUFFER.
             results = result if isinstance(result, tuple) else (result,)
@@ -214,15 +257,19 @@ class Backend(ABC):
             if len(results) != len(bufs):
                 raise ValueError(f"node {nid!r}: forward returned {len(results)} values for {len(bufs)} outputs")
             for buf, t, r in zip(bufs, node.outputs, results, strict=True):
-                values[buf] = _coerce(r, _shape_of(t), t.dtype.np)
+                values[buf] = _coerce(r, _shape_of(t), t.dtype, preserve_bits=isinstance(node.op, BitcastOp))
 
         elapsed = (time.perf_counter() - t0) * 1000
         outputs = {name: values[name] for name in compiled.outputs}
-        return RunResult(outputs=outputs, time_ms=elapsed), pre_result
+        return RunResult(outputs=outputs, time_ms=elapsed, taps={name: values[name] for name in taps}), pre_result
 
 
-def _coerce(data, shape: tuple[int, ...], dtype: np.dtype | None = None) -> np.ndarray:
-    arr = np.asarray(data, dtype=dtype if dtype is not None else np.float32)
+def _coerce(data, shape: tuple[int, ...], dtype: DataType | None = None, *, preserve_bits: bool = True) -> np.ndarray:
+    if dtype == BF16:
+        source = np.asarray(data)
+        arr = source if preserve_bits and source.dtype == np.uint16 else encode_bf16(source)
+    else:
+        arr = np.asarray(data, dtype=dtype.np if dtype is not None else np.float32)
     if shape and arr.shape != shape:
         arr = arr.reshape(shape)
     return arr

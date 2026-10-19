@@ -40,7 +40,8 @@ cross-partition merge statements.
 A fold with an `observe` is a **scan**: the observer binds `(axis, *state)` positionally, its results are fresh names
 only kernel-boundary `OutputSpec` writes consume, and the streamed store reconstitutes inside the reduce loop after
 the observer stmts (`observed_result_names` + the `observed=` reconstitution arm). An observed fold makes the stream
-order-visible, so the schedule offers exactly the serial reduce plan and the cross-CTA split fork declines it.
+order-visible. A root without a provider chain offers a cooperative warp prefix scan beside the serial plan;
+register partials, transposed bands and cross-CTA splits remain unavailable.
 
 A recurrence is a fold that **carries a state** (`Fold.carries`): its ⊕ is the action `next` — the state becomes
 what the step computed — on every component, and its `cells` are the state's coordinates in the order the Loop IR
@@ -74,7 +75,9 @@ form is a realization of the kernel, not another kernel: the kernel keeps the li
 fork and its golden rows name. The state's cells are its axes alone, so a size-one dim the Loop IR spelled `0` holds
 no cell; a seed tensor keeps that dim, and both schedules read it with `0` there (`seed_index`). The
 register schedule reads the carrying fold itself and realizes the loop inside each CTA when the state rows are
-independent; the state's port, added at the lift for the classic realization, disappears during materialization,
+independent. An unmapped classic fallback takes the same serial form during materialization. Re-lifting a stored
+kernel reuses the state ports it already owns. The state's port, added at the lift for the classic realization,
+disappears during materialization,
 and externally read snapshots remain global outputs. Both preserve previous-state reads until the step has
 finished evaluating its outputs. The domain and choices are described in
 [`ir/schedule/ARCHITECTURE.md`](../schedule/ARCHITECTURE.md).
@@ -86,7 +89,7 @@ finished evaluating its outputs. The domain and choices are described in
 1. recursively lift nested reductions in place;
 2. remove the current loop's `Accum` statements from its step body;
 3. build the `lift`, `init`, and `combine` directly from those accumulators;
-4. a per-step `Write` over the carried state (the `025_lift_scan` shape) peels into an observer — the fold gains
+4. a per-step `Write` over the carried state (the `025_lower_scan` shape) peels into an observer — the fold gains
    `observe` with fresh `<state>__obs` results, and the store, rewritten to read the observed name, rides the stream
    position after the node, where output-spec extraction claims it as an ordinary boundary write;
 5. a loop that carries a state (`Loop.carries`) lifts to a fold folding the action `next`: the chain of loops
@@ -109,6 +112,8 @@ placement then derives the corresponding physical M/N orientation from the opera
 remains a placement fact rather than part of the Fold algebra. Where an operand owns several free axes, the smallest
 known output stride chooses its tiled axis. Undetermined layouts retain the trailing placement order. Stored schedules
 retain the same input and output tensors as the unscheduled Tile so reconstruction makes the same choice.
+A score contraction inside a chunked carrier inherits that consumer's placed M axis and uses the stream axis as N.
+Batch axes may follow the row in the free-axis order; their position does not change the nested contraction's geometry.
 
 The bilinear form is CANONICAL BY CONSTRUCTION: formation (`tile/_fromloop`) turns every load of a reduce
 step over coordinates into a slab operand (a data-dependent gather, the packed-pair table read by a decoded code,
@@ -283,12 +288,26 @@ The row is then unbound — no operand reads it — which gives the placement a 
 a left axis. That is the weaker statement, and it is the only one available where there is nothing to bind: a matvec
 whose A is a bare vector. The binding yields to it, firing only where the placement carries no extent-one free axis.
 
-Both rules are boundary-derived and general: neither recognizes a model or operation family.
+Post-init places a unit coordinate beside the trailing varying coordinate when every kernel output root is a
+contraction with one empty operand role and that same trailing coordinate in the other role. The physical matrix
+pair assigns the unit coordinate to the missing role: M for a vector on the left, N for a vector on the right.
+This orientation is a placement fact; it never swaps computed operands or their dependency-carrying bodies. The roots
+are read through zero-axis output projections, so a multi-channel carrier and independent output roots follow the
+same rule. A rank-one projection must have one free
+column that every boundary store writes directly or through a dense row-major reshape; a cut piece without explicit
+boundary stores also qualifies. With several free axes, an unshared vector qualifies when those axes are exactly the
+contraction's nonempty operand role. The earlier coordinates stay as groups, and every grouped or scattered store keeps
+its original index. In a per-batch matvec, both operands may instead read the other output coordinates; those shared
+coordinates stay on the grid as batch coordinates. B can change between batches because each batch owns an independent
+fragment. `contracts` tests the shared coordinates in the placed matrix pair, so B still cannot change across rows
+within one fragment. A mapped grid gains the same unit axis beside its trailing column; reconstructing the tile adds
+no further axis. This placement-only coordinate changes neither the computation nor its exact identity.
+
+These rules are general: none recognizes a model or operation family.
 
 The placed matrix pair must still separate the operand roles. A grouped matvec may have two free weight axes but
-no row axis on its vector. Those weight axes are not an `(m, n)` matrix pair: `contracts` leaves the node in the
-per-cell reduction domain, excluding both scalar matrix tiling and tensor-core tiles. A unit axis is harmless
-because only its zero coordinate executes.
+no row axis on its vector. A unit row supplies the missing matrix coordinate while the grouping axes remain batch
+coordinates. The unit axis is harmless because only its zero coordinate executes.
 
 Factoring preserves the pure cone's statement order. If a scalar projection between two nested Folds feeds the later
 Fold, the earlier Fold and scalar become a nested source projection; both Folds are never flattened ahead of that
@@ -354,8 +373,8 @@ A carrier that qualifies as NEITHER, because its channels multiply different ope
 does not stay one term: normalization hands it back as one fold per state under a projection re-exposing the state
 tuple (`Fold.per_state`). Two matmuls loop fusion put in one nest fold whole one at a time and not together — a tile
 holds one A fragment against a B slab per channel — and the mma tier the pair is refused is the one each of them
-alone already has. Only what refuses comes apart, and only when every state that comes out folds whole on its own,
-which is what leaves the fused shared-A form and a carrier of plain statistics as they were.
+alone already has. An independent bilinear state can also separate from a plain reduction on the same coordinates.
+The fused shared-A form and a carrier of plain statistics on one domain stay whole.
 
 ## Kernel identity
 
@@ -379,8 +398,8 @@ greedy decision memo and the budgeted descent seed, not a cache key: nothing sto
 Identity has two flavors: the default `structural=True` is schedule-equivalent (compute-unit op
 clusters collapse — `relu` and `tanh` epilogues share a key because their schedule evidence
 transfers; it is the strict golden decode's key), while `structural=False`
-names the exact kernel. Measured evidence itself joins a kernel by its `S_*` signature, not by
-this key.
+names the exact kernel. Measured evidence joins a kernel by that exact identity with its io
+(`wire.kernel_identity`, the identity of the tile its schedule fork was offered) and by nothing else.
 
 The design lesson the interface encodes: a fact a schedule reads must be in the body or the typed
 buffer roles, never re-derived beside a caller. The pool digest once shipped without per-axis extents,
@@ -445,8 +464,8 @@ Structural choices are deliberately outside this algebra. A cut or split changes
 kernel then constructs a fresh problem and fresh sites. Search ranks encoded accepted leaves and materialization
 consumes the typed schedule, so neither layer defines schedule membership.
 
-The single `tile/cut/030_cut` pass reaches a fixpoint over kernel-set alternatives before scheduling: placement
-first, then cross-CTA reduction splitting. `PLACE` uses the same tree-path codec to address a
+The single `tile/cut/030_cut` pass reaches a fixpoint over kernel-set alternatives before scheduling: placement,
+transposed-constant layout, then cross-CTA reduction splitting. `PLACE` uses the same tree-path codec to address a
 stored non-root Fold edge. The fused sibling preserves the maximal Fold tree; each semantically closed cut sibling
 writes the child Fold's complete state tuple to workspaces and replaces every canonically shared occurrence with
 ordinary `Load` edges. Both producer and consumer are fresh unmapped `TileOp`s. Unpinned cuts re-enter placement
@@ -454,9 +473,16 @@ before scheduling; any pinned cut carries the consumed placement decision on bot
 splitting. Synthesized evaluation nodes are not cut sites, and the rule neither recognizes operation families nor
 filters legal cuts by profitability.
 
+`LAYOUT@weight` offers the folded transpose and the constant's source storage when every read of that weight has two
+indices. The source arm replaces the constant input and reverses those load indices, then forms a fresh kernel; a
+group of weights with equal reads can change together. The folded arm records that its layout was decided, so the
+fixpoint moves on. The source arm's fresh identity gets its own measured schedule row, and the route records which
+layout produced it. Neither choice changes the maximal Fold region.
+
 A kernel carries no pins of its own. Pins live in the environment (the hand-pin path), and a measured row reaches a
-kernel only as evidence at its forks: every piece a cut or split mints is a brand-new kernel that inherits nothing
-from the kernel it replaced and is decided from the rows of its own signature.
+kernel only as evidence at its forks: every piece a cut or split mints, and every source-layout variant, is a
+brand-new kernel that inherits nothing
+from the kernel it replaced and is decided from the rows of its own identity.
 
 A computed edge injected into a twisted expectation is already the operand of the derived contraction that appears
 when placement materializes it. Its workspace therefore uses the consumer's public store dtype, not the producer's

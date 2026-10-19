@@ -15,17 +15,21 @@ sequence; ``ForkPoint`` wraps them for an offer.
 
 from __future__ import annotations
 
+import random
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
+from multiprocessing import current_process, get_context
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from emmy.compiler.graph import Graph
     from emmy.compiler.ir.base import Op
 
-from emmy.compiler.ir.schedule import Schedule, ScheduleContext, schedule
-from emmy.compiler.pipeline.knob import EVIDENCE_PREFIXES, METADATA_PREFIXES, evidence_row_vouches, values_equal
+from emmy.compiler.ir.schedule import Schedule, ScheduleContext, ScheduleRefused, schedule
+from emmy.compiler.pipeline.knob import evidence_row_vouches, values_equal
 
 
 class Fork(ABC):
@@ -62,13 +66,16 @@ class Fork(ABC):
     #: fan-out — legality only shrinks it), carried the same way. ``None`` outside a schedule
     #: enumeration. The greedy cold-pool budget triggers on this without walking anything.
     pool_bound: int | None = None
-    #: Upper bound on the option checks one random descent performs (the sum of per-node option
-    #: tuple lengths). ``None`` outside a schedule enumeration. The cold-pool sampler uses this
-    #: to bound work as well as the number of complete rows it draws.
-    pool_descent_bound: int | None = None
 
     @abstractmethod
     def expand(self) -> list[Op | Graph | Fork]: ...
+
+    def sample_child(self, rng: random.Random) -> Op | Graph | Fork | None:
+        """One option below this branch, drawn uniformly, or ``None`` when it has none — the step of a random
+        descent (:func:`descent_sample`). The default expands the branch and draws; a branch that can draw
+        without expanding (a schedule prefix, whose context draws one extension) overrides it."""
+        kids = self.expand()
+        return rng.choice(kids) if kids else None
 
     def narrow(self, row: Mapping) -> Fork:
         """This branch with its enumeration re-sourced to ``row`` where it can be: a schedule
@@ -82,11 +89,7 @@ class Fork(ABC):
         rule for a row that names a leaf (the decision memo's replay, the evidence pick's direct
         descent to a measured row). The base reading is value equality; a tree whose branches
         carry a prefix of the leaf's spelling or a level's projection of it refines it."""
-        return all(
-            name not in row or values_equal(name, row[name], value)
-            for name, value in self.knobs.items()
-            if not name.startswith(METADATA_PREFIXES)
-        )
+        return all(name not in row or values_equal(name, row[name], value) for name, value in self.knobs.items())
 
 
 @dataclass(frozen=True)
@@ -99,10 +102,24 @@ class DeferredFork(Fork):
     #: Other spellings of a key of ``knobs``, each mapped to the key it names — the occurrences of
     #: one clustered value, whose cut is one decision under any of them.
     aliases: dict = field(default_factory=dict)
+    #: What ``Match.output`` becomes when this arm is spliced: each buffer of the kernel the arm's
+    #: fragment replaces, mapped to the fragment output that takes it over. Set where the arm is
+    #: enumerated and applied by the engine, so an arm built on a forked worker — whose builder's
+    #: match the parent never sees — reconnects the kernel's buffers like one built in process.
+    #: ``None`` for an op rebind, and for a builder that sets the match's output itself.
+    output: dict[str, str] | None = None
     is_leaf = True
 
     def expand(self) -> list[Op | Graph | Fork]:
-        return [self.materialize()]
+        # Built once per arm: the route and placement readers each expand the same arm.
+        if "_built" not in self.__dict__:
+            object.__setattr__(self, "_built", self.materialize())
+        return [self.__dict__["_built"]]
+
+
+#: How many extensions a sampled child draws before giving the branch up as dead: a pick the composition
+#: refuses is rare (the frontier was filtered for it), so a run of them means the prefix has nothing to offer.
+_REFUSED_PICK_DRAWS = 4
 
 
 @dataclass(frozen=True)
@@ -117,13 +134,16 @@ class _ScheduleTree:
     exact_keys: frozenset[str] | None = None
 
     def step(self, context: ScheduleContext, row: Mapping) -> list[Fork]:
-        forks = []
-        for child in schedule(context, recursive=False):
-            if isinstance(child, Schedule):
-                forks.append(self.leaf(child))
-            else:
-                forks.append(_ScheduleFork(self, child, {**row, **self.row_delta(context, child)}))
-        return forks
+        """Every extension of ``context``, composed by the generic driver, as a child of the prefix spelling ``row``."""
+        return [self.child(context, row, composed) for composed in schedule(context, recursive=False)]
+
+    def child(self, context: ScheduleContext, row: Mapping, composed: ScheduleContext | Schedule) -> Fork:
+        """One composed extension of ``context`` as a child: a complete schedule becomes a leaf, a context the next
+        prefix carrying ``row`` plus what the step decided. The one place a child is built, for the walk
+        (:meth:`step`) and the draw (``_ScheduleFork.sample_child``)."""
+        if isinstance(composed, Schedule):
+            return self.leaf(composed)
+        return _ScheduleFork(self, composed, {**row, **self.row_delta(context, composed)})
 
 
 @dataclass(frozen=True)
@@ -144,14 +164,25 @@ class _ScheduleFork(Fork):
 
     @property
     def pool_bound(self) -> int:
-        return self.context.problem.bounds[0]
-
-    @property
-    def pool_descent_bound(self) -> int:
-        return self.context.problem.bounds[1]
+        return self.context.problem.bound
 
     def expand(self) -> list[Fork]:
         return self.tree.step(self.context, self.row)
+
+    def sample_child(self, rng: random.Random) -> Fork | None:
+        """One child drawn without expanding: the context draws one compatible extension
+        (:meth:`ScheduleContext.random_step`), composed by :meth:`_ScheduleTree.child` as the walk composes
+        every extension. A pick the composition refuses is drawn again, as the walk skips such a pick; ``None``
+        is a dead end the descent restarts from."""
+        for _ in range(_REFUSED_PICK_DRAWS):
+            try:
+                composed = self.context.random_step(rng)
+            except ScheduleRefused:
+                continue
+            if composed is None:
+                return None
+            return self.tree.child(self.context, self.row, composed.schedule if composed.schedule.kernel is not None else composed)
+        return None
 
     def narrow(self, row: Mapping) -> Fork:
         """The root of a schedule tree re-sourced to ``row``: its problem offers the row's values at
@@ -180,8 +211,6 @@ class _ScheduleFork(Fork):
         is a pin, not a decision, and still admits, as does a bare family key — a bare pin permits
         OFF."""
         for name, value in self.knobs.items():
-            if name.startswith(METADATA_PREFIXES):
-                continue
             family = name.split("@", 1)[0]
             if name in row:
                 want = str(row[name])
@@ -234,6 +263,102 @@ def exact_schedule_leaf(
     return keys, root.tree.exact({key: str(value) for key, value in row.items() if key in keys})
 
 
+def descent_sample(options: Sequence[Op | Graph | Fork], *, draw: int, seed: object, skip: Callable | None = None) -> list:
+    """Up to ``draw`` complete leaves drawn by seeded uniform descents through the lazy tree — a child at
+    random at every branch (:meth:`Fork.sample_child`, which a schedule prefix answers without expanding), so
+    the draw reaches every level's values the way an emission-order prefix never does and costs the options
+    it tries rather than the frontiers it passes. Dead ends (a branch with no child — legality killed the
+    subtree) and leaves ``skip`` refuses retry, up to four attempts per row. Duplicates are kept; the caller
+    decides whether a repeat matters. The draw is a pure function of the tree, ``draw`` and ``seed``."""
+    rng = random.Random(str(seed))
+    sample: list = []
+    attempts = 4 * draw
+    while len(sample) < draw and attempts > 0:
+        attempts -= 1
+        option = rng.choice(options)
+        dead = False
+        while isinstance(option, Fork) and not option.is_leaf:
+            option = option.sample_child(rng)
+            if option is None:
+                dead = True
+                break
+        if dead or (skip is not None and skip(option)):
+            continue
+        sample.append(option)
+    return sample
+
+
+#: The seeded pieces a parallel draw is cut into — fixed, so the rows do not depend on the worker count.
+_DRAW_CHUNKS = 64
+
+#: The tree a forked draw worker reads: set by the parent before the fork, so the lazy tree is inherited, never
+#: pickled.
+_DRAWING: tuple | None = None
+
+
+def _draw_chunk(job: tuple[str, int]) -> list[dict]:
+    seed, draw = job
+    options, skip = _DRAWING
+    return [leaf_knobs(leaf) for leaf in descent_sample(options, draw=draw, seed=seed, skip=skip)]
+
+
+def parallel_descent_rows(
+    options: Sequence[Op | Graph | Fork], *, draw: int, seed: object, skip: Callable | None = None, workers: int = 1
+) -> list[dict]:
+    """The knob rows of :func:`descent_sample` cut into :data:`_DRAW_CHUNKS` pieces, each seeded on ``seed`` and
+    its index and drawn on up to ``workers`` forked processes. The rows are a pure function of the tree, ``draw``
+    and ``seed``, whatever ``workers`` is; ``1`` draws every piece in this process. A worker returns rows, not
+    leaves: the lazy tree cannot cross a process boundary, so the caller builds only the leaf it picks."""
+    global _DRAWING
+    jobs = [(f"{seed}/{i}", draw // _DRAW_CHUNKS + (i < draw % _DRAW_CHUNKS)) for i in range(_DRAW_CHUNKS)]
+    jobs = [job for job in jobs if job[1]]
+    _DRAWING = (options, skip)
+    try:
+        chunks = _forked(_draw_chunk, jobs, workers)
+    finally:
+        _DRAWING = None
+    return [row for chunk in chunks for row in chunk]
+
+
+def _forked(fn: Callable, jobs: Sequence, workers: int) -> list:
+    """``fn`` over ``jobs``, on up to ``workers`` forked processes that inherit this process's memory — the fork
+    is the point: the children read what the parent set up and send back only results. One worker runs them here,
+    and so does a daemonic process, which may not start children (a vLLM worker compiling a kernel with no
+    evidence draws its cold pool in place)."""
+    if workers <= 1 or len(jobs) < 2 or current_process().daemon:
+        return [fn(job) for job in jobs]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*fork.*", category=DeprecationWarning)
+        with ProcessPoolExecutor(min(workers, len(jobs)), mp_context=get_context("fork")) as pool:
+            return list(pool.map(fn, jobs))
+
+
+#: The arms a forked expansion worker builds: set by the parent before the fork, so each arm's builder is
+#: inherited, never pickled.
+_EXPANDING: Sequence[DeferredFork] | None = None
+
+
+def _expand_arm(index: int) -> Op | Graph | Fork:
+    return _EXPANDING[index].expand()[0]
+
+
+def parallel_expand(arms: Sequence[DeferredFork], *, workers: int = 1) -> None:
+    """Build every unbuilt arm of ``arms`` — a kernel-set fork's cuts, each a splice of the parent kernel — on
+    up to ``workers`` forked processes, so a pick that ranks them all pays one arm's wall time per worker rather
+    than their sum. A worker returns what the arm's own expansion builds, and the parent memoizes it on the arm
+    exactly where :meth:`DeferredFork.expand` would, so every later reader finds it built. Nothing else crosses
+    back: what the arm's splice needs besides the fragment rides the arm (:attr:`DeferredFork.output`)."""
+    global _EXPANDING
+    pending = [index for index, arm in enumerate(arms) if "_built" not in arm.__dict__]
+    _EXPANDING = arms
+    try:
+        built = _forked(_expand_arm, pending, workers)
+    finally:
+        _EXPANDING = None
+    for index, value in zip(pending, built, strict=True):
+        object.__setattr__(arms[index], "_built", value)
+
+
 def iter_leaves(options: Iterable[Op | Graph | Fork]) -> Iterator[Op | Graph | Fork]:
     """Yield complete leaves depth-first without retaining the expanded tree or Python stack."""
     stack = [iter(options)]
@@ -247,32 +372,6 @@ def iter_leaves(options: Iterable[Op | Graph | Fork]) -> Iterator[Op | Graph | F
             stack.append(iter(option.expand()))
         else:
             yield option
-
-
-#: The ``S_*`` stamps the SCHEDULE fork mints on its own rows — properties of the offered schedule
-#: SPACE, not of the kernel. A kernel-set fork is decided before any schedule exists, so its
-#: candidates cannot carry them however warp-eligible the kernel turns out to be; a recorded row's
-#: copy therefore must not join against them (``policy/greedy._route_candidates``).
-SCHEDULE_FORK_STAMPS = frozenset({"S_warp_eligible"})
-
-
-def fork_signature(root_op: Op, options: Sequence[Op | Graph | Fork], ctx) -> frozenset:
-    """The ``S_*`` signature every candidate at one fork shares — the key a measured row of this
-    kernel is filed under. The offer op's structural stamp under the run's context features, plus
-    the stamps the enumeration itself minted on its options (``S_warp_eligible``: a property of
-    the offered space, carried on the pool's top level and inherited by every leaf). Read here by
-    the deploy's evidence pick and by the golden replay that keys a record's rows, so the two
-    agree by construction."""
-    base = {**ctx.features(), **dict(getattr(root_op, "knobs", None) or {})}
-    for option in options:
-        base.update((key, value) for key, value in (getattr(option, "knobs", None) or {}).items() if key.startswith(EVIDENCE_PREFIXES))
-    return stamp_signature(base)
-
-
-def stamp_signature(knobs: Mapping) -> frozenset:
-    """The evidence signature of a knob dict, values as strings: its ``S_*`` stamps and its exact ``I_kernel``
-    identity — the one spelling a measured row, a stored kernel and a fork's offer are joined on."""
-    return frozenset((key, str(value)) for key, value in knobs.items() if key.startswith(EVIDENCE_PREFIXES))
 
 
 def leaf_for(options: Sequence[Op | Graph | Fork], row: Mapping, *, skip: Callable[[dict], bool] | None = None):
@@ -292,8 +391,7 @@ def leaf_for(options: Sequence[Op | Graph | Fork], row: Mapping, *, skip: Callab
         knobs = leaf_knobs(option)
         if skip is not None and skip(knobs):
             continue
-        tunable = {key: str(value) for key, value in knobs.items() if not key.startswith(METADATA_PREFIXES)}
-        if evidence_row_vouches(tunable, row):
+        if evidence_row_vouches({key: str(value) for key, value in knobs.items()}, row):
             return option, knobs
     return None
 

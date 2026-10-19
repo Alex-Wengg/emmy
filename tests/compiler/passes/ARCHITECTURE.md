@@ -15,6 +15,11 @@ This catches semantic bugs that structural tests (checking which ops are
 present) cannot: wrong axis in a reduction, swapped operands, missing
 scale constant, incorrect coordinate mapping, etc.
 
+Kernel storage tests compare the padded shared state against ordered global launches on identical inputs.
+They cover selected and full updates, low-precision snapshots, a wider seed, externally visible carry ports and
+shared-memory limits. A recorded storage choice must also replay through strict evidence without a pin. The
+selected-load merge is held to memory order, carried loads and late coordinates.
+
 ## File Layout
 
 ```
@@ -35,7 +40,9 @@ tests/compiler/passes/
 ├── test_move_catalog.py           # schedule catalogs, site trees, and independent-root compatibility
 ├── test_cut_forks.py              # fused/cut Fold-edge offers and pinned CUDA lowering
 ├── test_placement_routing.py       # frontend placement pins, routing rows, and MIMO preservation
+├── test_layout_forks.py            # transposed constant layout, measured choice, pins, and golden body
 ├── test_split_fresh_kernels.py    # generic cross-CTA Fold splitting and fresh-piece invariants
+├── test_batched_matvec_unit_row.py # per-batch matvec MMA and numerical parity
 ├── test_masked_tile.py             # masked-tile pass (dynamic-shape boundary guard)
 ├── test_chunk_early_stop.py        # the chunk tier's stream bounds, read off the coordinate masks where the loop opens
 ├── test_stage_inputs_classify.py   # Stage-input classifier
@@ -60,6 +67,9 @@ entry. `tests/compiler/conftest.py` owns the `run_graph` parametrized fixture.
 
 | Rule file          | Op                      | Structural | Correctness       |
 |--------------------|-------------------------|------------|-------------------|
+| `007_conv1d.py`    | `Conv1dOp`              | —          | ✓ (dense, depthwise) |
+| `008_conv_transpose1d.py` | `ConvTranspose1dOp` | —          | ✓ (polyphase, ± padding) |
+| `009_conv2d.py`    | `Conv2dOp`              | —          | ✓ (± padding)     |
 | `010_sdpa.py`      | `SdpaOp`                | ✓          | ✓                 |
 | `020_silu.py`      | `ElementwiseOp("silu")` | ✓ (f16/bf16 opmath; f32/f64 controls) | ✓                 |
 | `030_pow.py`       | `ElementwiseOp("pow")`  | ✓          | ✓                 |
@@ -70,7 +80,7 @@ entry. `tests/compiler/conftest.py` owns the `run_graph` parametrized fixture.
 | `120_transpose.py` | `TransposeOp`           | —          | ✓                 |
 | `130_reshape.py`   | `ReshapeOp`             | —          | ✓                 |
 | `140_slice.py`     | `SliceOp`               | —          | ✓                 |
-| `150_cat.py`       | `CatOp`                 | —          | ✓                 |
+| `150_cat.py`       | `CatOp`                 | —          | ✓ (1, 2, 3 tensors) |
 
 ### Optimization (`passes/frontend/optimization/`)
 
@@ -78,26 +88,28 @@ entry. `tests/compiler/conftest.py` owns the `run_graph` parametrized fixture.
 |------------------------------------|-----------------------------|------------|-----------------------------------|
 | `002_insert_broadcast_indexmap.py` | `ElementwiseOp` (broadcast) | ✓          | ✓ (1D, scalar, 3D, RMSNorm chain) |
 
-### Fusion (`passes/loop/lifting/` + `passes/loop/fusion/`)
+### Lowering to loops and fusion (`passes/loop/lowering/` + `passes/loop/fusion/`)
 
-Lifting wraps each surviving tensor primitive (elementwise / reduce / scan / indexmap / gather) in a trivial
-single-op `LoopOp`. Fusion takes a maximal downstream region; separate terminal branches become output ports, and
-one splicer worklist inlines common producers once across all roots. `test_fusion_rules.py` runs lifting followed by
+Lowering wraps each surviving tensor primitive (elementwise / reduce / scan / indexmap / gather) in a single-op
+`LoopOp`. Fusion takes a maximal downstream region; separate terminal branches become output ports, and
+one splicer worklist inlines common producers once across all roots. `test_fusion_rules.py` runs lowering followed by
 fusion as a single pass; `tests/compiler/ir/loop/test_splicer.py` covers the multi-root worklist and scope rules
 and output equivalence clusters directly, while the pass tests exercise the resulting graph through Loop and CUDA
 lowering.
+`test_roll_recurrence.py` keeps a chain that re-derives no state when fused (`x * x * x`, `tanh(tanh(x))`) in that
+fused region, while chains that read their state at another cell, or whose states are read outside the chain, roll.
 
-| Rule file                              | Op                         | Tested via                                                                         |
-|----------------------------------------|----------------------------|------------------------------------------------------------------------------------|
-| `loop/lifting/010_lift_elementwise.py` | `ElementwiseOp` → `LoopOp` | `test_fusion_rules.py` (pass fixpoint)                                             |
-| `loop/lifting/020_lift_reduce.py`      | `ReduceOp` → `LoopOp`      | `test_fusion_rules.py::test_contraction_*`                                         |
-| `loop/lifting/025_lift_scan.py`        | `ScanOp` → `LoopOp`        | `test_pipeline_semantics.py::test_scan_*`                                          |
-| `loop/lifting/030_lift_indexmap.py`    | `IndexMapOp` → `LoopOp`    | `test_optimization_rules.py::test_matmul_with_transpose_fuses_to_one_kernel` (e2e) |
-| `loop/lifting/040_lift_gather.py`      | `GatherOp` → `LoopOp`      | `test_torch_ops.py::test_gather`                                                   |
-| `loop/lifting/090_spell_store_rounding.py` | public narrowing boundary → typed `copy` | `test_spell_store_rounding.py`                             |
-| `loop/fusion/010_merge_loop_ops.py`    | `LoopOp → LoopOp` (splice) | `test_fusion_rules.py` (fixpoint)                                                  |
+| Rule file                                    | Op                                     | Tested via                                                                         |
+|----------------------------------------------|----------------------------------------|------------------------------------------------------------------------------------|
+| `loop/lowering/010_lower_elementwise.py`     | `ElementwiseOp` → `LoopOp`             | `test_fusion_rules.py` (pass fixpoint)                                             |
+| `loop/lowering/020_lower_reduce.py`          | `ReduceOp` → `LoopOp`                  | `test_fusion_rules.py::test_contraction_*`                                         |
+| `loop/lowering/025_lower_scan.py`            | `ScanOp` → `LoopOp`                    | `test_pipeline_semantics.py::test_scan_*`                                          |
+| `loop/lowering/030_lower_indexmap.py`        | `IndexMapOp` → `LoopOp`                | `test_optimization_rules.py::test_matmul_with_transpose_fuses_to_one_kernel` (e2e) |
+| `loop/lowering/040_lower_gather.py`          | `GatherOp` → `LoopOp`                  | `test_torch_ops.py::test_gather`                                                   |
+| `loop/lowering/090_spell_store_rounding.py` | public narrowing boundary → typed copy | `test_spell_store_rounding.py`                                                     |
+| `loop/fusion/010_merge_loop_ops.py`          | `LoopOp` → `LoopOp` (splice)           | `test_fusion_rules.py` (fixpoint)                                                  |
 
-Numerical correctness for lifted + merged kernels runs through the
+Numerical correctness for lowered and merged kernels runs through the
 numpy backends in three places:
 
 - `test_fusion_rules.py::test_*_correctness` — runs the pre- and
@@ -113,6 +125,14 @@ numpy backends in three places:
   on, ~3s); the `_cuda` variants are gated by `@requires_cuda`.
 
 ### Tile lowering (`passes/tile/`)
+
+Independent equal-domain output sweeps have structural and numerical reform checks. Flat and rectangular output
+views become one shared-input contraction, and both results are compared with NumPy. Transposed output domains
+prove one or two shared input coordinates across differently named reduction axes, with distinct row/channel values
+and preserved output index order. Equal single-axis symbolic domains and windows stay intact. Unequal domains or
+windows, incompatible or repeated input coordinates, cross-coordinate dependencies, variable capture, scalar
+coordinate uses, and repeated output buffers retain their existing form. Separate Fold tests hold expression
+substitution to its parameter-binding and closure contracts.
 
 `test_twisted_rewrite.py` traces softmax, SDPA, and causal SDPA through total lift and the same `020_twisted` rule,
 then checks the resulting carrier arity, the derived contraction sites, and that plain and causal SDPA reach both MMA
@@ -162,14 +182,18 @@ output-tile rows when no MMA atom applies. `test_cut_forks.py` proves that `040_
 enumerator while an undecided cuttable seam remains, and calls it once placement is decided. It also checks fused and
 closed Fold-edge choices for SDPA score
 production, causal SDPA, and multi-output roots, then pins each representative cut through CUDA lowering, and proves
+that a named child can consume successive placement pins, including a site exposed by the first cut, while an unknown
+later pin remains unmatched. It also checks
 child-identity schedule receipts round-trip: under a pinned cut each child's stored identity decodes only its own
 kernel's schedule rows and keys its evidence row by that identity, including when target-boundary drift makes the
 regenerated
 Loop target contain several kernels and the stored identity must select one. Direct
 contraction-operand cuts remain strict xfails until Tile IR represents their materialized workspace dtype.
+The row-address tests check that one block workspace feeds packed-pair readers, that an out-of-bounds pair stays
+separate, and that a CUDA cut matches independent matrix and reshape results.
 The output-owning cut has its own group there: which seams own an output, that realizing one leaves single-output
-pieces whose placements gain a grid axis, that a piece takes the projection statements its own store reads, and the
-two refusals — a shared epilogue statement no piece can own, and a partition where no piece would gain an axis. The
+pieces whose placements gain a grid axis, that a piece takes the projection statements its own store reads, and that
+independent outputs remain cuttable when their grids agree. Shared epilogue statements prevent output ownership. The
 shared-epilogue shape is spelled in Python rather than taken from a case: both corpus shapes join their branches with
 an empty root body, so the body-splitting half of the ownership rule has no case to exercise it.
 This group is the ONLY coverage the output-owning cut has, and the corpus deliberately carries none. A case's
@@ -223,3 +247,9 @@ classic and register addressing, and time-dependent lifts retain their time bind
 Independent output sweeps, including dead loads left after lifting, have structural and numerical checks. Vector
 memory tests prove alignment across complete row strides, not just the last coordinate.
 Volta corpus cases exercise the shared FP16 promotion in direct and staged matrix schedules.
+Native FP4 staging tests refuse symbolic K and symbolic-row TMA, and reuse one CUDA compilation across runtime
+row counts 1, 17, 63, 64, 65, 128, 256 and 512 against independently decoded NumPy inputs with non-power-of-two
+scales, at K=768 and K=5120.
+Register epilogue tests check block-scale and split-coordinate loads at each fragment element, including a quotient
+boundary. Packed FP4 output has corpus coverage and independent bit-for-bit NumPy checks at static width 16 and
+runtime width 65; its conversion helper must be defined in the rendered kernel, including fused store epilogues.

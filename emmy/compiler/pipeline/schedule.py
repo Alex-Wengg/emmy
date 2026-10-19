@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from frozendict import frozendict
 
 from emmy.compiler.ir.schedule import Schedule, ScheduleContext
-from emmy.compiler.pipeline.fork import Fork, iter_leaves, schedule_forks
+from emmy.compiler.pipeline.fork import Fork, schedule_forks
 
 
 @dataclass(frozen=True)
@@ -30,20 +30,11 @@ class ScheduleLeaf(Fork):
         return [self.materialize(self.schedule, self.knobs)]
 
 
-class _SampleRow(dict):
-    __slots__ = ("schedule",)
-
-    def __init__(self, schedule: Schedule, row: Mapping) -> None:
-        super().__init__(row)
-        self.schedule = schedule
-
-
 def fork_schedule(
     context: ScheduleContext,
     *,
     codec,
     inherited_knobs: Mapping,
-    row_prefix: Mapping,
     materialize: Callable[[Schedule, dict], object],
     pool_id: str,
     sample=None,
@@ -51,7 +42,7 @@ def fork_schedule(
     """Build and optionally sample a lazy fork tree from a semantic schedule context."""
 
     def leaf(schedule: Schedule) -> ScheduleLeaf:
-        row = frozendict({**row_prefix, **codec._encode(schedule)})
+        row = frozendict(codec._encode(schedule))
         return ScheduleLeaf(schedule, row, dict(inherited_knobs), materialize, pool_id)
 
     keys = frozenset(codec.keys())
@@ -67,7 +58,7 @@ def fork_schedule(
 
     roots = schedule_forks(
         context,
-        branch_knobs={**inherited_knobs, **row_prefix},
+        branch_knobs=dict(inherited_knobs),
         row_delta=codec.delta,
         leaf=leaf,
         pool_id=pool_id,
@@ -76,9 +67,9 @@ def fork_schedule(
     )
     if sample is None:
         return roots
-    drawn = sample.take(_SampleRow(option.schedule, option.row) for option in iter_leaves(roots) if isinstance(option, ScheduleLeaf))
-    sample.totals[pool_id] = drawn.total
-    return [ScheduleLeaf(row.schedule, frozendict(row), dict(inherited_knobs), materialize, pool_id) for row in drawn.rows]
+    leaves = sample.draw(roots)
+    sample.totals[pool_id] = len(leaves)
+    return leaves
 
 
 __all__ = ["ScheduleLeaf", "fork_schedule"]

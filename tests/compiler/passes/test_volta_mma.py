@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from emmy.compiler.backend.cuda import nvcc
@@ -69,6 +71,8 @@ def _pin(monkeypatch, atom: str, *, tile: str = "f1x1", stage: str = "") -> None
 
 
 def _pin_sdpa(monkeypatch) -> None:
+    # One fused kernel is what these tests read the source of; the placement prior would otherwise decide the cut.
+    monkeypatch.setenv("EMMY_PLACE", "fuse")
     monkeypatch.setenv("EMMY_WORK", "w1x1")
     monkeypatch.setenv("EMMY_TILE@map.1/twist.1/inner", f"{VOLTA}/f1x1/k4")
     monkeypatch.setenv("EMMY_TILE@map.1/twist", f"{VOLTA}/f1x1/k4")
@@ -142,6 +146,27 @@ def test_volta_warp_tiles_respect_accumulator_register_budget() -> None:
     assert max(p.reg_m * p.reg_n for p in volta) == 16
     assert max(p.reg_m * p.reg_n for p in ampere) == 32
     assert all(p.reg_m * p.reg_n * p.atom.accumulator_registers_per_lane <= MAX_FRAGMENT_REGISTERS for p in volta + ampere)
+
+
+def test_volta_chunks_reach_the_width_the_16_deep_atoms_do() -> None:
+    """Volta's k4 atom reaches a 128-element K chunk at bk 32, the chunk a k16 atom reaches at bk 8: a skinny GEMM's
+    K-contiguous rows stream in 256 B runs rather than 64 B. No other atom's chunk domain moves."""
+    volta = {p.bk for p in warp_tile_moves((VOLTA,))}
+    assert volta == {1, 2, 4, 8, 16, 32}
+    for name in ATOM_REGISTRY:
+        if ATOM_REGISTRY[name].atom_k > 4:
+            assert {p.bk for p in warp_tile_moves((name,))} == {1, 2, 4, 8}, name
+
+
+def test_sm70_deep_chunk_stages_k_contiguous_b_through_the_crosswise_layout(monkeypatch) -> None:
+    """A bk 16 chunk is 64 K-contiguous elements per staged row: the copy and the crosswise drain cover both 32-column
+    halves of the slab."""
+    _pin(monkeypatch, VOLTA, tile="f2x4/k16", stage="d2/smem")
+    monkeypatch.setenv("EMMY_WORK", "w1x2")
+    src, knobs = _source(_graph(m=32, n=128, k=256, trans=True), Context(compute_capability=(7, 0)))
+    assert family_value(knobs, "TILE") == f"{VOLTA}/f2x4/k16"
+    assert "_b_smem[emmy_volta_crosswise(" in src
+    assert "_ks += 64" in src, "one chunk carries 64 K elements"
 
 
 @pytest.mark.parametrize("trans", [False, True])
@@ -424,10 +449,10 @@ def test_sm70_attention_uses_the_volta_fragment_layout(monkeypatch) -> None:
 def test_sm70_causal_attention_selects_the_mask_per_fragment_element(monkeypatch) -> None:
     _pin_sdpa(monkeypatch)
     src, _ = _source(_sdpa_graph(d=256, causal=True, dynamic=True), Context(compute_capability=(7, 0)))
-    assert "float _w0_0_v3[8]" in src
-    assert "_w0_0_v3[_e] = _w0_0_v1[_e] + __half2float(in1);" in src
-    assert "_w0_0_v3[0] = ((a0_b * 16 + a0_u * 16 + 0 + _vr < a1__ck + 0 + _vc) ? (-1e+30f) : (_w0_0_v3[0]));" in src
-    assert "_w0_0_v3[0] = ((a1__ck + 0 + _vc >= seq_len) ? (-1e+30f) : (_w0_0_v3[0]));" in src
+    (fragment,) = re.findall(r"(_w0_0_v\d+)\[_e\] = _w0_0_v\d+(?:__t\d+)?\[_e\] \+ __half2float\(in1\);", src)
+    assert f"float {fragment}[8]" in src
+    assert f"{fragment}[0] = ((a0_b * 16 + a0_u * 16 + 0 + _vr < a1__ck + 0 + _vc) ? (-1e+30f) : ({fragment}[0]));" in src
+    assert f"{fragment}[0] = ((a1__ck + 0 + _vc >= seq_len) ? (-1e+30f) : ({fragment}[0]));" in src
     assert "__frow" not in src and "__fcol" not in src
     assert "emmy_c_to_a_f16_m8n8k4" in src
 
@@ -437,6 +462,7 @@ def test_sm70_attention_rings_its_key_and_value_through_registers(monkeypatch) -
     and value load into packed registers past the barrier, the softmax and expectation of this
     chunk run, and the unpack and deposit land them in the free slot. The loads stay behind the
     barrier — a load moved above it would refill the vectors the unpack has not read yet."""
+    monkeypatch.setenv("EMMY_PLACE", "fuse")
     monkeypatch.setenv("EMMY_WORK", "w4x1")
     monkeypatch.setenv("EMMY_TILE@map.1/twist.1/inner", f"{VOLTA}/f1x2/k2")
     monkeypatch.setenv("EMMY_TILE@map.1/twist", f"{VOLTA}/f1x8/k8")

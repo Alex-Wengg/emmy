@@ -6,17 +6,22 @@ afterwards.
 
 ## `010_materialize` — bind the schedule to threads (and expand the contraction)
 
-`010_materialize` is a thin wrapper: after the split-survivor assert it makes **one** call to
-`_factor.factorize(tile, root)`, the entry to the recursive emitter, then passes the finished body through
-`_drop_repeated_declarations` — the emitted body's one legality guard. Operand cones splice INDEPENDENTLY
-(`Fold.spliced_step`), so two sibling cones reading one shared broadcast constant each carry their own copy of its
-`buf[0]` `Load`, under the same SSA name and at the same address; flattened into one loop body that is two C
-declarations of one name, which nvcc rejects (*already declared in the current scope*). The repeat binds nothing new,
-so it is dropped with NO rewrite — which is what keeps the guard narrow enough to run over a WHOLE kernel body. The
-renaming forms (`_atom._dedup_loads`, `stmt.dedup_loads`) collapse two DIFFERENT names at one address, which needs a
-memory-effect reading neither has: a `Write` or an async fill between two identical loads of a staged buffer makes the
-second a different value. A same-name repeat cannot hide such a reload, since a rebind in one C scope is already
-illegal. A name re-bound to a DIFFERENT address is left alone: that is an SSA fault and must surface as one.
+`010_materialize` is a thin wrapper: after the split-survivor assert it makes **one** call to `_factor.factorize(tile,
+root)`, the entry to the recursive emitter, spells every `Affine` statement of the finished body as its binary
+`Assign`s over `Let`-bound literals — Kernel IR evaluates one operation at a time, so no kernel pass meets a sum —
+then passes it through `_drop_repeated_declarations` — the emitted body's one legality guard. Operand cones splice
+INDEPENDENTLY (`Fold.spliced_step`), so two sibling cones reading one shared broadcast constant each carry their own
+copy of its `buf[0]` `Load`, under the same SSA name and at the same address; flattened into one loop body that is two
+C declarations of one name, which nvcc rejects (*already declared in the current scope*). The repeat binds nothing
+new, so it is dropped with NO rewrite — which is what keeps the guard narrow enough to run over a WHOLE kernel body.
+The renaming forms (`_atom._dedup_loads`, `stmt.normalize.place_values`) collapse two DIFFERENT names at one address,
+which needs a memory-effect reading neither has: a `Write` or an async fill between two identical loads of a staged
+buffer makes the second a different value. A same-name repeat cannot hide such a reload, since a rebind in one C scope
+is already illegal. A same-dtype `copy` of a value already bound to what its name holds is the same repeat in another
+spelling (a placement cut drops a workspace read's identity cast in one cone and keeps it in a sibling), and is
+dropped too. A name re-bound to a DIFFERENT address is left alone: that is an SSA fault and must surface as one.
+Repeated `Let` bindings follow the same rule: their expression representation and declared dtype must agree. Signed
+zero remains distinct, and an incompatible repeated declaration still surfaces as an SSA fault.
 
 When a projection recomputes only some outputs of an already bound reduction, its smaller loop is a distinct
 statement. Its exported accumulators receive distinct names through the same positional renaming used for other
@@ -70,6 +75,18 @@ it seals through the one `grid_tile` finalizer (the article's "schedule separate
 
 ### One emitter: the term's lowering
 
+A transposed cooperative reduction derives its output grid and reduction partition from the schedule's output lane
+count. `coop-t` uses 32 output lanes; `coop-t/n8` uses eight. The shared-memory combine groups by that same count, and
+the last output block clamps reads and guards stores when the extent does not divide into complete output groups.
+Serial providers are evaluated under each output lane's coordinates. A transposed root cannot share its band with a
+partitioned provider. Demand predicates independent of the output lane may guard the entire collective; lane-varying
+predicates never bypass its barriers. The shared-memory tree retains the ordinary band's reduction order.
+
+An observed root uses a warp prefix scan when its schedule cooperates. Each lane injects one consecutive value,
+shuffle-up rounds retain the inclusive prefixes, and the previous group's final state is merged before the observer
+writes. Padded lanes inject the monoid identity and discard their stores. The last lane broadcasts the group's state
+before the next chunk. Provider chains and register partials retain the serial scan.
+
 One recursion binds, and nothing walks the tree for statements. The **root** recursion `_factorize(op, ctx, tail,
 out_val)` binds a node to the grid: a zero-axis `Fold` recurses through its operand roots (projection → `tail`), and
 each leaf binds via the one `_bind` pipeline. The per-cell Loop IR of any node — the degenerate fold's whole body, the
@@ -109,6 +126,14 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 
 ### The one factorizer
 
+The scalar binding arm refuses a row that selects a contraction tile inside the subtree it lowers serially. The
+schedule offer applies the same rule (`TileOp.nested_tiles`), so an enumerated row should not reach this refusal,
+and a pin that names such a tile is refused at the offer with the rule's reason. The binder keeps the check for the
+cases the offer does not see: a root whose row tiles it but that still lowers serially here (its tile has no placed
+`(m, n)` axes, or the grid has fewer than two axes), a `TILE` at that root itself, and a root the binder peels to
+under that schedule that differs from the one `ops.kernel_roots` reads from the term. The greedy's rejected-row
+path then retries another schedule.
+
 `_factor.factorize(tile, root)` is the **entry** every `TileOp` root lowers through: it builds the ambient `Ctx` and
 binds a wholly serial tree directly, so shared carriers are lowered together. A schedule that tiles an output or
 partitions a reduction dispatches into `_factorize(op, ctx, tail, out_val)`. `_factorize` walks the node tree — a
@@ -127,7 +152,8 @@ operands members hoist ahead of their loops) binds through the chain arm (`_tile
 carries a partition — a contraction reaches this arm too whenever nothing tiles its output, which is where a fused
 norm-linear's own row statistic stops being evaluated once per thread — every partitioned member's hoisted loop and
 the root's own stride around ONE lane axis in body order, the segments between them per cell on every lane, and a
-stamped transposed band on such a root falls to the serial fold; each ILP copy suffixes only its per-copy SSA temps
+transposed root accepts serial providers but cannot share a band with a partitioned member. Each ILP copy suffixes
+only its per-copy SSA temps
 (`__r{r}`)
 — the shared iteration coordinates, **including any nested contraction's own reduce-axis var** (whose `for`
 declaration `copy_cell` does not rename), stay shared, so each copy re-declares its own nested
@@ -409,7 +435,10 @@ and clamping only its start still copies past the extent. A **multi-channel prod
 `(b, acc)` channels over one shared A edge, either a computed cone or a materialized load; `_AtomOps.channels` reads
 them off the node) fills one B slab per channel, drains N mma chains off the ONE ldmatrix'd A fragment into
 per-channel C fragments (`_fold_frag`), and the projection (SwiGLU) combines the channels per element in the store's
-epilogue `Lambda` (`extra_frags`). Materialized A copies into the same single A slab; computed A evaluates into it. A
+epilogue `Lambda` (`extra_frags`). Epilogue loads substitute the cell base plus each lane's row and column offsets
+inside their source index expressions, so block-scale quotients and split quotient/remainder coordinates retain
+their arithmetic. FP4 conversion helper emission reads the rendered kernel body, including these fused epilogues.
+Materialized A copies into the same single A slab; computed A evaluates into it. A
 computed A always takes the synchronous compute fill, as anywhere else, while its stored B slabs copy beside it with
 cp.async (`smem`) or TMA box copies (`smem-tma`, depths 1 and 2, with or without `/p2`); a materialized A stages
 through whichever transport the card offers, each depositing the same `1 + N` slabs — so the gate/up GEMM rings on
@@ -568,8 +597,16 @@ smem→register double-buffer) stays warp-only (an `ldmatrix` transform). The ne
 accumulator lifetime is handled by seeding the per-cell accumulators once in `_ScalarOps.state` (outside the outer
 loop) and marking the inner drain `Loop(seed=False)` so it folds without re-declaring. A masked **M** is supported
 (the drain indexes the slab by LOCAL tile coords, so an overhanging row reads in-slab and its store is guarded); a
-masked **N**, transposed **B**, or plainly transposed **A** declines staging (gmem-direct). TMA cannot transpose a
-physical `(K, M)` box into an `(M, K)` slab; issuing it poisons the CUDA context. Unstaged is byte-identical gmem-direct.
+masked **N** is supported for a transposed B, whose N-major slab copies complete K chunks. A copied K-major B with
+masked N and a plainly transposed A retain direct loads. TMA cannot transpose a physical `(K, M)` box into an
+`(M, K)` slab; issuing it poisons the CUDA context. Unstaged is byte-identical gmem-direct.
+
+A planar whole contraction with computed operands uses the synchronous depth-one compute fill. The scalar drain
+shares A across its independent product channels, with one B slab per channel. A and B keep their own element dtypes;
+the resolver includes every slab and statistic row in its budget. An operand varying along the other output axis
+retains direct loads. A copied operand needs a proven unit global stride; an unknown stride uses compute fill.
+For copied row-major A and N-major B, a 128-byte shared-memory row pitch gains a 16-byte pad to spread its rows across
+banks while preserving vector alignment. TMA boxes stay dense. Fill, drain and the resolver use the same padding.
 
 **Split-K composes with staging.** A split partial is a fresh kernel whose own schedule fork resolves a `STAGE`
 spec against the SLICED view (the `kslice` extent + the `ksplit`-offset operand indices), so the partial kernel's
@@ -689,14 +726,38 @@ the slab (`_restage_loads`). So every staging decision rides a `Stage` on the sc
 row · cp.async / TMA 2-D slab) lowers through one module. A contraction operand `Stage` never sets `smem`, which is how
 the two apply paths stay distinct on a coop-K contraction.
 
+## Shared carried state
+
+`035_shared_carry` offers a late storage choice for an ordered kernel whose state reads stay within independent
+leading batch coordinates. It proves ownership from each read's consuming predicates, including discarded clamped
+branches. One CTA owns each batch's complete state; the ordered axis and remaining grid axes become device loops.
+The scheduled reduction and its combine order remain unchanged. This changes kernel lowering, not Loop or Tile
+canonicalization, so the kernel keeps its identity.
+
+Two shared buffers separate the previous and next state. The seed initializes the first buffer, and barriers keep
+initialization, copies and updates uniform across the CTA. A wider seed retains its original first-iteration reads
+instead of rounding through shared storage early. Requested snapshots and externally read carry ports remain global
+outputs; only an unused private carry port is removed through the materializer's existing graph splice.
+
+When the next state selects between an update and the unchanged cell, the whole CTA copies the previous state and its
+snapshots before overwriting selected cells: the pass sinks each cell's private cone and stores under the predicate
+that selects its update and drops the branch that would only copy the cell. Intermediate casts or different output dtypes retain the ordinary
+per-cell path. Each shared row is padded by one column, so column-strided reads of the state do not share a bank.
+The resource check includes both state buffers and the reduction's existing shared scratch. Evidence picks between
+shared and global storage; ownership, supported geometry and the card's shared-memory limit decide only legality.
+
 ## Kernel-IR peepholes
 
 Vector loads and stores share one alignment proof over the complete flattened address. Every variable coefficient
 and the constant base must be divisible by the vector width, and subsequent elements must be consecutive. An aligned
 last coordinate alone is insufficient when an outer row has an odd stride. Unknown multidimensional layouts retain
 scalar operations; split coordinates may still vectorize when simplification reconstructs an aligned flat address.
+A strided loop's variable counts as a multiple of the alignment its start and step share, so a `coop/v<n>` lane that
+starts at `lane * n` reads its run as one vector even though the variable's own coefficient is one.
 
 `030_stamp_types` resolves element dtypes, including the common branch type of a `Select` used by later statements.
+Register-partial merges use the same accumulator policy as streaming updates: selecting folds retain the input dtype,
+while accumulating folds promote to f32. A merge reassigns the existing carrier and cannot change its declaration.
 Integer algebra is always restamped from its typed operands, repairing a
 stale float stamp that a structurally cloned, previously untyped body can carry. `050_vectorize_loads` /
 `080_vectorize_stores` /
@@ -715,12 +776,17 @@ destination the render finds not 16-bit keeps the four ordinary stores;
 `110_drop_redundant_syncs` collapses the defensive `Sync`s the
 cooperative / shared-row templates emit (body-level only — a slab `Smem` decl flags `smem_seen`, so a load-bearing
 prologue `Sync` is correctly retained; `with_bodies` preserves the cooperative tile's `block_threads`).
+`115_spread_one_cell` runs after it: a kernel with no grid axis is one cell, which the scalar tier ran on thread 0
+alone, so each free loop at the top of its body (no carrier) strides over the CTA's threads, every thread runs the
+rest, and a `Sync` precedes a statement reading a buffer an earlier spread loop wrote. It decides nothing and moves
+no identity — the pager's decision kernels, a count beside per-slot stores, went from 39 µs to under 5 µs on the 5090.
 
 `045_merge_select_loads` and `047_reuse_lane_loads` keep a cooperative row's reads to one per cell. A concatenation
 lowers to a coordinate `Select` whose branches read the same buffers at different offsets, each clamped in range; when
 the two branches' private chains are one computation up to their load indices (and at most one unary op on top of one
 branch — RoPE's rotate-half negation), `045` emits the chain once with each load at `cond ? index_a : index_b`, the
-branches' own clamps folded against `cond`. `047` then unrolls every lane-strided loop of at most eight trips (a
+branches' own clamps folded against `cond`. An effect between the two chains, a carried load, or a predicate or
+index defined after the chains start refuses the merge. `047` then unrolls every lane-strided loop of at most eight trips (a
 cooperative reduce's fold and its full-row projection: a 128-wide row at 32 lanes is four) and drops each load of a
 read-only buffer at an index an earlier load of the same body already read, compared after folding against the lane
 ranges. The projection reads the values the fold loaded, and a partner read resolves to another trip of the same lane.
@@ -733,16 +799,23 @@ reduction whose result is read only under an enclosing-coordinate predicate beco
 Its identity seed stays outside the loop. Stores, synchronization, warp operations and predicates depending on values
 computed later cannot be guarded this way.
 
+This pass also supplies the coordinate-demand transform for transposed cooperative reductions. They guard their
+collectives only with predicates independent of the swept output coordinate. Seeds, prologues and stores remain
+outside the collective guard.
+
 Memory and reduction peepholes record their decisions as on-by-default BOOL policy knobs on the `KernelOp`
 (`VECTORIZE_LOADS` / `VECTORIZE_STORES` / `GUARD_REDUCTIONS` / `INTERLEAVE_LOADS` / `PAIR_LDMATRIX` — the `050`
 pattern: idempotence via the recorded knob, `EMMY_<NAME>=0` pins it off, never a search dimension).
 
 `040_split_invariant_divides` replaces floating division by an axis-invariant divisor with a hoisted reciprocal and
 multiply when `FAST_MATH` is enabled. It runs after dtype stamping, preserves floating dtypes, and leaves integer or
-varying division alone. Structural body normalization stays independent of arithmetic policy.
+varying division and explicit round-to-nearest f32 division alone. The latter protects FP4 encoding boundaries even
+under the default fast-math regime. Structural body normalization stays independent of arithmetic policy.
 
 `085_fast_exp` follows the enabled `FAST_MATH` default, unless an explicit `FAST_EXP` pin overrides it. It lowers
 `exp` through `__expf`, promoting half inputs and rounding back afterward, and records the policy for idempotence.
+The rewrite includes generated `RegStore` epilogue lambdas, each traversed in its own SSA scope. Host evaluation
+continues to use `exp`; only CUDA evaluation uses the approximate intrinsic.
 `100_loopify` remains off by default (`EMMY_LOOPIFY=N`), a generic **loop re-roller** iterated to a fixpoint.
 Loopify folds a maximal run of ≥ `N` congruent per-fragment statements —
 an mma body's per-fragment epilogue (`FragmentApply`), its load+mma pairs, the fragment `RegStore`s, the A-fragment

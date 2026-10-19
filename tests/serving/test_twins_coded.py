@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from emmy.compiler.dtype import F16
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import ConstantOp, InputOp
 from emmy.compiler.ir.frontend.ir import LinearOp
@@ -164,9 +165,9 @@ def test_gdn_serving_capture_has_explicit_state_inputs_and_outputs(tmp_path, qua
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
     from emmy.serving.twins import capture_twin_graphs
-    from tests.compiler.trace.test_huggingface import _QWEN3_5_TINY
+    from tests.serving.helpers import QWEN3_5_TINY
 
-    config = Qwen3_5TextConfig(**_QWEN3_5_TINY)
+    config = Qwen3_5TextConfig(**QWEN3_5_TINY)
     if quantized:
         import numpy as np
         from safetensors.torch import save_file
@@ -183,6 +184,8 @@ def test_gdn_serving_capture_has_explicit_state_inputs_and_outputs(tmp_path, qua
                 f"{base}.weight_scale": torch.from_numpy(np.ascontiguousarray(scales)).view(torch.float8_e4m3fn),
                 f"{base}.weight_scale_2": torch.from_numpy(scale2),
                 f"{base}.input_scale": torch.tensor([0.05]),
+                # An unquantized multi-token-prediction layer numbered like the trunk's first: not a twin's layer.
+                "mtp.layers.0.linear_attn.in_proj_qkv.weight": torch.zeros(128, 64, dtype=torch.bfloat16),
             },
             str(tmp_path / "model.safetensors"),
         )
@@ -201,8 +204,55 @@ def test_gdn_serving_capture_has_explicit_state_inputs_and_outputs(tmp_path, qua
     assert len(graphs["pre1-global"].outputs) == 4
     post = graphs["post1-global"]
     assert [tuple(post.buffer(key).shape) for key in post.inputs] == [(1, 64)] * 3
-    with pytest.raises(NotImplementedError, match="static sequence widths"):
-        capture_twin_graphs(str(tmp_path), decode_bucket=1, prefill_bucket=16)
+    # A GDN layer has no any-width program: the any-width capture keeps its static twins and adds only attention's.
+    symbolic = capture_twin_graphs(str(tmp_path), decode_bucket=1, prefill_bucket=16)
+    assert set(symbolic) == set(graphs) | {"pre-sym-global", "post-sym-global"}
+    # Width 1 serves any token count without padding, so a GDN layer has it whatever widths attention gets.
+    assert set(capture_twin_graphs(str(tmp_path), decode_bucket=0, prefill_bucket=0)) == {
+        f"gdn1{suffix}",
+        "pre-sym-global",
+        "post-sym-global",
+    }
+
+
+def test_bf16_serving_config_captures_bf16_twins_with_static_gdn(tmp_path):
+    """A config serving ``--dtype bfloat16`` gets BF16 twins: every buffer crossing a twin's boundary is BF16
+    except the GDN matrix state, which stays f32. The GDN layer has static twins only, width 1 among them, and
+    its width-1 twin carries a row in every lane although attention layers build no width-1 twin."""
+    pytest.importorskip("transformers.models.qwen3_5")
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    from emmy.serving.release import load_serving_config
+    from emmy.serving.twins import capture_serving_twins, twin_realizations
+    from tests.serving.helpers import QWEN3_5_TINY
+
+    Qwen3_5TextConfig(**QWEN3_5_TINY).save_pretrained(tmp_path / "model")
+    env = tmp_path / "serving.env"
+    env.write_text(
+        f"SERVE_MODEL=org/model\nSERVE_GPU=NVIDIA-Test\nSERVE_GOLDEN_FILE={tmp_path / 'g.json'}\nSERVE_MAX_NUM_BATCHED_TOKENS=16\n"
+        'SERVE_DECODE_BUCKET=4\nSERVE_PREFILL_BUCKET=16\nSERVE_M1_TIER=0\nSERVE_EXTRA_ARGS="--dtype bfloat16"\n'
+        'SERVE_WARM_SHAPES=":::fm"\n'
+    )
+    serving = load_serving_config(env)
+    graphs = capture_serving_twins(str(tmp_path / "model"), serving)
+    assert [row.name for row in twin_realizations(serving, "gdn1")] == ["m1", "m1.fm"]
+    assert twin_realizations(serving, "pre1-global") == ()
+    assert set(graphs) == {
+        "gdn1",
+        "gdn4",
+        "gdn16",
+        "pre4-global",
+        "post4-global",
+        "pre16-global",
+        "post16-global",
+        "pre-sym-global",
+        "post-sym-global",
+    }
+    for name, graph in graphs.items():
+        boundary = {key: graph.buffer(key).dtype.name for key in (*graph.inputs, *graph.outputs)}
+        state = {key for key in boundary if len(graph.buffer(key).shape) == 4}  # S[1, heads, k, v]
+        assert {key: dt for key, dt in boundary.items() if key not in state} == dict.fromkeys(set(boundary) - state, "bf16"), name
+        assert all(boundary[key] == "f32" for key in state), name
 
 
 def test_attention_query_layout_accepts_validated_deepseek_low_rank_signature():
@@ -283,7 +333,13 @@ def test_deepseek_serving_twins_capture_the_hyper_connection_seam_weight_free(tm
     graphs = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=0)
     # The attention sublayer is the fork's and routing runs outside the twins, so the three attention kinds and two
     # router kinds of this config all compile the same programs: ONE profile, not one per (mlp, attention) pairing.
-    assert set(graphs) == {f"{half}{width}" for half in ("pre", "post", "expert") for width in ("4", "-sym")}
+    # The expert twins add width 1, which every MoE boot compiles for the fixed-slot tier, and width 256, the static
+    # prefill twin every boot with an any-width program compiles.
+    assert set(graphs) == {f"{half}{width}" for half in ("pre", "post", "expert") for width in ("4", "-sym")} | {
+        "expert1",
+        "expert256",
+        "expert-slots",
+    }
     pre, post, expert = (graphs[f"{half}4"] for half in ("pre", "post", "expert"))
     assert [tuple(pre.nodes[i].output.shape) for i in pre.inputs] == [(4, 64)]
     assert [tuple(pre.nodes[o].output.shape) for o in pre.outputs] == [(4, 32)]
@@ -294,22 +350,95 @@ def test_deepseek_serving_twins_capture_the_hyper_connection_seam_weight_free(tm
     assert not token_dim.is_static and token_dim.as_atom_name() == "num_tokens"
 
 
-def test_deepseek_expert_twin_records_the_native_mxfp4_program_serving_binds(tmp_path):
+def test_qwen4_exp_serving_twins_capture_the_gated_residual_seam_weight_free(tmp_path):
+    """Qwen3.8-Flash-Next's token mixers (Gated DeltaNet, sparse attention) and its n-gram PLE are the fork's, so its
+    four layers compile one pre/post/expert profile over the flattened ``hc_count * hidden`` carrier, like DeepSeek V4."""
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("transformers.models.qwen4_exp")
+
+    from emmy.serving.twins import capture_twin_graphs
+    from tests.serving.helpers import QWEN4_EXP_TINY
+
+    vision = dict(depth=1, hidden_size=16, intermediate_size=32, num_heads=2, out_hidden_size=32)
+    transformers.Qwen4ExpConfig(text_config=QWEN4_EXP_TINY, vision_config=vision).save_pretrained(tmp_path)
+    graphs = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=0)
+    assert set(graphs) == {f"{half}{width}" for half in ("pre", "post", "expert") for width in ("4", "-sym")} | {
+        "expert1",
+        "expert256",
+        "expert-slots",
+    }
+    pre, post, expert = (graphs[f"{half}4"] for half in ("pre", "post", "expert"))
+    assert [tuple(pre.nodes[i].output.shape) for i in pre.inputs] == [(4, 64)]
+    assert [tuple(pre.nodes[o].output.shape) for o in pre.outputs] == [(4, 32)]
+    assert [tuple(post.nodes[i].output.shape) for i in post.inputs] == [(4, 32), (4, 64)]
+    assert [tuple(post.nodes[o].output.shape) for o in post.outputs] == [(4, 64), (4, 32), (4, 2)]
+    assert [tuple(expert.nodes[i].output.shape) for i in expert.inputs] == [(4, 32), (32, 32), (32, 16)]
+    token_dim = graphs["pre-sym"].nodes[graphs["pre-sym"].inputs[0]].output.shape[0]
+    assert not token_dim.is_static and token_dim.as_atom_name() == "num_tokens"
+
+
+def test_qwen4_exp_nvfp4_expert_twins_bind_packed_trios_without_fetching_the_checkpoint(tmp_path, monkeypatch):
+    """RadixArk's Qwen3.8-Flash-Next NVFP4 codes the routed experts alone, so the trunk twins stay as traced and the
+    expert twins take each expert's packed pairs, e4m3 block scales and per-row global scale as inputs. The weight
+    index answers which trunk weights are coded, so capture never fetches the shards."""
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("transformers.models.qwen4_exp")
+
+    import emmy.compiler.loader.safetensors as safetensors
+    from emmy.serving.twins import capture_twin_graphs
+    from tests.serving.helpers import QWEN4_EXP_TINY
+
+    ignore = ["*.self_attn.*", "*.linear_attn.*", "*.mlp.gate*", "*.mlp.shared_expert.*", "*.mlp.shared_expert_gate*",
+              "*hyper_connection*", "*.ple.*", "mtp.*", "lm_head"]  # fmt: skip
+    group = {"weights": {"dynamic": False, "num_bits": 4, "type": "float", "group_size": 16}, "targets": ["Linear"]}
+    qc = {"quant_method": "modelopt", "quant_algo": "NVFP4", "config_groups": {"group_0": group}, "ignore": ignore}
+    vision = dict(depth=1, hidden_size=16, intermediate_size=32, num_heads=2, out_hidden_size=32)
+    config = transformers.Qwen4ExpConfig(text_config=QWEN4_EXP_TINY, vision_config=vision, quantization_config=qc)
+    config.save_pretrained(tmp_path)
+    head = "model.language_model.layers"
+    keys = [f"{head}.{i}.{m}_hyper_connection.hc_norm.weight" for i in range(4) for m in ("attn", "mlp")]
+    keys += [f"{head}.{i}.mlp.experts.{e}.{w}_proj.{leaf}" for i in range(4) for e in range(4) for w in ("gate", "up", "down")
+             for leaf in ("weight", "weight_scale", "weight_scale_2", "input_scale")]  # fmt: skip
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": dict.fromkeys(keys, "shard.safetensors")}))
+
+    def no_fetch(*_args, **_kwargs):
+        raise AssertionError("capture fetched the checkpoint")
+
+    monkeypatch.setattr(safetensors, "_resolve_model_dir", no_fetch)
+    graphs = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=0)
+    assert set(graphs) == {f"pre{w}" for w in ("4", "-sym")} | {f"post{w}" for w in ("4", "-sym")} | {
+        f"expert{w}@nvfp4" for w in ("4", "-sym", "1", "256", "-slots")
+    }
+    expert = graphs["expert4@nvfp4"]
+    shapes = {i: (tuple(expert.nodes[i].output.shape), expert.nodes[i].output.dtype.name) for i in expert.inputs[1:]}
+    assert shapes == {
+        "w_gate_up": ((32, 16), "f4e2m1x2"), "w_down": ((32, 8), "f4e2m1x2"),
+        "w_gate_up_scale": ((32, 2), "f8e4m3"), "w_gate_up_scale_2": ((32, 1), "f32"),
+        "w_down_scale": ((32, 1), "f8e4m3"), "w_down_scale_2": ((32, 1), "f32"),
+    }  # fmt: skip
+
+
+@pytest.mark.parametrize(("inter", "slices"), [(32, 1), (64, 2)])
+def test_deepseek_expert_twin_records_the_native_mxfp4_program_serving_binds(tmp_path, inter, slices):
     """The pinned checkpoint declares an fp8 TRUNK while storing its routed experts as native MXFP4
     (``expert_dtype: fp4``), and the serving loader keeps those experts packed. The expert twin has
     to follow the experts, not the trunk declaration, or the golden records a program serving never
     runs. ``w_down``'s packed shape also pins the layout the caller passes down: these experts are
     ``F.linear`` parameters, so the blocks lead with ``out``; the ``x @ W`` reading would produce
-    (16, 2, 16) here instead."""
-    pytest.importorskip("torch")
+    (16, 2, 16) here instead. Served across tensor-parallel ranks, each rank holds a slice of every
+    expert, so the twin is the sliced program: intermediate 64 over two ranks records the 32 one."""
+    torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
+    from safetensors.torch import save_file
 
     from emmy.serving.twins import capture_twin_graphs
 
     config = transformers.DeepseekV4Config(
         vocab_size=64,
         hidden_size=64,
-        moe_intermediate_size=32,
+        moe_intermediate_size=inter,
         num_hidden_layers=2,
         num_attention_heads=4,
         head_dim=8,
@@ -340,14 +469,27 @@ def test_deepseek_expert_twin_records_the_native_mxfp4_program_serving_binds(tmp
     }
     config.expert_dtype = "fp4"
     config.save_pretrained(tmp_path)
-    graphs = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=0)
-    assert set(graphs) == {"pre4", "pre-sym", "post4", "post-sym", "expert4@mxfp4", "expert-sym@mxfp4"}
+    # The fp8 trunk declaration sends the capture to the shards for the trunk's coded weights. This
+    # one stores none, so the trunk twins stay plain and only the expert program is under test.
+    save_file({"embed.weight": torch.zeros(64, 64, dtype=torch.float16)}, str(tmp_path / "model.safetensors"))
+    graphs = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=0, expert_slices=slices)
+    assert set(graphs) == {
+        "pre4",
+        "pre-sym",
+        "post4",
+        "post-sym",
+        "expert1@mxfp4",
+        "expert4@mxfp4",
+        "expert256@mxfp4",
+        "expert-sym@mxfp4",
+    } | {"expert-slots@mxfp4"}
     expert = graphs["expert4@mxfp4"]
     assert set(expert.inputs) >= {"w_gate_up", "w_gate_up_scale", "w_down", "w_down_scale"}
     by_id = {i: expert.nodes[i].output for i in expert.inputs}
     assert {out.dtype.name for i, out in by_id.items() if i.startswith("w_")} == {"u8"}
     shape = tuple(d.as_static() for d in by_id["w_down"].shape)
     assert shape == (64, 1, 16), f"expected (out, in/32, 16) for an F.linear expert, got {shape}"
+    assert tuple(d.as_static() for d in by_id["w_gate_up"].shape) == (64, 2, 16)
 
 
 @pytest.mark.skip(reason="global greedy ranking still traverses the full coded-expert schedule space")
@@ -648,6 +790,119 @@ def _nvfp4_checkpoint(path: Path) -> None:
     save_file(tensors, str(path / "model.safetensors"))
 
 
+def _static_fp8_checkpoint(path: Path, *, dynamic: bool = False) -> None:
+    """A tiny two-layer Qwen3 checkpoint in the official FP8 form with STATIC activations: every
+    linear stores its e4m3 bits, one per-tensor ``weight_scale_inv`` and one calibrated
+    ``activation_scale``. ``q_proj``'s differs from ``k_proj`` / ``v_proj``'s, as in the NVFP4
+    fixture, so both halves of the sharing rule are exercised.
+
+    ``dynamic`` writes the block form Qwen and DeepSeek publish instead: dynamic activations, one
+    ``weight_scale_inv`` per 32 x 32 weight block, no activation scale."""
+    import torch
+    import transformers
+    from safetensors.torch import save_file
+
+    hidden, inter, heads, kv, head_dim, layers = 64, 128, 4, 2, 16, 2
+    config = transformers.Qwen3Config(
+        vocab_size=64, hidden_size=hidden, intermediate_size=inter, num_hidden_layers=layers,
+        num_attention_heads=heads, num_key_value_heads=kv, head_dim=head_dim, max_position_embeddings=64,
+    )  # fmt: skip
+    config.save_pretrained(path)
+    document = json.loads((path / "config.json").read_text())
+    document["quantization_config"] = (
+        {"quant_method": "fp8", "activation_scheme": "dynamic", "fmt": "e4m3", "weight_block_size": [32, 32]}
+        if dynamic
+        else {"quant_method": "fp8", "activation_scheme": "static", "weight_block_size": None}
+    )
+    (path / "config.json").write_text(json.dumps(document, indent=1))
+
+    shapes = {
+        "self_attn.q_proj": (heads * head_dim, hidden),
+        "self_attn.k_proj": (kv * head_dim, hidden),
+        "self_attn.v_proj": (kv * head_dim, hidden),
+        "self_attn.o_proj": (hidden, heads * head_dim),
+        "mlp.gate_proj": (inter, hidden),
+        "mlp.up_proj": (inter, hidden),
+        "mlp.down_proj": (hidden, inter),
+    }
+    generator = torch.Generator().manual_seed(0)
+    tensors: dict[str, object] = {}
+    for layer in range(layers):
+        for module, shape in shapes.items():
+            base = f"model.layers.{layer}.{module}"
+            bits = torch.randint(0, 0x7F, shape, dtype=torch.uint8, generator=generator)  # finite e4m3 codes
+            tensors[f"{base}.weight"] = bits.view(torch.float8_e4m3fn)
+            if dynamic:
+                blocks = (shape[0] // 32, shape[1] // 32)
+                tensors[f"{base}.weight_scale_inv"] = (torch.rand(blocks, generator=generator) * 0.004).to(torch.bfloat16)
+                continue
+            tensors[f"{base}.weight_scale_inv"] = torch.tensor(0.002, dtype=torch.bfloat16)
+            tensors[f"{base}.activation_scale"] = torch.tensor(0.03 if module.startswith("self_attn.q") else 0.05, dtype=torch.bfloat16)
+    save_file(tensors, str(path / "model.safetensors"))
+
+
+def test_static_fp8_serving_twins_carry_the_declared_w8a8_program(tmp_path):
+    """A twin of a static-FP8 checkpoint records the checkpoint's own program: FP8 weight bits
+    under their checkpoint keys, and one FP8 encode per calibrated activation scale. Nothing is
+    exported beside the model's outputs — the codes stay an interior value of the kernel."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+    from emmy.serving.twins import capture_twin_graphs
+
+    _static_fp8_checkpoint(tmp_path)
+    graphs = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=0, symbolic=False)
+    assert set(graphs) == {"pre4@fp8", "post4@fp8"}
+
+    def weights(graph):
+        return {n.op.source_path for n in graph.nodes.values() if isinstance(n.op, ConstantOp) and n.output.dtype.name == "f8e4m3"}
+
+    def encodes(graph):
+        return [n for n in graph.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.op.name == "to_f8e4m3"]
+
+    assert weights(graphs["pre4@fp8"]) == {f"model.layers.0.self_attn.{m}_proj.weight" for m in "qkv"}
+    assert weights(graphs["post4@fp8"]) == {
+        f"model.layers.0.{module}.weight" for module in ("self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    }
+    # q reads the normed hidden state through its own scale; k and v share theirs. The post half
+    # quantizes the attention output, the normed residual (gate and up share it) and the MLP product.
+    assert len(encodes(graphs["pre4@fp8"])) == 2
+    assert len(encodes(graphs["post4@fp8"])) == 3
+    for graph in graphs.values():
+        assert not any(node.hints.get("trace.materialize") for node in graph.nodes.values())
+        graph.validate()
+
+
+def test_dynamic_fp8_serving_twins_carry_coded_weights_under_16_bit_activations(tmp_path):
+    """A twin of a dynamic block-FP8 checkpoint records what serving compiles from it: the FP8
+    weight bits and their block scales under their checkpoint keys, and no activation encode. Serving
+    runs that checkpoint weight-only, so a card without FP8 arithmetic holds the trunk at its stored
+    size."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
+    from emmy.serving.twins import capture_twin_graphs
+
+    _static_fp8_checkpoint(tmp_path, dynamic=True)
+    graphs = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=0, symbolic=False)
+    assert set(graphs) == {"pre4@fp8", "post4@fp8"}
+
+    def constants(graph, dtype):
+        return {
+            n.op.source_path: tuple(d.as_static() for d in n.output.shape)
+            for n in graph.nodes.values()
+            if isinstance(n.op, ConstantOp) and n.output.dtype.name == dtype
+        }
+
+    assert set(constants(graphs["pre4@fp8"], "f8e4m3")) == {f"model.layers.0.self_attn.{m}_proj.weight" for m in "qkv"}
+    assert constants(graphs["pre4@fp8"], "f32")["model.layers.0.self_attn.q_proj.weight_scale_inv"] == (2, 1, 2, 1)
+    for graph in graphs.values():
+        assert not [n for n in graph.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.op.name.startswith("to_f8")]
+        graph.validate()
+
+
 def _packed_weights(graph: Graph) -> dict[str, tuple[int, ...]]:
     """``{checkpoint key: packed shape}`` for every NVFP4 weight constant the twin carries."""
     return {
@@ -692,7 +947,27 @@ def test_nvfp4_serving_twins_carry_the_declared_w4a4_program(tmp_path):
         assert _structure(Graph.from_dict(json.loads(json.dumps(graph.to_dict())))) == _structure(graph)
 
 
-def test_nvfp4_twin_is_the_graph_serving_stamps(tmp_path):
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_fp8_trunk_stays_coded_on_the_serving_lane(tmp_path, dynamic):
+    """The serving loader leaves an FP8 trunk linear undecoded — a placeholder at the declared
+    shape — and says so in the store, which is what sends the runner to the checkpoint for the
+    bits. The default lane still decodes the same checkpoint to values."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    from emmy.compiler.trace.huggingface import load_quantized_split
+
+    _static_fp8_checkpoint(tmp_path, dynamic=dynamic)
+    model, store = load_quantized_split(tmp_path, torch.float16, compress_trunk=True)
+    assert store["trunk"] == "codes" and store["dir"] == str(tmp_path)
+    weight = model.state_dict()["model.layers.0.self_attn.q_proj.weight"]
+    assert not weight.is_meta and weight.dtype == torch.float16 and tuple(weight.shape) == (64, 64)
+    _model, decoded = load_quantized_split(tmp_path, torch.float16)
+    assert decoded["trunk"] == "values"
+
+
+@pytest.mark.parametrize("scheme", ["nvfp4", "fp8", "fp8-dynamic"])
+def test_checkpoint_spelled_twin_is_the_graph_serving_stamps(tmp_path, scheme):
     """The transfer property, asserted directly: the captured twin and the graph
     ``gen_runner._compile_split`` stamps on the same wrapper at the same width are the same graph.
 
@@ -703,7 +978,6 @@ def test_nvfp4_twin_is_the_graph_serving_stamps(tmp_path):
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")
 
-    import numpy as np
     import transformers
 
     from emmy.compiler.loader.quant import strip_engine_quant_config
@@ -711,7 +985,11 @@ def test_nvfp4_twin_is_the_graph_serving_stamps(tmp_path):
     from emmy.serving.gen_runner import _compile_split
     from emmy.serving.twins import capture_twin_graphs
 
-    _nvfp4_checkpoint(tmp_path)
+    if scheme == "fp8-dynamic":
+        _static_fp8_checkpoint(tmp_path, dynamic=True)
+    else:
+        {"nvfp4": _nvfp4_checkpoint, "fp8": _static_fp8_checkpoint}[scheme](tmp_path)
+    suffix = scheme.removesuffix("-dynamic")
     twins = capture_twin_graphs(str(tmp_path), decode_bucket=4, prefill_bucket=0, symbolic=False)
 
     config = transformers.AutoConfig.from_pretrained(tmp_path)
@@ -732,7 +1010,7 @@ def test_nvfp4_twin_is_the_graph_serving_stamps(tmp_path):
         def __init__(self, **_kwargs):
             pass
 
-        def compile(self, graph):
+        def compile(self, graph, *, ctx=None):
             raise _Stamped(graph)
 
     hidden, attn_width = config.hidden_size, config.num_attention_heads * config.head_dim
@@ -744,8 +1022,8 @@ def test_nvfp4_twin_is_the_graph_serving_stamps(tmp_path):
         patch.setattr("emmy.compiler.backend.cuda.backend.CudaBackend", _CaptureBackend)
         for half, wrapper in (("pre", pre_w), ("post", post_w)):
             with pytest.raises(_Stamped) as caught:
-                _compile_split(wrapper, examples[half], None, np.dtype("float16"), ckpt=(str(tmp_path), id_to_key))
-            assert _structure(caught.value.graph) == _structure(twins[f"{half}4@nvfp4"])
+                _compile_split(wrapper, examples[half], None, F16, ckpt=(str(tmp_path), id_to_key))
+            assert _structure(caught.value.graph) == _structure(twins[f"{half}4@{suffix}"])
 
 
 def _structure(graph: Graph):

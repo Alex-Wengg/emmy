@@ -17,43 +17,24 @@ from emmy.compiler.ir.stmt.body import Body
 from emmy.compiler.ir.stmt.identity import canonicalize_identity
 from emmy.compiler.ir.stmt.leaves import (
     Accum,
+    Affine,
     Assign,
     Init,
     Let,
     Load,
     Write,
 )
-from emmy.compiler.ir.stmt.normalize import normalize_body, sort_commutative_args
+from emmy.compiler.ir.stmt.normalize import (
+    _canonicalize_exprs,
+    _normalize_body,
+    normalize_body,
+    prepare_body,
+    rename_ssa_sequential,
+)
 
 # ---------------------------------------------------------------------------
 # sort_commutative_args
 # ---------------------------------------------------------------------------
-
-
-def test_sort_commutative_args_orders_add() -> None:
-    body = Body((Assign(name="v0", op="add", args=("y", "x")),))
-    out = sort_commutative_args(body)
-    assert out[0].args == ("x", "y")
-
-
-def test_sort_commutative_args_leaves_subtract_alone() -> None:
-    body = Body((Assign(name="v0", op="subtract", args=("y", "x")),))
-    out = sort_commutative_args(body)
-    assert out[0].args == ("y", "x")
-
-
-def test_sort_commutative_args_recurses_into_loop() -> None:
-    a = Axis("a", 4)
-    body = Body((Loop(axis=a, body=(Assign(name="v0", op="multiply", args=("y", "x")),)),))
-    out = sort_commutative_args(body)
-    assert out[0].body[0].args == ("x", "y")
-
-
-def test_sort_commutative_args_idempotent() -> None:
-    body = Body((Assign(name="v0", op="add", args=("y", "x")),))
-    once = sort_commutative_args(body)
-    twice = sort_commutative_args(once)
-    assert tuple(once) == tuple(twice)
 
 
 def test_affine_index_equivalence_and_cse_have_one_exact_identity() -> None:
@@ -84,7 +65,7 @@ def test_affine_index_equivalence_and_cse_have_one_exact_identity() -> None:
             )
             normalized = normalize_body(body)
             assert len(normalized.loads) == 1
-            assert len([s for s in normalized.iter() if isinstance(s, Assign)]) == 2
+            assert len([s for s in normalized.iter() if isinstance(s, (Assign, Affine))]) == 2
             assert normalize_body(Body(tuple(normalized))) == normalized
             keys.add(body.structural_key(structural=False))
     assert len(keys) == 1
@@ -307,7 +288,10 @@ def test_structural_key_equal_for_reordered_reduction_axis_metadata() -> None:
         )
 
     assert make(("row", "column")).structural_key(structural=False) == make(("column", "row")).structural_key(structural=False)
-    assert make(("row",)).structural_key(structural=False) != make(("column",)).structural_key(structural=False)
+    inner = Body((Load(name="x", input="X", index=(Var("row"), Var("column"))), Accum(name="total", value="x", axes=("column",))))
+    per_row_cell = (Loop(axis=Axis("column", 4), body=inner), Write(output="O", index=(Var("row"),), value="total"))
+    per_row = Body((Loop(axis=Axis("row", 4), body=per_row_cell),))
+    assert make(("row", "column")).structural_key(structural=False) != per_row.structural_key(structural=False)
 
 
 def test_structural_key_equal_for_ambiguous_free_axis_renaming() -> None:
@@ -324,6 +308,27 @@ def test_structural_key_equal_for_ambiguous_free_axis_renaming() -> None:
 
     assert normalize_body(make("z", "a")) == normalize_body(make("a", "z"))
     assert make("z", "a").structural_key(structural=False) == make("a", "z").structural_key(structural=False)
+
+
+def test_atomic_partition_axis_order_converges_independently_of_affine_spelling() -> None:
+    """An axis absent from an atomic output must not trade places with a scaled output axis every round."""
+    forms = set()
+    for names, reverse_loops, reverse_sum in product((("row", "part"), ("z", "a")), (False, True), (False, True)):
+        row, part = names
+        terms = (Var(row) * 256, Var(part) * 64)
+        index = terms[1] + terms[0] if reverse_sum else terms[0] + terms[1]
+        body = Body((Load(name="x", input="X", index=(index,)), Write(output="O", index=(Var(row) * 2,), value="x", atomic=True)))
+        for name in names if reverse_loops else reversed(names):
+            body = Body((Loop(axis=Axis(name, 2), body=body),))
+        prepared = rename_ssa_sequential(body)
+        # Check a bounded number of rounds before calling the fixed-point driver: the regression used to cycle.
+        for _ in range(4):
+            prepared = prepare_body(prepared)
+        assert prepare_body(prepared) == prepared
+        normalized = normalize_body(body)
+        assert normalize_body(Body.from_wire(normalized.to_wire())) == normalized
+        forms.add(normalized)
+    assert len(forms) == 1
 
 
 def test_normalize_body_keeps_shared_axes_outside_known_output_geometry() -> None:
@@ -517,6 +522,37 @@ def test_structural_key_equal_for_equivalent_index_and_comparison_expressions() 
     right = make(BinaryExpr("+", one, element), BinaryExpr(">", four, element))
     assert normalize_body(left) == normalize_body(right)
     assert left.structural_key(structural=False) == right.structural_key(structural=False)
+
+
+def test_a_commutative_comparison_orders_its_axes_by_binding_not_spelling() -> None:
+    """Normalization orders a commutative comparison's operands by where each axis is bound. Ordered by spelling, a
+    body re-spelled by its own normalization — as a golden's stored kernel is when it is read back — normalized again
+    to another body, and the kernel's identity moved."""
+
+    def condition(outer: str, inner: str) -> BinaryExpr:
+        body = Body(
+            (
+                Loop(
+                    axis=Axis(outer, 4),
+                    body=(
+                        Loop(
+                            axis=Axis(inner, 4),
+                            body=(
+                                Load(name="x", input="X", index=(Var(outer), Var(inner))),
+                                Cond(
+                                    BinaryExpr("==", Var(inner), Var(outer)),
+                                    body=(Write(output="O", index=(Var(outer), Var(inner)), value="x"),),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+        return _canonicalize_exprs(body)[0].body[0].body[1].cond
+
+    assert condition("a10", "a5") == BinaryExpr("==", Var("a10"), Var("a5"))
+    assert condition("a5", "a10") == BinaryExpr("==", Var("a5"), Var("a10"))
 
 
 def test_structural_key_equal_for_affine_index_spellings() -> None:
@@ -1051,10 +1087,43 @@ def test_structural_key_clusters_collapse_noncommutative_to_commutative() -> Non
 
 
 def test_structural_key_idempotent() -> None:
-    """Identity normalization reaches a fixed canonical body."""
+    """Identity is a fixed point of normalization: the normal form keys as the body it came from."""
     body = _matmul_body("X", "Y", "O")
-    canonical = canonicalize_identity(normalize_body(body))
-    assert canonicalize_identity(canonical.body).key == canonical.key
+    canonical = canonicalize_identity(body)
+    assert canonicalize_identity(normalize_body(body)) == canonical
+    assert set(canonical.arguments) == {"X", "Y", "O"}
+
+
+def test_normal_form_is_a_fixed_point_when_the_order_breaks_a_tie_by_spelling() -> None:
+    """Two loop-invariant values of one shape tie in the canonical order, which breaks the tie by their spelling: the
+    order runs again on its own output until it leaves it alone, so normalizing the normal form changes nothing."""
+    tile = (Literal(0, "int"), Var("a0"), Var("a2") / Literal(64, "int"), Var("a2") % Literal(64, "int"))
+    body = Body(
+        (
+            Loop(
+                Axis("a0", 48),
+                (
+                    Loop(
+                        Axis("a2", 512),
+                        (
+                            Assign("v36", "multiply", ("v35", "v3")),
+                            Assign("v37", "pad", ("v36",)),
+                            Write(output="reshape_9", index=tile, value="v37"),
+                            Loop(
+                                Axis("a7", 128),
+                                (
+                                    Assign("v146", "pad", ("v145",)),
+                                    Write(output="reshape_5", index=(*tile, Var("a7")), value="v146"),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    once = _normalize_body(body)
+    assert repr(_normalize_body(once)) == repr(once)
 
 
 def test_identity_coordinate_order_survives_axis_rename() -> None:
@@ -1079,7 +1148,7 @@ def test_identity_coordinate_order_survives_axis_rename() -> None:
             )
         )
         canonical = canonicalize_identity(body)
-        assert canonicalize_identity(canonical.body).key == canonical.key
+        assert canonicalize_identity(normalize_body(body)).key == canonical.key
         normalized = normalize_body(body)
         assert normalize_body(Body(tuple(normalized))) == normalized
         keys.add(canonical.key)

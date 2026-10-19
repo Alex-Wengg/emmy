@@ -11,7 +11,7 @@ from emmy.compiler.ir.expr import Literal, Var
 from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.ir.sigma import Sigma
 from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
-from emmy.compiler.ir.stmt.normalize import dedup_loads, normalize_body, prepare_body
+from emmy.compiler.ir.stmt.normalize import normalize_body, prepare_body
 from emmy.compiler.ir.stmt.subroutine import Call, Subroutine, definitions, pretty_subroutines
 from emmy.compiler.pipeline import Pipeline
 
@@ -69,9 +69,8 @@ def _body(target: Subroutine, offset: int, *, other: Subroutine | None = None) -
 def test_shifted_calls_preserve_values_and_share_common_loads(offset):
     body = _body(_project(), offset)
     prepared = prepare_body(body)
-    assert len(tuple(prepared.iter_of_type(Call))) == 2
     assert len(definitions(prepared)) == 1
-    assert len(tuple(dedup_loads(prepared).iter_of_type(Call))) == (1 if offset == 0 else 2)
+    assert len(tuple(prepared.iter_of_type(Call))) == (1 if offset == 0 else 2)
 
     op = LoopOp(body=body)
     assert not tuple(op.body.iter_of_type(Call))
@@ -162,11 +161,12 @@ def test_nested_calls_freshen_locals_without_capturing_arguments():
     assert compact.structural_key() == _body(inner, 4).structural_key()
 
 
-def test_expansion_preserves_unused_values_beside_output_writes():
+def test_expansion_drops_an_unused_value_beside_output_writes():
+    """A value no store reaches is work the kernel never needed: normalization drops it with the expansion."""
     body = Body((*_body(_project(), 0), Assign("unused", "exp", ("external",))))
     normalized = normalize_body(body)
     assert len(normalized.writes) == 1
-    assert any(isinstance(stmt, Assign) and stmt.op.name == "exp" and stmt.args == ("external",) for stmt in normalized.iter())
+    assert not any(isinstance(stmt, Assign) and stmt.op.name == "exp" for stmt in normalized.iter())
 
 
 def test_formal_coordinates_do_not_capture_canonical_axis_names():

@@ -1,6 +1,6 @@
 # Backend Architecture
 
-Three backends with a shared interpreter. Every backend exposes the
+Four backends with a shared interpreter. Every backend exposes the
 same two-step API (`backend/base.py`):
 
 ```python
@@ -17,6 +17,7 @@ What differs is `compile()` — how far the backend lowers the graph:
 |----------------|----------------------------------------------------|----------------------|
 | `NumpyBackend` | returns the graph as-is (no-op)                    | default `Backend.run`|
 | `LoopBackend`  | runs decomposition → optimization → fusion         | default `Backend.run`|
+| `CpuBackend`   | fusion + `tile/cut` + LLVM codegen per cut piece   | the Rust runtime     |
 | `CudaBackend`  | fusion + `lowering/kernel` + `lowering/cuda`       | the Rust runtime     |
 
 `numpy` and `loop` backends share the same runtime path — the only
@@ -31,12 +32,13 @@ Not a `Backend` — a small Graph→torch evaluator that runs a frontend-dialect
 `LinearOp`→`F.linear`, `ElementwiseOp`/`ReduceOp`/additive `ScanOp`→the torch elementwise/reduce/scan, layout
 ops→view/transpose/cat). A two-axis transpose swaps those axes, including for rank-two inputs. Matrix multiplication
 promotes its operands to include the declared output dtype, so an FP32 result from FP16 inputs is not rounded to
-FP16 before widening.
+FP16 before widening. Slices resolve a negative start against the input extent before adding their output extent.
 Single-source index maps with unchanged coordinates, broadcasts, permutations, diagonals, or constant-zero coordinates
 use strided views. These preserve noncontiguous input storage and avoid unnecessary gather/clamp expressions that can
 break Inductor fusion across a later slice. Other maps retain the clipped gather and source-selection semantics.
 The legacy stored unary `pad` form is an identity; coordinate-changing padding is an index map.
-`Conv1dOp` uses `torch.nn.functional.conv1d`, preserving groups, bias, stride, padding and dilation.
+`Conv1dOp` uses `torch.nn.functional.conv1d`, preserving groups, bias, stride, padding and dilation; `Conv2dOp` and
+`ConvTranspose1dOp` use `conv2d` and `conv_transpose1d` with their captured geometry.
 FP8 tensors remain exact `uint8` bit carriers; `to_f8*` casts to torch float8 and reinterprets its storage, while
 `from_f8*` performs the inverse reinterpretation before widening. Generic integer casts, shifts, masks, and `RangeOp`
 also keep their Torch integer dtypes, which lets loader-spelled reconstruction algebra serve as an exact pre-fusion
@@ -57,8 +59,10 @@ gets the same vs-torch comparison as a static one (benched at the `Dim` hint by
 benchmark decoded golden programs and in-memory provenance slices against torch.
 
 The strict run path evaluates Emmy and eager on the same inputs and returns a direct `rtol=atol=1e-3` proof with
-error statistics. The isolated CUDA worker transports that proof and the eager reference outputs back to the parent,
-so exact-pinned rows can be checked against the same reference rather than against another Emmy realization.
+error statistics; an elementwise failure is then weighed against an FP64 evaluation of the frontend graph
+(`torch_ref.build_callable(..., compute_dtype=torch.float64)`). The isolated CUDA worker transports that proof, the
+eager reference outputs and the FP64 outputs back to the parent, so exact-pinned rows are checked against the same
+references rather than against another Emmy realization.
 
 ## Backend ABC (`base.py`)
 
@@ -66,8 +70,9 @@ so exact-pinned rows can be checked against the same reference rather than again
 
 `Backend.run` provides a default implementation: walks the compiled
 graph in topological order and calls `node.op.forward(*args)` at each
-compute node. `InputOp` and `ConstantOp` boundaries are seeded from
-`input_data`; values are stored **per buffer** — a multi-output node's
+compute node. `InputOp` and externally bound `ConstantOp` boundaries are seeded from `input_data`. A declared
+`ConstantOp.value` is immutable: lowering may consume it, so changing that value requires recompilation.
+Values are stored **per buffer** — a multi-output node's
 `forward` returns a tuple matched positionally to `node.outputs`, and
 each result is reshaped to its own output tensor's shape when statically
 known.
@@ -111,10 +116,20 @@ this is the numpy backend with fusion in front.
 Used as the second axis of triangulation: **loop vs numpy disagreement
 implicates fusion; loop vs CUDA disagreement implicates codegen.**
 
+## CPU backend (`cpu/`)
+
+See `cpu/ARCHITECTURE.md`. Cuts the fused graph at every seam, compiles each piece's Loop IR to native code
+through LLVM (llvmlite, in process), and runs the pieces on a thread pool. A third triangulation axis that runs
+without a GPU: **cpu vs loop disagreement implicates the cut (which the loop backend never runs) or the CPU code
+generator, not fusion.**
+
 ## CUDA backend (`cuda/`)
 
 See `cuda/ARCHITECTURE.md`. Runs the full lowering chain, compiles every kernel with `nvcc`
 into the cubin cache, and executes the program through the Rust runtime.
+The `COLD_CACHE` input regime measures one replay per kernel after same-stream L2 eviction outside the event
+window. It reports a sum of per-kernel times, with no whole-program timing; worker requests carry the regime
+explicitly so a persistent worker cannot reuse a previous request's cache mode.
 
 ## Execution plan + pack (`plan.py`, `pack.py`)
 
@@ -144,6 +159,11 @@ A deterministic source-free bind record is the third binding kind: `plan_from_gr
 evaluates it once and its bytes ride the plan (`WeightSpec.generated`), so no checkpoint can supply it and
 `build_from_plan` fills that buffer from the plan itself — a caller-supplied array still wins, but an
 unsupplied constant buffer would otherwise allocate as ZEROS and run a silently weightless program.
+A bind record computed from ONE checkpoint tensor (the constant fold turns a norm's `1 + weight` into one, at a width
+where the broadcast to the token axis does not stop it) binds from that tensor: its `source_path` is the tensor's,
+and its first load op, `("record", …)`, carries the record with that leaf renamed to a fixed slot, which
+`apply_weight_loads` evaluates. Any other record keeps `load_ops=None`; the serving runner's binding raises on such
+a weight, and on one with no source, instead of leaving its buffer zero.
 `plan_from_graph` is the seam the whole runtime builds from: after it runs,
 nothing reads the graph again — `CompiledProgram.build(graph)` is exactly `build_from_plan(plan_from_graph(g))`,
 so a plan loaded from disk and a freshly compiled one share one launch path. The JSON form (`plan_to_dict` /
@@ -166,28 +186,45 @@ every lookup returns a fresh plan whose `WeightSpec`s contain that graph instanc
 paths or unresolved slots fail closed, and only these instantiated plans may reach source loading or pack serialization.
 This is deliberately not a persistent cache: `pack.py` owns cross-process environment/model validity.
 
-**Indirect operands** (`LaunchSpec.indirect_args`, `(arg, table_arg, sel_arg, slot)` per marked input): the
-kernel takes `const T* const* <arg>__table, const int* <arg>__sel, int <arg>__slot` in place of the plain
-pointer and resolves `table[sel[slot]]` in a body preamble — the serving MoE fixed-slot dispatch, where the
-weight base pointer comes from a device table indexed by the router's indices tensor. The change is ABI-level
-only: it enters as the `cuda.indirect_inputs` graph hint (set by the caller before compile, read by the final
-kernel lowering), so schedules, goldens, and the tile search are untouched, and non-indirect kernel sources stay
-byte-identical (`scripts/digest_kernels.py` is the gate). `arg_order` keeps the plain operand name; `_launch`
-expands it in place to `arrays[table], arrays[sel], slot`. An indirect operand staged through a TMA descriptor
-fails the lowering loudly (descriptors bake the base address at encode). A plan carrying the field serializes as
-`PLAN_FORMAT_INDIRECT` (2) — a runtime that ignored it would pass the wrong arg pack, so old readers reject such
-a plan and fall back to the full compile; plans without the field keep format 1 byte-compatibly.
-
 **Paged buffers** (`ExecutionPlan.paged`, `name -> (axis, page)`): a buffer that is a table of equal-sized pages
-rather than one allocation — the shape a KV cache has once it is allocated per request. The kernel takes
-`T* const* <name>__pages` in place of the plain pointer and every read or write resolves its page before its offset
-inside one. Like an indirect operand it enters as a graph hint (`cuda.paged_buffers`, `(name, axis, page, start)`
-per buffer) read by the final kernel lowering, so shapes, schedules, goldens and cubin keys of unpaged programs do
-not move. `start`, when given, names a graph tensor — an i64 scalar the kernel reads in its preamble — that shifts
-the buffer's own coordinate to an absolute one, so a step producing a chunk of new rows lands them anywhere in the
-cache while it stays one replayable graph. The plan carries the declaration so the runtime knows the buffer has no
-slab: it is never allocated, uploaded, zeroed or read back as one; its page table is bound by address
-(`CompiledProgram.alias_buffer`, or pages the runtime allocates itself for a standalone pack).
+rather than one allocation. The declaration enters as a graph hint (`cuda.paged_buffers`, `(name, axis, page)` per
+buffer) the host sets before compile and the final kernel lowering reads, so shapes, schedules, goldens and cubin
+keys of unpaged programs do not move. The kernel takes `T* const* <name>__pages` in place of the plain pointer, and
+every read or write resolves its page from its index along the axis — the index divided by `page` — before its offset
+inside one. The index is whatever the program spelled: an affine of the loop axes and symbols, a value loaded from
+another buffer, or a mix, and nothing in the lowering knows what the buffer holds. From the same index the lowering
+derives the pages the launch touches as a function of its inputs — an affine index gives an interval of pages, a
+loaded index the pages its buffer's values name, a mix their union — and emits, per launch, the program that writes
+that page list for the runtime's paging program (runtime `ARCHITECTURE.md`, "Paging"). An index computed inside the
+kernel is recomputed in that program from the kernel's inputs by its backward slice, which may be the whole producer
+run twice: a cost, never a cut or a fusion gate. A launch that touches one page of a buffer takes that page's base
+once in the preamble and addresses it flat, so staged copies and fragment stores work over it unchanged. The schedule
+search reads the same hint (`ClassicProblem.paged`): a transport that takes an operand's base address cannot feed a
+paged one, so TMA, which bakes the address into its descriptor, never stages a paged operand, and cp.async never
+stages one of several pages. The plan carries the declaration so the runtime knows the buffer has no slab: it is
+never allocated, uploaded, zeroed or read back as one; its page table is bound by address.
+
+Paging rests on a scatter the lowering spells as a store into its destination's memory: a `Write` whose index is a value
+the kernel loaded or computed, guarded so that an index past the end stores nothing, into an output stored over the
+destination (`Tensor.alias`, `BufferSpec.alias`) — the way a step writes the KV cache at its position, and the way the
+paging program keeps its tables and fills a slot. The `start` scalar that shifted an output's coordinate was the
+scatter's index and is gone, as is the per-launch pointer-table operand the serving MoE dispatch once resolved
+in-kernel: a gather by a selector is an index the program spells.
+
+Where a page table entry points — a device slot or a page's copy in mapped host memory — is the pager's, and the
+compiler never sees it: residency is not part of a kernel's identity, its schedule, the evidence context or a golden.
+The rows the evidence picks were measured with resident pages, and the schedules they pick also read host memory
+correctly. The paging program copies every miss in before a launch reads it, and only a launch that touches more
+pages than its buffer has slots reads host memory, so residency does not join the context.
+
+The paging step is three programs — the decisions, the table update, and the copy over the step's list of moved
+pages — traced once per page word with every size symbolic and read off the tables (`arange` over a table's length),
+so one kernel serves every paged buffer of every geometry. Ranks are counted per element and inverted by a scatter,
+never by a scan, so the decision kernels have no serial step. They are compiled at one fixed set of sizes (`paging.HINTS`), and the card's hardware
+golden holds their rows at those sizes, so a serving compile picks the recorded kernels whatever its geometry. Each
+launch's inspector is a slice of a kernel, with no program a record run could bench. The pager's kernels lower with
+strict evidence off: a fork no row decides — an inspector's, or a kernel with nothing to re-bench alone — takes the
+prior, under a scope that refuses that for the kernels they serve.
 
 `pack.py` bundles plans on disk: one directory per model × GPU × serving shape holding `manifest.json` (validity
 key + environment tags + provenance + program index) and `plan/<program>.json`. The validity key is composed by

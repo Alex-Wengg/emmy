@@ -1,11 +1,12 @@
 """Unit tests for structural feature extraction
-(``passes/identity.structure_features``).
+(``search/features.structure_features``).
 
 Hand-built ``Body`` fixtures (same style as ``tests/compiler/ir/stmt/
 test_structural_key.py``) exercise the skeleton histogram, the extent-free
 invariant, the ``S_ext_*`` extent block, and the ``S_dtype_*`` multiset; a
 second group compiles real frontend graphs (triple-matmul, matmul + epilogue,
-attention-like) through the loop passes and checks the stamped features.
+attention-like) through the loop passes and checks the features computed from
+the fused kernels (``search/features.stamps``).
 """
 
 from __future__ import annotations
@@ -22,14 +23,13 @@ from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.ir.stmt.blocks import Loop
 from emmy.compiler.ir.stmt.body import Body
 from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
-from emmy.compiler.pipeline.knob import STRUCT_PREFIX
-from emmy.compiler.pipeline.passes.identity import structure_features
+from emmy.compiler.pipeline.search.features import STRUCT_PREFIX, stamps, structure_features
 from emmy.compiler.tensor import Tensor
 
 
-def _rms_body(ext_i: int = 8, ext_k: int = 64) -> Body:
+def _rms_body(ext_i: int = 8, ext_k: int = 64, *, stored_k_major: bool = False) -> Body:
     """Free ``i`` over reduce ``k``: sum of squares of ``a`` → ``o``. One
-    reduce (RMSNorm-like)."""
+    reduce (RMSNorm-like); ``stored_k_major`` stores ``a`` as ``[k, i]``."""
     return Body(
         (
             Loop(
@@ -38,7 +38,7 @@ def _rms_body(ext_i: int = 8, ext_k: int = 64) -> Body:
                     Loop(
                         axis=Axis("k", ext_k),
                         body=(
-                            Load(name="x", input="a", index=(Var("i"), Var("k"))),
+                            Load(name="x", input="a", index=(Var("k"), Var("i")) if stored_k_major else (Var("i"), Var("k"))),
                             Assign(name="sq", op="multiply", args=("x", "x")),
                             Accum(name="s", value="sq", op=ElementwiseImpl("add")),
                         ),
@@ -96,6 +96,12 @@ def test_skeleton_histogram():
     assert feats["S_n_reduce_loop"] == 1.0
     assert feats["S_n_free_loop"] == 1.0
     assert feats["S_loop_depth"] == 2.0
+
+
+def test_a_load_along_the_reduction_in_memory_order_is_counted():
+    """The same reduction over a buffer stored the other way round reads it across the reduction axis."""
+    assert structure_features(_rms_body())["S_n_load_reduce_inner"] == 1.0
+    assert structure_features(_rms_body(stored_k_major=True))["S_n_load_reduce_inner"] == 0.0
 
 
 def test_reduce_multiset_distinguishes_one_vs_two_reduce():
@@ -267,12 +273,10 @@ def test_serial_cell_work_saturates_and_skips_symbolic_extents():
     assert structure_features(symbolic)["S_ext_serial_cell_work"] == 64.0
 
 
-def test_dtype_multiset_needs_graph():
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("a", (8, 64), "f16"), node_id="a")
-    feats = structure_features(_rms_body(), g)
+def test_dtype_multiset_needs_the_kernels_buffers():
+    feats = structure_features(_rms_body(), {"a": Tensor("a", (8, 64), "f16")})
     assert feats["S_dtype_f16"] == 1.0
-    # Without a graph there are no dtype features.
+    # Without the buffers there are no dtype features.
     assert not any(k.startswith("S_dtype_") for k in structure_features(_rms_body()))
 
 
@@ -280,14 +284,14 @@ def test_dtype_multiset_needs_graph():
 
 
 def _fused_loops(graph: Graph):
-    """Run the loop dialect (incl. the structural-feature stamp) and return
-    ``(fused_graph, [LoopOp, ...])``."""
+    """Run the loop dialect and return ``(fused_graph, [LoopOp, ...])``, each loop op bound to its
+    buffers — what its stamps read the dtypes off."""
     from emmy.compiler.context import Context  # noqa: PLC0415
     from emmy.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
     from emmy.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
 
     fused = Pipeline.build(LOOP_PASSES).run(graph, ctx=Context(compute_capability=(8, 0)), db=SearchDB())
-    return fused, [n.op for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
+    return fused, [n.op.with_io(fused, n) for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
 
 
 def _matmul_chain(shapes: list[tuple[str, tuple[int, int]]], mms: list[tuple[str, str, str, tuple[int, int]]]) -> Graph:
@@ -306,7 +310,7 @@ def _matmul_chain(shapes: list[tuple[str, tuple[int, int]]], mms: list[tuple[str
 
 
 def test_triple_matmul_features_include_both_nested_reductions():
-    """A chained triple-matmul ``((a@b)@d)`` fuses into one LoopOp whose stamped
+    """A chained triple-matmul ``((a@b)@d)`` fuses into one LoopOp whose
     ``S_*`` features describe both nested K reductions."""
     g = _matmul_chain(
         [("a", (64, 128)), ("b", (128, 48)), ("d", (48, 80))],
@@ -314,8 +318,9 @@ def test_triple_matmul_features_include_both_nested_reductions():
     )
     fused, loops = _fused_loops(g)
     assert len(loops) == 1
-    struct = {k: v for k, v in loops[0].knobs.items() if k.startswith(STRUCT_PREFIX)}
-    assert struct == structure_features(loops[0].body, fused), "stamped S_* must match structure_features"
+    struct = stamps(loops[0])
+    assert struct == structure_features(loops[0].body, loops[0].inputs), "a loop kernel's S_* row is its own body's"
+    assert not loops[0].knobs, "and nothing writes it onto the op"
     assert struct["S_n_reduce_loop"] == 2.0
     assert struct["S_ext_n_reduce_axis"] == 2.0
     assert struct["S_ext_reduce_prod"] == 128.0 * 48.0
@@ -328,8 +333,7 @@ def test_uncommon_shape_extents_land_in_features():
     g = _matmul_chain([("a", (48, 96)), ("b", (96, 80))], [("c", "a", "b", (48, 80))])
     fused, loops = _fused_loops(g)
     assert len(loops) == 1
-    struct = {k: v for k, v in loops[0].knobs.items() if k.startswith(STRUCT_PREFIX)}
-    assert struct == structure_features(loops[0].body, fused)
+    struct = stamps(loops[0])
     assert struct["S_ext_reduce_max"] == 96.0
     assert struct["S_ext_free_max"] == 80.0
 
@@ -349,9 +353,7 @@ def test_dtype_multiset_stamps_f8_generically():
     """``S_dtype_*`` is generated from buffer dtype NAMES, so an fp8 buffer stamps
     ``S_dtype_f8e4m3`` with no stamp-side change — the fp8 storage-class signal
     ``ShapeKey.from_s_features`` reads (M2a of the FP8 plan)."""
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("a", (8, 64), "f8e4m3"), node_id="a")
-    feats = structure_features(_rms_body(), g)
+    feats = structure_features(_rms_body(), {"a": Tensor("a", (8, 64), "f8e4m3")})
     assert feats["S_dtype_f8e4m3"] == 1.0
 
 
@@ -381,5 +383,5 @@ def test_in_graph_fp8_decode_cone_stamps_the_f8_dtype_feature():
     g.add_node(MatmulOp(), ["x", "w"], Tensor("y", (4, 8), "f16"), node_id="y")
     g.inputs, g.outputs = ["x"], ["y"]
     _, loops = _fused_loops(g)
-    stamped = [op for op in loops if op.knobs.get("S_dtype_f8e4m3")]
-    assert stamped, "no LoopOp stamped S_dtype_f8e4m3 for the in-graph fp8-B decode cone"
+    fp8 = [op for op in loops if stamps(op).get("S_dtype_f8e4m3")]
+    assert fp8, "no LoopOp reads an fp8 buffer for the in-graph fp8-B decode cone"

@@ -1,0 +1,13 @@
+tags:
+- onboarding
+- untested
+model:
+  huggingface: Aleph-Alpha/Kolibri-1
+  rationale: "Strong current attention: HN 669 pts and prior HF #1 trending; mature but high."
+  heat: 75
+  task: generate
+matrices:
+- deploy.gpu: NVIDIA H200 141GB
+  deploy.gpu_count: 2
+- deploy.gpu: NVIDIA B200
+  deploy.gpu_count: 2

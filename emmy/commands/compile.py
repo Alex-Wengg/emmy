@@ -94,6 +94,15 @@ def add_input_args(parser, *, include_dump_dir: bool = True) -> None:
         help="Layer index (when input is a model ID). Omit to process the whole model.",
     )
     parser.add_argument(
+        "--decoder",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Dotted module path of the decoder stack --layer indexes, for a model that holds several "
+            "(e.g. 'talker.model' in Qwen3-Omni). Omitted, the model's one text decoder is used."
+        ),
+    )
+    parser.add_argument(
         "--seq-len",
         type=int,
         default=DEFAULT_SEQ_HINT,
@@ -150,7 +159,8 @@ def add_golden_arg(parser) -> None:
         help=(
             "Select one realization by exact name or an unambiguous name substring — inside --golden PATH when given, "
             "else inside the live card's repository goldens. The embedded program of that realization is the input; "
-            "an ambiguous substring lists the matches and an unknown name lists what is available."
+            "an ambiguous substring lists the matches and an unknown name lists what is available. With --kernel, "
+            "require one exact row name and replay that kernel at its recorded sizes, regime and schedule."
         ),
     )
     parser.add_argument(
@@ -174,35 +184,30 @@ def add_golden_arg(parser) -> None:
 
 
 def resolve_golden_arg(args) -> None:
-    """Resolve ``--realization NAME`` (inside ``--golden PATH`` or the live card's corpus) to its
-    embedded stable Torch IR program and the golden records that are evidence for it.
+    """Resolve ``--realization NAME`` (inside ``--golden PATH`` or the live card's repository goldens) to the kernel
+    it names and the golden file that is evidence for it.
 
-    Four things come out on ``args``: ``_golden_graph`` (the target program), ``_golden_reference``
-    (the selected realization's frontend reference), ``_golden_records`` (every record of the file
-    recorded on that target — the golden evidence the compile's index loads, so a route's receipts
-    come along with it) and ``golden_configs`` (the rows ``run`` benches as pinned rows). Which rows
-    bench: a realization the operator NAMED is always benched;
-    a whole-file walk (``run --golden PATH`` alone, ``_explicit_realization`` false) benches a
-    target's verified rows and leaves proposals unbenched. Nothing here installs a pin: a measured
-    record reaches its kernel through the evidence
-    pick when the compile reaches that kernel's forks — except the kernel-set decisions a named
-    realization records, which the compile pins (:func:`selected_decisions`).
+    Four things come out on ``args``: ``_golden_graph`` (the target kernel's program, at the row's sizes),
+    ``_golden_reference`` (its Torch twin), ``_golden_scope`` (the file, the golden evidence the compile imports)
+    and ``golden_configs`` (the rows ``run`` benches as pinned rows: a named realization, except a whole-target latency
+    without a schedule or kernel measurement, and under ``--record-greedy`` a row with neither;
+    a whole-file walk (``_explicit_realization`` false) benches a target's
+    measured rows and leaves proposals and descendant rows to the evidence pick). Nothing here installs a pin: a
+    measured row reaches its kernel through the evidence pick — except the kernel-set decisions that minted it, which the compile
+    pins under ``--pin-route``, or an isolated ``--kernel`` row, whose full schedule is pinned (:func:`selected_decisions`).
 
-    ``NAME`` matches an exact realization name first, else a name **substring** — the same
-    identifier ``emmy eval --kernel`` filters the golden dataset on. Because compile/run build a
-    single graph, the substring must name **one** shape: a match spanning several shapes exits 2
-    listing them. Exits 2 on an unknown name (listing the available names) or a conflict with
-    ``--code`` / positional input / ``--ir`` / ``--dynamic``."""
+    ``NAME`` matches an exact row name first, else a name **substring**. Because compile/run build a single graph,
+    the substring must name **one** kernel: a match spanning several exits 2 listing them. Exits 2 on an unknown
+    name (listing the available names) or a conflict with ``--code`` / positional input / ``--ir`` / ``--dynamic``."""
+    from emmy.compiler.pipeline.search.golden import GoldenFile, repository  # noqa: PLC0415
+
     name = getattr(args, "realization", None)
     golden_file = getattr(args, "golden", None)
     program = getattr(args, "program", None)
     args.golden_configs = []
-    args._golden_records = []
+    args._golden_scope = None
     if program is not None:
-        # A stored traced program as the input, prepared as the inventory writer prepared it, so the
-        # loop stage is what ``emmy golden kernels`` must equal for the file to be current.
-        from emmy.compiler.pipeline.search.golden import GoldenFile  # noqa: PLC0415
-
+        # A stored traced program as the input — the whole layer or serving twin the file recorded.
         if not golden_file or name or args.code or args.input:
             logger.error("--program N selects a traced program inside --golden PATH and excludes --realization / --code / positional input")
             sys.exit(2)
@@ -211,7 +216,51 @@ def resolve_golden_arg(args) -> None:
             logger.error("--program %d: %s stores %d program(s)", program, golden_file, len(document.programs))
             sys.exit(2)
         args._golden_graph = document.program(program)
-        args._golden_records = document.records()
+        args._golden_document, args._golden_scope = document, [document]
+        return
+    if (kernel_name := getattr(args, "kernel", None)) is not None:
+        # One kernel as the whole program: its stored body or its exact tile reconstructed from recorded cuts,
+        # so a schedule pin reaches it alone.
+        if not golden_file or args.code or args.input:
+            logger.error("--kernel NAME selects a kernel inside --golden PATH and excludes --code / positional input")
+            sys.exit(2)
+        from emmy.compiler.pipeline.search.golden.restamp import isolated_program  # noqa: PLC0415
+
+        document = GoldenFile.load(golden_file)
+        found = [k for k in document.kernels if k.ref == kernel_name] or [k for k in document.kernels if kernel_name in k.ref]
+        if len(found) != 1:
+            logger.error(
+                "--kernel %r matches %d kernels.\nKernels: %s", kernel_name, len(found), ", ".join(sorted(k.ref for k in document.kernels))
+            )
+            sys.exit(2)
+        if name:
+            from emmy.compiler.pipeline.knob import values_equal  # noqa: PLC0415
+            from emmy.compiler.pipeline.search.space import precision_pins  # noqa: PLC0415
+
+            rows = [row for row in document.rows_of(name) if row.kernel == found[0].ref]
+            if len(rows) > 1:
+                choices = [row.pins | precision_pins(row.pins) | (row.knobs or {}) for row in rows]
+                live = _hand_pins({key for choice in choices for key in choice})
+                rows = [
+                    row
+                    for row, choice in zip(rows, choices, strict=True)
+                    if all(key not in choice or values_equal(key, value, choice[key]) for key, value in live.items())
+                ]
+            if len(rows) != 1:
+                logger.error(
+                    "--kernel with --realization requires one exact owned row; explicit regime/schedule pins must resolve duplicates"
+                )
+                sys.exit(2)
+            args._golden_rows = rows
+            bindings = rows[0].bindings
+        else:
+            bindings = next((row.bindings for row in document.rows if row.kernel == found[0].ref), found[0].bindings)
+        try:
+            args._golden_graph = isolated_program(document, found[0], bindings)
+        except ValueError as exc:
+            logger.error("--kernel %r: %s", kernel_name, exc)
+            sys.exit(2)
+        args._golden_document, args._golden_scope = document, [document]
         return
     if golden_file and not name:
         logger.error("--golden PATH requires --realization NAME here (run --golden PATH alone walks every realization)")
@@ -219,8 +268,8 @@ def resolve_golden_arg(args) -> None:
     if not name:
         return
 
-    # ``compile``'s ``--ir`` is an output STAGE (a key of _IR_STAGES), not an input
-    # file — only ``run``'s ``--ir`` (a JSON path) conflicts with ``--golden``.
+    # ``compile``'s ``--ir`` is an output STAGE (a key of _IR_STAGES), not an input file — only ``run``'s ``--ir``
+    # (a JSON path) conflicts with ``--golden``.
     ir_input = getattr(args, "ir", None)
     if ir_input in _IR_STAGES:
         ir_input = None
@@ -230,16 +279,10 @@ def resolve_golden_arg(args) -> None:
     if getattr(args, "dynamic", None):
         logger.error("--dynamic is incompatible with --golden (a dynamic golden's spec is part of its config)")
         sys.exit(2)
-    from emmy.compiler.pipeline.search.golden import GoldenEntryState, GoldenFile, golden_records, goldens_for_live_gpu
 
-    # Canonical replay scopes to the live card as before. An explicit working file is
-    # intentionally literal: no repository union and no live-card filtering, because its
-    # purpose is to verify the exact target currently being tuned (including Loop IR fallbacks).
-    document = None
     if golden_file:
-        # A multi-target replay hands us the document it already parsed: this file is a
-        # whole model inventory, so re-reading and re-validating it per target is the
-        # difference between minutes and days on a large golden.
+        # A multi-target walk hands us the document it already parsed: re-reading a model inventory per target is
+        # the difference between minutes and days on a large golden.
         document = getattr(args, "_golden_document", None)
         if document is None:
             try:
@@ -247,66 +290,55 @@ def resolve_golden_arg(args) -> None:
             except ValueError as exc:
                 logger.error(str(exc))
                 sys.exit(2)
-        records = document.records()
-        available = records
+        documents = [document]
     else:
-        records = goldens_for_live_gpu()
-        available = golden_records()
+        key = repository.live_gpu_key()
+        documents = repository.repository_documents(*key) if key is not None else repository.repository_documents()
 
-    exact = [index for index, record in enumerate(records) if record.name == name]
-    match_indexes = exact or [index for index, record in enumerate(records) if name in record.name]
-    matches = [records[index] for index in match_indexes]
+    rows = [(document, row) for document in documents for row in document.rows]
+    exact = [(document, row) for document, row in rows if row.name == name]
+    matches = exact or [(document, row) for document, row in rows if name in row.name]
+    if (pins := getattr(args, "_golden_pins", None)) is not None:
+        # A walk runs a target once per input regime its rows record: only that regime's rows are this run's.
+        matches = [(document, row) for document, row in matches if row.pins == pins]
     if not matches:
-        names = ", ".join(sorted({record.name for record in available}))
-        logger.error("unknown golden config %r.\nAvailable: %s", name, names)
+        logger.error("unknown golden config %r.\nAvailable: %s", name, ", ".join(sorted({row.name for _, row in rows})))
         sys.exit(2)
-    distinct = sorted({m.name for m in matches})
+    distinct = sorted({row.name for _, row in matches})
     if len(distinct) > 1:
-        logger.error("golden %r is ambiguous — matches %d shapes: %s\nNarrow it to one.", name, len(distinct), ", ".join(distinct))
+        logger.error("golden %r is ambiguous — matches %d rows: %s\nNarrow it to one.", name, len(distinct), ", ".join(distinct))
         sys.exit(2)
-    # ``--realization`` accepts an unambiguous substring; working-golden mutation is exact-name
-    # only, so it cannot update a similarly named sibling.
-    args.realization = distinct[0]  # the exact name from here on — what ``--record`` / ``--record-greedy`` write under
-    targets: list[dict] = []
-    for match in matches:
-        if not any(match.loop_wire == loop for loop in targets):
-            targets.append(match.loop_wire)
-    if len(targets) != 1:
-        logger.error("golden %r resolves to %d different embedded program targets", name, len(targets))
+    # ``--realization`` accepts an unambiguous substring; working-golden mutation is exact-name only.
+    args.realization = distinct[0]
+    kernels = {document.kernel(row.kernel).exact_identity for document, row in matches}
+    if len(kernels) != 1:
+        logger.error("golden %r resolves to %d different kernels", name, len(kernels))
         sys.exit(2)
-    args._golden_graph = matches[0].target_program.copy()
-    args._golden_reference = matches[0].reference_program
-    args._golden_records = [record for record in records if record.target_key == matches[0].target_key]
-    pinned = matches
-    if document is not None:
-        states = {row.name: row.kernel_set_state(entry.realizations) for entry in document.configs for row in entry.realizations}
-        if not getattr(args, "_explicit_realization", True):
-            pinned = [record for record in matches if states.get(record.name) is GoldenEntryState.VERIFIED]
-    # A receipt of a kernel a routing decision minted (its identity is no routing row's) replays under
-    # that decision: its piece keys compose with nothing on the unsplit program. The route is the
-    # target's routing rows, when they agree; conflicting arms leave the receipt to replay bare.
-    routing = [record for record in args._golden_records if record.is_routing]
-    route: dict[str, str] | None = {}
-    for record in routing:
-        for key, value in record.knobs.items():
-            if route is not None and route.setdefault(str(key), str(value)) != str(value):
-                route = None
-    minted = {record.identity for record in routing}
-    if route is not None and not any(str(key).split("@", 1)[0] == "PLACE" for key in route):
-        route["PLACE"] = "fuse"  # no placement row means the set ran fused; a cut taken would have been recorded
-
-    def row(match):
-        sample = golden_row(match, records)
-        if route and match.identity is not None and match.identity not in minted:
-            sample.route = {key: value for key, value in route.items() if key not in match.knobs}
-        return sample
-
-    args.golden_configs = [row(match) for match in pinned]
+    # The same kernel recorded on several cards — an off-card compile searches every repository golden — is one
+    # target, and every file that records it is evidence for it.
+    document, row = matches[0]
+    path = document.path_to(row.kernel)
+    target = document.kernel(path[0].parent if path else row.kernel)
+    args._golden_graph = document.executable(target, row.bindings)
+    args._golden_reference = document.reference_program(target)
+    args._golden_document, args._golden_scope = document, list({id(other): other for other, _ in matches}.values())
+    args._golden_rows = [row for _, row in matches]
+    pinned = [(source, row) for source, row in matches if row.knobs or row.measured or not row.latency]
+    if getattr(args, "record_greedy", False):
+        # A --record-greedy run writes the greedy pick, never a pinned row. A proposal (a row with no schedule and no
+        # measurement, such as a trace inventory's seed) benched beside the pick compiles the arm its route spells (on
+        # a whole-target row, the fused kernel) with nothing measured to schedule it, which strict evidence refuses —
+        # and that refusal would stop the record.
+        pinned = [(source, row) for source, row in pinned if row.knobs or row.measured]
+    if not getattr(args, "_explicit_realization", True):
+        whole = target.exact_identity  # a row of the target itself, in whichever file records it
+        pinned = [(source, row) for source, row in matches if row.measured and source.kernel(row.kernel).exact_identity == whole]
+    args.golden_configs = [golden_row(source, row) for source, row in pinned]
     logger.info(
-        "[golden] %s%s → embedded Loop IR target %s (%d matching row%s, %d automatic pin%s)",
+        "[golden] %s%s → kernel %s (%d matching row%s, %d automatic pin%s)",
         name,
         f" from {golden_file}" if golden_file else "",
-        matches[0].loop_index,
+        target.name,
         len(matches),
         "" if len(matches) == 1 else "s",
         len(pinned),
@@ -314,56 +346,117 @@ def resolve_golden_arg(args) -> None:
     )
 
 
-def selected_decisions(args) -> dict[str, str]:
-    """Under ``--pin-route``, the kernel-set decisions the realizations ``--realization`` named
-    record — their routes and cross-CTA splits, as one hand pin — so the compile takes the kernel
-    set the file describes; empty otherwise, and empty where the named rows disagree on a decision
-    (the walk leaves their receipts bare). A kernel set's measured price is its pieces' rows, which
-    the compile that takes the route is what records (``run --record-greedy``); until then nothing
-    prices the set, and a compile nothing pins keeps the kernel whole. The pin is the same hand pin
-    ``EMMY_KNOBS`` publishes, so one already set on a seam with another value is a conflict, refused."""
+def _hand_pins(keys) -> dict:
     from emmy.compiler.pipeline.knob import parse_knob_spec  # noqa: PLC0415
-    from emmy.compiler.pipeline.search.db import is_placement_knob  # noqa: PLC0415
 
-    if not getattr(args, "pin_route", False):
-        return {}
-    decisions: dict[str, str] = {}
-    for row in getattr(args, "golden_configs", None) or []:
-        for key, value in {**row.pins, **row.knobs}.items():
-            if is_placement_knob(key, value) and decisions.setdefault(str(key), str(value)) != str(value):
-                return {}
-    live = {
+    return {
         **parse_knob_spec(config.knobs_aggregate()),
-        **{key: config.knob_raw(key) for key in decisions if config.knob_raw(key) is not None},
+        **{key: config.knob_raw(key) for key in keys if config.knob_raw(key) is not None},
     }
+
+
+def selected_decisions(args) -> dict:
+    """For a named isolated row, its schedule; under ``--pin-route``, the decisions that mint the named rows — their routes
+    and cross-CTA splits, as one hand pin — so the compile takes the kernel set the file describes; empty otherwise,
+    and empty where the rows' routes disagree on a seam. A named row that benches as no pinned row (a whole-target
+    latency with no schedule and no measurement) pins the decisions that mint the kernel set its latency names. The
+    pin is the same hand pin ``EMMY_KNOBS`` publishes, so one already set on a seam with another value is a
+    conflict, refused."""
+    from emmy.compiler.pipeline.knob import values_equal  # noqa: PLC0415
+
+    isolated = bool(getattr(args, "kernel", None) and getattr(args, "realization", None))
+    if not isolated and not getattr(args, "pin_route", False):
+        return {}
+    decisions = {"PLACE": "fuse", **(args._golden_rows[0].knobs or {})} if isolated else {}
+    samples = [] if isolated else (getattr(args, "golden_configs", None) or [])
+    routes = [sample.route for sample in samples]
+    rows = (
+        []
+        if isolated
+        else [row for row in getattr(args, "_golden_rows", ()) if all(row != getattr(sample, "record", None) for sample in samples)]
+    )
+    for source in getattr(args, "_golden_scope", None) or ():
+        for row in rows:
+            if row in source.rows:
+                timed = dict.fromkeys(ref for latency in (row.latency or {}).values() for ref in latency.kernels)
+                routes.extend(_route_pins(source, ref) for ref in (timed or {row.kernel: None}))
+    for route in routes:
+        for key, value in route.items():
+            if decisions.setdefault(str(key), str(value)) != str(value):
+                return {}
+    live = _hand_pins(decisions)
     for key, value in decisions.items():
-        if key in live and str(live[key]) != value:
-            logger.error("--pin-route: the named row decides %s=%s but the hand pin says %s=%s", key, value, key, live[key])
+        if key in live and not values_equal(key, live[key], value):
+            logger.error("the named row decides %s=%s but the hand pin says %s=%s", key, value, key, live[key])
             sys.exit(2)
     return decisions
 
 
-def golden_row(record, records=()):
-    """A golden record as the duck-typed pinned row ``run`` benches and reports: the
-    :class:`~emmy.compiler.pipeline.search.dataset.Sample` view (``name`` / ``pins`` / ``knobs`` /
-    ``shape`` / ``dynamic``) plus the ``record`` itself — the row ``run`` measures under a hand pin and records as
-    deploy evidence.
+def _route_pins(document, ref: str) -> dict[str, str]:
+    """Address each recorded decision on the kernel and step where its parent exists. A piece is addressed by the
+    token its fresh name carries (``place_token``): the stored path is minted again for the names, because a stored
+    name keeps the token of the parent that first minted the piece, and a restamp keeps it through a re-key."""
+    from emmy.compiler.context import Context  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.tile._cut import place_token  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden.restamp import mint  # noqa: PLC0415
 
-    A record listing a ``kernel_set`` usually carries no row of its own, so its pin comes from the
-    routing rows it lists (:func:`~emmy.compiler.pipeline.search.golden.kernel_set_pins`, resolved
-    against ``records``). Those arms ride the row's ``pins`` beside the input regime, and the bench
-    publishes both: the compile then reaches the kernel set the recording measured, rather than
-    whatever the unpinned fork picks under the realization's name."""
+    path = document.path_to(ref)
+    fresh = {path[0].parent: document.kernel(path[0].parent)} if path else {}
+    if len(path) > 1:
+        ctx = Context.from_target(tuple(document.compute_cap), gpu_name=document.gpu_name or None)
+        for decision, same, children in mint(fresh[path[0].parent], path, ctx, document=document):
+            if not same:
+                raise ValueError(f"recorded route on {decision.parent} no longer replays")
+            fresh.update(zip(decision.children, children, strict=True))
+    steps = {path[0].parent: 0} if path else {}
+    route = {}
+    for decision in path:
+        parent = fresh[decision.parent]
+        stage = steps[decision.parent]
+        for key, value in decision.arm.items():
+            key = str(key)
+            if key.partition("@")[0] == "PLACE":
+                scope = [key.partition("@")[2]] if "@" in key else []
+                if stage:
+                    scope.insert(0, f"step.{stage}")
+                if (token := place_token(parent.name)) is not None:
+                    scope.insert(0, f"place_{token}")
+                key = "PLACE" + ("@" + "/".join(scope) if scope else "")
+            elif key.partition("@")[0] == "REDUCE":
+                token = place_token(parent.name)
+                key = "REDUCE@" + (f"place_{token}" if token is not None else "node_" + parent.name.removeprefix("k_"))
+            route[key] = str(value)
+        cut = any(str(key).partition("@")[0] == "PLACE" and value == "cut" for key, value in decision.arm.items())
+        for child in decision.children:
+            steps[child] = stage + 1 if cut and fresh.get(child, document.kernel(child)).name == parent.name else 0
+    return route
+
+
+def golden_row(document, row):
+    """A golden row as the duck-typed pinned row ``run`` benches and reports: ``name`` / ``pins`` (the input regime)
+    / ``route`` (the kernel-set decisions that mint its kernel, as a hand pin — ``PLACE=fuse`` for a kernel that ran
+    whole) / ``knobs`` (the schedule row) / ``shape`` (the kernel's structural signature) / the recorded
+    latencies, plus the ``record`` itself."""
     from types import SimpleNamespace  # noqa: PLC0415
 
-    from emmy.compiler.pipeline.search.dataset import Sample  # noqa: PLC0415
-    from emmy.compiler.pipeline.search.golden import kernel_set_pins  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.dataset import ShapeKey  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.features import stamps  # noqa: PLC0415
 
-    sample = vars(Sample.from_golden(record))
-    arms = kernel_set_pins(record, records)
-    if arms:
-        sample["pins"] = {**sample["pins"], **arms}
-    return SimpleNamespace(**sample, record=record)
+    kernel = document.kernel(row.kernel)
+    route = _route_pins(document, row.kernel)
+    if not route and row.knobs is not None:
+        route = {"PLACE": "fuse"}
+    return SimpleNamespace(
+        name=row.name,
+        pins=dict(row.pins),
+        route=route,
+        knobs={str(key): str(value) for key, value in (row.knobs or {}).items()},
+        shape=ShapeKey.from_s_features(stamps(kernel.op(row.bindings))),
+        dynamic=None,
+        latency_us=row.measurements.emmy_us if row.measurements is not None else None,
+        ref_us=row.measurements.reference_us if row.measurements is not None else None,
+        record=row,
+    )
 
 
 def add_quantize_arg(parser) -> None:
@@ -400,7 +493,7 @@ def add_diagnostics_args(parser) -> None:
             "-v: also pass timings and per-rule applied counts. "
             "-vv: also a unified-diff snapshot of every rule application, bracketed by "
             "``>>> <pass>:NNN_rulename`` / ``<<< <pass>:NNN_rulename`` markers (pass shorthands: "
-            "d=decomposition, o=optimization, l=lifting, f=fusion, n=canonicalize, s=stamp, t=tile/lift, "
+            "d=decomposition, o=optimization, l=lifting, f=fusion, s=stamp, t=tile/lift, "
             "p=tile/cut, h=tile/schedule, k=kernel, c=cuda). "
             "Diffs go to stdout (no ``2>&1`` needed). "
             "Slice one pass: ``... -vv | awk '/^>>> t:/,/^<<< t:/'``. "
@@ -495,11 +588,8 @@ def register_compile_command(subparsers):
         "--program",
         type=int,
         metavar="N",
-        help=(
-            "With --golden PATH: compile the golden's traced program N (its `programs` entry) instead of a "
-            "realization's kernel — the whole layer or serving twin the file recorded, prepared as the trace "
-            "inventory writer prepared it. With --ir loop -o fresh.json this writes the kernels the golden must store."
-        ),
+        help="With --golden PATH: compile the golden's traced program N (its `programs` entry) — the whole layer or serving "
+        "twin the file recorded.",
     )
     parser.add_argument(
         "--output",
@@ -527,8 +617,8 @@ def register_compile_command(subparsers):
             "Pass list to override the default. Accepts either a comma-separated list "
             "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
             "single-letter shortcuts: d=decomposition, o=optimization, l=lifting, "
-            "f=fusion, n=canonicalize, s=stamp, t=tile/lift, p=tile/cut, h=tile/schedule, "
-            "k=lowering/kernel, c=lowering/cuda. 'dolfnstp' stops after the cut pass: every cut a kernel "
+            "f=fusion, s=stamp, t=tile/lift, p=tile/cut, h=tile/schedule, "
+            "k=lowering/kernel, c=lowering/cuda. 'dolfstp' stops after the cut pass: every cut a kernel "
             "offers resolves by pins alone and no piece is scheduled, so the offered kernel sets can be read "
             "off the tile IR without paying for a schedule."
         ),
@@ -584,16 +674,15 @@ def handle_compile(args):
     db = SearchDB.for_compile(tune_db_path)
     logger.info("Using tuning DB: %s", tune_db_path)
 
-    from emmy.compiler.pipeline.search.golden import records_override, shared_regime_pins  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import evidence_scope  # noqa: PLC0415
     from emmy.compiler.pipeline.search.pins import pinned_knobs  # noqa: PLC0415
 
-    # A selected golden's records are the golden evidence this compile deploys from; their shared
-    # input regime is published so the rows read as live measurements, and the kernel-set decisions
-    # the named realization records are pinned so the compile takes the kernel set it describes.
-    scope = getattr(args, "_golden_records", None) or None
+    # A selected golden file is the golden evidence this compile deploys from; the rows' shared input regime is
+    # published so they read as live measurements, and under --pin-route the kernel-set decisions that mint the
+    # named row's kernel are pinned so the compile takes the kernel set the file describes.
     with (
-        pinned_knobs({**shared_regime_pins([sample.record for sample in args.golden_configs] or scope or []), **selected_decisions(args)}),
-        records_override(scope),
+        pinned_knobs({**golden_regime(args), **selected_decisions(args)}),
+        evidence_scope(getattr(args, "_golden_scope", None)),
         config.strict_evidence_override(True if args.strict_evidence else None),
     ):
         result = Pipeline.build(passes).run(graph, db=db, dump=dump)
@@ -635,18 +724,22 @@ def format_stage(graph, stage: str) -> str:
 
 
 def wire_stage(graph, stage: str) -> str:
-    """The stage as the wire a golden stores: the traced program for ``torch``, the Loop IR pool for
-    ``loop``. Other stages have no stored form."""
-    from emmy.compiler.pipeline.search.golden import kernel_pool_text, program_text  # noqa: PLC0415
+    """The stage as the wire a golden stores: the traced program, for ``torch``. Other stages have no stored form."""
+    from emmy.compiler.pipeline.search.golden import program_text  # noqa: PLC0415
 
     if stage == "torch":
         return program_text(graph)
-    if stage == "loop":
-        from emmy.compiler.pipeline.search.working_golden import kernel_programs  # noqa: PLC0415
-
-        return kernel_pool_text(program.to_wire() for _, program in kernel_programs(graph))
-    logger.error("a .json output holds the wire a golden stores, which exists for --ir torch and --ir loop only")
+    logger.error("a .json output holds the wire a golden stores, which exists for --ir torch only")
     sys.exit(2)
+
+
+def golden_regime(args) -> dict:
+    """The input regime the selected golden rows share, or the file's for a whole traced program, so they read
+    as live measurements; ``{}`` when they disagree or no golden is selected."""
+    document = getattr(args, "_golden_document", None)
+    if document is None:
+        return {}
+    return document.shared_regime(getattr(args, "_golden_rows", None))
 
 
 def _quantize_traced(graph: Graph, bundle, args) -> str:
@@ -712,6 +805,7 @@ def load_or_trace(args, *, architecture_only: bool = False) -> tuple[Graph, str,
             args.seq_len,
             dynamic_shapes=dynamic_shapes,
             architecture_only=architecture_only,
+            decoder_path=getattr(args, "decoder", None),
         )
     safe_name = args.input.replace("/", "-").lower()
     if args.layer is None:
@@ -800,6 +894,7 @@ def _trace_model(
     *,
     dynamic_shapes: dict | None = None,
     architecture_only: bool = False,
+    decoder_path: str | None = None,
 ) -> tuple[Graph, tuple]:
     """Trace an HF model and return ``(graph, (module, args, kwargs))``. The bundle
     is the runnable torch module + its trace-time example inputs — kept around so
@@ -840,7 +935,7 @@ def _trace_model(
         # Inventory traces need shapes and module structure, not checkpoint
         # values. Constructing from config under ``meta`` avoids downloading or
         # allocating enormous source checkpoints such as Laguna-S-2.1.
-        model = load_architecture_trace_twin(repo, dtype, layer, revision=revision)
+        model = load_architecture_trace_twin(repo, dtype, layer, revision=revision, decoder_path=decoder_path)
     else:
         # A hub id may pin its branch or commit as ``<repo>@<revision>``, the same spelling the
         # quantized lane above resolves through — a repo publishing one rung per branch has a
@@ -868,6 +963,7 @@ def _trace_model(
                 spell_dynamic_fp8_activations,
                 spell_quantized_constants,
                 spell_static_fp4_activations,
+                spell_static_fp8_activations,
                 spell_trellis_constants,
             )
             from emmy.compiler.trace.huggingface import retarget_constants_to_model  # noqa: PLC0415
@@ -876,6 +972,7 @@ def _trace_model(
                 retarget_constants_to_model(graph, wrapper, model)
             spell_quantized_constants(graph, str(quant_dir))
             spell_dynamic_fp8_activations(graph, str(quant_dir))
+            spell_static_fp8_activations(graph, str(quant_dir))
             spell_static_fp4_activations(graph, str(quant_dir))
             spell_trellis_constants(graph, str(quant_dir))
         return graph
@@ -903,7 +1000,7 @@ def _trace_model(
         stamp_sliding_windows(graph, _find_text_decoder(model).config)
         return graph, (wrapper, (input_ids,), {})
 
-    decoder = _find_text_decoder(model)
+    decoder = _find_text_decoder(model, decoder_path)
     layers = decoder.layers
     if layer >= len(layers):
         logger.error("Layer %d not found (model has %d layers)", layer, len(layers))
@@ -921,20 +1018,16 @@ def _trace_model(
 
     from emmy.compiler.trace.huggingface import trace_selected_layer
 
-    graph, bundle = trace_selected_layer(model, layer, seq_len, dtype, dynamic_shapes=dynamic_shapes)
+    graph, bundle = trace_selected_layer(model, layer, seq_len, dtype, dynamic_shapes=dynamic_shapes, decoder_path=decoder_path)
     return _stamp(graph, bundle[0]), bundle
 
 
-def _find_text_decoder(model):
-    """Locate the text transformer stack (the module owning the decoder
-    ``layers`` ModuleList + its ``rotary_emb``). Handles both the flat
-    ``model.model`` layout (Llama / Qwen) and nested multimodal layouts where
-    the language model sits under e.g. ``model.model.language_model`` (Gemma's
-    unified vision/audio/text models). Returns the deepest matching module."""
+def _find_text_decoder(model, path: str | None = None):
+    """:func:`~emmy.compiler.trace.huggingface.find_text_decoder` for the CLI: its refusal exits with the message."""
     from emmy.compiler.trace.huggingface import find_text_decoder
 
     try:
-        return find_text_decoder(model)
+        return find_text_decoder(model, path)
     except ValueError as exc:
         logger.error("%s", exc)
         sys.exit(1)

@@ -52,6 +52,7 @@ def _arange(x):
 
 _NAME_TO_FN: dict[str, object] = {
     "exp_fast": np.exp,  # the FAST_EXP-lowered exp — host semantics identical, CUDA renders __expf
+    "divide_rn_f32": np.divide,  # f32 reference division; CUDA keeps round-to-nearest under fast math
     "arange": _arange,
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "relu": lambda x: np.maximum(0.0, x),
@@ -119,6 +120,13 @@ _ARITY: dict[str, int] = {
     "where": 3,
     "next": 2,
 }
+
+
+def is_elementwise(name: str) -> bool:
+    """Whether ``name`` is an elementwise function: registered above, or a numpy ufunc. ``ElementwiseImpl``
+    also resolves a reduction's combine (``sum``, ``amax``) by any numpy name, and those are not."""
+    name = _ALIASES.get(name, name)
+    return name in _NAME_TO_FN or isinstance(getattr(np, name, None), np.ufunc)
 
 
 class ElementwiseImpl(Wire):
@@ -275,7 +283,7 @@ class ElementwiseImpl(Wire):
 # ---------------------------------------------------------------------------
 
 # Reduce/scan op aliases → their canonical combine identity. The single map
-# behind ``ElementwiseImpl.reduce_canon`` and the lift-reduce tensor→loop
+# behind ``ElementwiseImpl.reduce_canon`` and the reduce lowering rule
 # alias; an unlisted name canonicalizes to itself.
 _REDUCE_CANON: dict[str, str] = {
     "add": "add",
@@ -362,16 +370,17 @@ def reduce_spelling(op) -> ReduceSpelling:
 # - **copy** (rep ``copy``) — passthrough; its own bucket so a no-op
 #   doesn't get collapsed with arithmetic.
 _OP_CLUSTERS: dict[str, str] = {
-    # fma
-    "add": "add",
-    "sum": "add",
-    "subtract": "add",
-    "sub": "add",
-    "negative": "add",
-    "multiply": "add",
-    "prod": "add",
-    "abs": "add",
-    "fma": "add",
+    # fma — the representative is the product: a sum would fold with its neighbours into one flat sum under
+    # normalization and lose the tree the exact body had, while a product of two values folds with nothing.
+    "add": "multiply",
+    "sum": "multiply",
+    "subtract": "multiply",
+    "sub": "multiply",
+    "negative": "multiply",
+    "multiply": "multiply",
+    "prod": "multiply",
+    "abs": "multiply",
+    "fma": "multiply",
     # compare
     "maximum": "maximum",
     "minimum": "maximum",
@@ -379,6 +388,7 @@ _OP_CLUSTERS: dict[str, str] = {
     "sign": "maximum",
     # sfu_div
     "divide": "divide",
+    "divide_rn_f32": "divide",
     "true_divide": "divide",
     "floor_divide": "divide",
     "remainder": "divide",

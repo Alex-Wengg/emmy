@@ -206,6 +206,16 @@ def test_warp_tile_features_from_warp_tile():
     assert _warp_tile_features({"TILE@map.1/inner": "f2x4", "WORK": "t32x8"}) == {}  # scalar fragment → empty
 
 
+def test_wave_fill_reads_how_full_the_last_wave_is():
+    """170 CTAs on 170 SMs fill one wave; one CTA more opens a second wave holding it alone."""
+    from emmy.compiler.pipeline.search.features import _warp_tile_features  # noqa: PLC0415
+
+    knobs = {"TILE@map.1/inner": "mma_m16n8k16_f16_f32/f2x2/k2", "WORK": "w2x2", "H_sm_count": 170}
+    area = 2 * 2 * 16 * 2 * 2 * 8  # tile_m · tile_n
+    assert _warp_tile_features({**knobs, "S_ext_free_prod": area * 170})["D_wave_fill"] == 1.0
+    assert _warp_tile_features({**knobs, "S_ext_free_prod": area * 171})["D_wave_fill"] == pytest.approx(171 / 340)
+
+
 # ---------------------------------------------------------------------------
 # EMMY_KNOBS aggregate env var
 # ---------------------------------------------------------------------------
@@ -431,6 +441,11 @@ def test_family_value_reads_bare_or_suffixed():
     assert family_value({"REDUCE": "coop"}, "TILE") is None
 
 
+def test_reduce_family_validation_accepts_output_lanes_without_an_inventory() -> None:
+    assert knob_mod.validate_family_value("REDUCE", "coop-t") == "coop-t"
+    assert knob_mod.validate_family_value("REDUCE", "coop-t/n8") == "coop-t/n8"
+
+
 def test_pin_key_matches():
     """A global pin covers every site; a site pin matches only that exact site."""
     assert pin_key_matches("TILE", "TILE")
@@ -481,9 +496,19 @@ def test_is_off_value(monkeypatch):
     _pin_registry(monkeypatch)
     assert is_off_value("TILE", "")
     assert is_off_value("FAST_EXP", False)
+    for spelling in ("0", "off", "false", "no"):
+        assert is_off_value("FAST_EXP", spelling)
+    assert not is_off_value("FAST_EXP", "on")
+    assert not is_off_value("FAST_EXP", "typo")
+    assert not is_off_value("TILE", " ")  # schedule codecs compare their exact wire spelling
     assert not is_off_value("TILE", "w2x1")
     assert not is_off_value("BN", 0)  # BN declares no OFF
     assert not is_off_value("NOSUCH", "")
+
+
+def test_integer_off_values_use_the_registered_parser():
+    assert is_off_value("LOOPIFY", "0x0")
+    assert not is_off_value("LOOPIFY", "0x4")
 
 
 def test_exact_site_featurizes_consistently():
@@ -624,11 +649,9 @@ def test_complete_kernel_row_requires_the_emitted_exact_schedule():
         "TILE": "mma_m16n8k16_f16_f32/f1x1",
         "REDUCE": "",
         "STAGE": "",
-        "S_ext_free_prod": 64.0,
     }
     out = complete_kernel_row(row)
     assert out["TILE"] == "mma_m16n8k16_f16_f32/f1x1"
-    assert "S_ext_free_prod" not in out
     assert complete_kernel_row(out) == out
 
     # A kernel with neither a contraction nor a reduction site carries no TILE and no REDUCE key,

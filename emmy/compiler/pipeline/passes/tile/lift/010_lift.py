@@ -7,7 +7,7 @@ from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.pipeline import Match, Pattern
 from emmy.compiler.pipeline.passes.tile._cut import _input_fragment
 from emmy.compiler.pipeline.passes.tile._row import lift_kernel
-from emmy.compiler.pipeline.passes.tile._split import add_output_piece, state_ports
+from emmy.compiler.pipeline.passes.tile._split import add_output_piece, redirects, state_ports
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -22,6 +22,9 @@ def rewrite(match: Match, root: Node, ctx=None):
         return replace(tile, outputs={root.output.name: root.output})
     # A carried state: the term carries it (``Fold.cells``), and the classic schedule realizes it
     # as a buffer the kernel owns — so the node gains that port here, a splice where every other
-    # lift is a rebind. Register storage drops it again.
-    ports = state_ports(tile, root.id)
-    return add_output_piece(match, _input_fragment(match, root), root, tile, list(root.inputs), suffix="__lifted", states=ports)
+    # lift is a rebind — which threads the loop op in as the tile's ``source``, so the splice does the
+    # same. Register storage drops the port again.
+    ports = tuple(port for port in state_ports(tile, root.id) if port.name not in root.buffer_names())
+    lifted = replace(tile, source=loop)
+    match.output = redirects(root, "__lifted")
+    return add_output_piece(_input_fragment(match, root), root, lifted, list(root.inputs), suffix="__lifted", states=ports)

@@ -15,16 +15,24 @@ The per-cell choices stay exactly what they were — the catalog offers them bes
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
+from math import prod
 
 from emmy.compiler.ir.axis import Axis
-from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from emmy.compiler.ir.loop import LoopOp
-from emmy.compiler.ir.stmt import Body, Load, Loop, Stmt, Write
+from emmy.compiler.ir.pure import Fold
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Body, Load, Loop, OutputSpec, Stmt, Write
+from emmy.compiler.ir.stmt.passes import rewrite
 from emmy.compiler.ir.tile import TileOp
+from emmy.compiler.ir.tile.ops import UnbindableProjection, output_regions
 from emmy.compiler.ir.tile.path import sites
+from emmy.compiler.pipeline.passes.tile._free_axes import canonical_free_axes
 from emmy.compiler.pipeline.passes.tile._fromloop import lift_loop_op
 from emmy.compiler.pipeline.passes.tile._twist import rewrite_twisted
+from emmy.compiler.structural import form
 
 ROW_AXIS = "_row"
 
@@ -74,8 +82,7 @@ def _bind(body: Body, axis: Axis, position: int, shapes: dict) -> Body:
 def row_bound_body(op: LoopOp, position: int, name: str) -> Body:
     """``op``'s body with the coordinate at ``position`` bound as one extent-one free axis."""
     axis = Axis(name=name, extent=1)
-    shapes = {buffer: tensor.shape for buffer, tensor in (*op.inputs.items(), *op.outputs.items())}
-    return Body((Loop(axis=axis, body=_bind(Body.coerce(op.body), axis, position, shapes)),))
+    return Body((Loop(axis=axis, body=_bind(Body.coerce(op.body), axis, position, io_shapes(op))),))
 
 
 def binds_the_row(tile: TileOp, name: str) -> bool:
@@ -98,15 +105,28 @@ def row_candidates(op: LoopOp, tile: TileOp) -> tuple[int, ...]:
     they had: the reshaped-output matvec loses its TMA store descriptor and falls off the mma tier.
     So the two readings divide by what the term can support, and this one yields.
     """
-    if any(axis.extent.is_static and axis.extent.as_static() == 1 for axis in tile.place.free):
+    unit = any(axis.extent.is_static and axis.extent.as_static() == 1 for axis in tile.place.free)
+    # The batched-matvec unit row is only placement geometry. A size-one output
+    # coordinate may still bind into A, which gives the contraction its own row.
+    batched_unit = any(axis.name == "_um" for axis in tile.place.free) and any(
+        (view := node.as_contraction()) is not None and not view.left_axes and view.shared_axes for node in tile.views
+    )
+    if unit and not batched_unit:
         return ()
     return _unit_positions(op) if rowless(tile) else ()
 
 
-def lift_kernel(loop: LoopOp, *, name: str) -> TileOp:
-    """One kernel's program lifted as the lift pass lifts it: the complete nest as one Fold tree,
-    then, for a contraction that owns no free axis, its size-one row bound back so a tier has a
-    row to tile."""
+def io_shapes(op) -> dict:
+    """The shape of every buffer ``op`` reads or writes, by name."""
+    return {name: tensor.shape for name, tensor in {**op.inputs, **op.outputs}.items()}
+
+
+def lift_kernel(loop: LoopOp, *, name: str, shapes: Mapping | None = None) -> TileOp:
+    """One kernel formed from its program, a fused region and a piece alike: its free coordinates canonical over the
+    buffer ``shapes`` (``loop``'s own io by default), the complete nest as one Fold tree, then, for a contraction
+    that owns no free axis, its size-one row bound back so a tier has a row to tile."""
+    if (body := canonical_free_axes(loop.body, io_shapes(loop) if shapes is None else shapes)) is not None:
+        loop = replace(loop, body=body)
     tile = lift_loop_op(loop, name=name)
     # A contraction that owns no free axis has no row for any tier to tile. Its row is a size-one
     # output dimension Loop-IR normalization inlined; bound back, the term keeps every per-cell
@@ -116,6 +136,23 @@ def lift_kernel(loop: LoopOp, *, name: str) -> TileOp:
         if binds_the_row(bound, ROW_AXIS):
             return bound
     return tile
+
+
+def _value_axes(term: Fold, names: set[str]) -> set[str]:
+    """The axes the values ``names`` are evaluated over: the free axes of the terms of ``term``'s tree that define
+    or expose them."""
+    found: set[str] = set()
+    seen: set[int] = set()
+    pending = [term]
+    while pending and names:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if names & ({name for stmt in node.lift.body for name in stmt.defines()} | set(node.exposes)):
+            found |= set(node.free_axes)
+        pending.extend(node.operands)
+    return found
 
 
 def _orients_by_nest(tile: TileOp) -> bool:
@@ -129,7 +166,142 @@ def _orients_by_nest(tile: TileOp) -> bool:
     )
 
 
-def reformed(piece: TileOp) -> TileOp:
+def _align_owned_sweeps(piece: TileOp) -> TileOp:
+    """Give independent, equal-domain output sweeps common coordinates before re-forming the piece."""
+    op = piece.op
+    if piece.schedule is not None or len(piece.output_specs) < 2 or not isinstance(op, Fold) or op.axis is not None:
+        return piece
+    try:
+        regions = output_regions(op, piece.output_specs)
+    except UnbindableProjection:
+        return piece
+    if len(regions) < 2 or any(tail or len(stores) != 1 or not stores[0].sweep for _, tail, stores in regions):
+        return piece
+    sweeps = tuple(stores[0].sweep for _, _, stores in regions)
+    anchor = next((sweep for sweep in sweeps if len(sweep) == 1), sweeps[0])
+    axes = tuple(axis for sweep in sweeps for axis in sweep)
+    names = {axis.name for axis in axes}
+    outputs = tuple(stores[0].write.output for _, _, stores in regions)
+    if len(names) != len(axes) or len(set(outputs)) != len(outputs) or names & {axis.name for axis in piece.place.free}:
+        return piece
+    if len(anchor) == 1 and all(len(sweep) == 1 for sweep in sweeps):
+        if any(sweep[0].extent != anchor[0].extent or form(sweep[0].window) != form(anchor[0].window) for sweep in sweeps):
+            return piece
+    elif any(axis.window is not None or not axis.extent.is_static for axis in axes) or any(
+        prod(axis.extent.as_static() for axis in sweep) != prod(axis.extent.as_static() for axis in anchor) for sweep in sweeps
+    ):
+        return piece
+    for (region, _, stores), sweep in zip(regions, sweeps, strict=True):
+        owned = {axis.name for axis in sweep}
+        store_axes = {name for index in stores[0].write.index for name in index.free_vars()}
+        if region.free_axes & names != owned or store_axes & names != owned:
+            return piece
+        bound = set().union(
+            *(
+                {
+                    site.node.axis,
+                    *site.node.lift.params[: (site.node.axis is not None) + len(site.node.bindings)],
+                    *site.node.exposes,
+                    *site.node.lift.body.ssa_defs,
+                    *site.node.lift.body.axis_names,
+                }
+                for site in sites(region)
+            )
+        )
+        if bound & names or any(
+            site.node.observe is not None
+            or set(site.node.cells) & owned
+            or set(site.node.lift.results) & owned
+            or any(set(stmt.deps()) & owned for stmt in site.node.lift.body.iter() if not isinstance(stmt, Load))
+            for site in sites(region)
+        ):
+            return piece
+
+    def sigma(sweep: tuple[Axis, ...], mapping: dict[str, Var]) -> Sigma | None:
+        remaining = tuple(axis for axis in sweep if axis.name not in mapping)
+        available = tuple(axis for axis in anchor if axis.name not in {expr.name for expr in mapping.values()})
+        if prod(axis.extent.as_static() for axis in remaining) != prod(axis.extent.as_static() for axis in available):
+            return None
+        flat = Var(available[0].name) if available else Literal(0, "int")
+        for axis in available[1:]:
+            flat = flat * Literal(axis.extent.as_static(), "int") + Var(axis.name)
+        substitution: dict[str, Expr] = dict(mapping)
+        for i, axis in enumerate(remaining):
+            stride = prod(follower.extent.as_static() for follower in remaining[i + 1 :])
+            expr = flat
+            if stride > 1:
+                expr = BinaryExpr("/", expr, Literal(stride, "int"))
+            if i:
+                expr = BinaryExpr("%", expr, Literal(axis.extent.as_static(), "int"))
+            substitution[axis.name] = expr
+        return Sigma(substitution)
+
+    def loads(region: Fold) -> tuple[Load, ...]:
+        return tuple(
+            stmt
+            for site in sites(region)
+            for node in (site.node, *(edge for edge in site.node.operands if edge.as_slab() is not None))
+            for stmt in node.lift.body.iter()
+            if isinstance(stmt, Load)
+        )
+
+    anchor_region = next(region for (region, _, _), sweep in zip(regions, sweeps, strict=True) if sweep == anchor)
+    anchor_loads = loads(anchor_region)
+    extents = {axis.name: axis.extent for axis in piece.axes}
+    reference = {axis.name for axis in anchor}
+
+    def correspondence(region: Fold, sweep: tuple[Axis, ...]) -> dict[str, Var] | None:
+        if len(anchor) == 1:
+            return {}
+        owned = {axis.name for axis in sweep}
+        for load in loads(region):
+            for other in anchor_loads:
+                if load.input != other.input or len(load.index) != len(other.index):
+                    continue
+                coordinates = tuple(
+                    (left, right)
+                    for left, right in zip(load.index, other.index, strict=True)
+                    if isinstance(left, Var)
+                    and isinstance(right, Var)
+                    and left.name in extents
+                    and right.name in extents
+                    and extents[left.name] == extents[right.name]
+                )
+                shared = {left.name: right for left, right in coordinates if left.name in owned and right.name in reference}
+                reduced = {
+                    left.name: right
+                    for left, right in coordinates
+                    if left.name not in region.free_axes and right.name not in anchor_region.free_axes
+                }
+                # Equal load indices prove the shared coordinates, modulo equal-domain reduce binders.
+                # The rest of the output domain may flatten without mixing those coordinates.
+                if (
+                    shared
+                    and len({expr.name for expr in shared.values()}) == len(shared)
+                    and tuple(expr.substitute({**reduced, **shared}) for expr in load.index) == other.index
+                ):
+                    return shared
+        return None
+
+    substitutions: dict[tuple[Axis, ...], Sigma] = {}
+    for (region, _, _), sweep in zip(regions, sweeps, strict=True):
+        if sweep == anchor or len(sweep) == len(anchor) == 1:
+            substitutions[sweep] = Sigma({sweep[0].name: Var(anchor[0].name)}) if sweep != anchor else Sigma.IDENTITY
+            continue
+        mapping = correspondence(region, sweep)
+        substitution = sigma(sweep, mapping) if mapping is not None else None
+        if substitution is None:
+            return piece
+        substitutions[sweep] = substitution
+    operands = tuple(
+        rewrite(region, lambda name: name, substitutions[sweep]) for (region, _, _), sweep in zip(regions, sweeps, strict=True)
+    )
+    specs = tuple(replace(spec, write=spec.write.substitute(substitutions[spec.sweep]), sweep=anchor) for spec in piece.output_specs)
+    aligned = replace(piece, op=replace(op, operands=operands), output_specs=specs)
+    return aligned if all(not spec.sweep for spec in aligned.output_specs) else piece
+
+
+def reformed(piece: TileOp, shapes: Mapping) -> TileOp:
     """``piece`` formed as its own kernel: its tree lowered to the closed loop nest and lifted
     again, the way a kernel fusion had ended at a graph edge is formed.
 
@@ -146,14 +318,15 @@ def reformed(piece: TileOp) -> TileOp:
     AROUND the statistic the minted term holds beside it — the re-lifted reduce then reads the sweep
     axis, the rank rule promotes it, and the piece is back to folding its row statistic per output
     cell. The hoist is the form the reform is meant to preserve, so a piece that already has it is
-    not re-formed."""
+    not re-formed. ``shapes`` names every buffer the piece touches, as its own program does."""
+    piece = _align_owned_sweeps(piece)
     if any(store.sweep for store in piece.output_specs):
         return piece
     body = piece.op.lower(bound=frozenset(), stores=piece.output_specs, axes=piece.axes)
     try:
         # Through the LoopOp's normalization: that is where two reduce loops over one axis become
         # one loop with two accumulators, the twin the lift forms one term from.
-        formed = lift_kernel(LoopOp(body=body), name=piece.name)
+        formed = lift_kernel(LoopOp(body=body), name=piece.name, shapes=shapes)
         if _orients_by_nest(formed):
             # The closed nest's grid order is ``lower``'s choice. Formed once, the piece is lowered
             # again inside its own grid loops: nothing sits ahead of that chain, so normalization
@@ -165,7 +338,7 @@ def reformed(piece: TileOp) -> TileOp:
             for axis in reversed(formed.place.free):
                 again = Body((Loop(axis=axis, body=again),))
             try:
-                reoriented = lift_kernel(LoopOp(body=again), name=piece.name)
+                reoriented = lift_kernel(LoopOp(body=again), name=piece.name, shapes=shapes)
                 reoriented.op.lower(bound=frozenset(), stores=reoriented.output_specs, axes=reoriented.axes)
             except ValueError:
                 pass
@@ -185,9 +358,17 @@ def reformed(piece: TileOp) -> TileOp:
     if not any(site.node.as_contraction() is not None for site in sites(formed.op)):
         written = [name for spec in formed.output_specs[:1] for index in spec.write.index for name in sorted(index.free_vars())]
         grid = tuple(sorted(grid, key=lambda axis: written.index(axis.name) if axis.name in written else len(written)))
+    # A store rides a peeled axis its coordinates spell, or one the VALUES they name are evaluated over: a
+    # scatter's row is computed per cell of the sweep without naming the axis.
+    axis_names = {axis.name for axis in formed.axes}
+
+    def rides(spec: OutputSpec) -> set[str]:
+        guard = () if spec.when is None else (spec.when,)
+        read = {name for expr in (*spec.write.index, *guard) for name in expr.free_vars()}
+        return read | _value_axes(formed.op, read - axis_names)
+
     specs = tuple(
-        replace(spec, sweep=(*spec.sweep, *(axis for axis in peeled if any(axis.name in index.free_vars() for index in spec.write.index))))
-        for spec in formed.output_specs
+        replace(spec, sweep=(*spec.sweep, *(axis for axis in peeled if axis.name in rides(spec)))) for spec in formed.output_specs
     )
     # The loop nest carries no buffer shapes, so a row the minted piece announced (an elided unit
     # dimension) cannot be proven again from it. Without one, a contraction whose only shared axis is

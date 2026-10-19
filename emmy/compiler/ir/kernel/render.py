@@ -13,6 +13,7 @@ import numpy as np
 from emmy.compiler.backend.cuda.dtype import cuda_includes, cuda_name
 from emmy.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from emmy.compiler.backend.cuda.render_target import CudaRenderTarget
+from emmy.compiler.dim import spans_one_page
 from emmy.compiler.dtype import F4_VALUES, F32
 from emmy.compiler.ir.kernel.ir import (
     CpAsyncCopy,
@@ -1372,6 +1373,7 @@ def _wgmma_prelude(kernel_op: KernelOp) -> str:
 
 
 _INTRINSIC_TO_CUDA: dict[str, str] = {
+    "divide_rn_f32": "__fdiv_rn",
     "exp": "expf",
     "exp_fast": "__expf",
     "rsqrt": "rsqrtf",
@@ -1384,6 +1386,7 @@ _INTRINSIC_TO_CUDA: dict[str, str] = {
     "pow": "powf",
     "sqrt": "sqrtf",
     "erf": "erff",
+    "floor": "floorf",
 }
 
 _BUILTIN_TO_CUDA: dict[str, str] = {
@@ -1416,9 +1419,7 @@ def render_kernelop(
     shapes: dict[str, tuple[int, ...]] | None = None,
     literal_constants: dict[str, float] | None = None,
     runtime_args: tuple[str, ...] = (),
-    indirect_inputs: tuple[str, ...] = (),
-    paged_buffers: tuple[tuple[str, int, int, str | None], ...] = (),
-    starts: tuple[str, ...] = (),
+    paged_buffers: tuple[tuple[str, int, int], ...] = (),
 ) -> str:
     """Render a complete ``extern "C" __global__`` CUDA function for a ``KernelOp``.
 
@@ -1440,31 +1441,16 @@ def render_kernelop(
     ``float name = <value>;`` (see ``Load.render``) and the buf is
     excluded from the kernel signature.
 
-    ``indirect_inputs`` names input buffers whose base pointer is an
-    **indirect operand**: instead of ``const T* <n>`` the signature takes
-    ``const T* const* <n>__table, const int* <n>__sel, int <n>__slot``
-    and the body prepends ``const T* <n> = <n>__table[<n>__sel[<n>__slot]];``
-    — every downstream load is unchanged (the serving MoE fixed-slot
-    dispatch: the kernel fetches its weight base from a device pointer
-    table indexed by the router's indices tensor). Names absent from
-    ``kernel_op.inputs`` are ignored. Empty (the default) renders exactly
-    the historical signature — non-indirect kernel sources stay
-    byte-identical.
-
     ``paged_buffers`` names buffers virtualized along one axis, as
-    ``(name, axis, page_size, start)``: instead of a plain pointer the signature
+    ``(name, axis, page_size)``: instead of a plain pointer the signature
     takes ``<n>__pages``, a table of equal-sized pages, and every read or
-    write resolves its page before its offset (see ``render_paged_access``)
-    — the KV cache, whose pages are allocated per request and are not one
-    contiguous block. Shapes are untouched, so the paged axis stays
-    ``kv_len`` everywhere above the load. ``start`` names an i64 scalar in
-    device memory, listed in ``starts``: the signature takes its pointer
-    (after the outputs, unless the body already loads it), the preamble
-    reads ``<start>__at`` from it once, and that is added to the paged
-    index before the split — the absolute position a cache write lands
-    at, with the step still one replayable graph whatever the position.
-    ``None`` addresses from page 0. Empty (the default) renders every
-    buffer flat.
+    write resolves its page from its index along the axis before its offset
+    (``Paged``) — the KV cache, whose pages are allocated per request and
+    are not one contiguous block. The index is whatever the program spelled,
+    an axis or a value it loaded, so a store at an absolute position is an
+    ordinary scatter into the cache. Shapes are untouched, so the paged axis
+    stays ``kv_len`` everywhere above the load. Empty (the default) renders
+    every buffer flat.
 
     Kernel signature is derived from the body: ``kernel_op.inputs``
     (distinct ``Load.input`` names) become input params,
@@ -1504,19 +1490,18 @@ def render_kernelop(
                 "kernels are parameter names; keep checkpoint paths on ConstantOp.source_path, never the id"
             )
 
-    indirect = tuple(n for n in kernel_op.inputs if n in indirect_inputs and n not in literals)
     paged = {
-        n: Paged(n, axis, page, None if start is None else f"{start}__at")
-        for n, axis, page, start in paged_buffers
+        n: Paged(n, axis, page)
+        for n, axis, page in paged_buffers
         if n not in literals and (n in kernel_op.inputs or n in kernel_op.outputs)
     }
-    ctx.memory = dict(paged)
+    # A buffer whose one page spans it is addressed like the flat buffer it replaces: its base is
+    # the table's only entry, resolved once in the preamble, so every statement kind — a staged
+    # copy, a descriptor, a fragment store — works over it unchanged.
+    whole = {n for n, p in paged.items() if spans_one_page(tensors[n].shape, p.axis, p.page)}
+    ctx.memory = {n: p for n, p in paged.items() if n not in whole}
     sig_parts = [
-        f"const {cuda_name(_dtype_for(n))}* const* {n}__table, const int* {n}__sel, int {n}__slot"
-        if n in indirect
-        else f"const {cuda_name(_dtype_for(n))}* const* {n}__pages"
-        if n in paged
-        else f"const {cuda_name(_dtype_for(n))}* __restrict__ {n}"
+        f"const {cuda_name(_dtype_for(n))}* const* {n}__pages" if n in paged else f"const {cuda_name(_dtype_for(n))}* __restrict__ {n}"
         for n in kernel_op.inputs
         if n not in literals
     ]
@@ -1531,7 +1516,6 @@ def render_kernelop(
     # joins two programs, never one launch's read and write), so the compiler may keep a read-only
     # operand in registers across the kernel's stores and read it through the non-coherent path.
     sig_parts.extend(_out_param(n) for n in kernel_op.outputs)
-    sig_parts.extend(f"const long long* {n}" for n in starts if n not in kernel_op.inputs)
     # TMA descriptors are passed as ``__grid_constant__`` value parameters.
     # The kernel only takes their address (``&desc``) for inline asm, so
     # the opaque ``CUtensorMap`` forward decl above suffices.
@@ -1571,13 +1555,15 @@ def render_kernelop(
         pool_align = max(16, *(max(_nbytes_of(s.dtype), int(s.align) if s.align else 0) for s in kernel_op.smem_buffers.values()))
         pool_decl = f"    extern __shared__ __align__({pool_align}) unsigned char _smem_pool[];  // {smem_total} bytes\n"
         body_text = pool_decl + body_text
-    if indirect:
-        # Indirect-operand preamble: resolve each marked input's base pointer from its device
-        # table before any body statement runs; downstream loads use the plain name unchanged.
-        body_text = "".join(f"    const {cuda_name(_dtype_for(n))}* {n} = {n}__table[{n}__sel[{n}__slot]];\n" for n in indirect) + body_text
-    if starts:
-        # A paged write's start read off the device: the position a step lands its rows at.
-        body_text = "".join(f"    const int {n}__at = (int){n}[0];\n" for n in starts) + body_text
+    if whole:
+        body_text = (
+            "".join(
+                f"    {'const ' if n in kernel_op.inputs else ''}{cuda_name(_dtype_for(n))}* {n} = {n}__pages[0];\n"
+                for n in (*kernel_op.inputs, *kernel_op.outputs)
+                if n in whole
+            )
+            + body_text
+        )
     # Programmatic dependent launch (sm_90+): wait for the grid ahead before any memory access (the
     # preambles above already read device memory it may write). A no-op without the launch attribute.
     # No kernel releases its dependent early (``griddepcontrol.launch_dependents``): a dependent
@@ -1632,8 +1618,10 @@ def render_kernelop(
         mma_sync_prelude += _F8S_LOADER.format(sfx=dt, **_F8S_SPELLINGS[dt])
     uses_cp_async = any(isinstance(s, (CpAsyncCopy, CpAsyncCommit, CpAsyncWait)) for s in kernel_op.body.iter())
     cp_async_prelude = _CP_ASYNC_PRELUDE if uses_cp_async else ""
-    bitcast_prelude = _BITCAST_PRELUDE if any(isinstance(s, Assign) and s.op.name == "bitcast" for s in kernel_op.body.iter()) else ""
-    f4_encode = _F4_ENCODE_PRELUDE if any(isinstance(s, Assign) and s.op.name == "to_f4e2m1" for s in kernel_op.body.iter()) else ""
+    # Register epilogues and fragment chains render calls outside the body's scalar Assign walk, so both
+    # preludes are gated on the rendered text.
+    bitcast_prelude = _BITCAST_PRELUDE if "emmy_bitcast<" in body_text else ""
+    f4_encode = _F4_ENCODE_PRELUDE if "emmy_to_f4e2m1(" in body_text else ""
     preludes = (
         f"{includes}{bitcast_prelude}{f4_encode}{mma_sync_prelude}{_wgmma_prelude(kernel_op)}"
         f"{cp_async_prelude}{_swizzle_prelude(kernel_op)}{prelude}"

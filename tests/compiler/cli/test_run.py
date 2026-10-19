@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch  # used by test_bind_inputs_preserves_int_dtype
 
@@ -64,6 +65,35 @@ def test_random_input_values_bound_u8_scale_codes_without_changing_adjacent_inpu
 
     fp8 = _random_input_values(np.random.default_rng(13), (256,), "f8e4m3", name="activation_scale")
     assert fp8.dtype == np.uint8 and np.isfinite(decode_f8(fp8, "f8e4m3")).all()
+
+
+def test_random_input_values_use_adapter_scale_and_binary_selection():
+    import numpy as np
+
+    from emmy.commands.run import _random_input_values
+    from emmy.serving.lora import WEIGHT_INPUTS
+
+    assert WEIGHT_INPUTS == {"q_a", "q_b", "k_a", "k_b", "v_a", "v_b", "o_a", "o_b", "gate_a", "gate_b", "up_a", "up_b", "down_a", "down_b"}
+    for name in WEIGHT_INPUTS:
+        values = _random_input_values(np.random.default_rng(7), (1024,), "f16", name=name)
+        assert values.dtype == np.float32
+        assert 0.015 < float(values.std()) < 0.025
+
+    mask = _random_input_values(np.random.default_rng(7), (1024, 1), "f16", name="lora_mask")
+    assert set(np.unique(mask)) == {0.0, 1.0}
+
+
+def test_random_input_values_draw_routed_expert_weights_at_weight_scale():
+    """An expert program takes its weights as inputs; drawn at unit scale its FP16 projections overflow."""
+    import numpy as np
+
+    from emmy.commands.run import _random_input_values
+    from emmy.compiler.trace.huggingface import EXPERT_WEIGHT_INPUTS
+
+    for name in EXPERT_WEIGHT_INPUTS:
+        values = _random_input_values(np.random.default_rng(7), (1024,), "f16", name=name)
+        assert 0.015 < float(values.std()) < 0.025
+    assert 0.9 < float(_random_input_values(np.random.default_rng(7), (1024,), "f16", name="x").std()) < 1.1
 
 
 def test_run_no_code_errors(run_cli):
@@ -420,8 +450,9 @@ def test_ir_ab_replay_retains_boolean_input_pins(tmp_path, monkeypatch):
     source.write_text("{}")
     monkeypatch.setattr(run_mod, "pinned_knobs", capture_pins)
     monkeypatch.setattr(run_mod, "_cuda_knob_dicts", lambda _graph: [{"TILE": "f2x4"}])
+    monkeypatch.setattr(run_mod, "_cuda_kernel_names", lambda _graph: [("k_mock", "k_mock")])
     monkeypatch.setattr(run_mod, "_placement_knob_dicts", lambda _graph: [])
-    monkeypatch.setattr(Graph, "from_dict", staticmethod(lambda _document: object()))
+    monkeypatch.setattr(Graph, "from_dict", staticmethod(lambda _document: Graph()))
 
     rows = asyncio.run(run_mod._bench_ab_variants_ir(Backend(), source, (), ["FAST_MATH=False,TILE=f2x4"], warmup=1, iters=2))
 
@@ -544,11 +575,101 @@ def test_wrong_answer_flag_catches_bad_pinned_output():
     from emmy.commands.run import _wrong_answer_flag
 
     ref = {"o": np.full((4, 4), 100.0)}
-    assert _wrong_answer_flag({"o": ref["o"].copy()}, ref) is None
-    assert _wrong_answer_flag({"o": ref["o"] + 1.0}, ref) is None  # 1% off — reorder noise
-    assert "wrong-answer" in _wrong_answer_flag({"o": ref["o"] * 0.5}, ref)
-    assert "missing" in _wrong_answer_flag({}, ref)
-    assert "shape" in _wrong_answer_flag({"o": np.zeros((2, 2))}, ref)
+    none = frozenset()
+    assert _wrong_answer_flag({"o": ref["o"].copy()}, ref, none) is None
+    assert _wrong_answer_flag({"o": ref["o"] + 1.0}, ref, none) is None  # 1% off — reorder noise
+    assert "wrong-answer" in _wrong_answer_flag({"o": ref["o"] * 0.5}, ref, none)
+    assert "missing" in _wrong_answer_flag({}, ref, none)
+    assert "shape" in _wrong_answer_flag({"o": np.zeros((2, 2))}, ref, none)
+
+
+def test_wrong_answer_flag_forgives_sparse_code_flips_only_in_quantized_outputs():
+    """One bad row among 64 has a mean error under 0.5% of peak. It is a fault in an ordinary output, and the same
+    sparse pattern is a rounding-boundary code flip in a quantized one; an output wrong everywhere fails either way."""
+    from emmy.commands.run import _wrong_answer_flag
+
+    ref = {"o": np.full((64, 64), 6.0)}
+    one_row = ref["o"].copy()
+    one_row[17] *= 0.7  # 30% off on one row: mean error 0.47% of peak
+    assert "wrong-answer" in _wrong_answer_flag({"o": one_row}, ref, frozenset())
+    flips = ref["o"].copy()
+    flips.flat[::97] = 4.0  # sparse code flips, one quantization step each
+    assert _wrong_answer_flag({"o": flips}, ref, frozenset({"o"})) is None
+    assert "wrong-answer" in _wrong_answer_flag({"o": ref["o"] * 0.5}, ref, frozenset({"o"}))
+    with pytest.raises(AssertionError, match="frozenset"):
+        _wrong_answer_flag({"o": flips}, ref, {"o"})
+
+
+@pytest.mark.parametrize(
+    ("got", "ref", "flagged"),
+    [
+        (np.nan, 1.0, True),  # a NaN from the pinned kernel
+        (1.0, np.nan, True),  # a NaN in the reference only
+        (-np.inf, -np.inf, False),  # a mask on both sides
+        (np.inf, -np.inf, True),  # infinities of opposite sign
+        (1.0, -np.inf, True),  # a finite value where the reference masks
+    ],
+)
+def test_wrong_answer_flag_compares_non_finite_values_by_position(got, ref, flagged):
+    """A NaN must not pass because ``max`` ignores it; a matching mask is not a wrong answer."""
+    from emmy.commands.run import _wrong_answer_flag
+
+    reference = np.full((2, 3), 100.0)
+    reference[1, 2] = ref
+    output = reference.copy()
+    output[1, 2] = got
+    assert (_wrong_answer_flag({"o": output}, {"o": reference}, frozenset()) is not None) is flagged
+
+
+def test_random_packed_sources_spread_codes_and_scales_stay_positive():
+    """A generated NVFP4 weight looks like a real one: its 4-bit codes spread over the format and its
+    block scales decode positive and finite. Near-zero codes or negative scales bench a kernel on data no
+    checkpoint holds."""
+    from emmy.commands.run import _random_source_values
+    from emmy.compiler.dtype import decode_f8
+
+    rng = np.random.default_rng(0)
+    packed = _random_source_values(rng, (64, 256), "f4e2m1x2", name="model.layers.3.mlp.gate_proj.weight")
+    assert packed.dtype == np.uint8
+    assert len(np.unique(packed & 0xF)) >= 12 and len(np.unique(packed >> 4)) >= 12
+    scales = _random_source_values(rng, (64, 32), "f8e4m3", name="model.layers.3.mlp.gate_proj.weight_scale")
+    decoded = decode_f8(scales, "f8e4m3")
+    assert np.isfinite(decoded).all() and (decoded > 0).all()
+    tensor_scale = _random_source_values(rng, (64,), "f32", name="model.layers.3.mlp.gate_proj.weight_scale_2")
+    assert (tensor_scale > 0).all()
+
+
+def test_random_nvfp4_scales_match_the_synthesized_weights_and_activations():
+    """A synthesized NVFP4 linear dequantizes to weights of the 0.02 standard deviation the unquantized sources have,
+    and its ``input_scale`` quantizes a synthesized activation with e4m3 block scales well under the e4m3 maximum of
+    448. Scales out of proportion saturate every activation block scale and pin its codes at the e2m1 extremes, and
+    the eager reference then differs from a float64 evaluation of the same graph by thousands."""
+    from emmy.commands.run import _random_input_values, _random_source_values
+    from emmy.compiler.dtype import decode_f4x2, decode_f8
+
+    rng = np.random.default_rng(0)
+    base = "model.layers.3.mlp.down_proj"
+    codes = decode_f4x2(_random_source_values(rng, (64, 128), "f4e2m1x2", name=f"{base}.weight")).reshape(64, 16, 16)
+    block = decode_f8(_random_source_values(rng, (64, 16), "f8e4m3", name=f"{base}.weight_scale"), "f8e4m3")
+    global_scale = _random_source_values(rng, (), "f32", name=f"{base}.weight_scale_2")
+    weight = codes * block[..., None] * global_scale
+    assert 0.01 < float(np.sqrt(np.mean(weight**2))) < 0.04
+
+    activation = _random_input_values(rng, (32, 256), "f32", name="x")
+    input_scale = _random_source_values(rng, (), "f32", name=f"{base}.input_scale")
+    block_scale = np.abs(activation).reshape(32, 16, 16).max(-1) / 6 / input_scale
+    assert float(block_scale.max()) < 448 / 2
+
+
+@requires_cuda
+def test_bf16_bits_bind_by_reinterpretation_for_the_eager_reference():
+    """A folded BF16 table evaluates to its bits on a ``uint16`` carrier; converting them would read each bit pattern
+    as a number, and the eager reference would disagree with every NVFP4 kernel by orders of magnitude."""
+    from emmy.commands.run import _to_cuda_tensor
+    from emmy.compiler.dtype import encode_bf16
+
+    values = np.array([0.5, -6.0, 1.5], dtype=np.float32)
+    assert _to_cuda_tensor(encode_bf16(values), "bf16").float().cpu().numpy().tolist() == values.tolist()
 
 
 def test_strict_correctness_proof_uses_compiler_baseline_tolerance():
@@ -592,6 +713,103 @@ def test_strict_correctness_proof_accepts_a_mask_that_matches_its_reference():
     assert _strict_correctness_proof({"o": np.array([0.0005, -np.inf], dtype=np.float32)}, mask)["status"] == "pass"
     for wrong in ([0.0, np.inf], [-np.inf, 0.0], [0.0, np.nan]):
         assert _strict_correctness_proof({"o": np.array(wrong, dtype=np.float32)}, mask)["status"] == "fail"
+
+
+def test_strict_correctness_proof_weighs_a_rounding_flip_against_fp64():
+    """A candidate that leaves the elementwise rule against a low-precision reference passes only when
+    it is no less accurate than that reference against the exact values; a real fault still fails."""
+    import numpy as np
+
+    from emmy.commands.run import _strict_correctness_proof
+
+    exact = {"o": np.array([0.0422, 1.0, 2.0, 3.0])}
+    eager = {"o": np.array([0.0432, 1.0005, 2.0004, 3.0002])}
+    flip = {"o": np.array([0.0412, 1.0, 2.0, 3.0])}
+    assert _strict_correctness_proof(flip, eager)["status"] == "fail"
+    proof = _strict_correctness_proof(flip, eager, exact_out=lambda: exact)
+    assert proof["status"] == "pass"
+    stats = proof["exact_comparison"]["per_output"]["o"]
+    assert stats["candidate_max"] <= stats["reference_max"]
+
+    wrong = {"o": np.array([0.0412, 1.0, 2.0, 3.01])}
+    assert _strict_correctness_proof(wrong, eager, exact_out=exact)["status"] == "fail"
+    biased = {"o": np.array([0.0412, 1.001, 2.001, 3.001])}
+    assert _strict_correctness_proof(biased, eager, exact_out=exact)["status"] == "fail"
+
+
+def test_strict_proof_adopts_the_candidates_fp4_codes_at_an_activation_quantize(tmp_path):
+    """A candidate whose 4-bit activation codes sit one step from the reference's fails the strict check without
+    adoption, though both rounded correctly. The check that adopts the candidate's codes at the quantize node passes
+    it, reports the differing code, still fails a real error after the node, and fails a code two steps away at the
+    node itself."""
+    import torch
+
+    from emmy.commands.run import _graft_candidate, _quantize_nodes, _strict_eager_proof
+    from emmy.compiler.backend import torch_ref
+    from emmy.compiler.loader.safetensors import load_constants_from_safetensors
+    from tests.compiler.passes.test_nvfp4_w4a4 import _w4a4_linear
+
+    g = _w4a4_linear(tmp_path, m=4, n=32, k=64)
+    quantized = _quantize_nodes(g, g)
+    assert sorted(g.nodes[name].output.dtype.name for name in quantized) == ["f4e2m1x2", "f8e4m3"]
+    bits = next(name for name in quantized if g.nodes[name].output.dtype.name == "f4e2m1x2")
+
+    feed = {"x": (np.random.default_rng(3).standard_normal((4, 64)) * 0.5).astype(np.float16)}
+    data = {**load_constants_from_safetensors(g, str(tmp_path)), **feed}
+    inputs = {nid: torch.from_numpy(np.asarray(v)).to(torch_ref.torch_dtype(g.nodes[nid].output.dtype)) for nid, v in data.items()}
+
+    def evaluate(graph, tensors):
+        fn, args = torch_ref.build_callable(graph, tensors)
+        with torch.no_grad():
+            return [t.numpy() for t in fn(*args)]
+
+    probe = g.copy()
+    probe.outputs = list(quantized)
+    taps = dict(zip(quantized, evaluate(probe, inputs), strict=True))
+    # One code one step up (down from the largest magnitude): a value near the midpoint between two codes may round to
+    # its neighbour in another correct implementation.
+    taps[bits] = taps[bits].copy()
+    code = int(taps[bits].flat[0]) & 0xF
+    taps[bits].flat[0] = (int(taps[bits].flat[0]) & 0xF0) | (code + 1 if code & 7 < 7 else code - 1)
+    fed = {f"{name}_candidate": torch.from_numpy(v) for name, v in taps.items()}
+    outputs = {"y": evaluate(_graft_candidate(g, quantized), {**inputs, **fed})[0].astype(np.float32)}
+
+    assert _strict_eager_proof(g, inputs, outputs, g, {})[0]["status"] == "fail"
+    proof = _strict_eager_proof(g, inputs, outputs, g, taps)[0]
+    assert proof["status"] == "pass", proof
+    assert proof["quantize_nodes"][bits]["rounded_differently"] == 1
+
+    wrong = {"y": outputs["y"].copy()}
+    wrong["y"].flat[5] += 0.01 * float(np.abs(outputs["y"]).max())
+    assert _strict_eager_proof(g, inputs, wrong, g, taps)[0]["status"] == "fail"
+
+    far = {**taps, bits: taps[bits].copy()}
+    far[bits].flat[0] = (int(taps[bits].flat[0]) & 0xF0) | (code + 2 if code & 7 < 6 else code - 2)
+    proof = _strict_eager_proof(g, inputs, outputs, g, far)[0]
+    assert proof["status"] == "fail" and f"quantize node {bits!r}: 1/" in proof["error"], proof
+    assert proof["quantize_nodes"][bits]["beyond_one_code"] == 1
+
+
+def test_quantize_tap_codes_pass_within_one_code_and_fail_beyond():
+    """The strict proof accepts a tap value that is the reference's code or one of the two beside it on the format's
+    grid, and rejects one two codes away: in either direction, across zero, at the largest magnitude, for every
+    quantized format."""
+    from emmy.commands.run import _adjacent_codes, _quantized_values
+
+    def decode(codes, fmt):
+        return _quantized_values(np.array(codes, dtype=np.uint8), fmt)
+
+    cases = {
+        # reference codes, codes one step from them, codes two steps from them (e2m1 packs two codes per byte)
+        "f4e2m1x2": ([0x21, 0x08], [0x12, 0x19], [0x03, 0x2A]),
+        "f8e4m3": ([0x40, 0x00, 0x7E], [0x41, 0x01, 0x7D], [0x42, 0x02, 0x7C]),
+        "f8e5m2": ([0x40, 0x00], [0x3F, 0x81], [0x3E, 0x02]),
+    }
+    for fmt, (reference, near, far) in cases.items():
+        theirs = decode(reference, fmt)
+        assert _adjacent_codes(theirs, theirs, fmt).all(), fmt
+        assert _adjacent_codes(decode(near, fmt), theirs, fmt).all(), fmt
+        assert not _adjacent_codes(decode(far, fmt), theirs, fmt).any(), fmt
 
 
 def test_unreproducible_pin_flag(monkeypatch):
@@ -658,6 +876,8 @@ def test_unreproducible_pin_flag(monkeypatch):
     assert unreproducible_pin_flag({"PLACE": "fuse"}, [{"TILE": "f2"}], placement_knobs=[]) is None
     assert unreproducible_pin_flag({"PLACE@map.1/inner": "fuse"}, [{"TILE": "f2"}], placement_knobs=[])
     assert unreproducible_pin_flag({"PLACE": "fuse"}, [{"TILE": "f2"}], placement_knobs=[{"PLACE@map.1/inner": "cut"}])
+    # A trace holding only another family's receipt (a layout decision) took no cut either.
+    assert unreproducible_pin_flag({"PLACE": "fuse"}, [{"TILE": "f2"}], placement_knobs=[{"LAYOUT@w": "source"}]) is None
 
 
 @pytest.mark.parametrize("ambient_tile", (None, "mma_m16n8k16_f16_f32/f2x4"))
@@ -982,14 +1202,13 @@ def test_ab_json_labels_each_row_with_its_lane(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     from emmy.commands import run as run_mod
-    from emmy.compiler.pipeline.search.dataset import Sample
 
     _FakeNode = namedtuple("_FakeNode", "op id")
 
     def _node(knobs):
         return _FakeNode(SimpleNamespace(kernel_name="k_matmul", smem_bytes=0, knobs=knobs), "k_matmul")
 
-    greedy_graph, fm_graph, std_graph = object(), object(), object()
+    greedy_graph, fm_graph, std_graph = (SimpleNamespace(hints={}) for _ in range(3))
 
     def _nodes(graph):
         knobs = _classic_row(tile="mma_m16n8k16_f16_f16/f2x2/k4") if graph is fm_graph else _classic_row(work="t32x8", tile="f2x8")
@@ -998,14 +1217,14 @@ def test_ab_json_labels_each_row_with_its_lane(tmp_path, monkeypatch):
     monkeypatch.setattr(run_mod, "_launch_order_cuda_nodes", _nodes)
     monkeypatch.setattr(run_mod, "_placement_knob_dicts", lambda _graph: [])
 
-    fm = Sample(
+    fm = SimpleNamespace(
         knobs={"TILE": "mma_m16n8k16_f16_f16/f2x2/k4"},
         pins={"FAST_MATH": True},
         latency_us=100.0,
         name="mlp_gate_up",
         shape=object(),
     )
-    std = Sample(
+    std = SimpleNamespace(
         knobs={"TILE": "f2x8", "WORK": "t32x8"},
         pins={"FAST_MATH": False},
         latency_us=140.0,
@@ -1029,6 +1248,61 @@ def test_ab_json_labels_each_row_with_its_lane(tmp_path, monkeypatch):
     # The filter a sweep applies: only same-lane rows are comparable to the greedy.
     same_lane = [p for p in rec["pinned"] if p["lane"] == rec["greedy"]["lane"]]
     assert len(same_lane) == 1 and same_lane[0]["lane"] == "std"
+
+
+def test_ab_evidence_captures_each_rows_precision_scope(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from emmy.commands import compile as compile_mod
+    from emmy.commands import run as run_mod
+    from emmy.compiler.pipeline.search import bench_record
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    seen = []
+    monkeypatch.setattr(run_mod, "_records_evidence", lambda _args: True)
+    monkeypatch.setattr(compile_mod, "resolve_tune_db", lambda: tmp_path / "bench.db")
+
+    def record(_path, ctx, _graph, _bench):
+        seen.append(ctx)
+        return 1
+
+    monkeypatch.setattr(bench_record, "record_bench_perf", record)
+    samples = run_mod._ab_samples(["FAST_EXP=false,WORK=t32", "FAST_EXP=true,WORK=t64"])
+    benches = [run_mod._GoldenBench(sample, object(), object(), [], "ok") for sample in samples]
+    with pinned_knobs({"FAST_MATH": False}):
+        run_mod._record_bench_evidence(SimpleNamespace(), benches, None)
+    assert [ctx.precision_pins()["FAST_EXP"] for ctx in seen] == [False, True]
+    assert seen[0].compile_flags == seen[1].compile_flags
+    assert seen[0].structural_key() != seen[1].structural_key()
+
+
+def test_a_tune_also_freezes_its_rows_beside_the_cards_file(tmp_path, monkeypatch):
+    """A tune's clean rows are written twice, into the tune DB and a scratch DB, and the scratch DB is frozen into the
+    freeze directory. Any other run, and a tune under ``EMMY_FREEZE_DIR`` set empty, writes the tune DB alone."""
+    from types import SimpleNamespace
+
+    from emmy.commands import compile as compile_mod
+    from emmy.commands import run as run_mod
+    from emmy.compiler.pipeline.search import bench_record
+    from emmy.compiler.pipeline.search.db import freeze
+
+    written, frozen = [], []
+    monkeypatch.setattr(run_mod, "_records_evidence", lambda _args: True)
+    monkeypatch.setattr(compile_mod, "resolve_tune_db", lambda: tmp_path / "bench.db")
+    monkeypatch.setattr(bench_record, "record_bench_perf", lambda path, _ctx, _graph, _bench: written.append(Path(path).name) or 1)
+    monkeypatch.setattr(freeze, "write_run_freeze", lambda db, out: frozen.append((Path(db).name, out)) or [out / "card.r.json"])
+    monkeypatch.setenv("EMMY_FREEZE_DIR", str(tmp_path / "freezes"))
+    benches = [run_mod._GoldenBench(sample, object(), object(), [], "ok") for sample in run_mod._ab_samples(["WORK=t32"])]
+
+    run_mod._record_bench_evidence(SimpleNamespace(tune=3), benches, None)
+    assert (written, frozen) == (["bench.db", "run.db"], [("run.db", tmp_path / "freezes")])
+    written.clear(), frozen.clear()
+    run_mod._record_bench_evidence(SimpleNamespace(tune=None), benches, None)
+    assert (written, frozen) == (["bench.db"], [])
+    written.clear()
+    monkeypatch.setenv("EMMY_FREEZE_DIR", "")
+    run_mod._record_bench_evidence(SimpleNamespace(tune=3), benches, None)
+    assert (written, frozen) == (["bench.db"], [])
 
 
 _NCU_CSV = """"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"
@@ -1484,6 +1758,61 @@ def test_bind_inputs_preserves_bf16_bits_for_inputs_and_constants():
         _comparison_outputs({"x": bound["x"]}, g)["x"],
         np.array([1.0, -2.0], dtype=np.float32),
     )
+
+
+@pytest.mark.parametrize(
+    "fmt,codes,reference,changed",
+    [
+        ("f4e2m1x2", [0x88, 0x21], [0x00, 0x21], [0x22, 0x31]),
+        ("f8e4m3", [0x80, 0x38], [0x00, 0x38], [0x39, 0x40]),
+        ("f8e5m2", [0x80, 0x3C], [0x00, 0x3C], [0x3D, 0x40]),
+    ],
+)
+def test_quantized_correctness_decodes_signed_zero_but_rejects_other_codes(fmt, codes, reference, changed):
+    import numpy as np
+
+    from emmy.commands.run import (
+        _check_accuracy,
+        _comparison_outputs,
+        _eager_outputs_by_name,
+        _exact_outputs,
+        _quantized_outputs,
+        _strict_correctness_proof,
+        _wrong_answer_flag,
+    )
+    from emmy.compiler import dtype as dt
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+
+    graph = Graph()
+    graph.add_node(op=InputOp(), inputs=[], output=Tensor("packed", (1, 2), fmt), node_id="packed")
+    graph.inputs = graph.outputs = ["packed"]
+
+    emmy = _comparison_outputs({"packed": np.array([codes], dtype=np.uint8)}, graph)
+    tensor = torch.tensor([reference], dtype=torch.uint8)
+    eager = _eager_outputs_by_name(emmy, tensor, graph)
+    exact = _exact_outputs(graph, {"packed": tensor}, emmy)
+    np.testing.assert_array_equal(exact["packed"], eager["packed"])
+    quantized = _quantized_outputs(emmy, graph)
+    assert quantized == (frozenset({"packed"}) if fmt == "f4e2m1x2" else frozenset())
+    assert _wrong_answer_flag(emmy, eager, quantized) is None
+    assert _check_accuracy(emmy, eager) is None
+    assert _strict_correctness_proof(emmy, eager, exact_out=exact)["status"] == "pass"
+    if fmt != "f4e2m1x2":
+        torch_format = torch.float8_e4m3fn if fmt == "f8e4m3" else torch.float8_e5m2
+        native = _eager_outputs_by_name(emmy, tensor.view(torch_format), graph)
+        np.testing.assert_array_equal(native["packed"], eager["packed"])
+    for code in changed:
+        bad = _comparison_outputs({"packed": np.array([[codes[0], code]], dtype=np.uint8)}, graph)
+        assert _wrong_answer_flag(bad, eager, quantized) is not None
+        assert _strict_correctness_proof(bad, eager, exact_out=exact)["status"] == "fail"
+
+    opaque = Graph()
+    opaque.add_node(op=InputOp(), inputs=[], output=Tensor("packed", (1, 2), dt.U8), node_id="packed")
+    opaque.inputs = opaque.outputs = ["packed"]
+    bits = _comparison_outputs({"packed": np.array([[0x88, 0x21]], dtype=np.uint8)}, opaque)
+    assert bits["packed"].dtype == np.uint8
+    np.testing.assert_array_equal(bits["packed"], [[0x88, 0x21]])
 
 
 def test_bind_inputs_arity_mismatch_raises():
@@ -2079,3 +2408,27 @@ def test_unreproducible_pin_flag_reads_a_cross_cta_split_structurally(monkeypatc
     # A value with no cross-CTA stage is unaffected — the old behaviour stands.
     assert "unreproducible pin" in unreproducible_pin_flag({"REDUCE": "coop"}, [{"REDUCE": ""}])
     assert unreproducible_pin_flag({"REDUCE": "coop"}, [{"REDUCE": "coop"}]) is None
+
+
+def test_run_on_the_cpu_target_benches_and_records_a_symbolic_kernel(run_cli, tmp_path, monkeypatch):
+    """``--gpu-arch cpu`` compiles on the CPU backend, checks against eager torch and files each kernel's row
+    under the host CPU's context, at the size the symbolic dim was bound to — 1 here, which torch would otherwise
+    specialize away."""
+    import json
+    import shutil
+    import sqlite3
+
+    pytest.importorskip("llvmlite")
+    if not (shutil.which("cc") or shutil.which("clang")):
+        pytest.skip("needs a C linker")
+    monkeypatch.setenv("EMMY_TUNE_DB", str(tmp_path / "tune.db"))
+    code = "x = torch.randn(1, 64)\nw = torch.randn(32, 64)\nF.linear(x, w)"
+    flags = ("--gpu-arch", "cpu", "--bench", "--warmup", "5", "--iters", "20", "--dynamic", "rows@x:0", "--json", str(tmp_path / "r.json"))
+    rc, stdout, stderr = run_cli("run", *flags, "--code", code)
+    assert rc == 0, stderr
+    assert "Eager PyTorch" in stdout and "Emmy" in stdout
+    record = json.loads((tmp_path / "r.json").read_text())
+    assert record["sizes"] == {"rows": 1} and record["kernels"] and all(len(k["us"]) == 20 for k in record["kernels"])
+    with sqlite3.connect(tmp_path / "tune.db") as db:
+        rows = db.execute("SELECT c.backend, c.arch, p.bindings FROM perf p JOIN context c ON c.id = p.context").fetchall()
+    assert rows and all(backend == "cpu" and arch and bindings == '{"rows":1}' for backend, arch, bindings in rows)

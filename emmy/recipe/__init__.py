@@ -16,6 +16,8 @@ from emmy.recipe.recipe import (
     resolve_for_hardware,
     validate_docker_options,
     validate_extra_args,
+    validate_input_modalities,
+    validate_modality_input,
 )
 from emmy.recipe.types import (
     BenchmarkConfig,
@@ -23,6 +25,7 @@ from emmy.recipe.types import (
     DeployConfig,
     EngineConfig,
     LLMConfig,
+    LoRAAdapterConfig,
     ModelConfig,
     Recipe,
     SglangConfig,
@@ -35,6 +38,7 @@ __all__ = [
     "DeployConfig",
     "EngineConfig",
     "LLMConfig",
+    "LoRAAdapterConfig",
     "ModelConfig",
     "Recipe",
     "SglangConfig",
@@ -57,4 +61,6 @@ __all__ = [
     "resolve_recipe_dir",
     "validate_docker_options",
     "validate_extra_args",
+    "validate_input_modalities",
+    "validate_modality_input",
 ]

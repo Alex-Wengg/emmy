@@ -2,6 +2,10 @@
 
 Three layers over a shared `Graph` container.
 
+`Context` identifies the target card, precision decisions, compiler flags and measurement cache mode. Hot and cold
+measurements have distinct structural and tune DB keys. The `COLD_CACHE` input pin selects the mode; it is replayed
+with a golden's precision pins and does not change lowering or become a prior feature.
+
 Reading a `--ir torch` / `--ir tensor` dump: [IR-PSEUDOCODE-TORCH.md](IR-PSEUDOCODE-TORCH.md).
 
 ```
@@ -11,7 +15,7 @@ PyTorch module
 Graph (frontend ops)                        ── Layer 1
    │  pipeline/passes/frontend/decomposition
    │  pipeline/passes/frontend/optimization
-   │  pipeline/passes/loop/lifting
+   │  pipeline/passes/loop/lowering
    │  pipeline/passes/loop/fusion
    ▼
 Graph[LoopOp]  (one LoopOp = one kernel)    ── Layer 2
@@ -64,6 +68,14 @@ fields. Each implementer's docstring documents what's deliberately
 excluded (names, hints, ambient I/O) — the contract is "include only
 bits that affect codegen output or dataflow semantics" so the
 autotuning cache doesn't bust on cosmetic edits.
+
+`Context` binds the effective precision decisions when a compile starts. Its key includes those decisions beside
+the target, compiler flags and cache mode, so an independent `FAST_EXP`, `F16_MMA_F32_ACC` or `FP8_MMA` override
+cannot read another regime's timings. Reconstructed contexts take the recorded pins explicitly; later environment
+changes do not alter their keys. The bound decisions are the one carrier of the fast-math decision: the nvcc flag
+string names it only where a context is built from flags alone (`Context.from_target(compile_flags=…)`), and every
+reader — the context key, the `H_fast_math` feature, the tune DB's regime, the dataset's regime key — takes
+`Context.precision_pins()` or the row's `precision`, never the flag string.
 
 ## Module layout
 
@@ -167,6 +179,13 @@ working-golden inventory generation alone promotes the marked bits and scale val
 preserves the materialized W8A8 boundary. Native FP8 tensor-core enumeration remains explicitly gated by `FP8_MMA`,
 and a conservative compile can still execute the same graph algebra without selecting that hardware path.
 
+When the declaration specifies static activations instead, `loader.quant.spell_static_fp8_activations` spells the same
+encode, decode and scale round trip at the calibrated per-tensor scale each linear stores beside its weight
+(`activation_scale`, or `input_scale`). There is no amax: the encode saturates to the format's finite range, which is
+the clamp the calibrated scale relies on. Linears reading one activation through equal scales share one round trip,
+as a projection group calibrated together does. Nothing is marked to stay materialized: the codes are an interior
+value of the kernel, and a contraction that wants both multiplicands as FP8 bytes takes a cut at that seam.
+
 **Input-sourced fp8.** When the weights are forward-argument `InputOp`s instead of constants (the MoE serving seam's
 expert programs — one program per layer kind, per-expert 2-D slices fed per launch), the constant speller can never
 fire; `loader.quant.spell_quantized_inputs(graph, specs)` is the post-trace twin. Each named input keeps its node id
@@ -176,8 +195,8 @@ input at its own traced dtype for this reason) — and a new `<name>_scale` inpu
 / broadcast-multiply cone re-creating the value the trace promised. The same W8A16 mul-hoist binding absorbs it:
 the gate/up matmul can stream fp8 bytes with the scale on the accumulator epilogue. Whether the down matmul's cone
 (the down projection sum-contracts the exp-bearing SwiGLU activation) inlines or stays materialized is loop fusion's
-ordinary outcome — a fusion-band decision upstream of the tile binding, shared with the constant path.
-Indirect operands compose: bits and scale inputs both compile as table-resolved operands for fixed-slot dispatch.
+ordinary outcome — a fusion-band decision upstream of the tile binding, shared with the constant path. The spelling
+holds for an E-stacked bits input the serving slots program gathers by a selector, paged or resident.
 
 **NVFP4 checkpoints.** The dtype layer carries the storage format — `f4e2m1x2` (a uint8 element holding a packed
 pair of e2m1 codes) with its LUT decode `decode_f4x2` and a raw-byte CUDA spelling. `loader/quant.py` recognizes
@@ -224,8 +243,9 @@ activations and stores per-linear `input_scale` tensors (modelopt's calibrated a
 calibration amax / (6 · 448)) marks its linears for W4A4. `loader.quant.spell_static_fp4_activations` runs after
 `spell_quantized_constants`, whose spelled weight cones are the marker it reads, and writes the quantize→dequantize
 round trip in front of each marked linear, in the same
-shared-vocabulary algebra: per 16-element K block, the e4m3 scale round trip (`to_f8e4m3(amax / (6·s2))`), ONE
-f32→f16 rounding of the fused scale (`fuse_nvfp4_scales` parity), the e2m1 encode over the rounded scale, the pair
+shared-vocabulary algebra: per 16-element K block, the e4m3 scale round trip (`to_f8e4m3((amax · 1/6) · 1/s2)`),
+the e2m1 encode over the fused f32 scale with round-to-nearest division even under fast math, the f32→f16 rounding
+of the scale during reconstruction (`fuse_nvfp4_scales` parity), the pair
 pack into an `f4e2m1x2` buffer, and the same pair-table-gather decode chain the weight side spells. Both matmul
 operands then read as one decode-chain shape, the graph's own meaning becomes Σ x̂·ŵ for the marked matmuls, and the
 numpy backend stays the parity oracle for every lowering of it. Two halves spell the round trip, and the split
@@ -285,10 +305,19 @@ its own names. `loader.quant.spell_mxfp4_inputs` re-mints a traced logical exper
 value map, power-of-two scaling, and reshape algebra. Nibbles always decode in the stored `(out, in)` orientation, so
 each spec also declares its experts module's layout: an `x @ W` module traces `(in, out)` and ends in a transpose,
 while an `F.linear` one traces the stored orientation and takes none. Shapes cannot decide it — a square expert matrix
-reads both ways — so the layout is declared, never sniffed. U8 is an
+reads both ways — so the layout is declared, never sniffed. Every axis before the weight's two — the expert axis of
+the E-stacked tensors the serving slot program gathers from — rides through the decode unchanged. U8 is an
 ordinary one-byte integer dtype throughout the generic compiler; no MXFP4 operation or metadata crosses the
 birth-time spelling boundary. `decode_mxfp4` is the NumPy value reference. The serving loader preserves the packed
 checkpoint tensors and only permutes the gate/up output axis once to restore concatenated gate/up halves.
+
+**NVFP4 expert inputs.** `loader.quant.spell_nvfp4_inputs` is the input-sourced twin of the NVFP4 constant speller,
+for routed experts stored as NVFP4 trios (RadixArk's Qwen3.8-Flash-Next codes nothing else). It re-mints a traced
+`(out, in)` expert input as `(out, in/2)` `f4e2m1x2` pairs and appends `<name>_scale` `(out, in/16)` e4m3 bits and
+`<name>_scale_2` `(out, 1)` f32. The global scale is per row, so a gate/up weight stacked from two stored tensors
+keeps each tensor's own; the decode is the constant speller's own (`_nvfp4_decode`), so both round the fused scale
+once to f16. Leading axes — a stack of experts — ride through like the MXFP4 ones. The program is weight-only: its
+activations stay in the model dtype.
 
 **Trellis-coded checkpoints (EXL3).** `loader/exl3.py` owns the pure NumPy reference:
 packed-window extraction, computed codebooks, tile ordering, and the block Hadamard/sign fold.
@@ -300,7 +329,10 @@ At graph birth, `spell_trellis_constants` replaces each coded weight together wi
 ranges, casts/bitcasts, integer algebra, gathers/index maps, layouts, and matmuls. The packed decode
 becomes the core contraction's computed B operand; no logical dense weight or fp16 weight-rounding
 buffer exists in the executable graph. `spell_trellis_inputs` applies the same builder to expert
-weight inputs. Marker presence selects the generic codebook algebra. An unsupported or shared
+weight inputs — one coded weight and its `LinearOp`, or an E-stacked weight the serving slot program reads through
+a gather by the router's picks and a matmul: the codes and both channel vectors carry the expert axis, the picks
+gather them the same way, and the factorized contraction runs batched over the picks, so no pick's weight is ever
+dense. Marker presence selects the generic codebook algebra. An unsupported or shared
 coded linear fails at birth rather than falling back to materialization; ordinary padded channel
 dimensions are handled inside the generic spelling.
 
@@ -329,10 +361,10 @@ origin is `len(pieces)` over the union of that origin's pieces across the whole 
 
 It rides on one chokepoint: `Graph.splice` calls `provenance.propagate` with a `mint_pieces` flag (set by
 `Candidate.apply` from the pass namespace — `True` only for `frontend/decomposition`). Decomposition *mints* each new
-fragment node as a fresh piece of the consumed origins; fusion / lifting / optimization folds *aggregate* the consumed
-piece sets onto the merged node (unioning the dissolved producers so a multi-output splice drops nothing). Lowering is
-in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched. Seeded once at
-`Pipeline.run` entry (idempotent); pure metadata, excluded from structural / cache keys.
+fragment node as a fresh piece of the consumed origins. Loop lowering, fusion, and optimization passes *aggregate* the
+consumed piece sets onto the merged node (unioning the dissolved producers so a multi-output splice drops nothing).
+Later lowering uses in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched.
+It is seeded once at `Pipeline.run` entry (idempotent); pure metadata, excluded from structural / cache keys.
 Boundary sentinels (`InputOp`/`ConstantOp`) never carry prov: `put` refuses to stamp them and `propagate` scrubs splice
 outputs that land on one (the generic hint merge would otherwise copy prov onto e.g. the ConstantOp produced by the sm_90+
 weight-transpose fold, inflating `totals` so every kernel of that origin read partial coverage).

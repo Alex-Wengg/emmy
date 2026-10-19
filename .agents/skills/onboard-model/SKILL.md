@@ -78,6 +78,12 @@ belong to the caller.
 Both modes run every section below; for a recipe without an Emmy serving configuration, sections 2 and 4 are the
 point of the run. Any other change to an existing recipe needs explicit caller authorization.
 
+When a recipe carries `emmy-blocked`, find the commit that last changed its `RESULTS.md` before editing either file.
+Inspect the Git history from that commit to `HEAD` for changes to the named blocker in Emmy, the serving image, and
+relevant related projects. Read the actual diff, not just commit titles. A newer commit alone does not lift a blocker:
+retest the exact failed gate before removing the tag. When nothing relevant changed, keep the tag and do not repeat
+the failed gate solely because time passed. Continue the other required work for a manual run or periodic verification.
+
 **Bounded fixes.** You may make a small, model-agnostic fix under `emmy/` when this exact qualification needs it: a
 serving compatibility fix, a compiler coverage gap, or a lowering or schedule fix that closes a kernel loss. Prefer an
 existing mechanism, add a focused test or a realization-corpus case, update the nearest `ARCHITECTURE.md`, and
@@ -144,7 +150,17 @@ Read the `--json` record (`record_knobs`, `status`, `flags`, `lane` per row), ne
 it benches land in the tune DB as measured evidence. Rank targets by `tcompile_us / emmy_us`, losers first, and
 classify each loss:
 
-- a **missing measurement** is fixed by measuring more — bench the schedule a sibling uses with `--ab` and record it;
+- a **missing measurement** is fixed by measuring more. Tune the losing target's slow kernels one at a time, each as
+  its own program, against the same tune DB:
+
+  ```bash
+  emmy run --golden <working.json> --kernel <kernel name> --bench --tune 100
+  ```
+
+  The clean rows land under the identity the layer compile reads, and the tune writes them once more as a file
+  beside the card's under `search/freezes/`, which comes back with the working golden and is committed with it. A
+  kernel times differently alone than in its layer (warm weights), so re-bench the whole target afterwards and
+  record only what wins there. `--ab` stays the tool for one specific schedule, such as a sibling's;
 - an **eligibility or optimization lockout**, a pin that refuses or fails to lower, or a pin that runs wrong gets a
   bounded fix when one is tractable, and otherwise becomes a realization-corpus case (below);
 - a **code generation quality** loss is reported, not recorded;
@@ -162,7 +178,7 @@ family already winning at a neighbouring binding, or a roofline argument — and
 case=tests/compiler/realization/cases/<family>/<name>_xfail_<stage>.json
 emmy trace -c "<snippet>" --target sm_<cc> -o "$case"
 # set the realization's "knobs" from record_knobs, and "note": "evidence: ..."
-make test-corpus-regen   # normalizes and stamps identity; the note stays
+make test-corpus-regen   # restamps the case onto the fresh lowering; the note stays
 ```
 
 The case must fail without its suffix and pass with it; record the command. A stale existing case is reported, not
@@ -188,7 +204,8 @@ emmy deploy ssh --recipe experiments/<model>/serving --ssh <target>
 
 Before measuring performance, require: weights load and the server reaches health; a real chat or completion request
 returns coherent output; advertised tool calling returns structured `tool_calls`; advertised reasoning lands in the
-engine's reasoning field; requested multimodal input is exercised, or disabled for a text-only run; and the largest
+engine's reasoning field; requested multimodal input is exercised and the recipe declares
+`model.input_modalities: [text, image]`, or it is disabled for a text-only run and the field stays unset; and the largest
 claimed context is tested with an input that materially fills it. Start context testing at the native maximum; on an
 out-of-memory or capacity failure, halve it and retry from a clean deployment. Never claim a context from startup
 alone. Search upstream issues for an unfamiliar error and make one evidence-backed change per retry.
@@ -226,6 +243,10 @@ only the verified tag as `cloudriftai/vllm-emmy-<model-slug>:<tag>`, pin the rec
 `docker login --password-stdin`, and run `docker logout` on success and failure.
 
 When a gate fails, the recipe falls back to the vLLM or SGLang lane from section 3, and the report names the gate.
+On a successful stock serving recipe, add `emmy-blocked` only when a concrete Emmy gate remains blocked beyond a
+bounded fix on every declared deployment, and name that blocker in `RESULTS.md`. Do not use the tag for an unmeasured
+gate, a card-specific gap, or work left unfinished only because the run ended. Remove the tag only after the exact
+Emmy gates pass on the requested platform.
 
 ## 5. Measure the final serving configuration
 
@@ -289,7 +310,7 @@ emmy deploy ssh --dry-run --recipe recipes/<model> --ssh <target>
 
 Also check:
 
-- the coverage manifest accounts for every layer and seam; a complete trace has a committed golden whose every entry
+- the coverage manifest accounts for every layer and seam; a complete trace has a committed golden whose every row
   has paired positive O3 and reference timings and lowers on the requested compute capability, and a partial trace
   has nothing under `golden/`;
 - only repeated O3 rows are called deployable, and each tuning winner names its O1 ranking lane;
@@ -301,6 +322,8 @@ Also check:
   a vLLM or SGLang recipe;
 - the experiment snapshot has the shared `recipe.yaml` and `RESULTS.md` plus this platform's LFS archive with its
   records inside, and other platforms' archives and sections are unchanged;
+- the prior reproduction gate passes on the recipe's golden, or the recipe is tagged `prior-pending` (AGENTS.md
+  finalization step 22);
 - every new corpus case reproduces its named stage, `pytest tests/compiler/realization` is green,
   `make test-corpus-regen` is a no-op, and every `_xfail_*` note has an `evidence:` paragraph;
 - nothing staged is a dated run directory, loose benchmark output, or onboarding summary, and no tracked artifact holds
@@ -357,7 +380,10 @@ line of at most 1000 characters from that exact lane; the workflow notification 
        "stage": "offered", "emmy_us": 30.81, "tcompile_us": 24.10}
     ]
   },
-  "emmy": {"eligible": true, "reason": "all eligibility gates passed", "image": "cloudriftai/...:tag"},
+  "emmy": {
+    "eligible": true, "blocked": false,
+    "reason": "all eligibility gates passed", "image": "cloudriftai/...:tag"
+  },
   "cleanup": {"workloads": "complete", "docker_logout": true},
   "failure": null
 }

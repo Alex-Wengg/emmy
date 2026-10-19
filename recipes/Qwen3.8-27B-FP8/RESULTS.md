@@ -9,6 +9,10 @@ and they are kept below as evidence rather than as a recommended platform.
 the same route the DeepSeek-V4-Flash lane uses on this engine. Every number below is a property of that path, not of
 hardware FP8.
 
+**The H200 entry is not measured here.** The recipe also carries an H200 x1 entry at 0.55 of the card for a two-model
+deploy plan beside Ornith-1.5-35B-A3B-FP8; that lane keeps the vision tower and accepts up to four images per request.
+It has not been run, with or without an image. The Volta lanes below are text-only, exactly as qualified.
+
 ## Four V100 SXM2 16GB (TP4)
 
 Re-qualified 2026-09-15 on a host with NVLink; first qualified 2026-09-05 on a host without it.
@@ -32,7 +36,7 @@ through NCCL, which can ring over linked pairs only.
 | Model | `Qwen/Qwen3.8-27B-FP8@017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` |
 | GPUs | 4 x NVIDIA Tesla V100 SXM2 16GB, compute capability 7.0, driver 580.173.02, NVLink as above |
 | Engine image | `cloudriftai/1cat-vllm-deepseek-v4-flash-0731:1.2.3-d76126608` (vLLM `1.2.3.dev87+gd76126608.d20260810`) |
-| Serving shape | TP4, context 262,144, `gpu_memory_utilization` 0.88, text-only, concurrency cap 4 — the cap this table was measured at; the recipe now ships 16, see Concurrency below |
+| Serving shape | TP4, context 262,144, `gpu_memory_utilization` 0.88 (the recipe now also pins the key/value cache at 4.5 GiB per card, see Memory below), text-only, concurrency cap 4 — the cap this table was measured at; the recipe now ships 16, see Concurrency below |
 | Backends | FLASH_ATTN_V100 attention, Triton Gated DeltaNet prefill, TurboMind FP8 dequantization |
 | Workload | 16 prompts, 1,000 input / 1,000 output tokens, client concurrency 4, temperature 0, ignored EOS, 2 warm-ups, three repeats on one server with seeds 0, 1, 2 |
 
@@ -198,7 +202,47 @@ cost is linear in sequence length; only the remaining 16 pay the quadratic atten
 `--max-num-batched-tokens` was tested at 8192 against the shipped 4096 and rejected. It raised the KV pool from
 288,281 to 355,162 tokens, but no row improved beyond noise, and 4K prompts at 16 concurrent got 69% slower
 (6.2 s to 10.4 s median) because a request arriving mid-step waits longer for a larger step to finish.
-`gpu_memory_utilization` and FP8 key/value cache were not tested, so no claim is made about them.
+FP8 key/value cache was not tested, so no claim is made about it. Memory sizing is covered next.
+
+### Memory: the key/value cache is pinned
+
+The lane shipped with the cache sized from `gpu_memory_utilization` 0.88, and in production that ran out of memory
+twice, five days apart, mid-request: an 80 MiB activation buffer of a 4,096-token prefill chunk found under 75 MiB
+free on every card. The engine core died and the server stopped answering until it was restarted by hand.
+
+The cause is how vLLM sizes the cache. It profiles memory at start-up and gives the cache whatever the fraction leaves,
+and that profile is about 1.5 GiB larger on a cold start than on a restart with a warm compile cache. The same fraction
+therefore gives a different cache, and a different margin, depending on how the container last started:
+
+| Shape, 2026-10-06, one SXM2 x4 host with NVLink | Cache per card | KV pool | Full-window concurrency |
+| --- | ---: | ---: | ---: |
+| 0.88, warm restart — the shape that ran out of memory | 6.02 GiB | 378,994 | 1.45x |
+| 0.85, cold start | 4.04 GiB | fails to start: 40 MiB short of one full-window request | — |
+| 0.85, warm restart | 5.54 GiB | 349,012 | 1.33x |
+| **pinned 4.5 GiB, cold start and warm restart** | **4.5 GiB** | **289,050** | **1.10x** |
+
+The production backend's first, cold start ran for eleven days; its restart got the warm 6.0 GiB cache and died five
+days later. A lower fraction cannot fix this, because at 0.85 it already cannot start cold at full context, and it still
+gives most of any saving back to the cache on a warm start. `--kv-cache-memory-bytes` pins the cache at 4.5 GiB, the
+cold size, so every start leaves 1.5 GiB more per card outside the cache than the shape that failed, and the pool is
+the 288,281 tokens the lane was qualified with.
+
+The pinned shape passed every check on the host above: a cold start without a restart, a warm restart to the same
+pool, a planted passphrase retrieved from a 240,046-token prompt in 194 s, and two loads at 16 concurrent requests with
+512 output tokens and ignored EOS:
+
+| Load, 16 concurrent | Shape | OK / failed | Output | Median TTFT | P99 TTFT | Median TPOT |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 48 x 16K prompts | pinned 4.5 GiB | 48 / 0 | 39.8 tok/s | 22.9 s | 142.9 s | 315 ms |
+| 48 x 16K prompts | 0.88 warm | 48 / 0 | 42.1 tok/s | 17.0 s | 113.7 s | 334 ms |
+| 64 x 4K prompts | pinned 4.5 GiB | 64 / 0 | 115.1 tok/s | 6.0 s | 22.7 s | 128 ms |
+| 64 x 4K prompts | 0.88 warm | 64 / 0 | 116.5 tok/s | 6.0 s | 22.7 s | 126 ms |
+
+These loads did **not** reproduce the failure: the 0.88 warm shape survived them too, so they show that the pinned
+shape serves, not that it removes the failure. The production requests that failed ran with 93% prefix-cache hits
+over several days, which random prompts in a 15-minute run do not recreate. The margin argument above is what the fix
+rests on. Its cost is the smaller pool against a warm 0.88 start: 16K prompts at 16 concurrent wait about a third
+longer for their first token, and 4K prompts are unaffected. One run per row.
 
 ### Fit
 
@@ -242,86 +286,78 @@ the slowest of the three measured setups (table above), and it cannot hold a 250
 
 ## Emmy
 
-There is still no Emmy serving lane: the recipe serves the stock 1Cat-vLLM fork, and every serving figure above is
-that engine. What follows is compiler evidence — measured CUDA kernels for this checkpoint's decoder path on one
-V100 — and it does not imply that Emmy can serve the model.
+Measured 2026-10-07 on the same four SXM2 16 GB cards, CUDA 12.9, torch 2.14.0+cu126.
 
-Compiler rechecked 2026-09-28 from `a98fd4f85` on four Tesla V100-SXM2-16GB (one card per independent walk), CUDA
-12.9, torch 2.13.0+cu126, at nvcc's deployable `-O3`. `emmy tune` was not used; every result below came from a
-manually pinned schedule or kernel-set cut.
+Emmy now serves this checkpoint end to end on the same four SXM2 16 GB cards, one pipeline stage per card. It is
+correct but much slower than the stock lane, so the recipe keeps stock 1Cat-vLLM. The FP8 weights stay coded on the
+card and decode inside each matrix multiply under 16-bit activations; decoded to FP16 the trunk alone would need
+13.5 GB of every card. `serving-v100.env` names the shape, and the golden now holds its nine serving programs.
 
-### Current coverage
-
-| Item | Value |
+| Setting | Value |
 | --- | --- |
-| Stored programs | 5, covering the Gated DeltaNet paths, full attention, recurrent update and output projection |
-| Fresh Loop targets | 17 |
-| Existing V100 golden | 10 targets; 13 measured schedule rows and one routing row |
-| Working golden | all 17 targets; 11 have a runnable O3 fallback and 6 remain blocked |
-| Frontend reference | eager and `torch.compile`, 10 warm-up / 100 measured, strict eager correctness |
-| Internal-target reference | isolated same-input greedy output; these targets have no standalone Torch twin |
+| Image | vllm-emmy built on `cloudriftai/1cat-vllm-deepseek-v4-flash-0731:1.2.3-d76126608` at repository `6e223e6ad`, not published |
+| Shape | PP4 × TP1, FP16 trunk, standard lane (fast math off), decode width 16, prefill width 64, 64 batched tokens, 4 sequences, 8,192 context, eager, no prefix caching |
+| Boot | 13 min from container start to ready, every kernel from a golden row under `EMMY_STRICT_EVIDENCE=1` |
+| Key/value pool | 33.1× concurrency at 8,192 tokens |
 
-The previous 129-target figures described an older lowering. Maximal fusion in the current compiler produces 17
-targets from the same five stored programs. The existing ten golden targets still lower freshly and strictly decode,
-but the file is not a complete inventory for the current compiler. The working file adds all seven missing targets;
-only `k_matmul_reduce_81b2ae` currently reaches a valid measured fallback.
+| Workload | Emmy | Stock 1Cat-vLLM (TP4) |
+| --- | ---: | ---: |
+| One request, 96 output tokens: decode | 196 ms/token | — |
+| One request, ~25-token prompt: time to first token | 4.6 s | — |
+| Four concurrent requests, 100 output tokens each: per-stream decode | 557–638 ms/token | 92 ms/token (1,000-token prompts) |
+| Four concurrent requests: output throughput | 5.4 tok/s | 40.8 tok/s |
 
-The checkpoint's weights reach the kernels as stored e4m3 bytes with one scale per 128x128 block, and its declared
-dynamic per-token activation scaling is spelled in the graph. These kernels therefore compute the W8A8 form declared
-by the checkpoint rather than a dequantized f16 stand-in.
+The Emmy rows are single probes, not a benchmark run. Correctness: layers 0–3 (three gated DeltaNet layers and one
+full-attention layer) on the real weights match transformers on decoded fp32 weights to a relative L2 error of 4e-4 to
+8e-4 at 1, 16 and 64 tokens. The served model answers factual and explanatory prompts correctly, returns a structured
+`tool_calls` entry with the `qwen3_coder` parser, and puts its thinking in the reasoning field with the `qwen3` parser.
 
-### Manual schedule results
+Where the time goes. A decode token spends about 137 ms in the 48 gated DeltaNet layers (2.85 ms each) and about
+39 ms in the 16 full-attention layers. Known gaps, largest first:
 
-| Target | Emmy | `torch.compile` | Result |
-| --- | ---: | ---: | --- |
-| output projection `k_linear_a08942` | 3,771-3,778 us | 6,082-6,089 us | 1.61x faster, strict pass twice |
-| 64-step scan, 384 rows | 30.56-31.01 us | 4.00-4.45 us | 6.87-7.75x slower, strict pass twice |
-| 64-step scan, 48 rows | 6.93-7.84 us | 2.93-3.17 us | 2.18-2.68x slower, strict pass twice |
-| recurrent update, existing golden | 194.36 us | 25.19 us | 7.72x slower, strict pass |
-| recurrent update, manual winner | 33.63-34.21 us | 19.48-19.50 us | 1.72-1.75x slower, strict pass twice |
-| new internal matmul-reduce | 492.54-514.05 us | — | strict same-input pass twice |
+- Gated DeltaNet layers serve the requests of a step one after another, so decode slows with every request in flight.
+- At one token no tensor-core tile is offered (one row has no output-axis pair for a fragment), so the width-1
+  projections run thread schedules at 5–6× their weight-streaming floor; the width-1 state update recomputes its
+  convolution and norm per output cell and takes about 1 ms.
+- Prefill is slow: 55 ms per gated DeltaNet layer for a 16-token step and 120 ms for a 64-token one, and the any-width
+  attention program runs scalar (1.7 s at 512 tokens). Long prompts are impractical.
+- The serving programs carry no `torch.compile` comparison: on the bench's random FP8 weights the eager reference
+  overflows FP16 and returns NaN.
 
-The recurrent winner cuts `PLACE@map.1/map.2/inner`, runs both reductions in its producer serially, and schedules the
-residual with `WORK=t32` and cooperative reductions. It reduces the isolated kernel-set sum from 194 us to 28-29 us;
-whole-program capture is 34 us. Every other single cut, every composition of that winner with one other legal cut,
-thread widths from 4 through 512, and the remaining reduction choices were slower.
+Each program was cut by hand (pinned `PLACE` routes recorded with `--record-greedy`), and the slowest pieces were
+tuned with `emmy run --kernel … --tune`. The gated DeltaNet routes take the full-projection cut and then cut the
+multi-output pieces it leaves serial; the triangular state update reuses the shared-memory schedule recorded above.
 
-### Why the golden was not promoted
+### The golden
 
-The two scan targets expose no schedule choice: their one implementation is a serial prefix. A parallel scan
-schedule is required before either can meet the `torch.compile` bar; measuring more rows cannot change them.
+`golden/v100_sm70.json` holds the nine programs `serving-v100.env` compiles, traced from the real checkpoint with
+`emmy trace --serving-twins`: the full-attention layer before and after the attention call at 16, 64 and any number of
+tokens, and the gated DeltaNet layer at 1, 16 and 64 tokens, all in the standard lane. It has 151 kernels, 31 routing
+rows and 133 measured rows, and a strict-evidence boot compiles every kernel from it. Replaying a program from the
+file alone (`emmy run --golden … --realization … --strict-evidence`) takes, per layer: gated DeltaNet 2.8 ms at one
+token, 55 ms at 16 and 120 ms at 64; attention 0.67 + 1.79 ms at 16 tokens and 6.6 + 43 ms at 64.
 
-Six fresh maximal targets still lack a valid O3 fallback:
-
-- Both conv-linear targets exceed the 10 s first-iteration watchdog. Thirteen single cuts were screened on the first
-  target and all 15 on the second; both full composed cut sets with explicit thread widths still leave the residual
-  kernel over the watchdog.
-- The ordered GDN target has no cut. Its six register schedules spend minutes in CUDA compilation and do not reach a
-  benchmark within the bounded run.
-- The 150-origin Gated DeltaNet target still exceeds the watchdog after all 85 legal cuts, after its 30-seam full
-  projection cut, and with explicit thread widths.
-- The 784-origin Gated DeltaNet target now survives schedule-tree enumeration, but its 122-seam composed cut does not
-  reach a benchmark within ten minutes.
-- The full-attention target does not finish even the cut/schedule walk within ten minutes.
-
-The deep Gated DeltaNet target originally raised `RecursionError` while walking more than 2,000 nested schedule
-branches. The walk is now iterative, so this failure is gone. That exposes the underlying compile-time and generated
-work, but does not make those kernels fast. The remaining failures are scan, cut and lowering gaps rather than search
-shortfalls; retaining an arbitrary row would turn a failed onboarding run into deploy evidence.
-
-The complete working inventory and raw O3 records remain under `_tune/qwen38_fp8_v100_manual/`. The repository golden
-was deliberately left unchanged because six targets have no measured fallback and three frontend targets remain
-slower than `torch.compile`.
+It replaces the four compile-path programs the 2026-10-02 passes recorded (one gated DeltaNet layer traced through
+`emmy compile`, the output head and the recurrence), which were partial coverage and not what serving runs. Their
+best schedules carried over where the kernels are the same: the shared-memory triangular update (200 us at 16 tokens,
+against 42 ms unpinned), the 64-step scan and the cut of the QK product. Those passes measured, against
+`torch.compile`: the scans 2.2–3.5x faster, the QK and triangular mask 1.1–1.5x, the recurrent update 1.45x and the
+output head 1.85x.
 
 ### Reproduce
 
 ```bash
-emmy trace Qwen/Qwen3.8-27B-FP8 --layer 0 --target sm_70 -o layer0.yaml     # and --layer 3
-emmy run --golden recipes/Qwen3.8-27B-FP8/golden/v100_sm70.json --bench --bench-backends eager,tcompile,emmy
+# capture the serving programs (needs the checkpoint), then replay one from the golden alone
+emmy trace /path/to/Qwen3.8-27B-FP8 --serving-twins --serving-config recipes/Qwen3.8-27B-FP8/serving-v100.env -o twins.json
+EMMY_FAST_MATH=0 emmy run --golden recipes/Qwen3.8-27B-FP8/golden/v100_sm70.json \
+  --realization gdn1-dense-linear@fp8 --strict-evidence --bench --bench-backends emmy
+# serve, one pipeline stage per card, in a vllm-emmy image built on the 1Cat base
+EMMY_FAST_MATH=0 EMMY_GEN_DECODE_BUCKET=16 EMMY_GEN_PREFILL_BUCKET=64 EMMY_GEN_M1_TIER=0 EMMY_STRICT_EVIDENCE=1 \
+emmy serve Qwen/Qwen3.8-27B-FP8@017b9c7af6b5689d5dd426a76e0bc077eb5ca20a --runner generate \
+  --golden recipes/Qwen3.8-27B-FP8/golden/v100_sm70.json --dtype float16 --pipeline-parallel-size 4 \
+  --max-model-len 8192 --max-num-seqs 4 --max-num-batched-tokens 64 --no-enable-prefix-caching \
+  --language-model-only --gpu-memory-utilization 0.92
 ```
-
-On a Volta host, install a torch build that still ships `sm_70` kernels (`torch==2.13.0+cu126`) and preload a CUDA 12
-NVRTC, per the README's pre-Turing notes.
 
 ## Reproduce
 

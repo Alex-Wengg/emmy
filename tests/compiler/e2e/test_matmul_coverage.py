@@ -38,8 +38,8 @@ from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from emmy.compiler.ir.tensor.ir import ElementwiseOp
 from emmy.compiler.pipeline import CUDA_PASSES, TILE_PASSES, Pipeline
 from emmy.compiler.pipeline.knob import family_value
-from emmy.compiler.pipeline.search.features import mma_atom
-from tests.compiler.helpers import dyn_M, requires_cuda, requires_sm, requires_sm90
+from emmy.compiler.pipeline.search.features import mma_atom, stamps
+from tests.compiler.helpers import device_compute_capability, dyn_M, requires_cuda, requires_sm, requires_sm90
 
 
 def _supports_tma() -> bool:
@@ -57,6 +57,31 @@ def _dtype(name: str):
 # =========================================================================== #
 # Scalar TILE tier — register-tile variants, epilogues, staging, regressions.
 # =========================================================================== #
+
+
+@requires_cuda
+@pytest.mark.xdist_group("cuda")
+@pytest.mark.skipif(device_compute_capability() != (7, 0), reason="eight-output-lane reduction schedules are offered only on sm_70")
+def test_transposed_reduction_preserves_the_cross_warp_addition_order():
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.pipeline.search.pins import pinned_knobs
+
+    graph = Graph()
+    graph.add_node(InputOp(), [], Tensor("x", (1, 64), F32), node_id="x")
+    graph.add_node(InputOp(), [], Tensor("w", (8, 64), F32), node_id="w")
+    graph.add_node(LinearOp(), ["x", "w"], Tensor("out", (1, 8), F32), node_id="out")
+    graph.inputs, graph.outputs = ["x", "w"], ["out"]
+    rng = np.random.default_rng(4)
+    inputs = {"x": np.linspace(1e-4, 1e4, 64, dtype=np.float32).reshape(1, 64), "w": rng.standard_normal((8, 64), dtype=np.float32)}
+    backend = CudaBackend()
+    outputs = []
+    for work, reduce in (("t64", "coop"), ("t512", "coop-t/n8/v4")):
+        with pinned_knobs({"WORK": work, "REDUCE": reduce, "TILE": "", "STAGE": "", "PLACE": "fuse"}):
+            compiled = backend.compile(graph)
+        result, _ = backend.run(compiled, input_data=inputs)
+        outputs.append(np.asarray(result.outputs["out"]))
+    np.testing.assert_array_equal(*outputs)
+
 
 # Square base shape, divisible by every variant's parallel·register product; the symbolic column
 # runs at an off-divisor length (masked tail), which is the size a stored case cannot ask for.
@@ -279,6 +304,19 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     assert "__shared__" in src and "cp.async" not in src
 
 
+def test_scalar_stage_budget_includes_the_bank_padding() -> None:
+    from emmy.commands.trace import graph_from_code  # noqa: PLC0415
+    from emmy.compiler.ir.tile import TileOp  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.pins import pinned_knobs  # noqa: PLC0415
+
+    graph = graph_from_code("import torch\na=torch.randn(64,128)\nb=torch.randn(64,128)\na @ b.transpose(-2,-1)")[0]
+    with pinned_knobs({"WORK": "t16x8", "TILE": "f2x8", "REDUCE": "", "STAGE": "d2/smem", "RASTER": ""}):
+        out = Pipeline.build(TILE_PASSES).run(graph, ctx=Context.from_target((7, 0)))
+    op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    stage = _node_stage(op)
+    assert stage.depth == 2 and stage.bk_elems == 64, "128-wide chunks fit only if both operands' row pads are omitted"
+
+
 def test_scalar_masked_n_stage_pin_refuses(monkeypatch) -> None:
     """A masked-N (overhanging inner dim) SCALAR-tier contraction must DECLINE cp.async / TMA
     staging: the B-slab fill would clamp a chunk-start column into a row-crossing gmem address and
@@ -377,6 +415,7 @@ def test_producer_band_without_a_driveable_stage_enumerates_nothing(monkeypatch)
 
     monkeypatch.setenv("EMMY_TILE", "mma_m16n8k16_f16_f32/f2x2/k2")
     monkeypatch.setenv("EMMY_WORK", "w2x2+p2")
+    monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the subject is the band, not the split fork
     monkeypatch.setenv("EMMY_STAGE", "d2/smem-async")
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(dtype=F16), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
@@ -764,6 +803,9 @@ def test_matmul_mma_f16acc_coverage(stage, monkeypatch):
     monkeypatch.setenv("EMMY_F16_MMA_F32_ACC", "1")
     M = N = K = 128
     monkeypatch.setenv("EMMY_STAGE", _F16ACC_STAGES[stage])
+    # No cross-CTA split: the transport is what this test asserts, and a split the prior may pick offers no
+    # staged transport on its pieces.
+    monkeypatch.setenv("EMMY_REDUCE", "")
     run_m = M + 2
     rng = np.random.default_rng(0)
     a = (rng.standard_normal((run_m, K)) * 0.1).astype(np.float16)
@@ -1138,6 +1180,7 @@ def test_bf16_operands_stage_via_cp_async(monkeypatch):
 
     monkeypatch.setenv("EMMY_TILE", "mma_m16n8k16_bf16_f32/f2x2/k2")
     monkeypatch.setenv("EMMY_WORK", "w2x2")
+    monkeypatch.setenv("EMMY_REDUCE", "")
     monkeypatch.setenv("EMMY_STAGE", "d2/smem-async")
     M = 256
     g = Graph()
@@ -1369,7 +1412,7 @@ def test_masked_symbolic_m_structure(transport, monkeypatch):
     assert "int seq_len" in src, "runtime extent must be a kernel arg"
     assert "mma.sync.aligned.m16n8k16" in src
     if transport == "smem-async":
-        assert kop.knobs.get("S_ext_n_symbolic_axis"), "symbolic-M warp row must carry a symbolic axis"
+        assert stamps(kop).get("S_ext_n_symbolic_axis"), "symbolic-M warp row must carry a symbolic axis"
         assert "ldmatrix" in src
         # Clamp on the hoisted cooperative A fill: bound by the runtime extent, fall back to last row.
         assert "< seq_len) ?" in src and "seq_len - 1" in src, "A-slab fill must clamp to the runtime extent"
@@ -1619,16 +1662,38 @@ def test_raster_fork_offers_both_orders(monkeypatch):
     assert vals == {"", "gm8"}, f"every contraction row must spell RASTER, flat first: {vals}"
 
 
-def test_raster_symbolic_grid_stays_flat(monkeypatch):
-    """A symbolic-M (masked-tile) grid renders through the dynamic decode path, which does not
-    carry the swizzle — the enumeration must decide the flat ``""`` only there (offering ``gm8``
-    would stamp a launch order the kernel doesn't realize: the silent-degrade family)."""
+def test_raster_symbolic_grid_offers_the_grouped_order(monkeypatch):
+    """A symbolic-M grid renders the grouped decode too, its extents as runtime C expressions, so the enumeration
+    offers ``gm8`` there as on a static grid: the dynamic projections of a serving layer take the L2-friendly order
+    (the H100 gate/up projection ran 312 us flat against 205 us grouped at the same static size)."""
     from emmy.compiler.pipeline.search.ranking import enumerate_graph  # noqa: PLC0415
 
     g = _mma_matmul_graph("dynamic", 1280, 2048, 1024, "f16", False)
     rows = enumerate_graph(g, Context.from_target((12, 0))).rows
     vals = {r.get("RASTER") for r in rows if any(k.split("@")[0] == "TILE" for k in r)}
-    assert vals == {""}, f"symbolic grids must stay flat: {vals}"
+    assert vals == {"", "gm8"}, f"every contraction row must spell RASTER, flat first: {vals}"
+
+
+@pytest.mark.parametrize("raster", ["gm8", "gn4"])
+@pytest.mark.parametrize("run_m", [1280, 300])
+@requires_sm90
+@requires_cuda
+def test_raster_symbolic_grid_decodes_every_tile_once(raster, run_m, monkeypatch):
+    """The grouped decode over a symbolic M covers every output tile exactly once at a runtime M that fills the
+    groups and at one that leaves a ragged last group (300 rows: 5 M tiles against a group of 8)."""
+    _pin_tile(monkeypatch, _RASTER_TILE)
+    monkeypatch.setenv("EMMY_REDUCE", "")
+    monkeypatch.setenv("EMMY_STAGE", "d2/smem-async")
+    monkeypatch.setenv("EMMY_RASTER", raster)
+    N, K = 2048, 1024
+    rng = np.random.default_rng(0)
+    a = (rng.standard_normal((run_m, K)) * 0.1).astype(np.float16)
+    b = (rng.standard_normal((K, N)) * 0.1).astype(np.float16)
+    got, src = _compile_run_mma(_mma_matmul_graph("dynamic", 1280, N, K, "f16", False), {"a": a, "b": b})
+
+    assert "_rsub" in src and "int seq_len" in src, "the grouped decode must render over the runtime extent"
+    diff = float(np.abs(got.reshape(run_m, N).astype(np.float32) - a.astype(np.float32) @ b.astype(np.float32)).max())
+    assert diff < 5e-2, f"{raster} at M={run_m}: mismatch (max abs err {diff})"
 
 
 def test_regstore_rewrite_preserves_atomic():
@@ -1722,6 +1787,9 @@ def test_reshaped_b_under_cp_async_matches_reference(monkeypatch):
     """A re-strided B staged through cp.async: each copy chunk reads the index at its own
     coordinates, so the derived row stride is what the fill copies."""
     monkeypatch.setenv("EMMY_STAGE", "d2/smem-async")
+    # No cross-CTA split, pinned: the bare transport pin names every kernel of the compile, and a split's
+    # partial kernel whose slice of K is shorter than a staged tile cannot take it.
+    monkeypatch.setenv("EMMY_REDUCE", "")
     g, ref = _imap_graph("reshape_b")
     got, _, ins = _imap_run(g)
     want = ref(ins)
@@ -1735,6 +1803,10 @@ def test_reshaped_a_fragment_takes_the_derived_row_stride(monkeypatch):
     """The gmem-direct mma fragment loader steps the reshaped A's rows at the DERIVED 128, not the
     buffer's declared trailing extent 256 — the ``ldm`` argument IS the bug, visible in the source."""
     monkeypatch.setenv("EMMY_STAGE", "")
+    # The mma tile and no cross-CTA split, pinned: the loader is what this test asserts, and the prior may
+    # otherwise pick a schedule with no mma fragment loader at all.
+    _pin_tile(monkeypatch, _WARP_PIN)
+    monkeypatch.setenv("EMMY_REDUCE", "")
     _, src, _ = _imap_run(_imap_graph("reshape_a")[0])
     calls = [ln.strip() for ln in src.splitlines() if "emmy_mma_load_a_gmem" in ln and "(_a" in ln]
     assert calls, "the gmem-direct pin must reach the mma fragment loader"
@@ -1766,6 +1838,7 @@ def test_reshaped_a_tma_pin_is_refused(monkeypatch):
 def test_sliced_a_still_stages_through_tma(monkeypatch):
     """The canonical (sliced) A keeps its TMA box, so the refusal above is not a dead pin."""
     monkeypatch.setenv("EMMY_STAGE", "d2/smem-tma")
+    monkeypatch.setenv("EMMY_REDUCE", "")  # no cross-CTA split, for the reason the cp.async test above gives
     _, src, _ = _imap_run(_imap_graph("slice_a")[0])
     assert "cp.async.bulk.tensor" in src
 

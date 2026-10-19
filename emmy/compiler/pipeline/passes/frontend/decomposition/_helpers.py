@@ -14,11 +14,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import BF16, F16, F32
 from emmy.compiler.dtype import get as get_dtype
 from emmy.compiler.graph import Graph, Node, Tensor
 from emmy.compiler.ir.base import ConstantOp, InputOp
-from emmy.compiler.ir.expr import BinaryExpr, Literal, placeholder
+from emmy.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, placeholder
 from emmy.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
 from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to, squeeze_axis
 from emmy.compiler.pipeline.passes.frontend.decomposition._matmul_helpers import matmul_unsqueeze
@@ -30,6 +31,7 @@ __all__ = [
     "matmul_decompose",
     "matmul_unsqueeze",
     "open_fragment",
+    "opmath_dtype",
     "reduction_shape",
     "single_indexmap",
     "softmax_decompose",
@@ -74,6 +76,12 @@ def reduction_shape(shape: tuple, axis: int) -> tuple:
     return tuple(shape[:a]) + (1,) + tuple(shape[a + 1 :])
 
 
+def opmath_dtype(dtype):
+    """The dtype a value of ``dtype`` is computed at: f32 for f16 and bf16, whose products and partial sums are
+    formed at f32 and rounded once at the output (PyTorch's opmath), the dtype itself otherwise."""
+    return F32 if dtype in (F16, BF16) else dtype
+
+
 def const_bc(frag: Graph, *, name: str, value=None, context_value=None, target_shape: tuple, dtype: str) -> Node:
     """Add a scalar ConstantOp and broadcast it to ``target_shape``. Pass ``value`` for a
     static scalar, or ``context_value`` (an ``Expr`` over symbolic-dim names) for a runtime
@@ -103,7 +111,7 @@ def matmul_decompose(frag: Graph, a: Node | str, b: Node | str, *, name: str, dt
     ew = frag.add_node(
         op=ElementwiseOp(op="multiply"),
         inputs=[a_bc, b_bc],
-        output=Tensor(f"{name}_ew", mul_shape, F32 if dtype in (F16, BF16) else dtype),
+        output=Tensor(f"{name}_ew", mul_shape, opmath_dtype(dtype)),
     )
     red_shape = reduction_shape(mul_shape, k_axis)
     red = frag.add_node(
@@ -161,3 +169,41 @@ def gqa_broadcast(
         p = placeholder(d)
         coord_map.append(BinaryExpr("/", p, Literal(group_size, "int")) if d == head_axis else p)
     return single_indexmap(frag, src, out_shape=target_shape, coord_map=coord_map, name=name, dtype=dtype)
+
+
+def static_extent(extent) -> int:
+    """Unwrap a channel/tap extent to int. These axes are weight-derived and never symbolic."""
+    if isinstance(extent, Dim):
+        if not extent.is_static:
+            raise NotImplementedError(f"a convolution requires static channel and tap extents, got {extent}")
+        return extent.as_static()
+    return int(extent)
+
+
+def padded_read(frag: Graph, x: Node, *, out_shape: tuple, channel: object, length: object, in_length: int, name: str) -> Node:
+    """Read ``x[n, channel, length]`` over ``out_shape``, yielding zero where ``length`` is padded off the end."""
+    coords = (placeholder(0), channel, length)
+    if isinstance(length, Literal) or in_length <= 0:
+        return single_indexmap(frag, x, out_shape=out_shape, coord_map=coords, name=name)
+
+    in_bounds = BinaryExpr("&&", BinaryExpr(">=", length, Literal(0, "int")), BinaryExpr("<", length, Literal(in_length, "int")))
+    # Clamp the off-domain coord so the post-fusion unconditional Load stays in range; the
+    # select is what actually discards the value.
+    clamped = TernaryExpr(cond=in_bounds, if_true=length, if_false=Literal(0, "int"))
+    zero_id = frag.add_node(
+        op=ConstantOp(name=f"{name}_zero", value=0.0),
+        inputs=[],
+        output=Tensor(f"{name}_zero", (1,), x.output.dtype),
+    )
+    nid = frag.add_node(
+        op=IndexMapOp(
+            out_shape=tuple(out_shape),
+            sources=(
+                IndexSource(input_idx=0, coord_map=(placeholder(0), channel, clamped), select=in_bounds),
+                IndexSource(input_idx=1, coord_map=(Literal(0, "int"),)),
+            ),
+        ),
+        inputs=[x, zero_id],
+        output=Tensor(name, tuple(out_shape), x.output.dtype),
+    )
+    return frag.nodes[nid]

@@ -29,6 +29,8 @@ and kernel identity — the Loop IR the term lowers to — is the algebra alone.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 
@@ -38,16 +40,31 @@ from emmy.compiler.ir.expr import Var
 from emmy.compiler.ir.pure.lam import Lambda
 from emmy.compiler.ir.pure.twist import Recipe, Twist
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Carry, Load, Loop, OutputSpec, Pre, Select, Stmt
+from emmy.compiler.ir.stmt import Accum, Affine, Assign, Body, Carry, Load, Loop, OutputSpec, Pre, Select, Stmt
 from emmy.compiler.ir.stmt.body import free_names
 
 # ``Body.structural_key()`` dispatches :func:`emmy.compiler.ir.stmt.passes.rewrite` over every
 # stmt for SSA / Expr / axis canonicalization. Register the structural node's handler here — an
 # INLINE node operand dispatches back through the same registry, so a stored computed operand
 # (the cone, flash's ``P``) canonicalizes like any other subtree.
-from emmy.compiler.ir.stmt.passes import _rewrite_kind
+from emmy.compiler.ir.stmt.passes import _rename_ssa_vars_in_expr, _rewrite_kind
 from emmy.compiler.ir.stmt.passes import rewrite as _rewrite  # noqa: E402
 from emmy.utils import cached_method
+
+#: The symbolic extents of the program being compiled. The launch binds them, so a term reads one free — like a
+#: coordinate the grid binds — and never as a value some level defines: a scatter's guard compares its index with its
+#: destination's extent. The pipeline binds them per graph (:func:`binding_extents`).
+EXTENTS: ContextVar[frozenset[str]] = ContextVar("EXTENTS", default=frozenset())
+
+
+@contextmanager
+def binding_extents(names):
+    """Read ``names`` as symbolic extents, on top of those already bound, for the enclosed block."""
+    token = EXTENTS.set(EXTENTS.get() | frozenset(names))
+    try:
+        yield
+    finally:
+        EXTENTS.reset(token)
 
 
 @dataclass(frozen=True)
@@ -159,37 +176,6 @@ class AffineView:
     kept: int | None
 
 
-#: The name a matcher spells both sides' bound axis as, so an operand that CAPTURES it compares
-#: alpha-invariantly. Reserved: no kernel axis is spelled this way.
-_MATCH_AXIS = "_match_axis"
-
-
-def _rebind(term: Fold, name: str) -> Fold:
-    """``term`` with the axis it BINDS spelled ``name`` — in its lift and in every operand that
-    captures it.
-
-    Not :func:`_rewrite_kind` on the term: that applies σ hygienically, and a term's own axis is
-    precisely the binder it drops σ for. Here the binder is what we are renaming, so the rename is
-    applied at this node and σ handed to the subtree unmodified; an operand that rebinds the same
-    spelling drops it for its own subtree, which is the hygiene that still applies.
-    """
-    old = term.axis
-    sigma = Sigma({old: Var(name)})
-
-    def axis_fn(axis, old=old, name=name):
-        return replace(axis, name=name) if axis.name == old else axis
-
-    return replace(
-        term,
-        operands=tuple(_rewrite_kind(edge, lambda n: n, sigma, axis_fn) for edge in term.operands),
-        lift=Lambda(
-            params=(name, *term.lift.params[1:]),
-            body=Body(tuple(_rewrite(stmt, lambda n: n, sigma, axis_fn) for stmt in term.lift.body)),
-            results=term.lift.results,
-        ),
-    )
-
-
 @dataclass(frozen=True)
 class Fold:
     """The ONE reduce term — ``reduce(⊕) ∘ map(f)``, the typed successor of the annotated reduce
@@ -268,8 +254,8 @@ class Fold:
     # names (disjoint from the state) that only kernel-boundary ``OutputSpec`` writes consume —
     # the effect stays at the boundary, the term stays pure. Part of the ALGEBRA: it keys into
     # ``structural_key`` (a cumsum is not a sum), and it makes the stream order-visible, so an
-    # observed fold offers exactly the serial reduce plan (every partitioned combine — coop band,
-    # ILP register partials, the cross-CTA split — changes which prefixes exist).
+    # observed fold needs a prefix-preserving schedule: serial or a cooperative warp scan.
+    # ILP register partials, transposed bands and cross-CTA splits lose the intermediate prefixes.
     observe: Lambda | None = field(kw_only=True, default=None)
 
     def __post_init__(self) -> None:
@@ -695,6 +681,17 @@ class Fold:
             return None  # a dot product over shared axes only carries no output role to tile: a planar reduce
         slab = b_edge.as_slab()
         b_trans = slab is not None and self.axis in slab.load.index[-1].free_vars()
+
+        def transposed(edge: Fold) -> bool:
+            edge_slab = edge.as_slab()
+            return edge_slab is not None and self.axis in edge_slab.load.index[-1].free_vars()
+
+        # One contraction reads ONE B space: the roles below and every slab a tier builds are read off
+        # this channel, so a channel whose streamed edge spans other coordinates or runs the other way
+        # (a Gated DeltaNet gate's per-head intermediate ``X[h, d, k]``, K-contiguous, beside its
+        # ``W[k, h]`` projections) would be staged as if it were this one and read the wrong elements.
+        if any(edge.free_axes != b_space or transposed(edge) != b_trans for _, edge in channels[1:]):
+            return None
         return ContractionView(
             axis=self.axis,
             left_axes=frozenset(left_only),
@@ -866,7 +863,7 @@ class Fold:
                 base=Lambda.componentwise((pluses[index],), (self.base.results[index],)),
             )
             children.append(child)
-        if not all(child.tiles_whole() for child in children) and len({child.free_axes for child in children}) == 1:
+        if not any(child.tiles_whole() for child in children) and len({child.free_axes for child in children}) == 1:
             return None
         return Fold(operands=tuple(children), lift=Lambda.closing(self.exposes, Body(()), self.exposes))
 
@@ -1066,12 +1063,12 @@ class Fold:
                 continue  # a twisted pivot must already carry THIS recipe: another one's carrier is not its pivot
             if axes[self.axis].extent != axes[pivot.axis].extent or axes[self.axis].window != axes[pivot.axis].window:
                 continue
-            fused = self._twist(pivot, recipe)
+            fused = self._twist(pivot, recipe, axes)
             if fused is not None:
                 return fused
         return None
 
-    def _twist(self, pivot: Fold, recipe) -> Fold | None:
+    def _twist(self, pivot: Fold, recipe, axes) -> Fold | None:
         view, pview = self.as_reduction(), pivot.as_reduction()
 
         def cone(fold: Fold, name: str) -> tuple:
@@ -1093,20 +1090,14 @@ class Fold:
             return fn, values
 
         def alike(x: Fold, y: Fold) -> bool:
-            """Whether two operand terms are the same value, up to the axis each of them BINDS.
+            """Compare values under their actual coordinate scopes, independently of a lift's
+            coordinate-parameter order and the names of the axes its operands bind."""
+            from emmy.compiler.ir.stmt.identity import canonicalize_identity  # noqa: PLC0415
 
-            :meth:`canonical` abstracts a term's bound axis in its own lift and leaves it FREE
-            wherever an operand captures it — a lift that reads a coordinate without declaring it as
-            a param, which a ``cat``'s coord-predicated ``Select`` does. Two alpha-equal score cones
-            whose contractions were numbered ``a2`` and ``a3`` at lift time then compare unequal,
-            and the online-softmax recipe declines on every rotary attention, whose ``rotate_half``
-            is exactly that ``cat``. Spelling both axes as one reserved name before comparing is
-            what the matcher can do that :meth:`canonical` cannot: the correspondence between these
-            two terms is the question being asked, and a term alone does not know it.
-            """
-            if x.axis is None or y.axis is None or x.axis == y.axis:
-                return x.canonical() == y.canonical()
-            return _rebind(x, _MATCH_AXIS).canonical() == _rebind(y, _MATCH_AXIS).canonical()
+            if self.axis != pivot.axis:
+                x = _rewrite_kind(x, lambda name: name, Sigma({self.axis: Var(pivot.axis)}), lambda axis: axis)
+            scope = tuple(axes.values())
+            return canonicalize_identity(x.lower(axes=scope)) == canonicalize_identity(y.lower(axes=scope))
 
         def same(a: tuple, b: tuple) -> bool:
             if a[0].canonical() != b[0].canonical() or len(a[1]) != len(b[1]):
@@ -1184,15 +1175,15 @@ class Fold:
                 *zip(extra_edges, _slots(extra_params, extra_edges), strict=True),
             ]
             body, results, inits = list(pivot.lift.body), list(pivot.lift.results), list(pivot.init)
-            for name, index, init in added:
+            for name, index, init in tuple(added):
                 taken = {n for stmt in body for n in stmt.defines()} | {p for _, slot in held for p in slot}
-                cone = recipe.channels[index].injection
-                names = {param: roles[param] for param in cone.params}
+                injection = recipe.channels[index].injection
+                names = {param: roles[param] for param in injection.params}
                 # Statement by statement, so a channel BINDS what the body already computes rather
                 # than spelling it again: softmax's denominator and its expectation share the whole
                 # weight prefix, and instantiating each cone whole put two ``exp(s)`` in one lift.
                 have = {(stmt.op, stmt.args): stmt.name for stmt in body if isinstance(stmt, Assign)}
-                for stmt in cone.body:
+                for stmt in injection.body:
                     spelled = stmt.rewrite(lambda read, names=names: names.get(read, read))
                     if isinstance(spelled, Assign) and (prior := have.get((spelled.op, spelled.args))) is not None:
                         names[stmt.name] = prior
@@ -1204,8 +1195,31 @@ class Fold:
                     taken.add(fresh)
                     if isinstance(spelled, Assign):
                         have[(spelled.op, spelled.args)] = fresh
-                results.append(names[cone.results[0]])
+                if name in pview.states:
+                    slot = pview.states.index(name)
+                    bound_roles = {**roles, recipe.lift.params[0]: x}
+                    injected = injection.rename(lambda read, bound_roles=bound_roles, name=name: bound_roles.get(read, f"{name}__{read}"))
+                    candidate = replace(
+                        self, lift=Lambda.closing(self.lift.params, Body((*found[0].body, *injected.body)), injected.results)
+                    )
+                    contribution = cone(candidate, injected.results[0])
+                    if old != new:
+                        contribution = (contribution[0].rename({old: new}), contribution[1])
+                    # A shared dependent can reach the pivot again through another score cone.
+                    # Reuse its state only when both copies inject the same value into the same channel.
+                    if (
+                        slot == 0
+                        or pivot.twist.channels[slot - 1] != index
+                        or pivot.init[slot] != init
+                        or not same(cone(pivot, pivot.lift.results[slot]), contribution)
+                    ):
+                        raise ValueError(f"conflicting definitions of twisted state {name!r}")
+                    added.remove((name, index, init))
+                    continue
+                results.append(names[injection.results[0]])
                 inits.append(init)
+            if not added:
+                return pivot
             # An operand the lift no longer names is nobody's — the recipe's own contribution
             # replaced the statements that read it.
             read = {name for stmt in body for name in stmt.deps()} | set(results)
@@ -1295,6 +1309,7 @@ class Fold:
 
         Propagate demand through narrowed lifts. Shared terms keep the union of their readers'
         requests, so lowering never emits overlapping carriers with duplicate accumulator names.
+        Interior stores keep the defining subtree's reads, without demanding its enclosing results.
         """
         taken: dict[int, tuple[str, ...]] = {}
         pending = [(self, self.exposes)]
@@ -1305,10 +1320,10 @@ class Fold:
             if taken.get(id(term)) == names:
                 continue
             taken[id(term)] = names
-            narrowed = term.exposing(names) if names else None
+            narrowed = term if _writes_under(term, stored) else term.exposing(names) if names else None
             read = narrowed.step().ssa_uses | set(narrowed.exposes) if narrowed is not None else set()
             for edge in term.operands:
-                keep = edge.exposes if _writes_under(edge, stored) else tuple(name for name in edge.exposes if name in read)
+                keep = tuple(name for name in edge.exposes if name in read or name in stored)
                 pending.append((edge, keep))
         return taken
 
@@ -1351,16 +1366,24 @@ class Fold:
         The ONE lowering spelling — every consumer of a term's statements calls this. Memoized on
         the term per binding.
         """
-        if bound is None:
-            bound = self.free_axes
+        # The launch binds the symbolic extents, as the caller binds its coordinates.
+        bound = (self.free_axes if bound is None else bound) | EXTENTS.get()
         # The stores are spelled in this term's own vocabulary; they render with the lift.
         spelled = dict(zip(self.lift.params, self.applied.params, strict=True))
-        stores = tuple(replace(spec, write=spec.write.rewrite(lambda name: spelled.get(name, name))) for spec in stores)
+        stores = tuple(
+            replace(
+                spec,
+                write=spec.write.rewrite(lambda name: spelled.get(name, name)),
+                when=None if spec.when is None else _rename_ssa_vars_in_expr(spec.when, lambda name: spelled.get(name, name)),
+            )
+            for spec in stores
+        )
         coordinates: dict[str, Axis] = {axis.name: axis for axis in axes}
         declared: list[str] = []  # the order the tree first reads its coordinates — the tie order below
         internal: set[str] = set()  # the axes terms of the tree bind: a store under a reduce loop may index one
         readers: dict[str, int] = {}
         origin: dict[str, tuple[int, str]] = {}  # a value's defining term and what it is there
+        terms: dict[int, Fold] = {}
         seen: set[int] = set()
         pending = [self]
         while pending:
@@ -1368,6 +1391,7 @@ class Fold:
             if id(term) in seen:
                 continue
             seen.add(id(term))
+            terms[id(term)] = term
             declared.extend(name for name in term.lift.params[(term.axis is not None) + len(term.bindings) :] if name not in declared)
             if term.axis is not None:
                 internal.add(term.axis)
@@ -1385,22 +1409,50 @@ class Fold:
                     origin.update((name, (id(term), "observed")) for name in term.exposes[len(term.base.results) :])
             pending.extend(reversed(term.operands))
         owned: dict[tuple[int, str], list[OutputSpec]] = {}
-        taken = self.read_components(frozenset(name for spec in stores for name in spec.write.values))
+        # The order the terms are placed: a term's operands before its own step (:func:`place`).
+        placed_at: dict[int, int] = {}
+
+        def rank(term: Fold) -> None:
+            if id(term) in placed_at:
+                return
+            for edge in term.operands:
+                rank(edge)
+            placed_at[id(term)] = len(placed_at)
+
+        rank(self)
+        # A store's coordinate the tree COMPUTES — a scatter's row, a value some term defines — is read
+        # like a stored value: its term is kept, and the store follows the last of the terms it reads.
+        indexed = frozenset(
+            name
+            for spec in stores
+            for expr in _store_reads(spec)
+            for name in expr.free_vars()
+            if name in origin and name not in coordinates and name not in bound and name not in internal
+        )
+        stored = frozenset(name for spec in stores for name in spec.write.values) | indexed
+        taken = self.read_components(stored)
 
         def placed(term: Fold) -> tuple[Fold, ...]:
-            return tuple(edge.exposing(taken[id(edge)]) for edge in term.operands if taken[id(edge)])
+            # An interior store retains its defining subtree, without exporting every state of
+            # its enclosing carrier to a cut workspace.
+            return tuple(
+                edge if _writes_under(edge, stored) else edge.exposing(taken[id(edge)])
+                for edge in term.operands
+                if taken[id(edge)] or _writes_under(edge, stored)
+            )
 
         for spec in stores:
             key = origin.get(spec.write.values[0])
             assert key is not None and all(origin.get(name) == key for name in spec.write.values), (
                 f"a store over {spec.write.values} writes values no one term defines"
             )
-            owned.setdefault(key, []).append(spec)
+            rows = {origin[name] for expr in _store_reads(spec) for name in expr.free_vars() if name in indexed}
+            owned.setdefault(max((key, *rows), key=lambda k: placed_at[k[0]]), []).append(spec)
         for spec in stores:
             for axis in spec.sweep:
                 coordinates.setdefault(axis.name, axis)
         declared.extend(name for name in coordinates if name not in declared)
-        read = self.free_axes | {name for spec in stores for expr in spec.write.index for name in expr.free_vars()}
+        read = self.free_axes | ({name for spec in stores for expr in _store_reads(spec) for name in expr.free_vars()} - indexed)
         if missing := read - bound - internal - set(coordinates):
             raise ValueError(f"lower: no extent for coordinates {sorted(missing)} — the closed program takes them as axes")
         # A name a nested reduce binds is still a free coordinate here when the tree reads it free
@@ -1440,18 +1492,34 @@ class Fold:
                         body.append(Loop(axis=coordinates[name], body=self.assemble((*path, name))))
                 return Body(body).coalesce()
 
-        def attach(term: Fold, kind: str, target: list[Stmt], node: tuple[str, ...], scope: frozenset[str], nest: _Nest) -> None:
+        def attach(
+            term: Fold,
+            kind: str,
+            target: list[Stmt],
+            node: tuple[str, ...],
+            scope: frozenset[str],
+            nest: _Nest,
+            computed: bool | None = None,
+        ) -> None:
             # The stores over what ``term`` defines as ``kind`` — its step's results, its carried
-            # state, or its observer's per-step values — land right after it, in ``target``.
+            # state, or its observer's per-step values — land right after it, in ``target``. ``computed``
+            # selects the stores whose coordinates name a value some term computes (``True``), the others
+            # (``False``), or every store (``None``).
             for spec in owned.get((id(term), kind), ()):
-                extra = {name for expr in spec.write.index for name in expr.free_vars()} - scope
+                if computed is not None and computed != bool({name for expr in _store_reads(spec) for name in expr.free_vars()} & indexed):
+                    continue
+                # The store sits under the loops binding every coordinate it spells, and every coordinate a
+                # value it names is evaluated over (a scatter's row, computed per cell of a sweep).
+                read = {name for expr in _store_reads(spec) for name in expr.free_vars()}
+                extra = (read - indexed) | set().union(*(terms[origin[name][0]].free_axes for name in read & indexed))
+                extra -= scope
                 if not extra:
-                    target.append(spec.write)
+                    target.append(spec.stmt())
                     continue
                 assert extra <= set(nest.opened), (
                     f"a store reads coordinates {sorted(extra - set(nest.opened))} no term declares and no sweep names"
                 )
-                nest.sink((*node, *(name for name in nest.opened if name in extra))).append(spec.write)
+                nest.sink((*node, *(name for name in nest.opened if name in extra))).append(spec.stmt())
 
         emitted: dict[tuple[int, int], tuple[Fold, list[Stmt]]] = {}
 
@@ -1462,7 +1530,7 @@ class Fold:
                 _, scope, stmts = loops[depth]
                 loops, node = loops[: depth + 1], path
             else:
-                node = nest.path_of(term.free_axes, path)
+                node = nest.path_of(term.free_axes if term.axis is not None else _needs(term), path)
                 scope, stmts, loops = nest.bound | set(node), None, []
             if term.axis is not None or term.step():
                 target = stmts if stmts is not None else nest.sink(node)
@@ -1476,13 +1544,21 @@ class Fold:
                 # A step reading nothing the tree binds or defines (a multi-output root's constant result)
                 # needs no coordinate, so it sits at the top of its path.
                 reads = {name for stmt in step for name in free_names(stmt)} - {name for stmt in step for name in stmt.defines()}
-                if step and stmts is None and not reads & {*term.lift.params, *origin}:
+                early = step and stmts is None and not reads & {*term.lift.params, *origin}
+                if early:
                     node = nest.path_of(frozenset(), path)
                     nest.sink(node).extend(step)
-                    attach(term, "step", nest.sink(node), node, nest.bound | set(node), nest)
+                    attach(term, "step", nest.sink(node), node, nest.bound | set(node), nest, computed=False)
                     step = ()
-                for edge in placed(term):
-                    place(edge, loops, node if step else path, nest)
+                # An operand the step never reads — a value only stored, beside the step — sits on its own path, not
+                # under the coordinates of the operands the step combines.
+                read = {id(edge) for param, edge, index in term.bindings if {param, edge.exposes[index]} & reads}
+                kept = [edge for edge in term.operands if taken[id(edge)] or _writes_under(edge, stored)]
+                for edge, operand in zip(placed(term), kept, strict=True):
+                    place(edge, loops, node if step and id(operand) in read else path, nest)
+                if early:
+                    # A store whose coordinate an operand computes follows that operand, not the step alone.
+                    attach(term, "step", nest.sink(node), node, nest.bound | set(node), nest, computed=True)
                 if step:
                     target = stmts if stmts is not None else nest.sink(node)
                     target.extend(step)
@@ -1530,9 +1606,22 @@ class Fold:
             target.append(Loop(axis=coordinates[term.axis], body=Body(inner).coalesce()))
             attach(term, "state", target, node, scope, nest)
 
+        def _needs(term: Fold) -> frozenset[str]:
+            # The coordinates a map's step is evaluated over: what it reads itself and what the operands it reads
+            # are evaluated over — not those of an operand it only carries to a store.
+            step = term.step()
+            reads = {name for stmt in step for name in free_names(stmt)}
+            needed = reads.union(*(edge.free_axes for param, edge, index in term.bindings if {param, edge.exposes[index]} & reads))
+            return term.free_axes & needed
+
         root = _Nest(opened, frozenset(bound))
         place(self, [], None, root)
         return root.assemble()
+
+
+def _store_reads(spec: OutputSpec) -> tuple:
+    """The expressions a boundary store reads: its coordinates and its guard."""
+    return (*spec.write.index, *(() if spec.when is None else (spec.when,)))
 
 
 @_rewrite_kind.register
@@ -1557,11 +1646,20 @@ def _(s: Fold, rename, sigma, axis_fn):
         mapped = sigma.get(name) if sigma is not None else None
         return mapped.name if isinstance(mapped, Var) else rename(name)
 
-    lift = Lambda(
-        params=(*lead, *(_param(p) for p in s.lift.params[len(lead) :])),
-        body=Body(tuple(_rewrite(st, rename, sigma, axis_fn) for st in s.lift.body)),
-        results=tuple(rename(r) for r in s.lift.results),
-    )
+    bound_count = len(lead) + len(s.bindings)
+    substitutions = {
+        p: mapped
+        for p in s.lift.params[bound_count:]
+        if sigma is not None and (mapped := sigma.get(p)) is not None and not isinstance(mapped, Var)
+    }
+    needed = set().union(*(expr.free_vars() for expr in substitutions.values()))
+    params = (*lead, *(_param(p) for p in s.lift.params[len(lead) : bound_count]))
+    params += tuple(_param(p) for p in s.lift.params[bound_count:] if p not in substitutions or p in needed)
+    body = Body(tuple(_rewrite(st, rename, sigma, axis_fn) for st in s.lift.body))
+    results = tuple(rename(r) for r in s.lift.results)
+    # Only an expression substitution can introduce a coordinate absent from the original tail.
+    # A self-referential substitution still keeps its old binder in its original position.
+    lift = Lambda.closing(params, body, results) if substitutions else Lambda(params, body, results)
     base = s.base.rename(rename) if s.base is not None else None
     cells = tuple(_param(cell) for cell in s.cells)  # coordinates, like the environment tail
     observe = None
@@ -1622,6 +1720,8 @@ def _affine_classes(
             env.update(_affine_classes(stmt, state, reads, memo, kept))
         elif isinstance(stmt, Assign):
             env[stmt.name] = combine(stmt.op.name, tuple(of(arg) for arg in stmt.args))
+        elif isinstance(stmt, Affine):
+            env[stmt.name] = combine("add", tuple(of(arg) for arg in stmt.args))
         elif isinstance(stmt, Load):
             coordinates = tuple(of(var) for expr in stmt.index for var in expr.free_vars())
             env[stmt.name] = ("non", False) if any(kind != "free" for kind, _ in coordinates) else ("free", any(v for _, v in coordinates))

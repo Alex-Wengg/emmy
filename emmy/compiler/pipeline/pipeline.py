@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 
 from emmy.compiler.graph import Graph, Node
 from emmy.compiler.pipeline.fork import Fork, iter_leaves, leaf_for
-from emmy.compiler.pipeline.knob import Knob, apply_off_defaults, decision_view, family_of
+from emmy.compiler.pipeline.knob import Knob, apply_off_defaults, family_of
 from emmy.compiler.pipeline.strategy import PassEndEvent, RunStartEvent, discovered_strategies
 
 if TYPE_CHECKING:
@@ -237,8 +237,9 @@ class Match:
     pattern entry's name to the matched node id. ``consumed`` and
     ``output`` may be overwritten by the rewrite function to control
     which nodes the rewriter removes and which node its edges get
-    redirected to. ``output`` defaults to ``root_node_id`` when left
-    as ``None``.
+    redirected to; a chosen leaf fork that carries a redirect map
+    (``DeferredFork.output``) sets ``output`` when it is applied.
+    ``output`` defaults to ``root_node_id`` when left as ``None``.
 
     ``rule`` locates this match in the pipeline; the rewriter reaches
     pass metadata via ``match.rule.pass_``. Stamped by
@@ -298,25 +299,6 @@ class Match:
             if n is not self._identities[nid]:
                 return False
         return True
-
-    def remap(self, graph: Graph) -> Match:
-        """Build a fresh ``Match`` against ``graph`` (a copy of the
-        original) that mirrors this match's ids. Re-snapshots
-        ``_identities`` against the new graph's nodes so ``is_alive``
-        still works after the copy. Used when materializing a lazy
-        fork — the fork copies the parent's snapshot, then needs a
-        match anchored on the copy."""
-        identities = {nid: graph.nodes[nid] for nid in self._identities if nid in graph.nodes}
-        return Match(
-            graph=graph,
-            root_node_id=self.root_node_id,
-            rule=self.rule,
-            nodes=dict(self.nodes),
-            consumed=set(self.consumed),
-            output=self.output,
-            is_last=self.is_last,
-            _identities=identities,
-        )
 
 
 def _off_fill_pass(graph: Graph, pass_: Pass) -> None:
@@ -531,11 +513,13 @@ class Pipeline:
         POLICY, owned by
         :class:`~emmy.compiler.pipeline.search.strategy.greedy.GreedyStrategy` —
         this method is the thin engine entry point."""
+        from emmy.compiler.ir.pure.fold import binding_extents  # noqa: PLC0415
         from emmy.compiler.ir.schedule.base import clear_pin_refusals  # noqa: PLC0415
         from emmy.compiler.pipeline.search.strategy import GreedyStrategy  # noqa: PLC0415
 
         clear_pin_refusals()  # a refusal names the compile it happened in, not an earlier one
-        return GreedyStrategy(self, backend=backend, db=db, dump=dump).run(graph, ctx)
+        with binding_extents(name for buffer in graph.inputs for dim in graph.buffer(buffer).shape for name in dim.expr.free_vars()):
+            return GreedyStrategy(self, backend=backend, db=db, dump=dump).run(graph, ctx)
 
 
 @dataclass
@@ -723,7 +707,7 @@ class Run:
             domain = _structural_domain(options) if structural else None
             if structural and (chosen := _replay_structural_decision(cand.structural_decisions, match.root.op, options)) is not None:
                 option = _concrete_option(chosen)
-                cand.apply(match, option, knobs=_choice_knobs(chosen, option, match.root.op), aliases=getattr(chosen, "aliases", None))
+                cand.apply(match, option, knobs=_choice_knobs(chosen, option, match.root.op), **_fork_carry(chosen))
                 if match.rule.fixpoint:
                     return None
                 continue
@@ -738,7 +722,7 @@ class Run:
                 if option is None:
                     raise ValueError(f"decide returned a branch Fork at {match.rule.name!r} — return a concrete option or a leaf Fork")
                 knob_delta = _choice_knobs(choice, option, root_op)
-                minted = cand.apply(match, option, knobs=knob_delta, aliases=getattr(choice, "aliases", None))
+                minted = cand.apply(match, option, knobs=knob_delta, **_fork_carry(choice))
                 if domain is not None:
                     _remember_structural_decision(cand.structural_decisions, root_op, domain, knob_delta)
                 assert trace is not None
@@ -800,6 +784,13 @@ def _is_structural_option(option: object) -> bool:
     return isinstance(option, Graph) or (isinstance(option, Fork) and option.structural)
 
 
+def _fork_carry(choice: object) -> dict:
+    """What a chosen leaf fork hands the apply besides its option: the other spellings of its keys
+    (``aliases``) and the redirect map its splice runs under (``output``). A concrete option carries
+    neither."""
+    return {"aliases": getattr(choice, "aliases", None), "output": getattr(choice, "output", None)}
+
+
 def _concrete_option(option: object) -> object | None:
     """Unwrap one raw rewrite option to the concrete ``Op`` / ``Graph`` a
     replayed structural decision can apply inline: leaf Forks fire their
@@ -812,20 +803,18 @@ def _concrete_option(option: object) -> object | None:
 
 
 def _option_decision(option: object, root_knobs: dict) -> dict | None:
-    """The decision-knob delta one raw structural-fork option would stamp vs the offer op: the
-    DECIDED knobs (:func:`~emmy.compiler.pipeline.knob.decision_view` — features are facts, not
-    decisions) the option's op / fork knobs **add or change** vs the offer. A ``Graph`` option
-    reads the union over its nodes' op knobs: a fragment's kernels are brand-new ones carrying only
-    their own restamped features plus whatever decision the rule stamped, so that union IS the
-    decision. A *changed value* on an existing key counts, not only a brand-new key. ``None`` when
-    the option stamps nothing new."""
+    """The decision-knob delta one raw structural-fork option would stamp vs the offer op: the knobs
+    the option's op / fork knobs **add or change** vs the offer. A ``Graph`` option reads the union
+    over its nodes' op knobs: a fragment's kernels are brand-new ones carrying only whatever decision
+    the rule stamped, so that union IS the decision. A *changed value* on an existing key counts, not
+    only a brand-new key. ``None`` when the option stamps nothing new."""
     if isinstance(option, Graph):
         knobs: dict = {}
         for node in option.nodes.values():
             knobs.update(getattr(node.op, "knobs", None) or {})
     else:
         knobs = getattr(option, "knobs", None) or {}
-    delta = {k: v for k, v in decision_view(knobs).items() if root_knobs.get(k) != v}
+    delta = {k: v for k, v in knobs.items() if root_knobs.get(k) != v}
     return delta or None
 
 
@@ -844,7 +833,7 @@ def _choice_knobs(choice: object, option: object, root_op) -> dict:
 
 def _option_receipt(option: object, root_knobs: dict) -> dict:
     """The exact decided-knob receipt carried by one raw fork option, without materializing it."""
-    return decision_view(dict(option.knobs)) if isinstance(option, Fork) else _option_decision(option, root_knobs) or {}
+    return dict(option.knobs) if isinstance(option, Fork) else _option_decision(option, root_knobs) or {}
 
 
 def _structural_domain(options: list) -> tuple[str, ...] | None:
@@ -856,7 +845,6 @@ def _structural_domain(options: list) -> tuple[str, ...] | None:
 def _remember_structural_decision(decisions: list, root_op, domain: tuple[str, ...], receipt: dict) -> None:
     """Record the first exact structural choice for an identical offer in one cut domain."""
     key = root_op.identity_key(with_io=True, with_knobs=True)
-    receipt = decision_view(receipt)
     if key is None or not receipt or any(prior_key == key and prior_domain == domain for prior_key, prior_domain, _ in decisions):
         return
     decisions.append((key, domain, dict(receipt)))

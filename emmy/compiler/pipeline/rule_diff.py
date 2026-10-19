@@ -33,9 +33,8 @@ _RESET = "\x1b[0m"
 PASS_SHORTHAND = {
     "frontend/decomposition": "d",
     "frontend/optimization": "o",
-    "loop/lifting": "l",
+    "loop/lowering": "l",
     "loop/fusion": "f",
-    "loop/canonicalize": "n",
     "loop/stamp": "s",
     "tile/lift": "t",
     "tile/cut": "p",

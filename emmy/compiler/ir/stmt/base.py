@@ -181,6 +181,7 @@ _INTEGER_ELEMENTWISE_OPS = frozenset(
     {
         "add",
         "subtract",
+        "negative",
         "multiply",
         "floor_divide",
         "remainder",
@@ -224,6 +225,12 @@ def dtype_promote(op_name: str, arg_dtypes: list[str]) -> str:
     if arg_dtypes and all(d == "f16" for d in arg_dtypes):
         return "f16"
     return "f32"
+
+
+def spell_literal(value: float) -> str:
+    """The one spelling of a literal: an integer without a point, anything else as Python repr."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() and abs(value) < 2**53 else repr(value)
 
 
 def _pad(n: int) -> str:
@@ -295,6 +302,8 @@ def op_to_expr(fn: str, inputs: list[Expr], *, dtype: str | None = None) -> Expr
         return FuncCallExpr("bitwise_count", tuple(inputs))
     if fn in _BINARY_OP:
         return BinaryExpr(_BINARY_OP[fn], inputs[0], inputs[1])
+    if fn == "divide_rn_f32":
+        return FuncCallExpr(fn, tuple(inputs))
     if fn == "maximum":
         return FuncCallExpr("fmax", tuple(inputs))
     if fn == "minimum":
@@ -333,7 +342,7 @@ def op_to_expr(fn: str, inputs: list[Expr], *, dtype: str | None = None) -> Expr
         neg_x = BinaryExpr("-", Literal(0.0, "float"), inputs[0])
         exp_neg = FuncCallExpr("exp", (neg_x,))
         return BinaryExpr("/", Literal(1.0, "float"), BinaryExpr("+", Literal(1.0, "float"), exp_neg))
-    if fn in ("exp", "exp_fast", "log", "rsqrt", "sin", "cos", "tanh", "sqrt", "erf"):
+    if fn in ("exp", "exp_fast", "log", "rsqrt", "sin", "cos", "tanh", "sqrt", "erf", "floor"):
         return FuncCallExpr(fn, tuple(inputs))
     if fn == "abs":
         return FuncCallExpr("fabs", tuple(inputs))
@@ -414,10 +423,50 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx, shape: tuple | None =
     whose paged axis is the page size rather than the buffer's full extent. A single index is
     already a flat address; any other index spells every dim of a known shape, ``0`` at a size-one dim.
     """
+    flat = _flat_index(buf, indices, ctx, shape)
+    return flat if isinstance(flat, str) else flat.render(ctx)
+
+
+def render_address(buf: str, indices: tuple, ctx: RenderCtx) -> str:
+    """``&buf[...]`` with the flat index's constant terms added to the pointer: ``&k[i] + 2056``.
+
+    CUDA 12's front end widens an ``int`` index sum to 64 bits before it folds the sum's
+    constant, so ``&k[i + 2048]`` and ``&k[i + 2056]`` become two live 64-bit pointers, where
+    ``&k[i] + 2048`` is one pointer and a load immediate. A register-carried tile's unrolled
+    fragment loads hold a hundred such offsets, and the extra pointers spill a kernel at the
+    register cap (the GDN chunk step: 255 registers and a spill on CUDA 12.9, 179 with this form).
+    """
+    flat = _flat_index(buf, indices, ctx)
+    if isinstance(flat, str):
+        return f"&{buf}[{flat}]"
+    index, offset = _split_offset(flat)
+    if not offset:
+        return f"&{buf}[{flat.render(ctx)}]"
+    return f"&{buf}[{(index or Literal(0, 'int')).render(ctx)}] + {offset}"
+
+
+def _split_offset(e: Expr) -> tuple[Expr | None, int]:
+    """``e`` as ``index + offset``, the constant taken through ``+`` and ``* literal``."""
+    if isinstance(e, Literal) and e.dtype == "int":
+        return None, int(e.value)
+    if isinstance(e, BinaryExpr) and e.op == "+":
+        (left, a), (right, b) = _split_offset(e.left), _split_offset(e.right)
+        return (left if right is None else right if left is None else BinaryExpr("+", left, right)), a + b
+    if isinstance(e, BinaryExpr) and e.op == "*":
+        for term, scale in ((e.left, e.right), (e.right, e.left)):
+            if isinstance(scale, Literal) and scale.dtype == "int":
+                index, offset = _split_offset(term)
+                return (None if index is None else BinaryExpr("*", index, scale)), offset * int(scale.value)
+    return e, 0
+
+
+def _flat_index(buf: str, indices: tuple, ctx: RenderCtx, shape: tuple | None = None) -> Expr | str:
+    """The row-major flat index of ``buf[indices]``: a simplified ``int`` Expr, or the rendered
+    ``long long`` sum when the buffer's extent exceeds ``int`` addressing."""
     if len(indices) == 0:
-        return "0"
+        return Literal(0, "int")
     if len(indices) == 1:
-        return indices[0].simplify(SimplifyCtx.empty()).render(ctx)
+        return indices[0].simplify(SimplifyCtx.empty())
     shape = ctx.shapes.get(buf) if shape is None else shape
     if shape is None or len(shape) != len(indices):
         raise ValueError(f"{buf}: {len(indices)} indices for a buffer of shape {shape} — an index spells every dim of its buffer")
@@ -441,7 +490,7 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx, shape: tuple | None =
     if wide:
         return "(" + " + ".join(parts) + ")"
     assert flat is not None
-    return flat.simplify(SimplifyCtx.empty()).render(ctx)
+    return flat.simplify(SimplifyCtx.empty())
 
 
 @dataclass(frozen=True)
@@ -469,10 +518,9 @@ class Paged:
     flat buffer. Both halves fold through the ordinary index simplifier, so a loop tiled to a
     multiple of the page size resolves the page once per tile rather than once per element.
 
-    ``start`` names the kernel-local ``int`` (a device scalar the preamble reads) that makes the
-    buffer's own coordinate absolute before the split, which is the whole of a cache write: the
-    kernel's output holds only the step's new rows and ``start`` decides which pages of the cache
-    they land in.
+    The index along the paged axis is whatever the program spelled — an axis, a value it loaded, a
+    mix — so a cache written at an absolute position is a scatter into it, and no shift is applied
+    here.
 
     Not vectorizable: a vector access spans consecutive elements, which may cross a page.
     """
@@ -480,25 +528,19 @@ class Paged:
     name: str
     axis: int
     page: int
-    start: str | None = None
     vectorizable: ClassVar[bool] = False
 
     def base(self, index: tuple, ctx: RenderCtx) -> str:
-        page = BinaryExpr("//", self._position(index), Literal(self.page, "int"))
+        page = BinaryExpr("//", index[self.axis], Literal(self.page, "int"))
         return f"{self.name}__pages[{page.simplify(SimplifyCtx.empty()).render(ctx)}]"
 
     def flat(self, index: tuple, ctx: RenderCtx) -> str:
         shape = ctx.shapes.get(self.name)
         if shape is None or len(shape) != len(index):
             raise ValueError(f"paged buffer {self.name!r} needs a declared shape matching its {len(index)} indices; got {shape}")
-        within = BinaryExpr("%", self._position(index), Literal(self.page, "int"))
+        within = BinaryExpr("%", index[self.axis], Literal(self.page, "int"))
         inside = tuple(within if d == self.axis else idx for d, idx in enumerate(index))
         return render_index(self.name, inside, ctx, shape=(*shape[: self.axis], self.page, *shape[self.axis + 1 :]))
-
-    def _position(self, index: tuple) -> Expr:
-        """The coordinate on the paged axis, shifted to the cache's own by ``start``."""
-        own = index[self.axis]
-        return own if self.start is None else BinaryExpr("+", Var(self.start), own)
 
 
 def _exceeds_int_range(shape) -> bool:

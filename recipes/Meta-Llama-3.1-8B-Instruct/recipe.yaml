@@ -1,14 +1,13 @@
 # FP16 Llama 3.1 8B Instruct on one 32 GB Volta GPU. The public mirror's
 # config and all four model shards are byte-identical to Meta's gated release.
 tags:
-  - best-effort
+  - maintained
+  - lifecycle-locked
 
 model:
   huggingface: "NousResearch/Meta-Llama-3.1-8B-Instruct"
-  rationale: "Llama 3.1 is cooling per family reads, despite stable serving volume; attention shifted to Qwen3.8."
-  heat: 15
-  # FP16 fits one 32 GB V100 and avoids weight-only quantization. The pinned
-  # public mirror is byte-identical to the official Meta model payload.
+  rationale: "Stable utility downloads but zero trending or arena presence; cooling family."
+  heat: 25
   revision: d10aef7999a2b5ba950ab3974312feeedbfe0b77
   task: generate
 
@@ -20,10 +19,9 @@ engine:
     context_length: 65536
     max_concurrent_requests: 8
     vllm:
-      # RESULTS.md qualified digest sha256:8405bb60…, which only ever existed on the qualifying
-      # host: a registry pull by that digest fails, so a fresh VM could never deploy this recipe.
-      # The public tag is what the other SM70 recipes run; re-qualify on it.
-      image: "cloudriftai/1cat-vllm-sm70:1.0.0"
+      image: "cloudriftai/1cat-vllm-sm70@sha256:6f34e0b247a78ca65f88f305b1f1cc52c9020ecb83a5ca21df0599676dc443d3"
+      extra_env:
+        VLLM_FLASH_V100_DISABLE_PAGED_PREFILL: "1"
       extra_args: >-
         --dtype half
         --attention-backend FLASH_ATTN_V100
@@ -32,6 +30,7 @@ engine:
         --tokenizer-revision db1f81ad4b8c7e39777509fac66c652eb0a52f91
         --enable-auto-tool-choice
         --tool-call-parser llama3_json
+        --no-enable-prefix-caching
 
 matrices:
   - deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"

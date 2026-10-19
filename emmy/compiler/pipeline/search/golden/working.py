@@ -1,0 +1,296 @@
+"""The working golden's writers: trace inventories, and the write-back of what a record run measures.
+
+A trace inventory is a golden with no measurement: every kernel a traced program lowers to, and one unmeasured row
+per kernel and input regime — the targets ``run --golden PATH --bench`` benches. ``--record-greedy`` writes the
+greedy pick's kernel set back as kernels, routing rows and measured rows; ``--record`` writes a row's per-card
+latencies. Every write-back is one locked read-modify-write (:meth:`GoldenFile.edit`).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from emmy import gpu
+from emmy.compiler import pipeline, provenance
+from emmy.compiler.context import Context
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.pipeline import Pipeline
+from emmy.compiler.pipeline.search.db import RoutingRow, is_placement_knob
+from emmy.compiler.pipeline.search.pins import measured_regime_pins
+from emmy.compiler.specialize import specialize_program
+from emmy.compiler.wire import intern, kernel_bindings, kernel_tile
+
+from .format import GoldenFile, Latency, Measurements, Row, prepare_traced_graph
+from .repository import is_repository_golden_path
+from .restamp import definition, mint
+
+
+@dataclass(frozen=True)
+class TraceInventoryResult:
+    """Artifacts written for one trace-generated working inventory."""
+
+    path: Path
+    target_count: int
+
+
+def preflight_trace_inventory(path: str | Path) -> Path:
+    """Resolve a fresh trace-inventory destination and reject replacement."""
+    destination = Path(path)
+    if destination.exists():
+        raise FileExistsError(f"refusing to replace existing golden artifact: {destination}")
+    return destination
+
+
+def inventory(graph, ctx=None, *, model=None, model_quant_digest=None, realizations=None, name_prefix=None) -> GoldenFile:
+    """A traced program's inventory as a document: every kernel it lowers to at ``ctx`` (the live card when none is
+    given) and one unmeasured row per kernel and template."""
+    document, ctx = _empty_inventory(ctx, model=model, model_quant_digest=model_quant_digest)
+    _append(graph, ctx=ctx, document=document, name_prefix=name_prefix, realizations=realizations)
+    return document
+
+
+def write_trace_inventory(graph, path, *, model=None, ctx=None, realizations=None, model_quant_digest=None) -> TraceInventoryResult:
+    """Lower a trace through fusion and write a self-contained target inventory."""
+    destination = preflight_trace_inventory(path)
+    document = inventory(graph, ctx, model=model, model_quant_digest=model_quant_digest, realizations=realizations)
+    document.dump(destination)
+    return TraceInventoryResult(path=destination, target_count=len(document.kernels))
+
+
+def append_trace_inventory(graph, path, *, model=None, ctx=None, model_quant_digest=None) -> TraceInventoryResult:
+    """Add one more traced program to an existing working inventory: a model whose whole-graph export is not
+    bounded is traced one distinct path at a time, and those are one model's inventory. A kernel already covered is
+    recorded once."""
+    from emmy.compiler.context import Context  # noqa: PLC0415
+
+    ctx = ctx or Context.probe()
+    with GoldenFile.edit(path) as document:
+        validate_working_gpu(document, ctx)
+        document = replace(document, model=model or document.model, model_quant_digest=model_quant_digest or document.model_quant_digest)
+        added = _append(graph, ctx=ctx, document=document)
+        document.dump(path, overwrite=True)
+    return TraceInventoryResult(path=Path(path), target_count=added)
+
+
+def write_trace_inventories(graphs: dict[str, object], path, *, model=None, ctx=None, realizations=None, model_quant_digest=None):
+    """Combine named traces into one inventory: serving capture emits many independent pre/post/expert graphs, and a
+    directory of one-file-per-graph inventories is easy to promote only partially. Identical kernels are recorded
+    once. ``realizations`` is the row template every kernel takes, or a mapping from graph name to the rows that
+    graph's kernels take — a static twin its own width's, a symbolic twin the dynamic ones."""
+    destination = preflight_trace_inventory(path)
+    if not graphs:
+        raise ValueError("cannot write an empty trace inventory")
+    document, ctx = _empty_inventory(ctx, model=model, model_quant_digest=model_quant_digest)
+    added = 0
+    for name in sorted(graphs):
+        rows = realizations.get(name) if isinstance(realizations, Mapping) else realizations
+        added += _append(graphs[name], ctx=ctx, document=document, name_prefix=name, realizations=rows)
+    document.dump(destination)
+    return TraceInventoryResult(path=destination, target_count=added)
+
+
+def _empty_inventory(ctx, *, model, model_quant_digest) -> tuple[GoldenFile, object]:
+    from emmy.compiler.context import Context  # noqa: PLC0415
+
+    ctx = ctx or Context.probe()
+    document = GoldenFile(
+        gpu_name=ctx.gpu_name or None,
+        compute_cap=tuple(ctx.compute_capability),
+        model=model or None,
+        model_quant_digest=model_quant_digest or None,
+    )
+    return document, ctx
+
+
+def whole_origins(coverage: Mapping, program) -> tuple[str, ...]:
+    """The traced ops a kernel computes, when it computes every one of them whole — the frontend slice that is the
+    kernel's exact Torch twin. Empty for a kernel holding part of an op."""
+    origins = tuple(sorted(origin for origin in coverage if origin in program.nodes))
+    return origins if origins and all(coverage[origin][2] for origin in origins) else ()
+
+
+def _append(graph, *, ctx, document: GoldenFile, name_prefix: str | None = None, realizations: list[dict] | None = None) -> int:
+    """Append one traced program's kernels to ``document`` — at every set of sizes the row templates bind, since a
+    kernel specialized at a size is a kernel of its own — and a row per kernel and template. Returns the kernels
+    added."""
+    from .restamp import lift_targets  # noqa: PLC0415
+
+    prepare_traced_graph(graph)
+    traced = intern(document.programs, graph)
+    templates = realizations if realizations is not None else [{"name": "", "bindings": {}, "pins": measured_regime_pins()}]
+    by_bindings: dict[tuple, list[dict]] = {}
+    for template in templates:
+        by_bindings.setdefault(tuple(sorted(template.get("bindings", {}).items())), []).append(template)
+    added = 0
+    for bindings, group in by_bindings.items():
+        program = specialize_program(graph, dict(bindings))
+        fused = Pipeline.build(pipeline.LOOP_PASSES).run(program.copy(), ctx=ctx, db=None)
+        totals = provenance.totals(fused)
+        origins = {
+            frozenset(node.buffer_names()): whole_origins(provenance.coverage(provenance.get(node), totals), graph)
+            for node in fused.nodes.values()
+            if isinstance(node.op, LoopOp)
+        }
+        for outputs, tile in lift_targets(program, ctx).items():
+            kernel = definition(tile, tile.name, traced=traced, origins=origins.get(outputs, ()), bindings=dict(bindings))
+            stored_before = len(document.kernels)
+            stored = document.add_kernel(kernel)
+            added += len(document.kernels) - stored_before
+            for template in group:
+                pins = dict(template.get("pins", {}))
+                if any(row.kernel == stored.ref and row.pins == pins for row in document.rows):
+                    continue
+                name = f"{name_prefix}.{tile.name}" if name_prefix else tile.name
+                if template.get("name"):
+                    name = f"{name}.{template['name']}"
+                if any(row.name == name and row.kernel != stored.ref for row in document.rows):
+                    name = f"{name}.{stored.exact_identity[:12]}"
+                document.rows.append(Row(name=name, kernel=stored.ref, bindings=kernel_bindings(tile), pins=pins))
+    return added
+
+
+def validate_working_gpu(document: GoldenFile, ctx) -> None:
+    """Reject a working file recorded for a different concrete GPU."""
+    file_cap, file_gpu = document.compute_cap, document.gpu_name
+    if file_cap is not None and tuple(file_cap) not in ((0, 0), tuple(ctx.compute_capability)):
+        raise ValueError(
+            f"working golden targets compute capability {tuple(file_cap)}, but the live GPU is {tuple(ctx.compute_capability)}"
+        )
+    if file_gpu and ctx.gpu_name and gpu.canonical_name(file_gpu) != gpu.canonical_name(ctx.gpu_name):
+        raise ValueError(f"working golden targets {file_gpu}, but the live GPU is {ctx.gpu_name}")
+
+
+def _refuse_repository(path: Path) -> None:
+    if is_repository_golden_path(path):
+        raise ValueError(f"refusing to write measurements into a canonical repository golden: {path}")
+
+
+def record_latency(path, name: str, *, hardware_id: str, emmy_us: float, tcompile_us=None, eager_us=None, knobs=None, pins=None) -> None:
+    """Write one card's measured latencies into the row ``name`` (narrowed by ``knobs`` / ``pins`` when given, which
+    must select exactly one). The block is keyed by ``Context.hardware_id``, which separates same-die SKUs a card
+    name does not; each torch number is omitted rather than faked when the run did not time it. The kernel set the
+    timing names is the row's target and every piece the file's decisions reach from it — every kernel the bench
+    could have deployed."""
+    from emmy.compiler.pipeline.knob import canonical_row_key  # noqa: PLC0415
+
+    destination = Path(path)
+    _refuse_repository(destination)
+    wanted_knobs = canonical_row_key(knobs) if knobs is not None else None
+    wanted_pins = {key: str(value) for key, value in pins.items()} if pins is not None else None
+    with GoldenFile.edit(destination) as document:
+        matches = [
+            index
+            for index, row in enumerate(document.rows)
+            if row.name == name
+            and (wanted_knobs is None or canonical_row_key(row.knobs or {}) == wanted_knobs)
+            and (wanted_pins is None or {key: str(value) for key, value in row.pins.items()} == wanted_pins)
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"{destination} resolves {name!r} to {len(matches)} latency rows; exact knobs and pins must select one")
+        row = document.rows[matches[0]]
+        path_to = document.path_to(row.kernel)
+        timed = Latency(emmy_us=emmy_us, tcompile_us=tcompile_us, eager_us=eager_us)
+        document.rows[matches[0]] = _timed(row, hardware_id, timed, document.kernel_set(path_to[0].parent if path_to else row.kernel))
+
+
+def _timed(row: Row, hardware_id: str, latency: Latency, kernels: tuple[str, ...]) -> Row:
+    """``row`` with ``latency`` as its timings on the card ``hardware_id``, naming ``kernels`` as the set it timed; a
+    torch number the run did not take stays out of the block rather than being faked."""
+    torch_us = {name: float(us) for name, us in (("tcompile_us", latency.tcompile_us), ("eager_us", latency.eager_us)) if us}
+    block = Latency(emmy_us=float(latency.emmy_us), kernels=kernels, **torch_us)
+    return replace(row, latency={**(row.latency or {}), hardware_id: block})
+
+
+def _refuse_unreplayable(document: GoldenFile, routes: list[RoutingRow]) -> None:
+    """Replay compatible routes together from their shared root, refusing any decision the fresh unpinned cut
+    pass does not take again. Conflicting decisions on one parent need separate replays."""
+    ctx = Context.from_target(tuple(document.compute_cap), gpu_name=document.gpu_name or None)
+    groups: list[dict[str, RoutingRow]] = []
+    for route in routes:
+        path = [*document.path_to(route.parent), route]
+        group = next(
+            (g for g in groups if next(iter(g)) == path[0].parent and all(g.get(step.parent, step) == step for step in path)),
+            None,
+        )
+        if group is None:
+            group = {}
+            groups.append(group)
+        group.update((step.parent, step) for step in path)
+    replayed = [
+        (taken, same)
+        for group in groups
+        for taken, same, _ in mint(document.kernel(next(iter(group))), list(group.values()), ctx, document=document)
+    ]
+    for route in routes:
+        if not any(taken == route and same for taken, same in replayed):
+            raise ValueError(f"fresh unpinned replay does not take {route.parent} {route.arm} the same way, so a restamp would drop it")
+
+
+def seed_row(document: GoldenFile, name: str) -> Row:
+    """The row ``name`` in the live input regime, or a proposal to measure in that regime."""
+    from .evidence import regime_live  # noqa: PLC0415
+
+    seeds = document.rows_of(name)
+    if not seeds:
+        raise ValueError(f"the golden has no realization named {name!r}")
+    return next((row for row in seeds if regime_live(row.pins)), seeds[0])
+
+
+def record_greedy_pick(
+    path, name: str, *, decisions, kernels, reference_backend: str, latency: tuple[str, Latency] | None = None
+) -> list[str]:
+    """Write the greedy pick's kernel set back into the working golden as the DB would hold it. ``decisions`` are the
+    kernel-set decisions the compile took, ``(parent, arm, pieces)`` as the splice watcher reports them — each a
+    routing row and the kernels it names; ``kernels`` are the CUDA kernels it produced, ``(op, emmy_us,
+    reference_us, tried)`` — each a measured row of its kernel at the seed row's regime, named ``<seed>.<identity
+    prefix>``: the seed's pins name the realization and its precision regime (a precision gate the seed leaves open is
+    the one the compile enumerated under), while a regime knob that only says how the kernel was timed — the cache
+    mode — is the measurement's own (:func:`~emmy.compiler.pipeline.search.pins.measured_regime_pins`), whatever the
+    seed says. A row of the same kernel, sizes, regime and schedule takes the new timings. ``latency``,
+    ``(hardware_id, timings)``, is the whole pick's time beside torch on the card: it goes onto the seed row naming
+    the kernel set written here — the seed's target, every kernel the decisions name and every kernel that ran.
+    Returns the names written, in order."""
+    from emmy.compiler.pipeline.knob import canonical_row_key  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.space import PRECISION_KNOBS, REGIME_KNOBS  # noqa: PLC0415
+
+    destination = Path(path)
+    _refuse_repository(destination)
+    with GoldenFile.edit(destination) as document:
+        seed = seed_row(document, name)
+        timing = {knob.name for knob in REGIME_KNOBS if knob not in PRECISION_KNOBS}
+        regime = {**measured_regime_pins(), **{key: value for key, value in seed.pins.items() if key not in timing}}
+        path_to = document.path_to(seed.kernel)
+        timed = [path_to[0].parent if path_to else seed.kernel]
+        routes = []
+        for parent, arm, pieces in decisions:
+            stored = document.add_kernel(definition(parent, parent.name))
+            children = [document.add_kernel(definition(piece, piece.name)) for piece in pieces]
+            routes.append(RoutingRow(stored.ref, {str(k): str(v) for k, v in arm.items()}, tuple(c.ref for c in children)))
+            document.add_routing(routes[-1])
+            timed.extend(ref for ref in (stored.ref, *routes[-1].children) if ref not in timed)
+        _refuse_unreplayable(document, routes)
+        written = []
+        for op, emmy_us, reference_us, tried in kernels:
+            tile = kernel_tile(op)
+            if tile is None:
+                raise ValueError(f"kernel {op.kernel_name} lowered from no tile kernel, so no row can name it")
+            stored = document.add_kernel(definition(tile, op.kernel_name))
+            row = Row(
+                name=f"{name}.{stored.exact_identity[:12]}",
+                kernel=stored.ref,
+                bindings=kernel_bindings(tile),
+                pins=regime,
+                knobs=dict(canonical_row_key({k: v for k, v in (op.knobs or {}).items() if not is_placement_knob(k, v)})),
+                measurements=Measurements(
+                    emmy_us=float(emmy_us), reference_us=float(reference_us), reference_backend=reference_backend, tried=tried
+                ),
+            )
+            written.append(document.upsert_row(row).name)
+            if stored.ref not in timed:
+                timed.append(stored.ref)
+        if latency is not None:
+            index = document.rows.index(seed_row(document, name))
+            document.rows[index] = _timed(document.rows[index], latency[0], latency[1], tuple(timed))
+        return written

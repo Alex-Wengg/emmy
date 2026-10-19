@@ -139,7 +139,7 @@ own — takes `slots=True` as well. It drops the per-instance `__dict__`, which 
 access, and that is worth having on the leaf choice objects an enumeration builds in the millions (`Tile`, `Work`,
 `Reduce`, `Stage`, `Raster`).
 
-A BIGGER type — one that owns derived reads the rest of the compiler depends on (`Fold`, `TileOp`, `ClassicDomains`,
+A BIGGER type — one that owns derived reads the rest of the compiler depends on (`Fold`, `TileOp`, `ClassicNodeSite`,
 `ClassicScheduleContext`) — stays unslotted and declares those reads with `cached_property` or `cached_method`, per
 the next section. The two are mutually exclusive: both cache through the very `__dict__` that `slots=True` removes,
 so a slotted class raises `TypeError: No '__dict__' attribute on 'X' instance to cache 'y' property` on the first
@@ -212,6 +212,15 @@ async def run_cmd(command, stream=True, timeout=600):
 ```
 
 On `TimeoutError`: kill the process, await termination, log, return `(1, "", "")`.
+
+### Portability
+
+Emmy runs on Linux and macOS, and Windows is a target. Code takes the path every platform has: `pathlib` for paths,
+`os.cpu_count()` for the core count, and worker processes started with `multiprocessing.get_context("spawn")` — the
+one start method all three offer (`fork` and `forkserver` are Unix-only). A spawned worker is a fresh interpreter, so
+the worker function is a module-level function (it has to pickle) that imports what it needs itself, and a script
+that starts workers guards its entry with `if __name__ == "__main__":`. A Unix-only tool belongs to the code that
+runs on the remote Linux host it deploys to, never to the local CLI.
 
 ## Rust
 

@@ -4,7 +4,9 @@
 //! other threads keep running while a kernel completes.
 
 use emmy_runtime::artifact::{self, Artifact, Env};
+use emmy_runtime::cpu;
 use emmy_runtime::cuda::{self, HungKernel};
+use emmy_runtime::pager;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -30,6 +32,15 @@ fn translate(error: anyhow::Error) -> PyErr {
 fn env(values: Option<HashMap<String, i64>>) -> Env {
     values.unwrap_or_default().into_iter().collect()
 }
+
+/// One `run_each` entry as Python passes it: its symbols, then the operands it lends, copies in and
+/// copies out.
+type Run = (
+    HashMap<String, i64>,
+    Vec<cuda::Operand>,
+    Vec<cuda::Operand>,
+    Vec<cuda::Operand>,
+);
 
 fn regions(
     values: Option<HashMap<String, (u64, usize)>>,
@@ -247,9 +258,17 @@ impl Executor {
             .map_err(translate)
     }
 
-    /// Point one region at memory the host lends.
-    fn set_region(&mut self, py: Python<'_>, name: &str, ptr: u64, len: usize) -> PyResult<()> {
-        py.detach(|| self.0.set_region(name, ptr, len))
+    /// Point one region at memory the host lends; `wait=False` leaves queued work on the old memory.
+    #[pyo3(signature = (name, ptr, len, wait=true))]
+    fn set_region(
+        &mut self,
+        py: Python<'_>,
+        name: &str,
+        ptr: u64,
+        len: usize,
+        wait: bool,
+    ) -> PyResult<()> {
+        py.detach(|| self.0.set_region(name, ptr, len, wait))
             .map_err(translate)
     }
 
@@ -257,10 +276,6 @@ impl Executor {
     fn set_external(&mut self, py: Python<'_>, name: &str, ptr: u64, len: usize) -> PyResult<()> {
         py.detach(|| self.0.set_external(name, ptr, len))
             .map_err(translate)
-    }
-
-    fn release_region(&mut self, py: Python<'_>, name: &str) -> PyResult<()> {
-        py.detach(|| self.0.release_region(name)).map_err(translate)
     }
 
     /// Launch on a stream the host owns; `None` returns to the executor's own stream.
@@ -271,6 +286,20 @@ impl Executor {
 
     fn run_once(&mut self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.0.run_once()).map_err(translate)
+    }
+
+    /// Run the program once per entry of `runs`; see `cuda::Executor::run_each`.
+    fn run_each(&mut self, py: Python<'_>, runs: Vec<Run>) -> PyResult<()> {
+        let runs: Vec<cuda::Run> = runs
+            .into_iter()
+            .map(|(env, lent, inputs, outputs)| cuda::Run {
+                env: self::env(Some(env)),
+                lent,
+                inputs,
+                outputs,
+            })
+            .collect();
+        py.detach(|| self.0.run_each(&runs)).map_err(translate)
     }
 
     /// Per-call milliseconds of launch `index` repeated `batch` times in one event window.
@@ -290,8 +319,9 @@ impl Executor {
             .map_err(translate)
     }
 
-    fn capture_program_graph(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.0.capture_program_graph())
+    #[pyo3(signature = (batch_size=1))]
+    fn capture_program_graph(&mut self, py: Python<'_>, batch_size: u32) -> PyResult<()> {
+        py.detach(|| self.0.capture_program_batch(batch_size))
             .map_err(translate)
     }
 
@@ -319,6 +349,157 @@ impl Executor {
     }
 
     /// Any buffer's allocated bytes after every queued operation has completed.
+    fn read<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py.detach(|| self.0.read(name)).map_err(translate)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn output<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py.detach(|| self.0.output(name)).map_err(translate)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+}
+
+/// One loaded CPU program: host buffers, the kernel library and its thread pool.
+/// The pager: the owner of paged buffers' pages, slots and tables (`pager.rs`).
+#[pyclass]
+struct Pager(pager::Pager);
+
+#[pymethods]
+impl Pager {
+    #[new]
+    fn new() -> Self {
+        Self(pager::Pager::default())
+    }
+
+    /// Declare a paged buffer living at `host` (pinned, mapped host memory) with the geometry
+    /// `(pages, page_bytes, slots)`: that many pages of that many bytes, and that many device slots.
+    /// The tables start as a buffer nothing has touched.
+    fn declare(
+        &mut self,
+        py: Python<'_>,
+        device: &Device,
+        name: &str,
+        host: u64,
+        geometry: (usize, usize, usize),
+    ) -> PyResult<()> {
+        py.detach(|| self.0.declare(&device.0, name, host, geometry))
+            .map_err(translate)
+    }
+
+    /// Bind the buffer's tables into an executor: the inputs named after it and its page table.
+    fn bind(&self, py: Python<'_>, executor: &mut Executor, name: &str) -> PyResult<()> {
+        py.detach(|| self.0.bind(&mut executor.0, name))
+            .map_err(translate)
+    }
+
+    /// A table's device address and byte length.
+    fn table(&self, name: &str, table: &str) -> PyResult<(u64, usize)> {
+        self.0.table(name, table).map_err(translate)
+    }
+}
+
+#[pyclass]
+struct CpuExecutor(cpu::Executor);
+
+#[pymethods]
+impl CpuExecutor {
+    /// `library` is the shared library holding every kernel of `program`, `bindings` the starting
+    /// bytes of inputs and constants, `env` the symbolic axes bound on top of the hints, and
+    /// `threads` the launch parallelism (every core when omitted).
+    #[new]
+    #[pyo3(signature = (program, library, bindings, env = None, threads = None))]
+    fn new(
+        py: Python<'_>,
+        program: &Program,
+        library: PathBuf,
+        bindings: HashMap<String, Vec<u8>>,
+        env: Option<HashMap<String, i64>>,
+        threads: Option<usize>,
+    ) -> PyResult<Self> {
+        let program = program.0.clone();
+        let threads =
+            threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        py.detach(|| {
+            let binaries = program
+                .kernels
+                .keys()
+                .map(|k| (k.clone(), library.clone()))
+                .collect();
+            let artifact =
+                Artifact::from_program(program, bindings.into_iter().collect(), binaries)?;
+            cpu::Executor::load(artifact, threads, Some(self::env(env)))
+        })
+        .map(Self)
+        .map_err(translate)
+    }
+
+    fn load_times_ms(&self) -> HashMap<&'static str, f64> {
+        self.0.load_times_ms.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    fn env(&self) -> HashMap<String, i64> {
+        self.0.env().iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    fn threads(&self) -> usize {
+        self.0.threads()
+    }
+
+    /// A buffer's host address, allocated bytes and shape under the current environment.
+    fn buffer(&self, name: &str) -> PyResult<(u64, usize, Vec<i64>)> {
+        let view = self.0.buffer(name).map_err(translate)?;
+        Ok((view.ptr, view.bytes, view.shape))
+    }
+
+    fn bind(&mut self, py: Python<'_>, name: &str, data: &[u8]) -> PyResult<()> {
+        py.detach(|| self.0.bind(name, data)).map_err(translate)
+    }
+
+    /// Re-lay the program out under `env` and upload `bindings`.
+    fn rebind(
+        &mut self,
+        py: Python<'_>,
+        env: HashMap<String, i64>,
+        bindings: HashMap<String, Vec<u8>>,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.0
+                .rebind(self::env(Some(env)), bindings.into_iter().collect())
+        })
+        .map_err(translate)
+    }
+
+    /// Bind symbolic axes without touching memory; every buffer stays at its capacity.
+    fn set_env(&mut self, py: Python<'_>, env: HashMap<String, i64>) -> PyResult<()> {
+        py.detach(|| self.0.set_env(self::env(Some(env))))
+            .map_err(translate)
+    }
+
+    fn run_once(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.0.run_once()).map_err(translate)
+    }
+
+    /// Point one region at memory the host lends, as on the CUDA executor.
+    fn set_region(&mut self, py: Python<'_>, name: &str, ptr: u64, len: usize) -> PyResult<()> {
+        py.detach(|| self.0.set_region(name, ptr, len))
+            .map_err(translate)
+    }
+
+    /// Per-launch wall times in microseconds, `iters` samples per launch after `warmup` untimed runs; with
+    /// `flush_bytes`, the caches are pushed out before every timed launch.
+    #[pyo3(signature = (warmup, iters, flush_bytes = 0))]
+    fn time_launches(
+        &mut self,
+        py: Python<'_>,
+        warmup: usize,
+        iters: usize,
+        flush_bytes: usize,
+    ) -> PyResult<Vec<Vec<f64>>> {
+        py.detach(|| self.0.time_launches(warmup, iters, flush_bytes))
+            .map_err(translate)
+    }
+
     fn read<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = py.detach(|| self.0.read(name)).map_err(translate)?;
         Ok(PyBytes::new(py, &bytes))
@@ -438,6 +619,8 @@ fn runtime_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Device>()?;
     m.add_class::<Program>()?;
     m.add_class::<Executor>()?;
+    m.add_class::<CpuExecutor>()?;
+    m.add_class::<Pager>()?;
     m.add_function(wrap_pyfunction!(device_tensor_capsule, m)?)?;
     m.add("HungKernelError", m.py().get_type::<HungKernelError>())?;
     Ok(())

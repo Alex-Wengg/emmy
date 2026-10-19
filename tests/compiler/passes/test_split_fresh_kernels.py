@@ -18,6 +18,7 @@ knob rows are asserted without a device. Numerics for every carrier and both arm
 
 from __future__ import annotations
 
+import re
 from itertools import permutations
 
 import pytest
@@ -38,7 +39,7 @@ from emmy.compiler.ir.tile.ir import TileOp
 from emmy.compiler.ir.tile.ops import sched_of
 from emmy.compiler.pipeline import CUDA_PASSES, TILE_PASSES, Pipeline
 from emmy.compiler.pipeline.fork import leaf_knobs
-from emmy.compiler.pipeline.knob import STRUCT_PREFIX, decision_view, family_of
+from emmy.compiler.pipeline.knob import family_of
 from emmy.compiler.pipeline.pipeline import Run
 from tests.compiler.terms import contraction
 
@@ -82,9 +83,16 @@ def _kernels(out) -> dict[str, dict]:
     return {nid: dict(n.op.knobs) for nid, n in out.nodes.items() if getattr(n.op, "kernel_source", None)}
 
 
+def _stamps(out) -> dict[str, dict]:
+    """Each lowered kernel's ``S_*`` row, computed from the kernel it realizes."""
+    from emmy.compiler.pipeline.search.features import stamps
+
+    return {nid: stamps(n.op) for nid, n in out.nodes.items() if getattr(n.op, "kernel_source", None)}
+
+
 def _tile_pieces(graph=None) -> list[TileOp]:
     loop, _ = _resolve(
-        ["frontend/decomposition", "frontend/optimization", "loop/lifting", "loop/fusion", "loop/stamp"],
+        ["frontend/decomposition", "frontend/optimization", "loop/lowering", "loop/fusion", "loop/stamp"],
         graph,
     )
     tiled, _ = Run(pipeline=Pipeline.build(["tile/lift", "tile/cut", "tile/schedule"]), ctx=_CTX).resolve(
@@ -154,8 +162,9 @@ def test_split_workspace_preserves_output_axis_order(monkeypatch, free_order) ->
     result, _ = _resolve(["tile/lift", "tile/cut", "tile/schedule"], graph)
     partial = result.nodes["out__partial"]
     assert tuple(dim.as_static() for dim in partial.output.shape) == (2, 4, 64, 256)
-    # The piece is formed as its own kernel, which names its axes afresh: the tile axes are told by extent.
-    assert {axis.extent.as_static() for axis in sched_of(partial.op)._mn_for(partial.op.op)} == {64, 256}
+    # The piece is formed as its own kernel, which names its axes afresh: the tile axes are told by extent. Head and
+    # channel fuse into one column axis, contiguous in ``b``; the row stays its own.
+    assert {axis.extent.as_static() for axis in sched_of(partial.op)._mn_for(partial.op.op)} == {64, 4 * 256}
     result.validate()
 
 
@@ -202,10 +211,12 @@ def test_finalize_keeps_projection_input_edges(monkeypatch) -> None:
 
 
 def test_no_piece_inherits_the_kernel_it_replaces(monkeypatch) -> None:
-    """The pieces leave the rewrite UNSCHEDULED: no placement, no schedule slice, no decided knob,
-    and a structural stamp of their own. (The partial used to arrive wearing the pre-split kernel's
-    whole row — 21 ``S_*`` features describing a body it no longer had — and the finalize
-    already-placed with no knobs at all: no fork, no identity, untunable.)"""
+    """The pieces leave the rewrite UNSCHEDULED: no placement, no schedule slice, no decided knob.
+    (The partial used to arrive wearing the pre-split kernel's whole row — 21 ``S_*`` features
+    describing a body it no longer had — and the finalize already-placed with no knobs at all:
+    no fork, no identity, untunable.) A piece's features are computed from its own body."""
+    from emmy.compiler.pipeline.search.features import stamps
+
     monkeypatch.setenv("EMMY_REDUCE", "g2k")
     pieces = _tile_pieces()
     assert len(pieces) == 2, "the split must have produced two kernels"
@@ -213,9 +224,9 @@ def test_no_piece_inherits_the_kernel_it_replaces(monkeypatch) -> None:
         # Each SCHEDULED itself — so what it carries is its own row, keyed against its own tree.
         assert piece.place.is_mapped, "040_schedule must pick each piece up"
         assert not any(str(v).startswith("g") for k, v in piece.knobs.items() if family_of(k) == "REDUCE"), (
-            f"a piece must not carry the split it came from: {decision_view(piece.knobs)}"
+            f"a piece must not carry the split it came from: {dict(piece.knobs)}"
         )
-        assert {k for k in piece.knobs if k.startswith(STRUCT_PREFIX)}, "…and its own structural stamp"
+        assert stamps(piece), "…and its body has features of its own"
 
 
 @pytest.mark.parametrize("graph", [_matmul(), _sum()])
@@ -254,13 +265,17 @@ def test_each_piece_decides_its_own_row(monkeypatch) -> None:
 
 
 def test_each_piece_carries_its_own_structural_identity(monkeypatch) -> None:
-    """A piece featurizes as ITSELF. Without this the partial joined the pre-split kernel's
-    evidence — the same signature for a kernel doing half the reduction. The identity strategy
-    stamps each fragment at the splice boundary."""
+    """A piece featurizes as ITSELF, and is its own kernel. Without this the partial joined the pre-split
+    kernel's evidence — the same signature for a kernel doing half the reduction."""
+    from emmy.compiler.wire import kernel_identity
+
     monkeypatch.setenv("EMMY_REDUCE", "g2k")
-    stamps = [{k: v for k, v in row.items() if k.startswith(STRUCT_PREFIX)} for row in _kernels(_resolve(CUDA_PASSES)[0]).values()]
-    assert all(stamps), "every piece must carry a structural stamp"
+    out = _resolve(CUDA_PASSES)[0]
+    stamps = list(_stamps(out).values())
+    assert all(stamps), "every piece has a structural row"
     assert stamps[0] != stamps[1], "the pieces are structurally different kernels"
+    identities = {kernel_identity(n.op) for n in out.nodes.values() if getattr(n.op, "kernel_source", None)}
+    assert len(identities) == 2 and None not in identities
 
 
 def test_a_pieces_features_are_read_off_its_reconstituted_body(monkeypatch) -> None:
@@ -280,14 +295,15 @@ def test_a_pieces_features_are_read_off_its_reconstituted_body(monkeypatch) -> N
     digests identically across both arms and both carrier kinds.)
 
     Read against the pieces' known geometry: the partial's frees are ``(ksplit=2, m=128, n=128)``
-    and the finalize's the grid ``(m=128, n=128)`` over a 2-wide fold."""
+    and the finalize's the grid over a 2-wide fold — one ``m·n`` axis, the form its own program takes, since
+    every access it makes folds through the buffers' row-major layout."""
     monkeypatch.setenv("EMMY_REDUCE", "g2k")
-    kernels = _kernels(_resolve(CUDA_PASSES)[0])
+    kernels = _stamps(_resolve(CUDA_PASSES)[0])
     partial, finalize = kernels["o__partial"], kernels["o"]
     for name, row in (("partial", partial), ("finalize", finalize)):
         assert row.get("S_n_write") == 1.0, f"{name}: the boundary store must come back as a Write — {row.get('S_n_write')}"
     assert (partial["S_ext_n_free_axis"], partial["S_ext_free_prod"]) == (3.0, 2.0 * 128 * 128), partial
-    assert (finalize["S_ext_n_free_axis"], finalize["S_ext_free_prod"]) == (2.0, 128.0 * 128), finalize
+    assert (finalize["S_ext_n_free_axis"], finalize["S_ext_free_prod"]) == (1.0, 128.0 * 128), finalize
     assert finalize["S_ext_reduce_prod"] == 2.0, f"the cross-partition fold must read as a reduce — {finalize}"
 
 
@@ -320,27 +336,6 @@ def test_a_pin_hands_its_remaining_row_to_the_pieces(monkeypatch) -> None:
     assert len(kernels) == 2
     partial = next(row for nid, row in kernels.items() if nid.endswith("__partial"))
     assert any(str(v) == "coop" for k, v in partial.items() if family_of(k) == "REDUCE"), partial
-
-
-def test_the_split_node_is_priced_as_the_sum_of_its_pieces(monkeypatch) -> None:
-    """A kernel that splits has no latency of its own — it does not run. Its estimate is the Σ over
-    the kernels the resolution ends with, which is what lets the split row be compared against the
-    rows that keep one kernel. Every summand is a plain µs: a piece the trace scored contributes its
-    score, one it did not contributes the prior's estimate for the row it realized."""
-    from emmy.compiler.pipeline.search.policy import greedy
-
-    monkeypatch.setenv("EMMY_REDUCE", "g2k")
-    terminal, trace = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=_CTX).resolve(_matmul(), greedy.greedy_decide(prior=None))
-    kernels = [nid for nid, n in terminal.nodes.items() if isinstance(n.op, TileOp)]
-    assert len(kernels) == 2, "the pinned split must produce two kernels to price"
-
-    class _Flat:
-        def mean_scores(self, rows):
-            return [7.0] * len(rows)
-
-    scored = {d.node_id: d.score for d in trace}
-    total = greedy._resolved_price(terminal, trace, _CTX, _Flat())
-    assert total == pytest.approx(sum(scored.get(nid) if scored.get(nid) is not None else 7.0 for nid in kernels))
 
 
 def _softmax_scale_chain() -> Graph:
@@ -434,6 +429,75 @@ def test_sweep_resident_head_fold_refuses_the_split(monkeypatch) -> None:
         split_forks(None, root)
 
 
+@pytest.mark.parametrize(
+    ("code", "splits"),
+    [
+        ("(x - x.max(-1, keepdim=True).values).exp().sum(-1)", False),
+        ("x.exp().sum(-1)", True),
+        ("w = torch.randn(512, 8, dtype=torch.float16); (x * (x.square().mean(-1, keepdim=True) + 1e-6).rsqrt()) @ w", True),
+        ("w = torch.randn(512, 8, dtype=torch.float16); x @ w", True),
+    ],
+)
+def test_a_fold_over_a_whole_row_statistic_refuses_the_split(code, splits, monkeypatch) -> None:
+    """A sum or contraction over a same-axis statistic cannot slice its shared axis table.
+    A pin raises the refusal; removing the statistic keeps the split available."""
+    from types import SimpleNamespace
+
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.pipeline import LOOP_PASSES
+    from emmy.compiler.pipeline.passes.tile._split import split_forks
+
+    lowered = Pipeline.build(LOOP_PASSES).run(graph_from_code(f"x = torch.randn(4, 512, dtype=torch.float16); {code}")[0], ctx=_CTX)
+    lifted = Pipeline.build(["tile/lift"], select={"lift", "twisted"}).run(lowered, ctx=_CTX)
+    ((node_id, tile),) = [(node.id, node.op) for node in lifted.nodes.values() if isinstance(node.op, TileOp)]
+    root = SimpleNamespace(op=tile, id=node_id)
+    for var in ("EMMY_REDUCE", "EMMY_WORK"):
+        monkeypatch.delenv(var, raising=False)
+    options = split_forks(None, root)
+    assert options is not None and (len(options) > 1) == splits
+    monkeypatch.setenv("EMMY_REDUCE", "g4k")
+    if splits:
+        assert len(split_forks(None, root)) == 1, "the pinned split is the one arm"
+    else:
+        with pytest.raises(ValueError, match="reduces the split axis itself"):
+            split_forks(None, root)
+
+
+@pytest.mark.parametrize("stat_axis", ["k", "r"])
+def test_a_contraction_statistic_must_not_share_the_sliced_axis(stat_axis, monkeypatch) -> None:
+    """A cut piece can reuse one axis name for two lexical binders. Its statistic must stay whole."""
+    from types import SimpleNamespace
+
+    from emmy.compiler.ir.stmt import Assign
+    from emmy.compiler.pipeline.passes.tile._split import split_forks
+    from tests.compiler.terms import projection, reduction, slab
+
+    m, n, k, r = (Axis(name, Dim(extent)) for name, extent in (("m", 4), ("n", 8), ("k", 512), ("r", 512)))
+    stat = reduction(
+        stat_axis,
+        (slab("s", "x", "m", stat_axis),),
+        (Assign(name="stat__v", op="multiply", args=("s", "s")),),
+        ("stat",),
+    )
+    normalized = projection(
+        (slab("xv", "x", "m", "k"), stat),
+        (Assign(name="scaled", op="divide", args=("xv", "stat")),),
+    )
+    fold = contraction(k, normalized, (slab("wv", "w", "k", "n"), "acc"))
+    assert fold.as_contraction() is not None
+    tile = TileOp(op=fold, place=Placement(free=(m, n)), axes=(m, n, k, r))
+    root = SimpleNamespace(op=tile, id="out")
+    for var in ("EMMY_REDUCE", "EMMY_WORK"):
+        monkeypatch.delenv(var, raising=False)
+    assert (len(split_forks(None, root)) > 1) == (stat_axis != "k")
+    monkeypatch.setenv("EMMY_REDUCE", "g4k")
+    if stat_axis == "k":
+        with pytest.raises(ValueError, match="reduces the split axis itself"):
+            split_forks(None, root)
+    else:
+        assert len(split_forks(None, root)) == 1
+
+
 def test_a_twisted_carrier_split_partial_binds_a_tensor_core_tile() -> None:
     """The key-range split of a fused attention kernel (FlashAttention-2's split-KV): the partial
     stores the carrier's three states — pivot, denominator, expectation — to the workspace, so the
@@ -463,5 +527,7 @@ def test_a_twisted_carrier_split_partial_binds_a_tensor_core_tile() -> None:
     partial = next(src for nid, src in sources.items() if nid.endswith("__partial"))
     assert len(sources) == 2, sorted(sources)
     assert "mma_m16n8k16" in partial and "__ck" in partial, "the partial folds its key slice on the chunk tier"
-    for state in ("acc1", "acc3"):  # the pivot and the denominator: per-row registers, broadcast into a fragment to store
+    states = re.findall(r"float (acc\d+)__r0_0 = ", partial)
+    assert len(states) == 2, "the pivot and denominator each keep a per-row register"
+    for state in states:
         assert f"? ({state}__r0_0) : ({state}__r0_1)" in partial, f"{state} reaches the workspace whole"

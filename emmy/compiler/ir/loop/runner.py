@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 _INTRINSICS_CPP: dict[str, str] = {
+    "divide_rn_f32": "emmy_divide_rn_f32",
     "exp": "expf",
     "exp_fast": "expf",  # host reference stays libm-accurate; only the CUDA render takes __expf
     "rsqrt": "rsqrtf_",  # libm has no rsqrtf; PRELUDE provides one
@@ -54,6 +55,7 @@ _INTRINSICS_CPP: dict[str, str] = {
     "fmin": "fminf",
     "pow": "powf",
     "sqrt": "sqrtf",
+    "floor": "floorf",
 }
 
 
@@ -62,6 +64,7 @@ PRELUDE = """\
 #include <algorithm>
 #include <vector>
 static inline float rsqrtf_(float x) { return 1.0f / sqrtf(x); }
+static inline float emmy_divide_rn_f32(float x, float y) { return x / y; }
 template <typename To, typename From>
 static inline To emmy_bitcast(From value) {
     static_assert(sizeof(To) == sizeof(From), "emmy_bitcast requires equal widths");
@@ -119,6 +122,7 @@ def execute_loop_op_cpp(
     loop: LoopOp,
     input_arrays: dict[str, np.ndarray],
     out_shapes: dict[str, tuple[int, ...]],
+    initial: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray | tuple[np.ndarray, ...]:
     """JIT-compile ``loop`` to C++ if needed, then run it on ``input_arrays``.
 
@@ -126,7 +130,8 @@ def execute_loop_op_cpp(
     for MIMO). ``input_arrays``
     is keyed by the ``Load.input`` strings; the ordered list comes from
     ``loop.inputs`` (matcher-populated when run from the pipeline;
-    body-derived placeholders otherwise).
+    body-derived placeholders otherwise). An output in ``initial`` starts as a
+    copy of that array instead of zeros — an output written in place.
     """
     import cppyy
 
@@ -155,7 +160,11 @@ def execute_loop_op_cpp(
         fn = getattr(cppyy.gbl, fn_name)
         _FN_CACHE[cache_key] = fn
 
-    outputs = tuple(np.zeros(out_shapes[name], dtype=np.float32) for name in output_names)
+    initial = initial or {}
+    outputs = tuple(
+        np.array(initial[name], dtype=np.float32, copy=True) if name in initial else np.zeros(out_shapes[name], dtype=np.float32)
+        for name in output_names
+    )
 
     # cppyy accepts numpy arrays of matching dtype as ``const float*`` /
     # ``float*`` parameters via the buffer protocol. Ensure C-contiguous

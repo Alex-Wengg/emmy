@@ -363,6 +363,83 @@ def test_matvec_keeps_its_unit_row_beside_grouped_columns() -> None:
     assert rebuilt.place == tile.place
 
 
+@pytest.mark.parametrize("channels", (1, 2))
+@pytest.mark.parametrize("projected", (False, True))
+@pytest.mark.parametrize("scattered", (False, True))
+@pytest.mark.parametrize("mapped", (False, True))
+def test_rowless_grouped_columns_gain_a_unit_row(channels, projected, scattered, mapped) -> None:
+    group, n = Axis("group", 4), Axis("n", 16)
+    product = contraction(
+        K32,
+        slab("a", "a", "k"),
+        *((slab(f"b{i}", f"b{i}", "k", Var("group") * 16 + Var("n")), f"acc{i}") for i in range(channels)),
+    )
+    values = tuple(f"out{i}" if projected else f"acc{i}" for i in range(channels))
+    root = (
+        projection((product,), tuple(Assign(name=name, op="relu", args=(f"acc{i}",)) for i, name in enumerate(values)), values)
+        if projected
+        else product
+    )
+    index = (Var("group") / 2, Var("group") % 2, Var("n") * 2) if scattered else (Var("group"), Var("n"))
+    stores = tuple(OutputSpec(Write(output=f"out{i}", index=index, value=value)) for i, value in enumerate(values))
+    tile = TileOp(
+        op=root,
+        axes=(K32,),
+        place=Placement(free=(group, n), grid=(group, n) if mapped else (), mapped=mapped),
+        output_specs=stores,
+    )
+
+    assert tuple(axis.name for axis in tile.place.free) == ("group", "_um", "n")
+    assert tuple(axis.name for axis in tile.place.grid) == (("group", "_um", "n") if mapped else ())
+    assert tile.axis_of("_um").extent == Dim(1)
+    assert tuple(spec.write.index for spec in tile.output_specs) == (index,) * channels
+    rebuilt = TileOp(op=tile.op, place=tile.place, axes=tile.axes, output_specs=tile.output_specs)
+    assert rebuilt.place == tile.place
+    assert rebuilt.identity_key(with_io=True, with_knobs=True) == tile.identity_key(with_io=True, with_knobs=True)
+
+
+@pytest.mark.parametrize("second_has_row", (False, True))
+@pytest.mark.parametrize(("mirror_first", "mirror_second"), ((False, False), (True, False), (False, True), (True, True)))
+def test_unit_row_requires_every_output_root_to_be_rowless(second_has_row, mirror_first, mirror_second) -> None:
+    group, n = Axis("group", 4), Axis("n", 16)
+    first = contraction(K32, slab("a", "a", "k"), (slab("b", "b", "k", "group", "n"), "acc"))
+    second = contraction(
+        K32,
+        slab("c", "c", *(("group", "k") if second_has_row else ("k",))),
+        (slab("d", "d", "k", "n") if second_has_row else slab("d", "d", "k", "group", "n"), "acc2"),
+    )
+    if mirror_first or mirror_second:
+
+        def mirror(root):
+            left, right = (
+                projection((edge,), (Assign(name=f"v{i}", op="relu", args=edge.exposes),), (f"v{i}",))
+                for i, edge in enumerate(root.operands)
+            )
+            return contraction(K32, right, (left, root.exposes[0]))
+
+        first = mirror(first) if mirror_first else first
+        second = mirror(second) if mirror_second else second
+    root = projection(
+        (first, second),
+        (Assign(name="x", op="relu", args=("acc",)), Assign(name="y", op="relu", args=("acc2",))),
+        ("x", "y"),
+    )
+    tile = _tile(
+        root,
+        K32,
+        free=(group, n),
+        output_specs=tuple(OutputSpec(Write(output=name, index=(Var("group"), Var("n")), value=name)) for name in ("x", "y")),
+    )
+
+    expected = ("group", "n") if second_has_row else ("group", "_um", "n")
+    assert tuple(axis.name for axis in tile.place.free) == expected
+    if not second_has_row:
+        for site in tile.sites:
+            if (view := site.node.as_contraction()) is not None:
+                m, n = tile.grid_sched._mn_for(site.node)
+                assert (m.name, n.name) == (("n", "_um") if view.left_axes else ("_um", "n"))
+
+
 def test_promoted_attention_output_sweep_closes_the_a100_b_seam_idempotently() -> None:
     """The reduced Qwen3 target needs its promoted value-width axis to close computed B."""
     tile = case_target_tile("attention/rmsnorm-gqa-b-cut.json")
@@ -916,6 +993,25 @@ def test_a_carrier_of_two_independent_products_becomes_one_term_per_state() -> N
 
     tile = TileOp(op=carrier, place=Placement(free=(M8, N16)), axes=(M8, N16, a28))
     assert [site for site in tile.node_sites if tile.contracts(site)] == [1, 2]
+
+
+def test_a_contraction_beside_a_plain_reduction_keeps_its_own_term() -> None:
+    """A non-product channel must not hide a sibling's tensor-core schedule, even when both
+    results vary over the same output coordinates."""
+    k = Axis("k", Dim(64))
+    carrier = reduction(
+        k,
+        (slab("x", "X", "m", "k"), slab("w", "W", "n", "k"), slab("y", "Y", "m", "k"), slab("v", "V", "n", "k")),
+        (Assign(name="sum__v", op="add", args=("x", "w")), Assign(name="product__v", op="multiply", args=("y", "v"))),
+        ("sum", "product"),
+    )
+    apart = carrier.per_state()
+    assert apart is not None and apart.exposes == carrier.exposes
+    plain, product = apart.operands
+    assert plain.as_contraction() is None and product.tiles_whole()
+    assert plain.free_axes == product.free_axes
+    tile = TileOp(op=carrier, place=Placement(free=(M8, N16)), axes=(M8, N16, k))
+    assert [site for site in tile.node_sites if tile.contracts(site)] == [2]
 
 
 def test_a_carrier_that_folds_whole_or_carries_no_product_stays_one_term() -> None:

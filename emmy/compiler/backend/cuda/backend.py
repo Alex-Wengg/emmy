@@ -14,6 +14,7 @@ import numpy as np
 
 from emmy import config
 from emmy.compiler.backend import Backend, BenchmarkResult, RunResult
+from emmy.compiler.backend.base import resolve_tune_db
 from emmy.compiler.backend.cuda.program import (
     benchmark_program,
     run_program,
@@ -27,23 +28,6 @@ if TYPE_CHECKING:
     from emmy.compiler.context import Context
     from emmy.compiler.graph import Graph
     from emmy.compiler.pipeline.dump import CompilerDump
-
-
-def _resolve_tune_db(value: Path | str | None) -> Path | None:
-    """Resolve the ``tune_db=`` constructor argument.
-
-    - ``None`` → ``None`` (no DB; test-isolation default).
-    - ``"auto"`` → ``EMMY_TUNE_DB`` env → ``~/.cache/emmy/autotune.db``
-      (shared resolution in :func:`emmy.config.tune_db_path`). The result
-      is returned regardless of whether the file exists; ``compile()`` skips
-      opening it when missing.
-    - Explicit ``Path`` / ``str`` → that path (no env lookup).
-    """
-    if value is None:
-        return None
-    if value == "auto":
-        return config.tune_db_path()
-    return Path(value)
 
 
 class CudaBackend(Backend):
@@ -92,7 +76,7 @@ class CudaBackend(Backend):
         # resolve ``EMMY_TUNE_DB`` env var → ``~/.cache/emmy/autotune.db``,
         # open if the file exists. Explicit ``Path`` → use that file
         # (open if it exists; silently skip otherwise).
-        self.tune_db = _resolve_tune_db(tune_db)
+        self.tune_db = resolve_tune_db(tune_db)
         self._async_worker_obj = None  # lazily spawned on the first isolated bench
 
     def _async_worker(self):
@@ -129,6 +113,7 @@ class CudaBackend(Backend):
         *,
         input_data: dict[str, np.ndarray] | None = None,
         pre_run=None,
+        taps: tuple[str, ...] = (),
     ) -> tuple[RunResult, object]:
         # ``run_program`` / ``run_program_debug`` hold the GPU lock end
         # to end (compile + alloc + ``pre_run`` + launches + ``.get()``)
@@ -141,23 +126,28 @@ class CudaBackend(Backend):
             debug_result, pre_result = run_program_debug(compiled, input_data=input_data, pre_run=pre_run)
             self.last_debug_result = debug_result
             result_outputs = debug_result.outputs
+            tapped = {}  # a debug run returns no taps; ``last_debug_result`` holds every buffer per launch
             time_ms = None
         else:
             self.last_debug_result = None
-            result, pre_result = run_program(compiled, input_data=input_data, pre_run=pre_run)
+            result, pre_result = run_program(compiled, input_data=input_data, pre_run=pre_run, taps=taps)
             result_outputs = result.outputs
+            tapped = result.taps
             time_ms = result.time_ms
         # Symbolic output shapes bind from the supplied input array shapes:
         # each atomic symbolic input dim records its runtime size. Output dims
         # (possibly composite Dim exprs) then resolve via ``expr.eval(sym_env)``
         # — one path covers Literal / Var / BinaryExpr uniformly.
         sym_env = compiled.symbolic_env(input_data)
-        outputs: dict[str, np.ndarray] = {}
-        for name, vals in result_outputs.items():
-            t = compiled.buffer(name)
-            shape = tuple(int(d.expr.eval(sym_env)) for d in t.shape)
-            outputs[name] = np.asarray(vals, dtype=t.dtype.np).reshape(shape)
-        return RunResult(outputs=outputs, time_ms=time_ms), pre_result
+
+        def shaped(values: dict) -> dict[str, np.ndarray]:
+            buffers = {name: compiled.buffer(name) for name in values}
+            return {
+                name: np.asarray(vals, dtype=buffers[name].dtype.np).reshape(tuple(int(d.expr.eval(sym_env)) for d in buffers[name].shape))
+                for name, vals in values.items()
+            }
+
+        return RunResult(outputs=shaped(result_outputs), time_ms=time_ms, taps=shaped(tapped)), pre_result
 
     async def benchmark_async(
         self,

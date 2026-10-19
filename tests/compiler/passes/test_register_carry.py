@@ -22,7 +22,12 @@ from tests.compiler.ir.test_carried_state import _graph, _inputs, _reference, _u
 
 
 def _lift(graph):
-    return Pipeline.build(["tile/lift"], select=["lift"]).run(graph)
+    """``graph`` lifted, each tile bound to its node's buffers — as the matcher hands a rule the op it matched."""
+    lifted = Pipeline.build(["tile/lift"], select=["lift"]).run(graph)
+    for node in lifted.nodes.values():
+        if isinstance(node.op, TileOp):
+            node.op = node.op.with_io(lifted, node)
+    return lifted
 
 
 def _context(tile, target=(12, 0)):
@@ -291,6 +296,24 @@ def test_seed_tensor_keeps_unit_dimensions_on_cuda(register):
     arrays["S0"] = arrays["S0"].reshape(1, *arrays["S0"].shape[:1], 1, -1)
     result, _ = run_program(graph, arrays)
     np.testing.assert_allclose(result.outputs["out"], want, rtol=2e-3 if register else 1e-5, atol=2e-3 if register else 1e-6)
+
+
+def test_gmem_fragment_loads_keep_their_constant_offset_in_the_pointer():
+    """A gmem-direct fragment's constant offset is added to the pointer, outside the ``int`` index.
+
+    CUDA 12.9's front end widens ``&k[base + 2048]`` to 64 bits before folding the constant, so
+    every offset became its own live pointer: the GDN step below took 255 registers and spilled
+    24 bytes there, while CUDA 13 folded the same source into 189 registers. ``&k[base] + 2048``
+    is one pointer and a load immediate on both (179 registers on CUDA 12.9)."""
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+    from emmy.compiler.ir.stmt import RenderCtx
+
+    ctx = RenderCtx(shapes={"k": (Dim(4), Dim(64), Dim(128))}, buffer_dtypes={"k": "f32"}, ssa_dtypes={"r": "f16"})
+    row = BinaryExpr("+", BinaryExpr("*", Var("a0"), Literal(64, "int")), Literal(16, "int"))
+    load = LdmatrixLoad(frag="r", src_buffer="k", src_index=(Var("a1"), row, Literal(8, "int")), role="b", staged=False, ldm=128)
+    (line,) = load.render(ctx)
+    assert line.strip() == "emmy_mma_load_b_gmem<float, __half>(r, &k[a1 * 8192 + a0 * 64 * 128] + 2056, 128);"
 
 
 @requires_cuda
