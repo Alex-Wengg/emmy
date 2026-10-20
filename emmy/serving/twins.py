@@ -116,9 +116,10 @@ class LayoutConflict(RuntimeError):
 @dataclass
 class LayoutScope:
     """The layout each transposed weight of one family of twins is bound in (folded buffer name -> ``folded`` /
-    ``source``, or ``concat`` for a part of a concatenation of sibling weights) and what settled it. The cut pass offers a layout fork per kernel and the first kernel to decide fixes
-    it for its program; serving keeps one device copy per layout, so a later twin compiles with these layouts settled
-    (:meth:`settled`, for :func:`~emmy.compiler.pipeline.passes.tile._layout.settled_layouts`)."""
+    ``source``, or ``concat`` for a part of a concatenation of sibling weights) and what settled it. The cut pass
+    offers a layout fork per kernel and the first kernel to decide fixes it for its program; serving keeps one device
+    copy per layout, so a later twin compiles with these layouts settled (:meth:`settled`, for
+    :func:`~emmy.compiler.pipeline.passes.tile._layout.settled_layouts`)."""
 
     layouts: dict[str, tuple[str, str]] = field(default_factory=dict)
 

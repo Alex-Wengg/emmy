@@ -2100,9 +2100,7 @@ def _contraction_reads(tile: TileOp, root: Node, graph: Graph, groups, seam_of: 
         reads: dict[str, dict[int, dict[int, Fold]]] = {buffer: {} for buffer, _ in workspaces}
         dtypes: dict[str, set] = {buffer: set() for buffer, _ in workspaces}
         for ordinal, (member, position, exprs, ranges) in enumerate(group.members):
-            buffer, span = next(
-                (buffer, span) for buffer, span in workspaces if span is None or span[1] <= ranges[span[0]][0] < span[2]
-            )
+            buffer, span = next((buffer, span) for buffer, span in workspaces if span is None or span[1] <= ranges[span[0]][0] < span[2])
             dtypes[buffer].add(group.member_dtypes[ordinal] if group.member_dtypes else group.dtype)
             own = member.exposes[position]
             if own not in taken.get(id(member), member.exposes):

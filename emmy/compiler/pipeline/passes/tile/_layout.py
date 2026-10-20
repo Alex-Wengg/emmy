@@ -12,8 +12,8 @@ from dataclasses import replace
 from emmy.compiler.dim import to_dim
 from emmy.compiler.graph import Graph, Node, Tensor
 from emmy.compiler.ir.base import ConstantOp, InputOp
-from emmy.compiler.ir.frontend.ir import TransposeOp
 from emmy.compiler.ir.expr import BinaryExpr, Literal
+from emmy.compiler.ir.frontend.ir import TransposeOp
 from emmy.compiler.ir.pure import Fold
 from emmy.compiler.ir.stmt import Load
 from emmy.compiler.ir.tile import TileOp
