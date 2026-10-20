@@ -479,6 +479,18 @@ group of weights with equal reads can change together. The folded arm records th
 fixpoint moves on. The source arm's fresh identity gets its own measured schedule row, and the route records which
 layout produced it. Neither choice changes the maximal Fold region.
 
+Sibling weights — contractions that are one contraction except for the weight they read, at any widths — offer one
+more storage decision, before placement: apart (`LAYOUT=folded`, the kernel as it stands) or joined
+(`LAYOUT@weight=concat` for every weight of the family). The joined arm reads one constant, `cat__<weights>`, the
+checkpoint tensors side by side along their output features (`ConstantOp.source_parts`, parts in buffer-name order),
+each weight at its column offset. The contractions are then one contraction, so the cut gives them one producer whose
+grid spans every weight's columns where apart each weight was a launch of its own; the producer stores each weight's
+columns to a workspace of its own, under a guard, so every reader reads what it read apart and keeps its kernel and its
+rows. A row spells the joined arm only when it marks every weight of the family `concat`. Like a layout, the storage is
+the program's and its twins' (one device copy per weight): a family another reader or a twin already settled is
+offered in that storage only. The parts must share dtype, K and load chain; a family that differs in more than the
+weight (an NVFP4 weight's block scales and global scale) is not offered.
+
 A kernel carries no pins of its own. Pins live in the environment (the hand-pin path), and a measured row reaches a
 kernel only as evidence at its forks: every piece a cut or split mints, and every source-layout variant, is a
 brand-new kernel that inherits nothing
