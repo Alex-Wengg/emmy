@@ -149,7 +149,7 @@ class LayoutScope:
                 bound.setdefault(name, set()).add("folded")
         for weight, layouts in sorted(bound.items()):
             if len(layouts) > 1:
-                raise LayoutConflict(f"{twin} reads weight {weight!r} {' and '.join(sorted(layouts))} — two device copies")
+                raise LayoutConflict(f"{twin} reads weight {weight!r} both {' and '.join(sorted(layouts))} — two device copies")
             (layout,) = layouts
             held, settled_by = self.layouts.setdefault(weight, (layout, twin))
             if held != layout:

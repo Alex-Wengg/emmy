@@ -55,17 +55,16 @@ def fork_ahead(tile, decision: Mapping) -> bool:
     which is when the decision's price is a price of ``tile``. A decision ``tile`` has taken already — a placement
     once its placement is decided, the layout of a constant it already reads folded, a split once it declined the
     split — left another kernel and prices that one; so does the other arm of a fork ``tile`` is the kept arm of."""
+    from emmy.compiler.pipeline.passes.tile._layout import CONCAT, concat_ahead  # noqa: PLC0415 — the pass imports this module
+
     for key in decision:
         family = family_of(str(key))
         if (family == "PLACE" and tile.placement_decided) or (family == "REDUCE" and tile.split_consumed):
             return False
         if family == "LAYOUT" and str(key).partition("@")[2] in tile.layout_decided:
             return False
-        if family == "LAYOUT" and str(decision[key]) == CONCAT:
-            from emmy.compiler.pipeline.passes.tile._layout import concat_ahead  # noqa: PLC0415 — the pass imports this module
-
-            if not concat_ahead(tile, str(key).partition("@")[2]):
-                return False
+        if family == "LAYOUT" and str(decision[key]) == CONCAT and not concat_ahead(tile, str(key).partition("@")[2]):
+            return False
     return True
 
 
