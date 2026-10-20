@@ -360,9 +360,14 @@ class GoldenFile(Wire):
         computed = {buffer for origin in origins for buffer in program.nodes[origin].buffer_names()}
         reads = set(CompilerDump.frontend_reproducer_from_origins(program, origins).inputs)
         bound = {node_id for node_id, node in body.nodes.items() if isinstance(node.op, InputOp)}
-        # The kernel may read a buffer bound from a constant (a weight the lowering transposed); it may not read an
-        # activation the twin computes inside or never sees.
-        activations = {buffer for node in program.nodes.values() if not isinstance(node.op, ConstantOp) for buffer in node.buffer_names()}
+        # The kernel may read a buffer bound from a constant (a weight the lowering transposed, or a view of one such
+        # as a reshaped conv1d weight); it may not read an activation the twin computes inside or never sees.
+        constant: set[str] = set()
+        for node_id in program.topological_order():
+            node = program.nodes[node_id]
+            if isinstance(node.op, ConstantOp) or (node.inputs and all(name in constant for name in node.inputs)):
+                constant.update(node.buffer_names())
+        activations = {buffer for node in program.nodes.values() for buffer in node.buffer_names() if buffer not in constant}
         if not (set(body.outputs) <= computed and reads <= bound and not (bound - reads) & activations):
             return None
         graph = specialize_program(CompilerDump.frontend_reproducer_from_origins(program, origins), kernel.bindings)

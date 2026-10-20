@@ -1,4 +1,6 @@
-"""Offer a constant's folded transpose and its original storage layout as measured alternatives."""
+"""Offer a constant's storage as measured alternatives: its folded transpose or its original storage layout, and for
+sibling weights — the weights of contractions that are one contraction except for the weight — one constant holding
+them all."""
 
 from __future__ import annotations
 
@@ -11,8 +13,8 @@ from emmy.compiler.dim import to_dim
 from emmy.compiler.graph import Graph, Node, Tensor
 from emmy.compiler.ir.base import ConstantOp, InputOp
 from emmy.compiler.ir.frontend.ir import TransposeOp
-from emmy.compiler.ir.pure import Fold
 from emmy.compiler.ir.expr import BinaryExpr, Literal
+from emmy.compiler.ir.pure import Fold
 from emmy.compiler.ir.stmt import Load
 from emmy.compiler.ir.tile import TileOp
 from emmy.compiler.pipeline import Match
@@ -159,7 +161,8 @@ def _taken_layout(graph: Graph, root: Node, name: str) -> str | None:
         return "source"
     if any(user != root.id and not _undecided(graph.nodes[user].op, name) for user in graph.buffer_users(name)):
         return "folded"
-    return (_SETTLED.get() or {}).get(name)
+    settled = (_SETTLED.get() or {}).get(name)
+    return None if settled == CONCAT else settled
 
 
 def layout_forks(match: Match, root: Node) -> list[DeferredFork] | None:
@@ -216,11 +219,32 @@ def layout_forks(match: Match, root: Node) -> list[DeferredFork] | None:
     return [option for option in options if all(pins.get(key, pins.get("LAYOUT", value)) == value for key, value in option.knobs.items())]
 
 
-#: The ``LAYOUT`` value that stores sibling weights as one constant, concatenated along their output features.
+#: The ``LAYOUT`` value of a weight stored as one part of a concatenation of sibling weights.
 CONCAT = "concat"
-#: The concatenated constant's buffer is its first part's name with this suffix.
-CONCAT_SUFFIX = "__cat"
+#: A concatenation's buffer is ``cat__`` followed by its parts' buffer names, ``__``-joined in sorted order — the
+#: order the parts sit in along the output features, so every program reading the parts names one constant.
+_CONCAT_PREFIX = "cat__"
 _CONCAT = "__concat"
+
+
+def concat_name(names) -> str:
+    return _CONCAT_PREFIX + "__".join(sorted(names))
+
+
+def concat_parts(name: str) -> tuple[str, ...] | None:
+    """The part buffers concatenation ``name`` holds, or ``None`` when ``name`` is no concatenation."""
+    return tuple(name.removeprefix(_CONCAT_PREFIX).split("__")) if name.startswith(_CONCAT_PREFIX) else None
+
+
+def _apart(name: str) -> str:
+    """The ``layout_decided`` entry of a weight a kernel decided to read on its own rather than concatenated."""
+    return f"{name}:apart"
+
+
+def concat_ahead(tile: TileOp, name: str) -> bool:
+    """Whether ``tile`` still meets the concatenation decision of weight ``name`` — the price of a recorded
+    concatenation of it is a price of ``tile``."""
+    return _apart(name) not in tile.layout_decided
 
 
 def _concat_part(graph: Graph, name: str) -> Node | None:
@@ -229,35 +253,35 @@ def _concat_part(graph: Graph, name: str) -> Node | None:
     node = graph.producer(name)
     if node is None or _source_shape(node) is None or node.op.source_path is None or node.op.source_graph is not None:
         return None
-    return node
+    return node if "__" not in name else None
 
 
 def _concat_fragment(graph: Graph, root: Node, names: tuple[str, ...]) -> Graph:
     """``root``'s kernel reading the constants ``names`` as one constant: their source tensors concatenated along
-    the output features (``ConstantOp.source_parts``) and each read at its offset there."""
+    the output features (``ConstantOp.source_parts``, in ``names`` order) and each read at its offset there."""
     parts = [graph.producer(name) for name in names]
     k = parts[0].output.shape[0].as_static()
     widths = [part.output.shape[1].as_static() for part in parts]
     offsets = dict(zip(names, (sum(widths[:i]) for i in range(len(widths))), strict=True))
-    width = sum(widths)
-    cat = f"{names[0]}{CONCAT_SUFFIX}"
-    op = replace(
-        parts[0].op,
-        source_path=None,
-        source_parts=tuple((part.op.source_path, tuple(part.op.source_shape)) for part in parts),
-        source_shape=(width, k),
-    )
+    cat = concat_name(names)
+    shape = (to_dim(k), to_dim(sum(widths)))
     fragment = Graph()
     tile: TileOp = root.op
-    shapes = io_shapes(tile)
-    shapes[cat] = (to_dim(k), to_dim(width))
+    shapes = {**io_shapes(tile), cat: shape}
     for name in root.inputs:
         if name not in offsets:
             fragment.add_node(InputOp(), [], graph.buffer(name), node_id=name)
     if (existing := graph.buffer(cat)) is not None:
         fragment.add_node(InputOp(), [], existing, node_id=cat)
     else:
-        fragment.add_node(op, [], Tensor(cat, (to_dim(k), to_dim(width)), parts[0].output.dtype), node_id=cat)
+        op = replace(
+            parts[0].op,
+            name=cat,
+            source_path=None,
+            source_parts=tuple((part.op.source_path, tuple(part.op.source_shape)) for part in parts),
+            source_shape=(sum(widths), k),
+        )
+        fragment.add_node(op, [], Tensor(cat, shape, parts[0].output.dtype), node_id=cat)
 
     def read(load: Load) -> Load:
         row, column = load.index
@@ -269,37 +293,62 @@ def _concat_fragment(graph: Graph, root: Node, names: tuple[str, ...]) -> Graph:
     return add_output_piece(fragment, root, piece, inputs, suffix=_CONCAT)
 
 
+def _taken_concatenation(graph: Graph, root: Node, names: tuple[str, ...]) -> bool | None:
+    """Whether the program already holds ``names`` concatenated (``True``) or apart (``False``), or ``None`` when
+    nothing settled it: another kernel reads their concatenation or reads one of them alone, or a program sharing
+    their device copies settled them (:func:`settled_layouts`)."""
+    settled = _SETTLED.get() or {}
+    if graph.buffer(concat_name(names)) is not None or any(settled.get(name) == CONCAT for name in names):
+        return True
+    if any(settled.get(name) in {"folded", "source"} for name in names):
+        return False
+    if any(user != root.id for name in names for user in graph.buffer_users(name)):
+        return False
+    return None
+
+
 def concat_forks(match: Match, root: Node) -> list[DeferredFork] | None:
-    """PROTOTYPE: the concatenation of sibling weights this kernel's contractions read (``_cut.sibling_weights``),
-    offered only where ``LAYOUT@<weight>=concat`` pins every weight of the family."""
-    from emmy.compiler.pipeline.passes.tile._cut import sibling_weights  # noqa: PLC0415
+    """The first family of sibling weights this kernel's contractions read (``_cut.sibling_weights``) whose storage is
+    still open: read apart, as the kernel stands, or as one constant, the parts side by side along their output
+    features. Joined, the contractions are one contraction over the joined features, so a cut makes them one
+    producer whose grid spans all of them, where apart each weight is a launch of its own.
+
+    The parts must be checkpoint tensors of one dtype, K and load chain. A weight's storage is the program's and its
+    family's (one device copy per weight), so a family another reader or program already settled is offered in that
+    storage only."""
+    from emmy.compiler.pipeline.passes.tile._cut import sibling_weights  # noqa: PLC0415 — the cut imports this module
 
     tile: TileOp = root.op
-    if tile.op is None or tile.loop_body is None or tile.carries:
+    if tile.op is None or tile.loop_body is None or tile.carries or not takes_kernel_set_decision(tile):
         return None
-    pins = dict(family_pins("LAYOUT"))
     graph = match.graph
-    import os  # noqa: PLC0415 — PROTOTYPE switch
-
-    offer = os.environ.get("HFUSE_OFFER") == "1"
-    for names in sibling_weights(tile):
-        marker = "concat:" + "+".join(names)
-        if marker in tile.layout_decided:
+    pins = dict(family_pins("LAYOUT"))
+    for family in sibling_weights(tile):
+        names = tuple(sorted(family))
+        if any(not concat_ahead(tile, name) for name in names):
             continue
         parts = [_concat_part(graph, name) for name in names]
         if any(part is None for part in parts):
             continue
         if len({(part.output.shape[0], part.output.dtype, part.op.load_ops, part.op.source_dtype) for part in parts}) > 1:
             continue
-        concat = DeferredFork(
+        joined = DeferredFork(
             lambda names=names: _concat_fragment(graph, root, names),
             {f"LAYOUT@{name}": CONCAT for name in names},
             structural=True,
             output=redirects(root, _CONCAT),
         )
-        if all(pins.get(f"LAYOUT@{name}") == CONCAT for name in names):
-            return [concat]
-        if offer:
-            apart = DeferredFork(lambda marker=marker: replace(tile, layout_decided=(*tile.layout_decided, marker)), {"LAYOUT": "folded"})
-            return [apart, concat]
+        apart = DeferredFork(
+            lambda names=names: replace(tile, layout_decided=(*tile.layout_decided, *(_apart(name) for name in names))),
+            {"LAYOUT": "folded"},
+        )
+        taken = _taken_concatenation(graph, root, names)
+        if taken is not None:
+            return [joined if taken else apart]
+        wanted = {pins.get(f"LAYOUT@{name}", pins.get("LAYOUT")) for name in names} - {None}
+        if wanted == {CONCAT}:
+            return [joined]
+        if wanted:
+            return [apart]
+        return [apart, joined]
     return None

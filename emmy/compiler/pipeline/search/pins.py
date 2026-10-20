@@ -61,6 +61,11 @@ def fork_ahead(tile, decision: Mapping) -> bool:
             return False
         if family == "LAYOUT" and str(key).partition("@")[2] in tile.layout_decided:
             return False
+        if family == "LAYOUT" and str(decision[key]) == CONCAT:
+            from emmy.compiler.pipeline.passes.tile._layout import concat_ahead  # noqa: PLC0415 — the pass imports this module
+
+            if not concat_ahead(tile, str(key).partition("@")[2]):
+                return False
     return True
 
 
@@ -92,6 +97,15 @@ def spelled_arm(options, row) -> tuple[object, dict[str, str]] | None:
 
     arms = [(option, {str(key): str(value) for key, value in leaf_knobs(option).items()}) for option in options]
     keys = {key for _, knobs in arms for key in knobs}
+    from emmy.compiler.pipeline.passes.tile._layout import CONCAT  # noqa: PLC0415 — the pass imports this module
+
+    if any(CONCAT in knobs.values() for _, knobs in arms):
+        # A concatenation fork: the row spells the joined arm when it marks every weight of it concatenated, and the
+        # weights apart otherwise — a row with no such key, or one that decided their folded or source layout.
+        joined = next(((option, knobs) for option, knobs in arms if CONCAT in knobs.values()), None)
+        if all(str(row.get(key)) == CONCAT for key in joined[1]):
+            return joined
+        return next(((option, knobs) for option, knobs in arms if CONCAT not in knobs.values()), None)
     if any(family_of(key) == "LAYOUT" for key in keys):
         offered = {key for key in keys if family_of(key) == "LAYOUT"}
         want = {str(key): str(value) for key, value in row.items() if key in offered}

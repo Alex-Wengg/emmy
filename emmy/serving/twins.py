@@ -116,7 +116,7 @@ class LayoutConflict(RuntimeError):
 @dataclass
 class LayoutScope:
     """The layout each transposed weight of one family of twins is bound in (folded buffer name -> ``folded`` /
-    ``source``) and what settled it. The cut pass offers a layout fork per kernel and the first kernel to decide fixes
+    ``source``, or ``concat`` for a part of a concatenation of sibling weights) and what settled it. The cut pass offers a layout fork per kernel and the first kernel to decide fixes
     it for its program; serving keeps one device copy per layout, so a later twin compiles with these layouts settled
     (:meth:`settled`, for :func:`~emmy.compiler.pipeline.passes.tile._layout.settled_layouts`)."""
 
@@ -136,18 +136,20 @@ class LayoutScope:
     def record(self, twin: str, constants) -> None:
         """Take the layouts twin ``twin`` binds — ``constants`` pairs each bound constant's buffer name with whether
         its load chain ends in a transpose — into the scope; raise :class:`LayoutConflict` when it reads a weight in
-        both layouts, or in the other layout than the scope already holds."""
-        from emmy.compiler.pipeline.passes.tile._layout import SOURCE_SUFFIX  # noqa: PLC0415
+        two layouts (alone and inside a concatenation among them), or in another layout than the scope already holds."""
+        from emmy.compiler.pipeline.passes.tile._layout import CONCAT, SOURCE_SUFFIX, concat_parts  # noqa: PLC0415
 
         bound: dict[str, set[str]] = {}
         for name, transposed in constants:
+            for part in concat_parts(name.removesuffix(SOURCE_SUFFIX)) or ():
+                bound.setdefault(part, set()).add(CONCAT)
             if name.endswith(SOURCE_SUFFIX):
                 bound.setdefault(name.removesuffix(SOURCE_SUFFIX), set()).add("source")
             elif transposed:
                 bound.setdefault(name, set()).add("folded")
         for weight, layouts in sorted(bound.items()):
             if len(layouts) > 1:
-                raise LayoutConflict(f"{twin} reads weight {weight!r} both folded and source — two device copies")
+                raise LayoutConflict(f"{twin} reads weight {weight!r} {' and '.join(sorted(layouts))} — two device copies")
             (layout,) = layouts
             held, settled_by = self.layouts.setdefault(weight, (layout, twin))
             if held != layout:
