@@ -129,3 +129,13 @@ def test_the_release_is_the_launch_argument_after_the_runtime_ints() -> None:
     src = render_kernelop(_kernel(), tensors=_TENSORS, runtime_args=("num_tokens",))
     assert "int num_tokens, int _pdl_release)" in src
     assert 'if (_pdl_release) asm volatile("griddepcontrol.launch_dependents;");' in src
+
+
+def test_only_constants_are_read_through_the_non_coherent_path() -> None:
+    """A kernel released early starts while the grid ahead still writes its other inputs, and the wait makes those
+    writes visible to coherent loads only. ``__restrict__`` on a read-only input lets the compiler use the
+    non-coherent read-only path (``LDG.CONSTANT``), which served a stale value, so only constants keep it."""
+    src = render_kernelop(_kernel(Load(name="v", input="x", index=(Var("t"), Literal(0)))), tensors=_TENSORS, constant_buffers=frozenset({"w"}))
+    assert "const __half* __restrict__ w," in src
+    assert "const __half* x," in src
+    assert "float* __restrict__ y" in src

@@ -143,7 +143,7 @@ def test_a_paged_output_stored_over_its_cache_writes_through_the_table_at_its_in
 
     signature = _signature(kernel)
     assert f"float* const* {name}__pages" in signature, signature
-    assert "const long long* __restrict__ past" in signature and not kernel.runtime_args, signature
+    assert "const long long* past" in signature and not kernel.runtime_args, signature
     page = kernel.kernel_source.split(f"{name}__pages[", 1)[1].split("]", 1)[0]
     assert f"/ {PAGE}" in page and "past" in kernel.kernel_source, page  # the page of a value computed from ``past``, not an axis
     assert f"{name}__pages" in kernel.arg_order and name not in kernel.arg_order
