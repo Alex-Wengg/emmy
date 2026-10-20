@@ -1216,7 +1216,28 @@ impl Executor {
             .iter()
             .any(|(name, extent)| env.get(name).is_some_and(|step| step + 1 < *extent));
         let next = if more_steps { index } else { index + 1 };
+        // DEBUG bisect toggles (scratch worktree only).
+        let static_only = std::env::var_os("EMMY_PDL_DBG_STATIC_ONLY").is_some();
+        let no_serial = std::env::var_os("EMMY_PDL_DBG_NO_SERIAL").is_some();
+        let max_launches: Option<usize> = std::env::var("EMMY_PDL_DBG_MAX_LAUNCHES").ok().and_then(|v| v.parse().ok());
+        let min_launches: Option<usize> = std::env::var("EMMY_PDL_DBG_MIN_LAUNCHES").ok().and_then(|v| v.parse().ok());
+        let range: Option<(usize, usize)> = std::env::var("EMMY_PDL_DBG_RANGE").ok().and_then(|v| {
+            let (a, b) = v.split_once('-')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        });
+        let dbg_ok = range.is_none_or(|(a, b)| index >= a && index < b)
+            && max_launches.is_none_or(|m| program.launches.len() <= m)
+            && min_launches.is_none_or(|m| program.launches.len() >= m)
+            && !(static_only
+            && program
+                .launches
+                .iter()
+                .any(|l| !l.runtime_args.is_empty() || !l.serial.is_empty()))
+            && !(no_serial
+                && (!launch.serial.is_empty()
+                    || (next < program.launches.len() && !program.launches[next].serial.is_empty())));
         let release = kernel.is_some_and(|k| k.early_release)
+            && dbg_ok
             && dependent
             && next < program.launches.len()
             && self.starts_early(next, env)?;
