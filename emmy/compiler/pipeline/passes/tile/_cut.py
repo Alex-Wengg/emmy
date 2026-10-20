@@ -50,7 +50,7 @@ from emmy.compiler.ir.pure.fold import (
 from emmy.compiler.ir.pure.lam import Lambda
 from emmy.compiler.ir.schedule.packing import match_packed_pair_node
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Affine, Assign, Body, Let, Load, Loop, Write
+from emmy.compiler.ir.stmt import Affine, Assign, Body, Cond, Let, Load, Loop, Write
 from emmy.compiler.ir.stmt.passes import rewrite as rewrite_stmt
 from emmy.compiler.ir.tile import OutputSpec, Placement, TileOp
 from emmy.compiler.ir.tile.ops import (
@@ -121,6 +121,9 @@ class ContractionGroup:
     members: tuple
     space: tuple
     dtype: object
+    #: Each channel's own workspace dtype, in ``members`` order — what a channel's workspace holds where the channels
+    #: keep one workspace each (a joined weight's, :func:`_joined_parts`).
+    member_dtypes: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -984,6 +987,7 @@ def _group_contractions(seams: list[CutSite], axes: tuple) -> tuple[tuple[CutSit
             members=tuple((seams[index].node, position, exprs, ranges) for index, position, exprs, ranges in members),
             space=tuple(space),
             dtype=next(iter(dtypes)) if len(dtypes) == 1 else F32,
+            member_dtypes=tuple(seams[index].dtypes[position] for index, position, *_ in members),
         )
         built.append((group, [index for index, *_ in members]))
     # Contractions whose channels share a seam node are one decision: the node is replaced by reads of all of them.
@@ -1828,9 +1832,9 @@ def realize(
     # cone contains the score dots whose operand cones are cut beside it), and that producer must
     # read the workspace like any other consumer. Containment is strict, so order is free.
     everything = {target: loads for *_, replacements in pieces for target, loads in replacements.items()}
-    contraction_pieces = _contraction_reads(tile, root, contractions, seam_of, taken, read_names)
+    contraction_pieces = _contraction_reads(tile, root, match.graph, contractions, seam_of, taken, read_names)
     channel_reads: dict[int, dict[int, Fold]] = {}
-    for *_, reads in contraction_pieces:
+    for _, _, reads, *_ in contraction_pieces:
         for target, positions in reads.items():
             channel_reads.setdefault(target, {}).update(positions)
     members = {id(member): member for group in contractions for member, *_ in group.members}
@@ -1844,7 +1848,7 @@ def realize(
         )
     parent_fold = _replace_fold(tile.op, everything, read_names)
     stored = {buffer: dtype for seam, *_, buffers, _ in pieces for buffer, dtype in zip(buffers, seam.dtypes, strict=False)}
-    stored.update((buffer, group.dtype) for group, buffer, _ in contraction_pieces)
+    stored.update((buffer, dtype) for _, buffer, _, _, dtype in contraction_pieces)
     parent_fold = _without_identity_casts(parent_fold, stored)
     specs = tuple(
         # The seam renames what a store writes AND what its coordinates and guard name (a scatter's row).
@@ -1880,12 +1884,12 @@ def realize(
     fragment = _input_fragment(match, root)
     spelled = {buffer: seam.spelling for seam, *_, buffers in produced_pieces for buffer in buffers}
     # each workspace's seam
-    spelled.update((buffer, seam_of[id(group)].spelling) for group, buffer, _ in contraction_pieces)
+    spelled.update((buffer, seam_of[id(group)].spelling) for group, buffer, *_ in contraction_pieces)
     all_buffers = list(spelled)
     # Every buffer a piece reads or writes: the kernel's own, and each workspace at the shape its reader reads it at.
     shapes = io_shapes(tile)
     shapes.update((buffer, tuple(axis.extent for axis in axes)) for _, _, axes, *_, buffers in produced_pieces for buffer in buffers)
-    shapes.update((buffer, tuple(to_dim(extent) for _, extent in group.space)) for group, buffer, _ in contraction_pieces)
+    shapes.update((buffer, _workspace_shape(group, span)) for group, buffer, _, span, _ in contraction_pieces)
     batches: dict[tuple, list] = {}
     for piece in contraction_pieces:
         batches.setdefault(id(seam_of[id(piece[0])]), []).append(piece)
@@ -1895,7 +1899,7 @@ def realize(
                 tile,
                 seam_of[id(batch[0][0])],
                 batch,
-                {tensor: load for tensor, load in everything.items() if not any(tensor in reads for *_, reads in batch)},
+                {tensor: load for tensor, load in everything.items() if not any(tensor in reads for _, _, reads, *_ in batch)},
                 shapes,
             ),
             batch,
@@ -1945,7 +1949,7 @@ def realize(
         entries.append((producer, produced, workspace_tensors))
 
     entries += [
-        (producer, producer.op, tuple(Tensor(name=buffer, shape=shapes[buffer], dtype=group.dtype) for group, buffer, _ in batch))
+        (producer, producer.op, tuple(Tensor(name=buffer, shape=shapes[buffer], dtype=dtype) for _, buffer, _, _, dtype in batch))
         for producer, batch in producers
     ]
     # One producer may read another's workspace (a contraction inside a cone that is itself cut, a statistic inside
@@ -2053,9 +2057,35 @@ def _reindexed(body: Body, mapping: dict) -> Body:
     return Body(tuple(visit(stmt, mapping) for stmt in body))
 
 
-def _contraction_reads(tile: TileOp, root: Node, groups, seam_of: dict, taken: dict, read_names: dict) -> list[tuple]:
-    """Per contraction, ``(group, buffer, {node id: {position: workspace read}})``: every channel of the contraction
-    reads the workspace at its own address, offset by the space's lower bound. The contractions of one seam
+def _joined_parts(group: ContractionGroup, graph: Graph) -> tuple[int, tuple[tuple[int, int], ...]] | None:
+    """``(slot, part spans)`` when ``group`` contracts a CONCATENATION of sibling weights (``_layout.concat_parts``)
+    along one placeholder and every channel reads inside one part: the spans of the parts along that slot. ``None``
+    otherwise."""
+    from emmy.compiler.pipeline.passes.tile._layout import concat_parts  # noqa: PLC0415 — the layout pass imports this module
+
+    joined = {name for member, *_ in group.members for name in _buffer_reads(member) if concat_parts(name)}
+    producer = graph.producer(next(iter(joined))) if len(joined) == 1 else None
+    if producer is None or not getattr(producer.op, "source_parts", ()):
+        return None
+    widths = [shape[0] for _, shape in producer.op.source_parts]
+    slots = [slot for slot, span in enumerate(group.space) if span == (0, sum(widths))]
+    if len(slots) != 1:
+        return None
+    (slot,) = slots
+    spans = tuple((sum(widths[:i]), sum(widths[: i + 1])) for i in range(len(widths)))
+    for *_, ranges in group.members:
+        lo, extent = ranges[slot]
+        if not isinstance(extent, int) or not any(start <= lo and lo + extent <= end for start, end in spans):
+            return None
+    return slot, spans
+
+
+def _contraction_reads(tile: TileOp, root: Node, graph: Graph, groups, seam_of: dict, taken: dict, read_names: dict) -> list[tuple]:
+    """Per workspace of each contraction, ``(group, buffer, {node id: {position: workspace read}}, span, dtype)``: every
+    channel of the contraction reads the workspace at its own address, offset by the space's lower bound. A contraction
+    of joined sibling weights (:func:`_joined_parts`) keeps one workspace per weight, ``span`` ``(slot, lo, hi)``
+    naming its columns, so each channel reads its own weight's columns from where they started and reads them as the
+    weights read apart do; ``span`` is ``None`` for a workspace over the whole space. The contractions of one seam
     (``seam_of``) share its seam token (:func:`seam_token`) and are numbered in their node's channel order: a nest's
     stores are ordered by buffer, so the producer keeps the channel order of the seam node it comes from."""
     batches: dict[int, list] = {}
@@ -2064,32 +2094,75 @@ def _contraction_reads(tile: TileOp, root: Node, groups, seam_of: dict, taken: d
     out = []
     for group, number in ((group, number) for batch in batches.values() for number, group in enumerate(batch)):
         token = seam_token(tile, seam_of[id(group)].spelling)
-        buffer = f"{root.id}__place_{token}_{number}"
-        reads: dict[int, dict[int, Fold]] = {}
-        for ordinal, (member, position, exprs, _) in enumerate(group.members):
+        parts = _joined_parts(group, graph)
+        spans = [None] if parts is None else [(parts[0], lo, hi) for lo, hi in parts[1]]
+        workspaces = [(f"{root.id}__place_{token}_{number}" + ("" if span is None else f"_{i}"), span) for i, span in enumerate(spans)]
+        reads: dict[str, dict[int, dict[int, Fold]]] = {buffer: {} for buffer, _ in workspaces}
+        dtypes: dict[str, set] = {buffer: set() for buffer, _ in workspaces}
+        for ordinal, (member, position, exprs, ranges) in enumerate(group.members):
+            buffer, span = next(
+                (buffer, span) for buffer, span in workspaces if span is None or span[1] <= ranges[span[0]][0] < span[2]
+            )
+            dtypes[buffer].add(group.member_dtypes[ordinal] if group.member_dtypes else group.dtype)
             own = member.exposes[position]
             if own not in taken.get(id(member), member.exposes):
                 continue
-            index = tuple(
-                expr if lo == 0 else BinaryExpr("+", expr, Literal(-lo, "int")) for expr, (lo, _) in zip(exprs, group.space, strict=True)
-            )
+            starts = [lo for lo, _ in group.space]
+            if span is not None:
+                starts[span[0]] = span[1]
+            index = tuple(_shifted(expr, -lo) for expr, lo in zip(exprs, starts, strict=True))
             name = _read_name(own, token, ordinal)
-            reads.setdefault(id(member), {})[position] = Fold.slab(Load(name=name, input=buffer, index=index))
+            reads[buffer].setdefault(id(member), {})[position] = Fold.slab(Load(name=name, input=buffer, index=index))
             read_names.setdefault(own, name)
-        out.append((group, buffer, reads))
+        for buffer, span in workspaces:
+            dtype = group.dtype if span is None or len(dtypes[buffer]) != 1 else next(iter(dtypes[buffer]))
+            out.append((group, buffer, reads[buffer], span, dtype))
     return out
 
 
+def _shifted(expr: Expr, offset: int) -> Expr:
+    """``expr + offset``, folded into the literal ``expr`` already adds when it adds one."""
+    if offset == 0:
+        return expr
+    if isinstance(expr, BinaryExpr) and expr.op == "+" and isinstance(expr.right, Literal):
+        total = expr.right.value + offset
+        return expr.left if total == 0 else BinaryExpr("+", expr.left, Literal(total, "int"))
+    return BinaryExpr("+", expr, Literal(offset, "int"))
+
+
+def _workspace_shape(group: ContractionGroup, span) -> tuple:
+    """The shape of one workspace of ``group`` (:func:`_contraction_reads`)."""
+    extents = [extent for _, extent in group.space]
+    if span is not None:
+        extents[span[0]] = span[2] - span[1]
+    return tuple(to_dim(extent) for extent in extents)
+
+
 def _contraction_producer(tile: TileOp, seam: CutSite, batch: list, others: dict, shapes: dict) -> TileOp:
-    """The contractions of one seam (``batch``, ``(group, buffer, reads)`` each) swept over their spaces, each written
-    to its buffer, one nest per space: built from each contraction with its free operand indices replaced by
-    placeholders, so no channel's layout is copied."""
+    """The contractions of one seam (``batch``, ``(group, buffer, reads, span, dtype)`` each) swept over their spaces, each
+    written to its buffers, one nest per space: built from each contraction with its free operand indices replaced by
+    placeholders, so no channel's layout is copied. A workspace holding one span of the space takes the cells of that
+    span, under a guard."""
+    by_group: dict[int, list] = {}
+    for group, buffer, _, span, _ in batch:
+        by_group.setdefault(id(group), [group]).append((buffer, span))
     by_space: dict[tuple, list] = {}
-    for group, buffer, _ in batch:
-        by_space.setdefault(group.space, []).append(_contraction_body(tile, group, buffer, others, shapes))
+    for group, *workspaces in by_group.values():
+        body, write = _contraction_body(tile, group, workspaces[0][0], others, shapes)
+        stores = []
+        for buffer, span in workspaces:
+            if span is None:
+                stores.append(replace(write, output=buffer))
+                continue
+            slot, lo, hi = span
+            var = Var(f"{_PLACEHOLDER}{slot}")
+            index = tuple(_shifted(expr, -lo) if position == slot else expr for position, expr in enumerate(write.index))
+            guard = BinaryExpr("&&", BinaryExpr(">=", var, Literal(lo, "int")), BinaryExpr("<", var, Literal(hi, "int")))
+            stores.append(Cond(cond=guard, body=(replace(write, output=buffer, index=index),)))
+        by_space.setdefault(group.space, []).append((body, stores))
     nests = []
     for space, parts in by_space.items():
-        nest = (*(stmt for body, _ in parts for stmt in body), *(write for _, write in parts))
+        nest = (*(stmt for body, _ in parts for stmt in body), *(store for _, stores in parts for store in stores))
         for slot in reversed(range(len(space))):
             nest = (Loop(axis=Axis(f"{_PLACEHOLDER}{slot}", space[slot][1]), body=Body(nest)),)
         nests.extend(nest)

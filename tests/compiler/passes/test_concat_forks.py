@@ -53,7 +53,9 @@ def _traced():
     return graph.copy(), module, args
 
 
-def _lower(joined: bool) -> tuple[Graph, list[list[dict]]]:
+def _lower(joined: bool, *, cut: bool = False) -> tuple[Graph, list[list[dict]]]:
+    """The traced program through the cut pass with its weights joined or apart; ``cut`` takes, at each kernel's
+    placement fork, the arm that cuts the most seams (the contractions' own kernels), else every kernel stays fused."""
     graph, _, _ = _traced()
     offered: list[list[dict]] = []
 
@@ -63,6 +65,8 @@ def _lower(joined: bool) -> tuple[Graph, list[list[dict]]]:
             offered.append(knobs)
             parallel_expand([option for option in point.options if _is_structural_option(option)], workers=1)
             return next(option for option in point.options if (CONCAT in option.knobs.values()) == joined)
+        if cut and any(value == "cut" for row in knobs for value in row.values()):
+            return max(point.options, key=lambda option: sum(value == "cut" for value in option.knobs.values()))
         return next((option for option in point.options if not _is_structural_option(option)), point.options[0])
 
     graph = Pipeline.build(LOOP_PASSES).run(graph)
@@ -95,14 +99,18 @@ def _run(graph: Graph) -> dict:
     return result.outputs
 
 
+def _family(offered: list[list[dict]]) -> list[str]:
+    return sorted(key.partition("@")[2] for row in offered[0] for key, value in row.items() if value == CONCAT)
+
+
 def test_joined_weights_compute_what_eager_computes() -> None:
     joined, offered = _lower(True)
     apart, _ = _lower(False)
     # The fork offers the weights apart and joined, the joined arm spelling every weight of the family.
     assert len(offered[0]) == 2 and {"LAYOUT": "folded"} in offered[0]
-    names = sorted(key.partition("@")[2] for row in offered[0] for key, value in row.items() if value == CONCAT)
+    names = _family(offered)
     assert len(names) == 4
-    constants = {name: op for name, op in joined.loadable_constants()}
+    constants = dict(joined.loadable_constants())
     assert concat_name(names) in constants and not set(names) & set(constants)
     assert len(constants[concat_name(names)].source_parts) == 4
     _, module, args = _traced()
@@ -110,6 +118,21 @@ def test_joined_weights_compute_what_eager_computes() -> None:
     for graph in (joined, apart):
         (value,) = _run(graph).values()
         np.testing.assert_allclose(value, eager, rtol=1e-5, atol=1e-5)
+
+
+def test_a_cut_of_joined_weights_keeps_one_workspace_per_weight() -> None:
+    """One producer reads the joined weight and stores each weight's columns to a workspace of its own, so each
+    weight's readers read what the weights read apart give them. (Not executed here: the loop runner sizes an output
+    by its write's index over the whole nest, not under the guard such a workspace is stored under.)"""
+    joined, offered = _lower(True, cut=True)
+    apart, _ = _lower(False, cut=True)
+    names = _family(offered)
+    (producer,) = (node for node in joined.nodes.values() if concat_name(names) in node.inputs)
+
+    def widths(nodes) -> list[tuple]:
+        return sorted(tuple(dim.as_static() for dim in tensor.shape) for node in nodes for tensor in node.outputs)
+
+    assert widths([producer]) == widths(node for node in apart.nodes.values() if set(names) & set(node.inputs))
 
 
 def test_a_row_spells_the_joined_arm_only_when_it_joins_every_weight() -> None:
