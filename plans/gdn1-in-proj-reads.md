@@ -416,3 +416,44 @@ from) deleted each other's rows mid-compile, and strict evidence refused forks t
    function of the row still gets its own axis. The exact `/ B` check gives up above 2^20 points of a row's coordinates.
    A size guard comparing a group's space with its readers' address union would make the rule fall back to the old
    clustering on the next unhandled shape instead of building a product space.
+
+## Joined sibling weights: measured, no decode win (2026-10-21)
+
+Draft PR #1220 (`fix/sibling-contraction-grid`) offers a second storage for the GDN input projections: `in_proj_qkv`,
+`in_proj_z`, `in_proj_a` and `in_proj_b` side by side in one constant (5120 x 16480), so the four contractions become
+one producer kernel with one grid over all 16480 columns. The fork is `LAYOUT@<weight>=concat` for every weight of the
+family; rows without it read as apart. The PR stopped at the kill check: the joined arm is slower per gdn1 layer.
+
+Measured on the RTX 5090, strict whole-target bench of the gdn1 target (`emmy run --golden ... --realization
+gdn1-dense-linear@nvfp4.k_conv1d_linear_mean_reduce_970a92.m1.fm --bench --strict-evidence`, nsys, hot regime):
+
+| gdn1 layer | in_proj kernels | sum of kernels | whole target (e2e) |
+| --- | --- | --- | --- |
+| apart (#1210's golden, merged with the PR) | 28.0 + 49.5 + 5.8 = 83.3 µs, tensor cores | 113.5 µs | 145.7 µs |
+| joined (PR code before the merge with main, tuned producer) | 117.8 µs, one kernel | 148.2 µs | 151.1 µs |
+
+The joined layer loses about 5 µs end to end (about 0.26 ms per decoded token over 48 GDN layers), so no serving boot
+was run. Earlier cold-cache A/B of plain GEMVs (best of 8 schedules each): joined 112.6 µs against 71.4 + 44.8 + 14.3
+= 130.5 µs apart, and cuBLAS 104.4 against 116.7 µs; served today, the apart kernels take 112.5 µs per layer. The
+joined producer streams 169 MB, which never fits the 5090's L2, so its hot and cold times agree (112.9 µs best tuned).
+
+Why it loses:
+- No tensor-core schedule reaches the joined producer: the tune refuses every MMA row with "atom
+  mma_m16n8k16_bf16_f32 is not offered here (offered: none)". The producer stores each weight's columns to that
+  weight's own workspace under a guard; the guarded multi-workspace store is the likely reason. Its best schedule is
+  `t512 coop-t/v2` (CUDA cores), against `w1x8 mma` / `w1x4 mma` with `smem-tma` / `smem` staging apart.
+- 16480 is not a multiple of 64 or 128, so even with the atom offered, the staged fills (`cp.async`, TMA) refuse the
+  masked N tile (`staging._warp_vector_copy`, `_warp_tma`). Padding the joined constant to a multiple of 128 columns
+  (a zero part in `source_parts`) or masked-N staged fills would be needed.
+- Only after both would the joined arm save anything; at best it saves the launches it merges (gdn1 23 to 18) and
+  the stock vLLM gap (cuBLAS joined is 12 µs faster than cuBLAS apart).
+
+State of the branch against main fd9633b9 (after #1206, "Form every cut piece from its own body"): the joined root
+forms a different nest than the apart root, so the apart arm's recorded cut route (`PLACE@map.1/map.1/reduce.1/inner`
+...) no longer spells the joined arm (`PLACE@map.1/map.1/map.1/reduce.1/inner` ...). A greedy pick under the old
+route pins fuses the readers into one 40 ms kernel and leaves the producer at 226 µs tuned. Recording the joined arm
+again needs its own route first; the joined measurements above predate #1206.
+
+The measurement logs, scripts and golden working copies are in the laptop's `tmp-claude/tune-5090/hfuse-boot/`
+(not in the repository): `W.json` is the pre-#1206 joined recording, `boot/joined-gdn1-items.json` the joined
+kernels, routes and producer rows taken out of it. They do not compile under the current branch code.
