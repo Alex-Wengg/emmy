@@ -103,6 +103,10 @@ class RenderCtx:
     # :class:`Memory`. Absent names are :class:`Flat`, so an empty map renders every buffer
     # exactly as it always was.
     memory: dict[str, Memory] = field(default_factory=dict)
+    # Buffers a kernel must read through coherent loads, never the non-coherent (read-only) path:
+    # an earlier grid writes them, and with programmatic dependent launch it may still be writing them
+    # after this kernel has started. Empty renders every read as it always was.
+    coherent: frozenset[str] = frozenset()
     # Per-buffer canonical dtype tokens (``"f32"`` / ``"f16"``) for every
     # global-buffer name (kernel inputs + outputs). ``Load`` declares its
     # SSA-name local in the source buffer's C type so values flow at

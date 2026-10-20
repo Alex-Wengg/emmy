@@ -278,7 +278,8 @@ class Load(Stmt):
         native_n = {"float2": 2, "float4": 4, "__half2": 2}.get(vec_type)
         use_array_index = native_n != n
         if self.carried == "load":  # re-assign the declared vector only (see the class doc)
-            return [f"{pad}{vname} = __ldg(reinterpret_cast<const {vec_type}*>(&{self.input}[{flat}]));"]
+            src = f"reinterpret_cast<const {vec_type}*>(&{self.input}[{flat}])"
+            return [f"{pad}{vname} = {f'*{src}' if self.input in ctx.coherent else f'__ldg({src})'};"]
         if self.carried == "unpack":
             if use_array_index:
                 return [f"{pad}{nm} = {vname}_h[{k}];" for k, nm in enumerate(self.names)]

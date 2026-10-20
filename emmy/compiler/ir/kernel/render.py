@@ -1641,8 +1641,16 @@ def render_kernelop(
     # copy, a descriptor, a fragment store — works over it unchanged.
     whole = {n for n, p in paged.items() if spans_one_page(tensors[n].shape, p.axis, p.page)}
     ctx.memory = {n: p for n, p in paged.items() if n not in whole}
+    # An input an earlier grid writes may still be in flight when this kernel starts (programmatic
+    # dependent launch): ``griddepcontrol.wait`` makes the writes visible to coherent loads only, and the
+    # non-coherent read-only path may serve a stale line. Such an input drops ``__restrict__``, which is
+    # what lets the compiler pick that path, and its staged reads skip ``__ldg``. Only the program's
+    # bound constants, which no kernel writes, keep both.
+    ctx.coherent = frozenset(n for n in kernel_op.inputs if n not in literals and n not in constant_buffers)
     sig_parts = [
-        f"const {cuda_name(_dtype_for(n))}* const* {n}__pages" if n in paged else f"const {cuda_name(_dtype_for(n))}* __restrict__ {n}"
+        f"const {cuda_name(_dtype_for(n))}* const* {n}__pages"
+        if n in paged
+        else f"const {cuda_name(_dtype_for(n))}* {'' if n in ctx.coherent else '__restrict__ '}{n}"
         for n in kernel_op.inputs
         if n not in literals
     ]
@@ -1652,10 +1660,9 @@ def render_kernelop(
         elem = cuda_name(_dtype_for(n))
         return f"{elem}* const* {n}__pages" if n in paged else f"{elem}* __restrict__ {n}"
 
-    # Every plain buffer parameter is ``__restrict__``: a launch's output never shares memory with its
-    # inputs (the arena's live intervals end one launch past the last read, and a chained buffer
-    # joins two programs, never one launch's read and write), so the compiler may keep a read-only
-    # operand in registers across the kernel's stores and read it through the non-coherent path.
+    # An output is ``__restrict__``: it never shares memory with the launch's inputs (the arena's live
+    # intervals end one launch past the last read, and a chained buffer joins two programs, never one
+    # launch's read and write), so the compiler may keep an input in registers across the stores.
     sig_parts.extend(_out_param(n) for n in kernel_op.outputs)
     # TMA descriptors are passed as ``__grid_constant__`` value parameters.
     # The kernel only takes their address (``&desc``) for inline asm, so
