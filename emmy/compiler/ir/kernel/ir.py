@@ -758,6 +758,24 @@ class MbarrierArrive(Stmt):
 
 
 @dataclass(frozen=True)
+class GridDependencyWait(Stmt):
+    """``griddepcontrol.wait`` — block until the grid launched ahead of this one has completed and its
+    memory is visible (sm_90+; a no-op without the programmatic-launch attribute). Statements after it
+    may touch memory the earlier grid writes or reads. The renderer places it after the prologue that
+    only reads program constants (:func:`~emmy.compiler.ir.kernel.render.render_kernelop`)."""
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}GridDependencyWait"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return [
+            "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900",
+            f'{_pad(ctx.indent)}asm volatile("griddepcontrol.wait;" ::: "memory");',
+            "#endif",
+        ]
+
+
+@dataclass(frozen=True)
 class SetMaxNReg(Stmt):
     """``setmaxnreg.{inc,dec}.sync.aligned.u32 N;`` — Hopper+ register-budget
     redistribution. ``direction="dec"`` shrinks the calling warp's max
@@ -3033,6 +3051,7 @@ __all__ = [
     "MbarrierArrive",
     "MbarrierWait",
     "SetMaxNReg",
+    "GridDependencyWait",
     "WgmmaDescriptor",
     "WgmmaMma",
     "WgmmaFence",
@@ -3310,6 +3329,11 @@ def _(s: WgmmaMma, rename, sigma, axis_fn):
 
 @_rewrite_kind.register
 def _(s: WgmmaFence, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite_kind.register
+def _(s: GridDependencyWait, rename, sigma, axis_fn):
     return s
 
 

@@ -583,6 +583,9 @@ pub struct Executor {
     window: Option<(CudaEvent, CudaEvent)>,
     /// The device takes programmatic dependent launches (sm_90+).
     dependent_launch: bool,
+    sm_count: u32,
+    /// Resident CTAs per SM by kernel, block size and dynamic shared memory.
+    occupancy: BTreeMap<(String, u32, u32), i32>,
 }
 
 // A captured graph is a raw driver handle the driver does not synchronize, so cudarc leaves it
@@ -641,6 +644,11 @@ impl Executor {
         }
         let module_ms = started.elapsed().as_secs_f64() * MILLISECONDS_PER_SECOND;
         let started = Instant::now();
+        let sm_count = u32::try_from(
+            device
+                .context
+                .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        )?;
         let mut executor = Self {
             load_times_ms: BTreeMap::new(),
             context,
@@ -661,6 +669,8 @@ impl Executor {
             events: Vec::new(),
             window: None,
             dependent_launch: device.context.compute_capability()?.0 >= 9,
+            sm_count,
+            occupancy: BTreeMap::new(),
         };
         executor.provision(layout, regions.as_ref())?;
         // A paged buffer starts with pages of the runtime's own spanning its declared shape —
@@ -1171,29 +1181,6 @@ impl Executor {
                 result::memset_d8_async(self.address(name)?, 0, placement.bytes.max(1), stream)?;
             }
         }
-        let descriptors = &self.descriptors[key];
-        let mut params: Vec<Param> =
-            Vec::with_capacity(launch.args.len() + launch.runtime_args.len() + 2);
-        for name in &launch.args {
-            if let Some(descriptor) = descriptors.get(&(index, name.clone())) {
-                params.push(Param::Ptr(descriptor.ptr));
-            } else {
-                params.push(Param::Ptr(self.address(name)?));
-            }
-        }
-        for name in &launch.runtime_args {
-            let value = *env
-                .get(name)
-                .with_context(|| format!("unbound runtime argument {name}"))?;
-            params.push(Param::Int(i32::try_from(value)?));
-        }
-        let mut raw: Vec<*mut c_void> = params
-            .iter_mut()
-            .map(|p| match p {
-                Param::Ptr(v) => v as *mut u64 as *mut c_void,
-                Param::Int(v) => v as *mut i32 as *mut c_void,
-            })
-            .collect();
         let grid = dimensions(&launch.grid, env)?;
         let block = dimensions(&launch.block, env)?;
         ensure!(
@@ -1211,16 +1198,55 @@ impl Executor {
             "invalid CUDA grid for {}",
             launch.kernel
         );
-        let function = &self.functions[&launch.kernel];
-        let smem = launch.smem.saturating_sub(function.static_smem);
+        let smem = launch
+            .smem
+            .saturating_sub(self.functions[&launch.kernel].static_smem);
+        let kernel = program.kernels.get(&launch.kernel);
         // A memset ahead of the kernel is not a grid it can wait on, so that launch stays serialized.
         let dependent = dependent
             && self.dependent_launch
             && launch.zero_outputs.is_empty()
-            && program
-                .kernels
-                .get(&launch.kernel)
-                .is_some_and(|k| k.dependent_launch);
+            && kernel.is_some_and(|k| k.dependent_launch);
+        // A kernel compiled to release the grid behind it at entry does so only when that grid is
+        // this program's next launch and may start early (`starts_early`). Past the program's last
+        // launch the next grid is the host's, which may launch programmatically without expecting
+        // its predecessor to release it early.
+        let more_steps = launch
+            .serial
+            .iter()
+            .any(|(name, extent)| env.get(name).is_some_and(|step| step + 1 < *extent));
+        let next = if more_steps { index } else { index + 1 };
+        let release = kernel.is_some_and(|k| k.early_release)
+            && dependent
+            && next < program.launches.len()
+            && self.starts_early(next, env)?;
+        let descriptors = &self.descriptors[key];
+        let mut params: Vec<Param> =
+            Vec::with_capacity(launch.args.len() + launch.runtime_args.len() + 3);
+        for name in &launch.args {
+            if let Some(descriptor) = descriptors.get(&(index, name.clone())) {
+                params.push(Param::Ptr(descriptor.ptr));
+            } else {
+                params.push(Param::Ptr(self.address(name)?));
+            }
+        }
+        for name in &launch.runtime_args {
+            let value = *env
+                .get(name)
+                .with_context(|| format!("unbound runtime argument {name}"))?;
+            params.push(Param::Int(i32::try_from(value)?));
+        }
+        if kernel.is_some_and(|k| k.early_release) {
+            params.push(Param::Int(i32::from(release)));
+        }
+        let mut raw: Vec<*mut c_void> = params
+            .iter_mut()
+            .map(|p| match p {
+                Param::Ptr(v) => v as *mut u64 as *mut c_void,
+                Param::Int(v) => v as *mut i32 as *mut c_void,
+            })
+            .collect();
+        let function = &self.functions[&launch.kernel];
         // The compiler defines the ABI and access bounds. Every pointer resolved above stays
         // alive and exclusively owned through completion.
         unsafe {
@@ -1253,6 +1279,55 @@ impl Executor {
             }
         }
         Ok(())
+    }
+
+    /// Whether launch `index` may start while the grid ahead of it still runs: it launches as a
+    /// programmatic dependent and cannot stack. Launched early, a kernel's CTAs land on the SMs free
+    /// at that moment; one with more CTAs than SMs, several resident per SM, piles onto a few of
+    /// them (a compute-bound grid of two CTAs per SM ran 1.5x slower, a 128-block GEMM 3-4x). A grid
+    /// of at most one CTA per SM spreads, and one resident CTA per SM cannot stack.
+    fn starts_early(&mut self, index: usize, env: &Env) -> Result<bool> {
+        let program = self.program.clone();
+        let launch = &program.launches[index];
+        if !(self.dependent_launch
+            && launch.zero_outputs.is_empty()
+            && program
+                .kernels
+                .get(&launch.kernel)
+                .is_some_and(|k| k.dependent_launch))
+        {
+            return Ok(false);
+        }
+        let grid = dimensions(&launch.grid, env)?;
+        if grid.0 * grid.1 * grid.2 <= self.sm_count {
+            return Ok(true);
+        }
+        let block = dimensions(&launch.block, env)?;
+        let smem = launch
+            .smem
+            .saturating_sub(self.functions[&launch.kernel].static_smem);
+        Ok(self.resident_ctas(&launch.kernel, block, smem)? <= 1)
+    }
+
+    /// How many CTAs of `kernel` an SM holds at once with this block and dynamic shared memory.
+    fn resident_ctas(&mut self, kernel: &str, block: (u32, u32, u32), smem: u32) -> Result<i32> {
+        let threads = block.0 * block.1 * block.2;
+        let key = (kernel.to_string(), threads, smem);
+        if let Some(n) = self.occupancy.get(&key) {
+            return Ok(*n);
+        }
+        let mut n = 0i32;
+        unsafe {
+            sys::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                &mut n,
+                self.functions[kernel].function,
+                i32::try_from(threads)?,
+                smem as usize,
+            )
+            .result()?;
+        }
+        self.occupancy.insert(key, n);
+        Ok(n)
     }
 
     fn submit(&mut self) -> Result<()> {

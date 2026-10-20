@@ -8,6 +8,9 @@ method does the per-line emission.
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Iterator
+
 import numpy as np
 
 from emmy.compiler.backend.cuda.dtype import cuda_includes, cuda_name
@@ -15,21 +18,32 @@ from emmy.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from emmy.compiler.backend.cuda.render_target import CudaRenderTarget
 from emmy.compiler.dim import spans_one_page
 from emmy.compiler.dtype import F4_VALUES, F32
+from emmy.compiler.ir.expr import Expr
 from emmy.compiler.ir.kernel.ir import (
+    CpAsyncCommit,
     CpAsyncCopy,
+    CpAsyncWait,
     FragmentRepack,
+    GridDependencyWait,
     KernelOp,
     LdmatrixLoad,
+    MbarrierArriveExpectTx,
+    MbarrierInit,
+    RegFragment,
     RegStore,
     Smem,
+    Stmt,
+    Sync,
+    Tile,
     TmaDescriptor,
+    TmaLoad,
     WgmmaMma,
     frag_dtype,
     pack_smem,
     swizzle_fn,
     swizzle_xor,
 )
-from emmy.compiler.ir.stmt import Paged, RenderCtx, render_body
+from emmy.compiler.ir.stmt import Body, Cond, Paged, RenderCtx, render_body
 from emmy.compiler.ir.stmt.leaves import Assign, Write
 from emmy.compiler.tensor import Tensor
 
@@ -1411,6 +1425,128 @@ _BLOCK_SIZE = 256
 
 
 _GRID_DEPENDENCY = '#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900\n    asm volatile("griddepcontrol.wait;" ::: "memory");\n#endif\n'
+#: The launch argument that tells a kernel whether to release the grid behind it at entry. The runtime
+#: passes 1 only when that grid is the program's next launch and may start early; the host's next grid
+#: may launch programmatically without expecting an early release.
+RELEASE_ARG = "_pdl_release"
+_RELEASE_DEPENDENTS = (
+    "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900\n"
+    f'    if ({RELEASE_ARG}) asm volatile("griddepcontrol.launch_dependents;");\n'
+    "#endif\n"
+)
+
+
+def _field_values(stmt: Stmt) -> Iterator[object]:
+    """Every field value of a statement, tuples flattened (one level of nesting suffices for the
+    index tuples the staging statements carry)."""
+    if not dataclasses.is_dataclass(stmt):
+        return
+    for f in dataclasses.fields(stmt):
+        value = getattr(stmt, f.name)
+        if isinstance(value, tuple):
+            yield from value
+        else:
+            yield value
+
+
+def _leaves(stmt: Stmt) -> Iterator[Stmt]:
+    return Body((stmt,)).iter()
+
+
+def _names(stmt: Stmt) -> set[str]:
+    """The buffer, barrier and descriptor names a statement or anything nested in it refers to."""
+    return {v for leaf in _leaves(stmt) for v in _field_values(leaf) if isinstance(v, str)}
+
+
+def _free_vars(stmt: Stmt) -> set[str]:
+    return {n for leaf in _leaves(stmt) for v in _field_values(leaf) if isinstance(v, Expr) for n in v.free_vars()}
+
+
+def _is_setup(stmt: Stmt) -> bool:
+    """A prologue statement that touches no global memory: a declaration, a CTA barrier, or the
+    elected thread's mbarrier init."""
+    if isinstance(stmt, (Smem, RegFragment, TmaDescriptor)):
+        return True
+    if isinstance(stmt, Sync):
+        return stmt.barrier_id == 0 and not stmt.warp
+    return isinstance(stmt, Cond) and not stmt.else_body and all(isinstance(s, MbarrierInit) for s in stmt.body)
+
+
+def _split_tma_fill(stmt: Stmt, constants: frozenset[str], sources: dict[str, str]) -> tuple[Stmt, Stmt | None] | None:
+    """A pipeline fill ``if (elected) { arrive.expect_tx; box copies }`` split into the copies of
+    constant buffers, under the same arm, and the rest; ``None`` when ``stmt`` is not such a fill or
+    copies no constant. The arm keeps the whole byte count, so the barrier phase completes once both
+    halves land."""
+    if not isinstance(stmt, Cond) or stmt.else_body or not stmt.body or not isinstance(stmt.body[0], MbarrierArriveExpectTx):
+        return None
+    arm, copies = stmt.body[0], stmt.body[1:]
+    if not copies or not all(isinstance(s, TmaLoad) and s.mbar == arm.mbar for s in copies):
+        return None
+    early = tuple(s for s in copies if sources.get(s.desc) in constants)
+    late = tuple(s for s in copies if sources.get(s.desc) not in constants)
+    if not early:
+        return None
+    return Cond(cond=stmt.cond, body=(arm, *early)), (Cond(cond=stmt.cond, body=late) if late else None)
+
+
+def _prefetch_before_grid_wait(kernel_op: KernelOp, constants: frozenset[str]) -> Body | None:
+    """The kernel body with its grid-dependency wait placed after the prologue fills that only read
+    program constants, or ``None`` when the body is not one ``Tile`` (the caller then waits first).
+
+    Constants are never written by any kernel, so their first pipeline stages may land while the
+    grid ahead still runs; everything else waits. The kernel's setup (declarations, mbarrier init,
+    the barrier publishing it) stays first; then the constant fills — the box copies of a TMA fill
+    whose descriptor reads a constant, or a whole cp.async commit group of constant copies — move up
+    to it, past statements that name none of their slabs or barriers and bind none of their indices;
+    then the wait; then the rest in order, a fill's non-constant copies where the fill stood."""
+    if len(kernel_op.body) != 1 or not isinstance(kernel_op.body[0], Tile):
+        return None
+    (tile,) = kernel_op.body
+    stmts = list(tile.body)
+    n = next((i for i, s in enumerate(stmts) if not _is_setup(s)), len(stmts))
+    setup, rest = stmts[:n], stmts[n:]
+    sources = {s.name: s.src_buf for s in tile.body.iter() if isinstance(s, TmaDescriptor)}
+    ready_barriers = {leaf.mbar for s in setup for leaf in _leaves(s) if isinstance(leaf, MbarrierInit)}
+    tile_vars = set(tile.binds_axes())
+    early: list[Stmt] = []
+    kept: list[Stmt] = []
+    passed: list[Stmt] = []
+
+    def movable(group: list[Stmt]) -> bool:
+        names = set().union(*(_names(s) for s in group))
+        uses = set().union(*(_free_vars(s) for s in group))
+        return uses <= tile_vars and not any(_names(p) & names for p in passed)
+
+    i = 0
+    while i < len(rest):
+        s = rest[i]
+        split = _split_tma_fill(s, constants, sources)
+        if split is not None and split[0].body[0].mbar in ready_barriers and movable([split[0]]):
+            early.append(split[0])
+            if split[1] is not None:
+                kept.append(split[1])
+            i += 1
+            continue
+        if isinstance(s, CpAsyncCopy):
+            j = i
+            while j < len(rest) and isinstance(rest[j], CpAsyncCopy):
+                j += 1
+            group = rest[i : j + 1]
+            ordered = not any(isinstance(leaf, (CpAsyncCopy, CpAsyncCommit, CpAsyncWait)) for p in passed for leaf in _leaves(p))
+            if (
+                j < len(rest)
+                and isinstance(rest[j], CpAsyncCommit)
+                and all(c.src in constants for c in group[:-1])
+                and ordered
+                and movable(group)
+            ):
+                early.extend(group)
+                i = j + 1
+                continue
+        kept.append(s)
+        passed.append(s)
+        i += 1
+    return Body((tile.with_bodies((Body((*setup, *early, GridDependencyWait(), *kept)),)),))
 
 
 def render_kernelop(
@@ -1420,6 +1556,7 @@ def render_kernelop(
     literal_constants: dict[str, float] | None = None,
     runtime_args: tuple[str, ...] = (),
     paged_buffers: tuple[tuple[str, int, int], ...] = (),
+    constant_buffers: frozenset[str] = frozenset(),
 ) -> str:
     """Render a complete ``extern "C" __global__`` CUDA function for a ``KernelOp``.
 
@@ -1451,6 +1588,10 @@ def render_kernelop(
     ordinary scatter into the cache. Shapes are untouched, so the paged axis
     stays ``kv_len`` everywhere above the load. Empty (the default) renders
     every buffer flat.
+
+    ``constant_buffers`` names the inputs no kernel ever writes (the program's weights). The
+    kernel's first pipeline stages of them are issued before it waits on the grid ahead
+    (:func:`_prefetch_before_grid_wait`), so they stream while that grid finishes.
 
     Kernel signature is derived from the body: ``kernel_op.inputs``
     (distinct ``Load.input`` names) become input params,
@@ -1530,11 +1671,14 @@ def render_kernelop(
     # after buffers and TMA descriptors so the launcher can simply tail-append
     # the resolved int values to the kernel-arg pack.
     sig_parts.extend(f"int {n}" for n in runtime_args)
+    sig_parts.append(f"int {RELEASE_ARG}")  # the runtime appends it after the runtime ints
     params_text = ", ".join(sig_parts)
     bounds = _launch_bounds_for(kernel_op)
     launch_bounds = f"\n__launch_bounds__({bounds})"
 
-    body_text = "\n".join(render_body(kernel_op.body, ctx))
+    # A paged buffer resolves its pages from a table an earlier kernel may write, before any statement.
+    ordered = None if paged else _prefetch_before_grid_wait(kernel_op, frozenset(constant_buffers) - set(literals))
+    body_text = "\n".join(render_body(kernel_op.body if ordered is None else ordered, ctx))
     # The cross-thread combine (``WarpShuffle`` / ``TreeHalve``) references the hardware
     # warp ``lane`` / ``warp`` ids; declare them at function entry when the body needs them.
     from emmy.compiler.ir.stmt.blocks import _body_uses_lane_warp  # noqa: PLC0415
@@ -1564,13 +1708,14 @@ def render_kernelop(
             )
             + body_text
         )
-    # Programmatic dependent launch (sm_90+): wait for the grid ahead before any memory access (the
-    # preambles above already read device memory it may write). A no-op without the launch attribute.
-    # No kernel releases its dependent early (``griddepcontrol.launch_dependents``): a dependent
-    # launched while its predecessor still runs places its blocks on the few SMs free at that moment,
-    # and a 128-block GEMM stacked that way ran 3-4x slower once released (s512 layer 133 -> 192 us).
-    # Released at the predecessor's exit, it still overlaps the launch with the predecessor's drain.
-    body_text = _GRID_DEPENDENCY + body_text
+    # Programmatic dependent launch (sm_90+), both no-ops without the launch attribute. The kernel
+    # waits for the grid ahead before any access to memory that grid may write or read: inside the
+    # body after the constant prefetch, else first (the preambles above read device memory). At
+    # entry it releases the grid behind it when the runtime says that grid may start early
+    # (``RELEASE_ARG``), so the next kernel's constant prefetch overlaps this one's tail.
+    if ordered is None:
+        body_text = _GRID_DEPENDENCY + body_text
+    body_text = _RELEASE_DEPENDENTS + body_text
     prelude = _TMA_PRELUDE if desc_names else ""
     sig_dtypes = [_dtype_for(n) for n in kernel_op.inputs if n not in literals]
     sig_dtypes.extend(_dtype_for(n) for n in kernel_op.outputs)
@@ -1582,7 +1727,7 @@ def render_kernelop(
     # The mma.sync (s16816) tensor-core path is pure inline PTX — its
     # ldmatrix / mma.sync wrappers are emitted in ``_MMA_SYNC_PRELUDE``, so
     # NVRTC needs no ``<mma.h>`` (the legacy ``nvcuda::wmma`` family is gone).
-    from emmy.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, MmaSyncPtx  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.ir import MmaSyncPtx  # noqa: PLC0415
 
     mma_stmts = tuple(s for s in kernel_op.body.iter() if isinstance(s, MmaSyncPtx))
     uses_m8n8k4 = any(s.shape == (8, 8, 4) for s in mma_stmts)

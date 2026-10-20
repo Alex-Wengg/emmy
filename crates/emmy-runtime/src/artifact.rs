@@ -286,6 +286,9 @@ pub struct Kernel {
     /// The kernel waits on the grid ahead of it before touching memory, so it may launch as a
     /// programmatic dependent launch.
     pub dependent_launch: bool,
+    /// The kernel can release the grid behind it at entry, so that grid may launch while it runs; it
+    /// takes one more `int` launch argument after the runtime ints that says whether to.
+    pub early_release: bool,
 }
 
 /// One buffer's place in the layout: a byte range inside a named region.
@@ -353,6 +356,8 @@ struct RawKernel {
     source: Option<String>,
     #[serde(default)]
     dependent_launch: bool,
+    #[serde(default)]
+    early_release: bool,
 }
 
 #[derive(Deserialize)]
@@ -615,6 +620,7 @@ impl Program {
                             arch_specific: k.arch_specific,
                             source: k.source,
                             dependent_launch: k.dependent_launch,
+                            early_release: k.early_release,
                         },
                     )
                 })

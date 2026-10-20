@@ -155,6 +155,21 @@ def test_only_a_kernel_that_waits_on_its_predecessor_launches_dependent():
     assert plan_from_dict(wire).kernels["k_test"].dependent_launch is False
 
 
+def test_a_kernel_that_releases_its_dependent_at_entry_is_marked():
+    """A kernel that releases the grid behind it early (``griddepcontrol.launch_dependents``) is marked, so
+    the runtime keeps a kernel that would stack from launching early behind it; a stored plan without the
+    mark reads unmarked."""
+    graph = _sample_graph()
+    assert plan_from_graph(graph).kernels["k_test"].early_release is False
+    node = graph.nodes["y"]
+    source = '__global__ void k_test() { asm volatile("griddepcontrol.launch_dependents;"); asm volatile("griddepcontrol.wait;"); }'
+    node.op = dataclasses.replace(node.op, kernel_source=source)
+    wire = json.loads(json.dumps(plan_to_dict(plan_from_graph(graph))))
+    assert plan_from_dict(wire).kernels["k_test"].early_release is True
+    del wire["kernels"]["k_test"]["early_release"]
+    assert plan_from_dict(wire).kernels["k_test"].early_release is False
+
+
 def test_a_plan_without_the_dtype_field_keeps_the_stored_dtype_read():
     """A pack baked before ``WeightSpec.graph_dtype`` existed must keep loading.
 

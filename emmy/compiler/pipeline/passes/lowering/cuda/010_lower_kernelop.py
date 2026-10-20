@@ -15,6 +15,7 @@ from dataclasses import replace
 from emmy.compiler.dim import paged_declarations, spans_one_page
 from emmy.compiler.graph import Node
 from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import ConstantOp
 from emmy.compiler.ir.cuda import CudaOp, TmaDescMeta
 from emmy.compiler.ir.kernel import KernelOp, Tile
 from emmy.compiler.ir.kernel.ir import TmaDescriptor
@@ -67,6 +68,21 @@ def _symbolic_runtime_args(kernel: KernelOp) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _bound_constants(graph, kernel: KernelOp, paged: dict) -> frozenset[str]:
+    """The kernel's inputs that are tensors bound once at load (weights, tables): a ``ConstantOp``
+    with no static or per-run value, and not paged (a pager moves paged pages at run time). No
+    kernel writes them, so the renderer may read them before waiting on the grid ahead."""
+    return frozenset(
+        n
+        for n in kernel.inputs
+        if n not in paged
+        and (node := graph.nodes.get(n)) is not None
+        and isinstance(node.op, ConstantOp)
+        and node.op.value is None
+        and node.op.context_value is None
+    )
+
+
 def rewrite(match: Match, root: Node) -> CudaOp | None:
     kernel: KernelOp = root.op
     tiles = [s for s in kernel.body if isinstance(s, Tile)]
@@ -112,7 +128,13 @@ def rewrite(match: Match, root: Node) -> CudaOp | None:
         zeroed = sorted(names & {*_atomic_outputs(kernel), *(zp.dst for zp in kernel.body.iter_of_type(ZeroPrologue))})
         if zeroed:
             raise NotImplementedError(f"paged buffer(s) {zeroed} are zero-initialized per launch, which has no page table to clear")
-    source = render_kernelop(kernel, tensors=tensors, runtime_args=runtime_args, paged_buffers=paged)
+    source = render_kernelop(
+        kernel,
+        tensors=tensors,
+        runtime_args=runtime_args,
+        paged_buffers=paged,
+        constant_buffers=_bound_constants(match.graph, kernel, declared),
+    )
 
     # A cooperative tile fixes the per-CTA thread count (``coop · ∏block-cells``): one CTA
     # per output-cell group, ``blockDim = block_threads``, ``gridDim = N / block_threads``

@@ -129,11 +129,21 @@ class KernelSpec:
     # memory access, which lets the runtime launch it as a programmatic dependent launch. A kernel
     # that does not wait, or a plan stored before the renderer emitted the wait, launches serialized.
     dependent_launch: bool = False
+    # Whether the kernel can release the grid behind it at entry (``griddepcontrol.launch_dependents``),
+    # so that grid may launch while this one still runs. Such a kernel takes one more ``int`` launch
+    # argument after the runtime ints (``render.RELEASE_ARG``): the runtime passes 1 only when the
+    # program's next launch may start early.
+    early_release: bool = False
 
     @classmethod
     def from_op(cls, op) -> KernelSpec:
-        source = op.kernel_source
-        return cls(source=source, arch_specific=_needs_arch_isa(op), dependent_launch="griddepcontrol.wait" in (source or ""))
+        source = op.kernel_source or ""
+        return cls(
+            source=op.kernel_source,
+            arch_specific=_needs_arch_isa(op),
+            dependent_launch="griddepcontrol.wait" in source,
+            early_release="griddepcontrol.launch_dependents" in source,
+        )
 
 
 @dataclass
@@ -620,6 +630,7 @@ def plan_to_dict(plan: ExecutionPlan) -> dict:
                 **({"binary_key": spec.binary_key} if spec.binary_key is not None else {}),
                 "arch_specific": spec.arch_specific,
                 **({"dependent_launch": True} if spec.dependent_launch else {}),
+                **({"early_release": True} if spec.early_release else {}),
             }
             for name, spec in plan.kernels.items()
         },
@@ -703,6 +714,7 @@ def plan_from_dict(d: dict) -> ExecutionPlan:
                 # ``uses_tma`` is the key packs baked before the fp4 atom wrote; same meaning, narrower name.
                 arch_specific=bool(spec.get("arch_specific", spec.get("uses_tma", False))),
                 dependent_launch=bool(spec.get("dependent_launch", False)),
+                early_release=bool(spec.get("early_release", False)),
             )
             for name, spec in d.get("kernels", {}).items()
         },
