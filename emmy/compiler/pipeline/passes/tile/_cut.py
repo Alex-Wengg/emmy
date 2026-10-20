@@ -270,7 +270,7 @@ def place_token(name: str) -> str | None:
     return name.rsplit("__place_", 1)[1].split("__", 1)[0] if "__place_" in name else None
 
 
-def cuttable_seams(tile: TileOp) -> tuple[CutSite, ...]:
+def _seams(tile: TileOp) -> tuple[CutSite, ...]:
     """Every semantically closed stored Fold edge a cut can hand its own kernel, grouped only by
     object sharing. A contraction's operand edges are seams too — cutting one materializes the cone
     feeding the operand into its own kernel and the contraction reads it back as an ordinary load —
@@ -368,8 +368,35 @@ def cuttable_seams(tile: TileOp) -> tuple[CutSite, ...]:
                 owned=owned,
             )
         )
-    grouped, rest = _group_contractions(out, tile.axes)
+    return tuple(out)
+
+
+def cuttable_seams(tile: TileOp) -> tuple[CutSite, ...]:
+    """Every seam a cut can hand its own kernel (:func:`_seams`), contractions grouped by contraction
+    (:func:`_group_contractions`) and the other values by value."""
+    grouped, rest = _group_contractions(list(_seams(tile)), tile.axes)
     return (*grouped, *_cluster_reindexed_contractions(_cluster_value_seams(rest, tile.axes), tile.axes))
+
+
+def sibling_weights(tile: TileOp) -> tuple[tuple[str, ...], ...]:
+    """The buffers that tell sibling contractions apart: per family of contraction channels that are one
+    contraction except for one buffer they read — one input cone and reduction against different weights, at
+    any widths — those buffers in first-read order. A family whose channels differ in more than one buffer
+    is not listed."""
+    families: dict[tuple, list[tuple]] = {}
+    for seam in _seams(tile):
+        found = _contraction_forms(seam, tile.axes)
+        for (key, arguments, symbolic), _, _ in (found or {}).values():
+            families.setdefault((key, symbolic), []).append(arguments)
+    out = []
+    for argument_sets in families.values():
+        distinct = list(dict.fromkeys(argument_sets))
+        if len(distinct) < 2 or len({len(arguments) for arguments in distinct}) > 1:
+            continue
+        differ = [slot for slot in range(len(distinct[0])) if len({arguments[slot] for arguments in distinct}) > 1]
+        if len(differ) == 1:
+            out.append(tuple(dict.fromkeys(arguments[differ[0]] for arguments in distinct)))
+    return tuple(out)
 
 
 def _hoisted_reduces(tile: TileOp) -> set[int]:
