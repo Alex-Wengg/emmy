@@ -1358,7 +1358,10 @@ def _substitute_and_fold(produced: Fold, name: str, sigma: Sigma, ctx: SimplifyC
     term is dropped as shadowed exactly where it has work to do. Each lift is re-closed instead —
     the substituted name leaves the param list and :meth:`Lambda.closing` appends the two the body
     now reads, as TRAILING params, which is where a coordinate already sat and is what keeps the
-    operand correspondence in the prefix untouched."""
+    operand correspondence in the prefix untouched. A fold over an axis of the same name binds that
+    name for itself and its operands, so it is left whole."""
+    if produced.axis == name:
+        return produced
     folding = _FoldingSigma(dict(sigma.mapping))
     object.__setattr__(folding, "_ctx", ctx)
     operands = tuple(_substitute_and_fold(edge, name, sigma, ctx) for edge in produced.operands)
@@ -2143,10 +2146,12 @@ def _digits(expr: Expr, placeholder: Var, by_name: dict) -> dict[str, Expr]:
     return {**{name: BinaryExpr("%", digit(name), Literal(radix[name], "int")) for name in lower}, top: digit(top)}
 
 
-def _preimage(expr: Expr, placeholder: Var, span: tuple, by_name: dict) -> dict[str, Expr]:
+def _preimage(expr: Expr, placeholder: Var, span: tuple, by_name: dict, *, shared: bool = False) -> dict[str, Expr]:
     """The one coordinate of an address ``expr`` read back from the ``placeholder`` that stands for it as a point
-    that reads each address of ``span``, or nothing: ``x`` for a token read clamped, ``(x < 4) ? x : 0``. The point is
-    the first coordinate value that reads the address, and it must sit at one offset from the address throughout."""
+    that reads each address of ``span``, or nothing: ``x`` for a token read clamped, ``(x < 4) ? x : 0``. The point
+    sits at one offset from the address throughout: the first coordinate value that reads it, or with ``shared`` the
+    smallest offset at which a coordinate value reads every address, as a clamp reads its first address at several
+    points (``(x + 2 < 4) ? 0 : x - 2`` reads 0 at x = 0, 1, 2 and 1 at x = 3: no first point fits, offset 2 does)."""
     names = tuple(expr.free_vars())
     lo, extent = span
     if len(names) != 1 or not isinstance(extent, int) or not by_name[names[0]].extent.is_static:
@@ -2154,13 +2159,14 @@ def _preimage(expr: Expr, placeholder: Var, span: tuple, by_name: dict) -> dict[
     (name,) = names
     size = by_name[name].extent.as_static()
     values = np.broadcast_to(np.asarray(expr.eval({name: np.arange(size)}), dtype=np.int64), (size,))
-    first: dict[int, int] = {}
+    points: dict[int, list[int]] = {}
     for point, value in enumerate(values.tolist()):
-        first.setdefault(value, point)
-    offsets = {first[address] - address if address in first else None for address in range(lo, lo + extent)}
-    if len(offsets) != 1 or None in offsets:
+        points.setdefault(value, []).append(point)
+    reads = [points.get(address, [])[: None if shared else 1] for address in range(lo, lo + extent)]
+    offsets = set.intersection(*({point - address for point in at} for address, at in zip(range(lo, lo + extent), reads, strict=True)))
+    if not offsets:
         return {}
-    (offset,) = offsets
+    offset = min(offsets)
     return {name: placeholder if offset == 0 else BinaryExpr("+", placeholder, Literal(offset, "int"))}
 
 
@@ -2173,7 +2179,9 @@ def _contraction_body(tile: TileOp, group: ContractionGroup, buffer: str, others
     by_input = {name for name in by_input if "__place_" not in name}
     candidates = sorted(group.members, key=lambda entry: tuple(entry[3]) != tuple(group.space))
     body = None
-    for member, position, exprs, ranges in candidates:
+    # A shared preimage offset is tried only once no channel builds from first points, so a space that builds from
+    # them keeps the body it has always had.
+    for (member, position, exprs, ranges), shared in ((entry, shared) for shared in (False, True) for entry in candidates):
         name = member.exposes[position]
         channel = _channels(member, (name,)) if len(member.exposes) > 1 else member
         replaced = _replace_fold(channel, others, {}) if others else channel
@@ -2183,7 +2191,7 @@ def _contraction_body(tile: TileOp, group: ContractionGroup, buffer: str, others
         preimages = {}
         for (expr, placeholder), span in zip(table.items(), ranges, strict=True):
             inverse.update(_digits(expr, placeholder, by_name))
-            preimages.update(_preimage(expr, placeholder, span, by_name))
+            preimages.update(_preimage(expr, placeholder, span, by_name, shared=shared))
         lowered = _pruned(Body(tuple(replaced.lower(bound=captured, axes=tile.axes))), frozenset((name,)))
         # A captured unit axis reads at 0 wherever a nested cut left it in an index.
         inverse.update({axis: Literal(0, "int") for axis in captured if axis not in inverse and _unit(by_name[axis])})
