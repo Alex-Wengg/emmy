@@ -32,6 +32,7 @@ See ``_SharedRawEmbedding``.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, fields
 
 import numpy as np
@@ -55,15 +56,21 @@ from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import YaRNSc
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import IsHybrid, SupportsMRoPE, SupportsPP
-from vllm.model_executor.models.utils import PPMissingLayer, make_empty_intermediate_tensors_factory
+from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, make_empty_intermediate_tensors_factory
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.linear_attn import (
-    BailingLinearAttentionMetadataBuilder,
     LinearAttentionBackend,
     LinearAttentionMetadata,
     LinearAttentionMetadataBuilder,
 )
+
+try:
+    from vllm.v1.attention.backends.linear_attn import BailingLinearAttentionMetadataBuilder as _CountingLinearBuilder
+except ImportError:
+    # The 1Cat fork's vLLM has no such builder. It serves Qwen3.8-Flash-Next, whose GDN layers it hosts itself, so
+    # no Emmy GDN program there needs a verify step's counts.
+    _CountingLinearBuilder = LinearAttentionMetadataBuilder
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 
@@ -268,9 +275,10 @@ def _decode_lm_head_into(head: nn.Module, src: dict) -> None:
 def _fork_attention_key(name):
     """``(absolute layer, key relative to the attention sublayer)`` of a checkpoint key the hosted
     fork attention owns, or ``None``. DeepSeek V4 publishes ``layers.N.attn.*`` in its own flat
-    namespace, Qwen3.8-Flash-Next ``model.language_model.layers.N.self_attn.*``; the MTP head's
-    attention (``mtp.*``) is neither."""
-    for layers, site in (("layers.", "attn."), ("model.language_model.layers.", "self_attn.")):
+    namespace, Qwen3.8-Flash-Next ``model.language_model.layers.N.self_attn.*`` for its sparse attention and
+    ``…linear_attn.*`` for its Gated DeltaNet; the MTP head's attention (``mtp.*``) is neither."""
+    qwen = "model.language_model.layers."
+    for layers, site in (("layers.", "attn."), (qwen, "self_attn."), (qwen, "linear_attn.")):
         if name.startswith(layers):
             layer, _, rest = name.removeprefix(layers).partition(".")
             if rest.startswith(site):
@@ -282,7 +290,9 @@ def _fork_attention_shards(rel):
     """The shards a fork attention parameter needs from the checkpoint: ``{None}`` for a whole one."""
     if rel.startswith("qkv_proj."):
         return {"q", "k", "v"}
-    return {0, 1} if "fused_" in rel else {None}
+    if rel.startswith("in_proj_qkvz."):
+        return {(0, 1, 2), 3}
+    return {0, 1} if "fused_" in rel or rel.startswith("in_proj_ba.") else {None}
 
 
 def _fork_attention_dest(rel):
@@ -294,7 +304,9 @@ def _fork_attention_dest(rel):
     ``fused_wqa_wkv``, and each compressor's ``wkv``+``wgate`` into its ``fused_wkv_wgate`` (matched
     by substring, so the indexer's compressor fuses the same way, exactly as the fork's substring
     matching does). Qwen3.8-Flash-Next: ``q_proj`` (query and output gate), ``k_proj`` and
-    ``v_proj`` load as the ``q``, ``k`` and ``v`` shards of ``qkv_proj``."""
+    ``v_proj`` load as the ``q``, ``k`` and ``v`` shards of ``qkv_proj``; a Gated DeltaNet layer's ``in_proj_qkv``
+    loads as the first three shards of ``in_proj_qkvz`` and ``in_proj_z`` as the fourth, ``in_proj_b`` and
+    ``in_proj_a`` as the two of ``in_proj_ba``, as vLLM's Qwen3.5 loader spells them."""
     if rel.endswith(".scale"):
         rel = rel[: -len(".scale")] + ".weight_scale_inv"
     if rel.startswith("compressor."):
@@ -311,6 +323,10 @@ def _fork_attention_dest(rel):
         ("q_proj.", "qkv_proj.", "q"),
         ("k_proj.", "qkv_proj.", "k"),
         ("v_proj.", "qkv_proj.", "v"),
+        ("in_proj_qkv.", "in_proj_qkvz.", (0, 1, 2)),
+        ("in_proj_z.", "in_proj_qkvz.", 3),
+        ("in_proj_b.", "in_proj_ba.", 0),
+        ("in_proj_a.", "in_proj_ba.", 1),
     ):
         if rel.startswith(source):
             return fused + rel[len(source) :], shard
@@ -328,7 +344,10 @@ def _build_fork_attention(vllm_config, runner, n_layers, prefix):
     back — there is no q/k/v seam to place a vLLM ``Attention`` in. Qwen3.8-Flash-Next's sparse
     attention (``Qwen4ExpQSAAttention``) is self-contained the same way, from the fused query, gate,
     key and value projection through the indexer and its two side caches to the gated, all-reduced
-    output projection; it takes the gated residual's mixed input.
+    output projection; it takes the gated residual's mixed input. Its Gated DeltaNet layers take vLLM's
+    ``QwenGatedDeltaNetAttention``, as the fork's own model builds them: the module declares its own per-request
+    state, sliced across tensor-parallel ranks, and registers it under the absolute layer's ``linear_attn``
+    prefix.
 
     Engine-level objects are shared across the layers exactly as the fork's own model builds them:
     one reserved top-k indices buffer for every indexer, and for DeepSeek the auxiliary streams its
@@ -340,6 +359,13 @@ def _build_fork_attention(vllm_config, runner, n_layers, prefix):
 
     config = getattr(vllm_config.model_config.hf_config, "text_config", vllm_config.model_config.hf_config)
     if getattr(config, "indexer_n_heads", None) is not None:
+        if not getattr(vllm_config, "use_v2_model_runner", False):
+            # The fork picks that runner by architecture name, and this class's is not one of its own.
+            raise ValueError(
+                "the 1Cat fork lays out Qwen3.8-Flash-Next's sparse-attention ring cache only in its Model Runner V2; "
+                "serve with VLLM_USE_V2_MODEL_RUNNER=1"
+            )
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
         from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
 
         topk_indices_buffer = torch.empty(
@@ -350,8 +376,13 @@ def _build_fork_attention(vllm_config, runner, n_layers, prefix):
         layers = []
         for i in range(n_layers):
             layer = runner.global_layer_id(i)
-            if config.layer_types[layer] != "full_attention":
-                raise NotImplementedError(f"EmmyGenModel: layer {layer} is a Gated DeltaNet layer, which the plugin does not host yet")
+            if config.layer_types[layer] == "linear_attention":
+                layers.append(
+                    QwenGatedDeltaNetAttention(
+                        config, vllm_config=vllm_config, prefix=f"{prefix}.layers.{layer}.linear_attn", gqa_interleaved_layout=False
+                    )
+                )
+                continue
             layers.append(
                 Qwen4ExpQSAAttention(
                     vllm_config=vllm_config,
@@ -381,6 +412,33 @@ def _build_fork_attention(vllm_config, runner, n_layers, prefix):
         )
         for i in range(n_layers)
     ]
+
+
+def _build_fork_ple(vllm_config, runner, n_layers, prefix):
+    """The fork's n-gram PLE (``Qwen4ExpPLELayer``) for each local layer that reads it, keyed by the local index as a
+    string. Qwen3.8-Flash-Next's ``ple_layer_ids`` name those layers one-indexed. The module holds the n-gram table and
+    its lookup, the gate and the short convolution, and declares the convolution's per-request history as vLLM state
+    under the absolute layer's ``ple`` prefix. Its table is numbered densely over the PLE layers, as the fork's own
+    model numbers it."""
+    config = getattr(vllm_config.model_config.hf_config, "text_config", vllm_config.model_config.hf_config)
+    ids = sorted(set(getattr(config, "ple_layer_ids", None) or ()))
+    if not ids:
+        return {}
+    import vllm.envs as envs
+    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
+
+    if envs.VLLM_PLE_CPU_OFFLOAD:
+        # The fork's offload process builds the model again by its architecture, on the meta device, which Emmy's
+        # runner cannot be built on.
+        raise ValueError("Emmy reads Qwen3.8-Flash-Next's n-gram table inside the worker; serve with VLLM_PLE_CPU_OFFLOAD=0")
+
+    return {
+        str(i): Qwen4ExpPLELayer(
+            config, vllm_config=vllm_config, layer_idx=layer, ple_dense_layer_id=ids.index(layer + 1), prefix=f"{prefix}.layers.{layer}.ple"
+        )
+        for i in range(n_layers)
+        if (layer := runner.global_layer_id(i)) + 1 in ids
+    }
 
 
 class _SharedRawEmbedding(nn.Module):
@@ -455,6 +513,12 @@ def _gdn_state_layout(config, dtype):
     return (history, state), (dtype, torch.float32)
 
 
+def _hosts_gdn(config) -> bool:
+    """Whether the engine hosts this checkpoint's GDN layers: a hyper-connection model's token mixers are the
+    fork's (Qwen3.8-Flash-Next), so its Gated DeltaNet runs as vLLM's own layer, not as an Emmy program."""
+    return int(getattr(config, "hc_count", 0) or 0) > 1
+
+
 @dataclass
 class _GdnMetadata(LinearAttentionMetadata):
     """vLLM's linear-attention metadata for one GDN cache group, plus what a GDN layer reads without a
@@ -469,7 +533,7 @@ class _GdnMetadata(LinearAttentionMetadata):
     writes: torch.Tensor | None
 
 
-class _GdnMetadataBuilder(BailingLinearAttentionMetadataBuilder):
+class _GdnMetadataBuilder(_CountingLinearBuilder):
     """vLLM's linear-attention builder, extended to :class:`_GdnMetadata`. vLLM's own metadata holds the
     token ranges only as device tensors, and a GDN layer reading them back would drain the CPU lead of
     vLLM's async scheduling once per step.
@@ -762,6 +826,9 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         self.fork_attn = None
         if self.runner.hc_mult > 1:
             self.fork_attn = nn.ModuleList(_build_fork_attention(vllm_config, self.runner, n_layers, prefix))
+            if any(isinstance(module, MambaBase) for module in self.fork_attn):
+                self._check_gdn_serving(vllm_config, hosted=True)
+            self.fork_ple = nn.ModuleDict(_build_fork_ple(vllm_config, self.runner, n_layers, prefix))
             # The sublayers' one argument beside positions and hidden states: DeepSeek's takes
             # ``llama_4_scaling``, Qwen's sparse attention an ``output`` buffer.
             self._fork_attn_args = {"output": None} if getattr(config, "indexer_n_heads", None) is not None else {"llama_4_scaling": None}
@@ -875,6 +942,8 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         # without capacity (the standalone oracle) or an over-coverage T.
         decode_ok = self.runner.has_device_decode and 0 < t <= self.runner.decode_bucket
         prefill_ok = 0 < t <= max(self.runner.prefill_capacity, self.runner.prefill_bucket + self.runner.rider_width)
+        if (decode_ok or prefill_ok) and self.fork_attn is not None:
+            return self._forward_streams(hidden, positions, ids, kwargs)
         if decode_ok or prefill_ok:
             return self._forward_device(hidden, positions, ids)
         if self.fork_attn is not None:
@@ -907,19 +976,30 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
             return torch.from_numpy(np.ascontiguousarray(hidden_np)).to(device)
         return IntermediateTensors({"hidden_states": torch.from_numpy(np.ascontiguousarray(hidden_np)).to(device)})
 
-    def _forward_streams(self, hidden, positions, token_ids):
+    def _forward_streams(self, hidden, positions, token_ids, engine_inputs):
         """Device-resident forward for a hyper-connection architecture (DeepSeek V4, Qwen3.8-Flash-Next).
 
         ``hidden`` is the flattened residual-stream carrier. Per layer: Emmy's ``pre`` collapses the
         streams and normalizes, the engine-owned sublayer runs the whole of attention against its own
         paged caches, and Emmy's ``post`` mixes the result back onto the streams, runs the
         feed-forward collapse, norm and shared expert, and closes with the routed combine (reduced
-        across the expert shards inside the runner)."""
+        across the expert shards inside the runner). A layer with an n-gram PLE first adds the PLE's
+        output to the streams, as the fork's layer does; it reads ``engine_inputs``, each request's
+        start in the step and the tokens before it, which the fork's model state hands the forward."""
         for layer in range(self.runner.num_layers):
+            if str(layer) in self.fork_ple:
+                ple_inputs = (engine_inputs["query_start_loc"], engine_inputs["ngram_context"])
+                hidden = hidden + self.fork_ple[str(layer)](hidden, token_ids, *ple_inputs)
             carrier = hidden
             x = self.runner.forward_layer_pre_device(layer, carrier)
-            x = x[0] if isinstance(x, tuple) else x
-            attn_out = self.fork_attn[layer](positions=positions, hidden_states=x.to(self.dtype), **self._fork_attn_args)
+            x = (x[0] if isinstance(x, tuple) else x).to(self.dtype)
+            mixer = self.fork_attn[layer]
+            if isinstance(mixer, MambaBase):
+                # A Gated DeltaNet layer writes its output into the buffer it is handed, as the fork's layer calls it.
+                attn_out = torch.empty_like(x)
+                mixer(hidden_states=x, output=attn_out)
+            else:
+                attn_out = mixer(positions=positions, hidden_states=x, **self._fork_attn_args)
             hidden = self.runner.forward_layer_post_device(layer, attn_out, carrier, token_ids=token_ids)
         if self._is_last_rank:
             return self.runner.final_norm_device(hidden)
@@ -928,8 +1008,6 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
     def _forward_device(self, hidden, positions, token_ids=None):
         """Device-resident decode forward (T <= decode_bucket): q/k/v and attn_out stay CUDA
         tensors through RoPE + vLLM attention — no per-layer numpy↔torch host hop."""
-        if self.fork_attn is not None:
-            return self._forward_streams(hidden, positions, token_ids)
         for layer in range(self.runner.num_layers):
             if self.gdn_state[layer] is not None:
                 hidden = self._forward_gdn(layer, hidden, token_ids)
@@ -957,13 +1035,21 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         return positions, 0
 
     @classmethod
-    def _check_gdn_serving(cls, vllm_config):
-        """Refuse, with the reason, what serving a model with GDN layers does not support."""
+    def _check_gdn_serving(cls, vllm_config, *, hosted=False):
+        """Refuse, with the reason, what serving a model with GDN layers does not support. A GDN layer the engine
+        hosts (``hosted``) keeps its state in vLLM's own Gated DeltaNet layer, so only the class must declare it;
+        the rest guards the GDN programs Emmy runs."""
         if not getattr(cls, "is_hybrid", False):
             raise ValueError(
                 "this checkpoint has GDN (linear_attention) layers; serve it with the architecture "
                 "EmmyGenHybridModel, which declares their per-request state to vLLM"
             )
+        if hosted:
+            if vllm_config.cache_config.mamba_cache_mode == "all":
+                raise NotImplementedError(
+                    "the fork's own model refuses mamba_cache_mode 'all' for its Gated DeltaNet layers; serve with --mamba-cache-mode align"
+                )
+            return
         if vllm_config.cache_config.enable_prefix_caching:
             raise NotImplementedError(
                 "prefix caching is not supported on a model with GDN layers: a request keeps one recurrent "
@@ -1111,6 +1197,7 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
             _decode_lm_head_into(self.lm_head, coded)
             loaded.add("lm_head.weight")
         fork_attn = getattr(self, "fork_attn", None)
+        fork_ple = getattr(self, "fork_ple", nn.ModuleDict())
         fork_params = None
         if fork_attn is not None:
             fork_params = [dict(module.named_parameters()) for module in fork_attn]
@@ -1132,6 +1219,12 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
                         # vLLM's strict tracker compares the returned names with this module's
                         # registered parameters, not with the checkpoint source spelling.
                         loaded.add(f"sinks.{local_layer}")
+                elif fork_params is not None and (ple := re.fullmatch(r"model\.language_model\.layers\.(\d+)\.ple\.(.+)", name)):
+                    # The PLE loads itself, as under the fork's own loader: the n-gram table arrives as row shards.
+                    local = str(int(ple[1]) - self.start_layer)
+                    if local in fork_ple:
+                        claimed = AutoWeightsLoader(fork_ple[local]).load_weights([(ple[2], w)])
+                        loaded |= {f"fork_ple.{local}.{key}" for key in claimed}
                 elif fork_params is not None and (site := _fork_attention_key(name)) is not None:
                     layer, rel = site
                     if not (self.start_layer <= layer < self.end_layer):
@@ -1174,6 +1267,9 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
                             f"loaded from the checkpoint (needed shards {sorted(need, key=str)}, got "
                             f"{sorted(got, key=str)}) — this layer's attention would run on construction garbage"
                         )
+            unloaded = {f"fork_ple.{name}" for name, _ in fork_ple.named_parameters()} - loaded
+            if unloaded:
+                raise ValueError(f"EmmyGenModel: the checkpoint did not load the n-gram PLE parameters {sorted(unloaded)}")
         if not is_last_rank:
             self.reclaim_device_memory()
             return loaded
@@ -1231,7 +1327,14 @@ class EmmyGenHybridModel(EmmyGenModel, IsHybrid):
     @classmethod
     def _state_layout(cls, vllm_config):
         mc = vllm_config.model_config
-        return _gdn_state_layout(getattr(mc.hf_config, "text_config", mc.hf_config), mc.dtype)
+        config = getattr(mc.hf_config, "text_config", mc.hf_config)
+        if _hosts_gdn(config):
+            # A hosted layer's state is the one the fork's own model class declares for it: sliced across
+            # tensor-parallel ranks, with room for draft tokens.
+            from vllm.models.qwen4_exp import Qwen4ExpForCausalLM as fork
+
+            return fork.get_mamba_state_shape_from_config(vllm_config), fork.get_mamba_state_dtype_from_config(vllm_config)
+        return _gdn_state_layout(config, mc.dtype)
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config):
@@ -1243,6 +1346,29 @@ class EmmyGenHybridModel(EmmyGenModel, IsHybrid):
 
     @classmethod
     def get_mamba_state_copy_func(cls):
-        # vLLM copies state between KV cache blocks only for prefix caching, which ``_check_gdn_serving``
-        # refuses; a verify step's states are written by ``_forward_gdn``.
-        raise NotImplementedError("a model with GDN layers serves without prefix caching")
+        # vLLM copies state between KV cache blocks only for prefix caching. ``_check_gdn_serving`` refuses it for
+        # the GDN programs Emmy runs (a verify step's states are written by ``_forward_gdn``); a hosted layer's
+        # state is vLLM's own Gated DeltaNet state, and copies the way vLLM copies it.
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
+
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    @classmethod
+    def get_mamba_state_copy_funcs(cls, mamba_types):
+        # A hosted n-gram PLE's short convolution keeps one state and copies it as vLLM copies a short convolution's.
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
+
+        short_conv, gdn = MambaStateCopyFuncCalculator.short_conv_state_copy_func(), cls.get_mamba_state_copy_func()
+        return {kind: short_conv if kind == MambaAttentionBackendEnum.SHORT_CONV else gdn for kind in mamba_types}
+
+    def get_model_state_cls(self):
+        """The model state vLLM's Model Runner V2 keeps for this model. A hosted checkpoint (Qwen3.8-Flash-Next) takes
+        the fork's own, which hands the forward what the n-gram PLE reads: each request's start in the step and the
+        tokens before its first one."""
+        if _hosts_gdn(self.config):
+            from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+
+            return Qwen4ExpModelState
+        from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+        return MambaHybridModelState
