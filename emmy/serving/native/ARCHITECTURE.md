@@ -1,8 +1,9 @@
 # Native cached generation
 
 Python prepares a standalone generation artifact for a dense Qwen3 or Qwen3.5 text model with FP16 or FP8 weights,
-or a Qwen3.5-MoE one with FP16 weights and resident routed experts. The artifact holds the weights,
-projection inputs, a KV cache for its full-attention layers and carried state for its Gated DeltaNet layers.
+or a Qwen3.5-MoE one with FP16 weights, its routed experts on the device or paged from host memory. The artifact
+holds the weights, projection inputs, a KV cache for its full-attention layers and carried state for its Gated
+DeltaNet layers.
 The output head retains FP32 logits through sampling so FP16 rounding cannot create a false maximum tie.
 The Rust runtime submits the exported launches and retains the KV cache. Compiled GPU reductions select greedy
 tokens; positive-temperature sampling runs on the CPU. No Python model operation runs after preparation. The
@@ -12,8 +13,9 @@ experimental native HTTP adapter serves one active request; this is not a perfor
 
 `prepare.export_model` traces the existing attention-split wrappers and final normalization/output head. It uses the
 compiler's plan-template cache to reuse identical layer structure. The compiled plans are joined into one ordinary
-static plan for each width: seams refer to the same named allocation, and internal names are scoped by layer.
-There is no new compiler or runtime alias format. Unsupported symbolic and descriptor arguments are rejected.
+static plan for each width: seams refer to the same named allocation, and internal names are scoped by layer. Kernels
+join by name; one whose name a different source already holds takes a suffix from its own source, as the paging splice
+does. There is no new compiler or runtime alias format. Unsupported symbolic and descriptor arguments are rejected.
 Cache buffers use the persistent output role, without joining the public logits/token output list. Custom launches
 identify their writes so Python scratch allocation preserves the same dependencies as native execution.
 
@@ -41,10 +43,11 @@ FP32 recurrent state and FP16 convolution history and writes the next ones over 
 input with every row replaced (a scatter), which the compiler stores into the input's memory. The pack key lists
 these buffers under `state` (below).
 
-A Qwen3.5-MoE decoder has routed experts and a gated shared expert in every layer, behind either mixer. The experts
-stay resident: each layer's E-stacked expert weights are constants of the step (`layer{i}.w_gate_up`,
-`layer{i}.w_down`), so the slot count is the expert count and nothing is paged. A MoE layer's section of the step
-is four programs in sequence, every one static:
+A Qwen3.5-MoE decoder has routed experts and a gated shared expert in every layer, behind either mixer. Each layer's
+E-stacked expert weights are two buffers of the step (`layer{i}.w_gate_up`, `layer{i}.w_down`). Preparation reads
+the vLLM plugin's budget, `EMMY_GEN_EXPERTS_GPU`: how many experts per layer the device holds. With no budget, or
+one at or above the expert count, the weights are constants of the step and nothing is paged; below it they are
+paged (below). A MoE layer's section of the step is four programs in sequence, every one static:
 
 1. The mixer is the attention split's MoE `post` or the GDN state wrapper's routed form, both in FP32-residual form.
    It writes the FP32 residual with the shared expert folded in (`layer{i}.h`) and the FP16 normalized rows the
@@ -66,12 +69,30 @@ Past its mixer, a MoE layer therefore runs `rows + 2` programs per step; the las
 since nothing reads its output. A quantized MoE checkpoint does not export: the checkpoint-sourced lane leaves its
 routed experts on the meta device, and the FP16-on-CPU check rejects the model.
 
-The hermetic tiny Qwen3.5-MoE GPU test has two full-attention layers. It checks every logit against Transformers'
-and its greedy tokens, through sequential and chunked prefill, capture and reset. No test in the suite runs a Gated
-DeltaNet MoE layer on a card: without evidence its kernels take minutes to compile, and the same gate with one GDN
-and one attention layer takes about ten minutes on an RTX 5090 (it passed by hand on 2026-10-22). Its program is
-checked on the CPU instead, traced from an FP16 model and interpreted by the NumPy backend: the FP32 residual, the
-FP16 normalized rows, the state and the history match the eager module.
+Below the budget, each expert weight buffer is an input of the step paged along its expert axis, one expert per
+page, with the budget as its device slots, as the plugin declares it. The backend splices each fixed-slot launch's
+inspector and the paging programs ahead of it, so they are ordinary launches of the step and a captured graph
+records them. The pager's tables, slots and clock enter the step as inputs named after the buffer
+(`layer{i}.w_gate_up__table` … `__slots`), and the copy reads the pages through the buffer's `__view`. Every row's
+launch in decode and prefill moves pages through the same tables, so the slots are one cache per buffer. The pack
+keeps the expert bytes once, page after page, under its `pages` index. The runtime reads each file straight into
+pinned, mapped host memory, declares it to the pager with its page count, page size and slots, and lends the
+pager's tables to both programs as they load (runtime `ARCHITECTURE.md`, "Cached generation"). The host therefore
+holds the experts once and the device holds the slots once; the trunk, the KV cache and the Gated DeltaNet state
+stay where they are. The budget is fixed at preparation: a reused pack keeps the slots it was prepared with. Each
+launch reading a paged buffer takes its own inspector and paging run, so a paged layer adds 28 launches per
+fixed-slot launch (14 per buffer).
+
+The hermetic tiny Qwen3.5-MoE GPU test has two full-attention layers. It checks every logit against Transformers' and
+its greedy tokens, through sequential and chunked prefill, capture and reset, at three budgets: every expert, four of
+eight, and one (below the two picks, so the second is read in place from host memory). Its experts are wide, about 100
+MB in all, so they dominate the worker's memory: after load its heap holds less than half of them, and its peak resident
+set stays within half of them of its resident set, so the load neither kept nor passed through a second copy. No test in
+the suite runs a Gated DeltaNet MoE layer on a card: without evidence its kernels take minutes to compile, and the same
+gate with one GDN and one attention layer takes about ten minutes on an RTX 5090 (it passed by hand on 2026-10-22, with
+every expert on the card and with two of eight). Its program is checked on the CPU instead, traced from an FP16 model
+and interpreted by the NumPy backend: the FP32 residual, the FP16 normalized rows, the state and the history match the
+eager module.
 
 A quantized checkpoint loads through the serving runner's checkpoint-sourced lane (`load_model`). Its twin is built
 from the config with the trunk's coded linears left as placeholders; each program's trace is re-addressed to the
@@ -97,19 +118,18 @@ program, including the output head, which yields the first generated token. Late
 step's token, which the runtime read back from the program or sampled from its logits, and uploaded with the position
 scalar. Prefill chunks execute no head and download nothing.
 
-The cache is one paged K and one paged V buffer per layer, shaped `[1, kv_heads, context, head_dim]` and paged along
-the token axis with `page_tokens` tokens per page (`export_model(page_tokens=…)`, `emmy generate --page-tokens`).
-The rotary program writes a chunk of each through the page tables at `position`, the attention program reads all of
-them through the same tables, and the runtime allocates every page at load and binds the tables (see the runtime's
-paged-buffer contract). The default page spans the whole context, so the table has one entry and the addressing is
-that of the contiguous array it replaces; a smaller page changes only the addressing, never the tokens generated. A
-new request resets the position and prompt length. Attention can only read positions already overwritten by that
-request, so clearing the entire cache is unnecessary. Decode owns the shared inputs, cache pages and constants.
-Prefill borrows the same constants through the runtime's region interface and the same cache through its page
-tables, and retains a separate scratch slab; scratch is packed by liveness within each program. The borrower drops
-before the owner. Loading allocates and uploads both programs before replacing duplicate regions and pages with
-borrowed ones, so peak load memory exceeds resident memory. The embedding and tied output-head copies within decode
-remain separate.
+The cache is one paged K and one paged V buffer per layer, shaped `[1, kv_heads, context, head_dim]` and paged along the
+token axis with `page_tokens` tokens per page (`export_model(page_tokens=…)`, `emmy generate --page-tokens`). The rotary
+program writes a chunk of each through the page tables at `position`, the attention program reads all of them through
+the same tables, and the runtime allocates every page at load and binds the tables (see the runtime's paged-buffer
+contract). The default page spans the whole context, so the table has one entry and the addressing is that of the
+contiguous array it replaces; a smaller page changes only the addressing, never the tokens generated. A new request
+resets the position and prompt length. Attention can only read positions already overwritten by that request, so
+clearing the entire cache is unnecessary. Decode owns the shared inputs, cache pages and constants. Prefill loads with
+the same inputs and constants lent through the runtime's region interface, takes the same cache through its page tables,
+and retains a separate scratch slab; scratch is packed by liveness within each program. The borrower drops before the
+owner. Only the cache pages are allocated twice at load, until prefill takes decode's tables. The embedding and tied
+output-head copies within decode remain separate.
 
 The state is updated in place. The next state reads whole columns of the old one, so the kernel that stores it over
 the old state must not also compute it: fusion keeps a kernel stored over a buffer apart from every loop that
@@ -139,16 +159,16 @@ returns the advanced position; intermediate chunks return no token or logits.
 
 ## Sampling contract
 
-Generation artifact version 6 ends the decode step at the FP32 logits and the greedy token, adds the prefill width,
-with a separate prefill program when that width exceeds one, and lists the carried `(read, write)` buffer pairs,
-empty for dense Qwen3. The decode program's inputs are the prompt, its
-length, the position and the previous step's token; its outputs are the logits and the lowest token ID among their
-maxima, which a compiled reduction selects on the device. At temperature zero the runtime downloads that token alone;
-at positive temperature it downloads the logits — one vocabulary-sized FP32 transfer per generated token, none during
-prefill — and samples on the host. The head keeps its scores in FP32, so FP16 rounding cannot create a false maximum
-tie. Older generation artifacts must be exported again; the underlying execution-plan format is unchanged.
-Temperature must be finite and nonnegative, and top-p must lie in `(0, 1]`. Nonfinite logits fail the request. Top-k
-is unsupported.
+Generation artifact version 8 ends the decode step at the FP32 logits and the greedy token, adds the prefill width,
+with a separate prefill program when that width exceeds one, lists the buffers a step carries, empty for dense
+Qwen3, and reads the pages of every buffer the pager holds from the pack. The decode program's inputs are the
+prompt, its length, the position and the previous step's token; its outputs are the logits and the lowest token ID
+among their maxima, which a compiled reduction selects on the device. At temperature zero the runtime downloads
+that token alone; at positive temperature it downloads the logits — one vocabulary-sized FP32 transfer per
+generated token, none during prefill — and samples on the host. The head keeps its scores in FP32, so FP16
+rounding cannot create a false maximum tie. Older generation artifacts must be exported again; the underlying
+execution-plan format is unchanged. Temperature must be finite and nonnegative, and top-p must lie in `(0, 1]`.
+Nonfinite logits fail the request. Top-k is unsupported.
 
 Greedy selection is a traced module the compiler lowers with the reductions it has: the peak of the logits, then the
 largest negated token ID among the tokens at the peak, so ties resolve to the lowest ID. A nonfinite logit leaves no
