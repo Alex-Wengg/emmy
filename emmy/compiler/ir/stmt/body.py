@@ -95,18 +95,6 @@ def _seeded_accumulators(s: Stmt) -> frozenset[str]:
     return frozenset(c.name for c in s.body if isinstance(c, Accum))
 
 
-def _without_folds_of(s: Stmt, folded: set[str]) -> Stmt | None:
-    """``s`` without the folds of the accumulators ``folded`` names, which an earlier loop of the
-    same scope already computes: a reduce loop keeps the statements its other accumulators read.
-    ``None`` when nothing is left; ``s`` itself when it folds none of them."""
-    accumulators = _seeded_accumulators(s)
-    if not accumulators & folded:
-        return s
-    if not accumulators - folded:
-        return None
-    return replace(s, body=Body(s.body.backward_cone(accumulators - folded).members))
-
-
 def free_names(s: Stmt) -> frozenset[str]:
     """Every name ``s`` (whole subtree) reads from its enclosing scope — SSA reads AND index
     coordinates, less what the subtree defines or binds.
@@ -376,9 +364,11 @@ class Body(tuple[Stmt, ...], Wire):
                 if stmt in seen:
                     continue
                 seen.add(stmt)
-                stmt = _without_folds_of(stmt, folded)
-                if stmt is None:
-                    continue
+                if redeclared := _seeded_accumulators(stmt) & folded:
+                    kept = _seeded_accumulators(stmt) - redeclared
+                    if not kept:
+                        continue
+                    stmt = replace(stmt, body=Body(stmt.body.backward_cone(kept).members))
             prior = out[-1] if out else None
             if (
                 isinstance(stmt, (Loop, StridedLoop))
