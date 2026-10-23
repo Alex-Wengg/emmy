@@ -83,6 +83,30 @@ def _exposed_defines(s: Stmt) -> set[str]:
     return out
 
 
+def _seeded_accumulators(s: Stmt) -> frozenset[str]:
+    """The accumulators a reduce loop declares in its enclosing scope: the ``Accum`` targets of its
+    immediate body, each seeded just ahead of the loop. Empty for any other statement, for a loop
+    whose accumulators are declared elsewhere (``seed=False``), and for a loop carrying a state."""
+    from emmy.compiler.ir.stmt.blocks import Loop, StridedLoop  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.leaves import Accum  # noqa: PLC0415
+
+    if not isinstance(s, (Loop, StridedLoop)) or not s.seed or s.body.carries:
+        return frozenset()
+    return frozenset(c.name for c in s.body if isinstance(c, Accum))
+
+
+def _without_folds_of(s: Stmt, folded: set[str]) -> Stmt | None:
+    """``s`` without the folds of the accumulators ``folded`` names, which an earlier loop of the
+    same scope already computes: a reduce loop keeps the statements its other accumulators read.
+    ``None`` when nothing is left; ``s`` itself when it folds none of them."""
+    accumulators = _seeded_accumulators(s)
+    if not accumulators & folded:
+        return s
+    if not accumulators - folded:
+        return None
+    return replace(s, body=Body(s.body.backward_cone(accumulators - folded).members))
+
+
 def free_names(s: Stmt) -> frozenset[str]:
     """Every name ``s`` (whole subtree) reads from its enclosing scope — SSA reads AND index
     coordinates, less what the subtree defines or binds.
@@ -332,18 +356,29 @@ class Body(tuple[Stmt, ...], Wire):
         not repeated accumulator updates. Equal definitions keep their first occurrence; effects
         are retained. Loops with identical iteration headers can share a pass unless the later
         loop reads a finalized result from the earlier one.
+
+        The first occurrence also wins per accumulator. Two lowerings of one shared fold need not
+        be equal statements: one cone edge lowers the fold alone, another fuses it into one pass
+        with a sibling fold over the same axis. A later reduce loop that folds an accumulator this
+        scope already declared keeps only the folds of its other accumulators. Without this, both
+        loops declare the shared accumulator in one scope, which does not compile.
         """
         from emmy.compiler.ir.stmt.blocks import Loop, StridedLoop  # noqa: PLC0415
 
         out: list[Stmt] = []
         seen: set[Stmt] = set()
+        folded: set[str] = set()  # accumulators the reduce loops of ``out`` declare at this scope
         for stmt in self:
             if stmt.has_side_effects:
                 seen.clear()
+                folded.clear()
             elif _exposed_defines(stmt):
                 if stmt in seen:
                     continue
                 seen.add(stmt)
+                stmt = _without_folds_of(stmt, folded)
+                if stmt is None:
+                    continue
             prior = out[-1] if out else None
             if (
                 isinstance(stmt, (Loop, StridedLoop))
@@ -357,6 +392,7 @@ class Body(tuple[Stmt, ...], Wire):
                 stmt = replace(prior, body=(prior.body + stmt.body).coalesce())
                 out.pop()
             out.append(stmt)
+            folded.update(_seeded_accumulators(stmt))
         return Body(out)
 
     def fold[T](
