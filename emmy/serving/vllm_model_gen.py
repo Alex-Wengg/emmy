@@ -224,10 +224,14 @@ def _rope_cache_limit(model_config, config) -> int:
 
 #: The ``lm_head`` sibling leaves an EXL3 checkpoint stores in place of a plain ``.weight``.
 _CODED_HEAD_LEAVES = ("trellis", "suh", "svh", "mcg", "mul1")
+#: An NVFP4 head's leaves: packed e2m1 codes, raw e4m3 block scales and the f32 global scale.
+_NVFP4_HEAD_LEAVES = ("weight", "weight_scale", "weight_scale_2")
+#: Output rows an NVFP4 head decodes at a time, bounding the f32 host copy while the trunk is resident.
+_NVFP4_HEAD_ROWS = 1024
 
 
 def _coded_lm_head_source(model_id: str) -> dict | None:
-    """The EXL3 or NVFP4 head's sibling tensors as numpy, or ``None`` when this checkpoint has a plain
+    """The EXL3 head's sibling tensors as numpy, or ``None`` when this checkpoint has a plain
     ``lm_head.weight`` for the ordinary weight stream to load.
 
     An EXL3 checkpoint quantizes the output head like any other linear (GLM-4.5-Air:
@@ -240,50 +244,61 @@ def _coded_lm_head_source(model_id: str) -> dict | None:
     qdir = quantized_checkpoint_dir(model_id)
     if qdir is None:
         return None
-    from emmy.compiler.loader.safetensors import _build_index, load_sources_by_path
+    from emmy.compiler.loader.safetensors import load_sources_by_path
 
-    index = _build_index(qdir)
-    if "lm_head.weight_scale_2" in index:
-        paths = [f"lm_head.{leaf}" for leaf in ("weight", "weight_scale", "weight_scale_2")]
-        if not set(paths) <= index.keys():
-            raise ValueError("NVFP4 lm_head is missing its packed weight or block scale")
-        return load_sources_by_path(str(qdir), paths, bits_paths={"lm_head.weight_scale"})
     src = load_sources_by_path(str(qdir), [f"lm_head.{leaf}" for leaf in _CODED_HEAD_LEAVES])
     return src if "lm_head.trellis" in src else None
+
+
+def _nvfp4_lm_head_source(model_id: str) -> dict | None:
+    """The NVFP4 head's leaves as numpy, its block scales as raw e4m3 bits, or ``None`` when this
+    checkpoint's head is not NVFP4. Its ``lm_head.weight`` holds packed codes, so the weight stream
+    must not load it. ``load_weights`` reads these and decodes them at once: only the decoded
+    parameter is kept, so the codes (0.67 GiB on Qwen3.8-27B) are not held through the trunk load."""
+    from emmy.compiler.loader.safetensors import load_sources_by_path
+    from emmy.compiler.trace.huggingface import quantized_checkpoint_dir
+
+    qdir = quantized_checkpoint_dir(model_id)
+    if qdir is None or not load_sources_by_path(str(qdir), ["lm_head.weight_scale_2"]):
+        return None
+    paths = [f"lm_head.{leaf}" for leaf in _NVFP4_HEAD_LEAVES]
+    src = load_sources_by_path(str(qdir), paths, bits_paths={"lm_head.weight_scale"})
+    if src.keys() != set(paths):
+        raise ValueError("NVFP4 lm_head is missing its packed weight or block scale")
+    return src
 
 
 def _decode_lm_head_into(head: nn.Module, src: dict) -> None:
     """Decode the EXL3 or NVFP4 head into vLLM's ``lm_head.weight``, block by block.
 
-    EXL3's loader orientation is ``(in, out)``, so its blocks transpose on the way in. NVFP4 blocks
-    already hold output rows. Blocking bounds the decoded host memory while the trunk is resident.
-    Padding rows (EXL3 rounds the out extent to 128, vLLM's ``ParallelLMHead`` to 64) stay zero — the logits processor slices
-    the logical vocab off the front either way."""
+    Blocked to bound the decoded host memory while the trunk is resident: EXL3's Hadamard fold runs
+    in float64 (~5 GiB for a vocab-sized head decoded whole). EXL3's loader orientation is
+    ``(in, out)``, so its blocks transpose on the way in; NVFP4 blocks already hold output rows.
+    EXL3 rounds the out extent to 128, so its rows past the parameter are padding and are dropped;
+    an NVFP4 head stores exactly the vocab, so a row past the parameter is a checkpoint/config
+    mismatch and raises. vLLM's ``ParallelLMHead`` pads to 64; those rows stay zero — the logits
+    processor slices the logical vocab off the front either way."""
     from emmy.compiler.loader.exl3 import decode_exl3_blocks
     from emmy.compiler.loader.quant import dequantize_nvfp4
 
     if getattr(head, "tp_size", 1) != 1:
         raise NotImplementedError("EmmyGenModel: a coded lm_head writes whole rows, so it is single-GPU only")
     param = head.weight
-    if "lm_head.trellis" in src:
-        trellis, suh, svh = src["lm_head.trellis"], src["lm_head.suh"], src["lm_head.svh"]
+    if (trellis := src.get("lm_head.trellis")) is not None:
         hidden = trellis.shape[0] * 16
-        blocks = (
-            (lo, hi, block.T)
-            for lo, hi, block in decode_exl3_blocks(trellis, suh, svh, mcg=src.get("lm_head.mcg"), mul1=src.get("lm_head.mul1"))
-        )
+        exl3 = decode_exl3_blocks(trellis, src["lm_head.suh"], src["lm_head.svh"], mcg=src.get("lm_head.mcg"), mul1=src.get("lm_head.mul1"))
+        blocks = ((lo, block.T) for lo, _hi, block in exl3)
     else:
-        packed, scales, scale_2 = (src[f"lm_head.{leaf}"] for leaf in ("weight", "weight_scale", "weight_scale_2"))
-        hidden = packed.shape[1] * 2
-        blocks = (
-            (lo, lo + 1024, dequantize_nvfp4(packed[lo : lo + 1024], scales[lo : lo + 1024], scale_2))
-            for lo in range(0, packed.shape[0], 1024)
-        )
+        packed, scales, scale_2 = (src[f"lm_head.{leaf}"] for leaf in _NVFP4_HEAD_LEAVES)
+        hidden, step = packed.shape[1] * 2, _NVFP4_HEAD_ROWS
+        if packed.shape[0] > param.shape[0]:
+            raise ValueError(f"NVFP4 lm_head stores {packed.shape[0]} rows, but vLLM's head parameter is {tuple(param.shape)}")
+        blocks = ((lo, dequantize_nvfp4(packed[lo : lo + step], scales[lo : lo + step], scale_2)) for lo in range(0, packed.shape[0], step))
     if param.shape[1] != hidden:
         raise ValueError(f"coded lm_head has in_features {hidden}, but vLLM's head parameter is {tuple(param.shape)}")
     param.data.zero_()
-    for lo, hi, block in blocks:
-        hi = min(hi, lo + block.shape[0], param.shape[0])
+    for lo, block in blocks:
+        hi = min(lo + block.shape[0], param.shape[0])
         if lo >= hi:
             break
         param.data[lo:hi].copy_(torch.from_numpy(np.ascontiguousarray(block[: hi - lo])))
@@ -663,8 +678,8 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         config = getattr(mc.hf_config, "text_config", mc.hf_config)
         self.config = config
         self.dtype = mc.dtype
-        # Revision-tagged: ``load_weights`` re-opens the checkpoint for an EXL3-coded head, and the
-        # runner resolves it again for the trace — both must land on the rung vLLM was pinned to.
+        # Revision-tagged: ``load_weights`` re-opens the checkpoint for an EXL3- or NVFP4-coded head,
+        # and the runner resolves it again for the trace — both must land on the rung vLLM was pinned to.
         self._model_id = pinned_model_id(mc)
         pp = get_pp_group()
         self._pp_rank = pp.rank_in_group
@@ -674,7 +689,7 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         self._is_last_rank = self.end_layer == config.num_hidden_layers
         self._coded_head_source = _coded_lm_head_source(self._model_id) if self._is_last_rank else None
         self._coded_head_spec = None
-        if self._coded_head_source is not None and "lm_head.trellis" in self._coded_head_source:
+        if self._coded_head_source is not None:
             from emmy.serving.exl3_head import Exl3HeadSpec
 
             self._coded_head_spec = Exl3HeadSpec.from_source(
@@ -1187,9 +1202,11 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         may carry only the embedding, so accept an ``*embed_tokens.weight`` alias for the head
         (the multimodal 'unified' checkpoint nests it at ``model.language_model.embed_tokens.weight``).
 
-        An EXL3 checkpoint carries no ``lm_head.weight`` at all — the head is trellis-coded — so
-        it decodes straight from the checkpoint instead (:func:`_coded_lm_head_source`) and the
-        weight stream is consumed only for what remains. An unsourced head is a hard error: vLLM's
+        An EXL3 checkpoint carries no ``lm_head.weight`` at all — the head is trellis-coded — and an
+        NVFP4 checkpoint's ``lm_head.weight`` holds packed codes, so either head decodes straight
+        from the checkpoint instead (:func:`_coded_lm_head_source`, read at construction for the
+        compiled EXL3 head; :func:`_nvfp4_lm_head_source`, read here) and the weight stream is
+        consumed only for what remains. An unsourced head is a hard error: vLLM's
         own strict check waives any parameter whose quant method defines
         ``process_weights_after_loading``, which the head's does, so nothing downstream would
         notice a head left at its construction garbage and the server would serve noise while
@@ -1212,6 +1229,8 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         coded = getattr(self, "_coded_head_source", None)
         if coded is None and is_last_rank and not hasattr(self, "_coded_head_source"):
             coded = _coded_lm_head_source(self._model_id)
+        if coded is None and is_last_rank:
+            coded = _nvfp4_lm_head_source(self._model_id)
         if coded is not None and coded_spec is not None:
             from emmy.serving.exl3_head import Exl3CodedHead
 
@@ -1302,8 +1321,9 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         if "lm_head.weight" not in loaded:
             raise ValueError(
                 "EmmyGenModel: no source for lm_head.weight in this checkpoint (no 'lm_head.weight', "
-                f"no tied '*embed_tokens.weight'{'' if tied else ' — the config is untied'}, and no EXL3 "
-                "'lm_head.trellis'). The head would stay uninitialized and every logit would be garbage."
+                f"no tied '*embed_tokens.weight'{'' if tied else ' — the config is untied'}, no EXL3 "
+                "'lm_head.trellis', and no NVFP4 'lm_head.weight_scale_2'). The head would stay uninitialized "
+                "and every logit would be garbage."
             )
         # Tied checkpoints: the loaded head IS the raw embed table — hand it to the runner and drop
         # the runner's own ~2 GiB folded device copy (uploaded eagerly at construction for the

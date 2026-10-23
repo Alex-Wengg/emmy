@@ -588,10 +588,13 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   untied single-TP coded head remains compressed and runs the same factorized compiler algebra with fp32 logits;
   `LogitsProcessor(logits_as_input=True)` then applies scale/softcap. Unsupported coded heads decode in out-feature
   blocks (`decode_exl3_blocks`; the whole-tensor fold runs in float64, ~5 GiB for a vocab-sized head).
-  An NVFP4 head loads its packed weight, raw e4m3 block scales and global scale directly from the checkpoint,
-  then decodes in output-row blocks through the loader's existing NVFP4 math. Its device parameter stays in the
-  model dtype: Qwen3.8-27B's BF16 head occupies 2.37 GiB even when its checkpoint stores 0.67 GiB of NVFP4 codes
-  and scales. Both decoded forms require single-TP output heads and release their coded host sources after loading.
+  An NVFP4 head's `lm_head.weight` holds packed codes, so `load_weights` reads it, its raw e4m3 block scales and
+  its global scale directly from the checkpoint (at load time, not construction: only the decoded parameter is
+  kept) and decodes them in output-row blocks through the loader's existing NVFP4 math. It stores exactly the
+  vocab, so a row past the head parameter raises, where EXL3's rows past it are padding. Its device parameter stays
+  in the model dtype: Qwen3.8-27B's BF16 head occupies 2.37 GiB even when its checkpoint stores 0.67 GiB of NVFP4
+  codes and scales. Both decoded forms require single-TP output heads and release their coded host sources after
+  loading.
   Reading the checkpoint directly also skips a second full pass over the shards, which on a 2-bit MoE is ~29 GiB of
   expert codes this model owns none of. **An unsourced head raises**: vLLM's own strict weight-tracking check waives
   any parameter whose quant method defines `process_weights_after_loading`, which `ParallelLMHead`'s does, so nothing

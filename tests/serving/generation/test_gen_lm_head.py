@@ -156,24 +156,44 @@ def test_coded_head_shape_mismatch_raises(tmp_path):
         _load(model)
 
 
-@pytest.mark.parametrize("vocab", [1088, 1100, 1152])
-def test_nvfp4_head_decodes_scales_and_multiple_blocks(tmp_path, vocab):
+def _write_nvfp4_head(dirpath, rows):
+    """A checkpoint whose head is NVFP4: packed 0x21 holds 0.5 and 1.0, block scales 0.5 / 1.0, global scale 2."""
     from safetensors.torch import save_file
 
-    packed = torch.full((1100, 16), 0x21, dtype=torch.uint8)
-    scales = torch.full((1100, 2), 0.5).to(torch.float8_e4m3fn)
+    scales = torch.full((rows, 2), 0.5).to(torch.float8_e4m3fn)
     scales[:, 1] = 1.0
     save_file(
-        {"lm_head.weight": packed, "lm_head.weight_scale": scales, "lm_head.weight_scale_2": torch.tensor(2.0)},
-        str(tmp_path / "model.safetensors"),
+        {
+            "lm_head.weight": torch.full((rows, 16), 0x21, dtype=torch.uint8),
+            "lm_head.weight_scale": scales,
+            "lm_head.weight_scale_2": torch.tensor(2.0),
+        },
+        str(dirpath / "model.safetensors"),
     )
-    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}))
+    (dirpath / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}))
+    return torch.tensor([0.5, 1.0] * 8 + [1.0, 2.0] * 8).repeat(rows, 1)
+
+
+@pytest.mark.parametrize("vocab", [1100, 1152])
+def test_nvfp4_head_decodes_scales_and_multiple_blocks(tmp_path, vocab):
+    """1100 rows span two decode blocks; a parameter padded past the stored vocab keeps its padding zero."""
+    expected = _write_nvfp4_head(tmp_path, rows=1100)
     model, _ = _model(model_id=str(tmp_path), vocab=vocab, hidden=32)
-    assert _load(model) == {"lm_head.weight"}
-    # Packed 0x21 holds 0.5 and 1.0; block scales 0.5 / 1.0, global scale 2.
-    expected = torch.tensor([0.5, 1.0] * 8 + [1.0, 2.0] * 8).repeat(min(vocab, 1100), 1)
+
+    def _explode():
+        raise AssertionError("the stream's lm_head.weight holds packed codes; the NVFP4 path must not walk it")
+
+    assert _load(model, (_explode() for _ in range(1))) == {"lm_head.weight"}
     assert torch.equal(model.lm_head.weight[:1100], expected)
     assert torch.count_nonzero(model.lm_head.weight[1100:]) == 0
+
+
+def test_nvfp4_head_with_more_rows_than_the_parameter_raises(tmp_path):
+    """An NVFP4 head stores exactly the vocab, unlike EXL3's rows rounded up to 128: extra rows are a mismatch."""
+    _write_nvfp4_head(tmp_path, rows=1100)
+    model, _ = _model(model_id=str(tmp_path), vocab=1088, hidden=32)
+    with pytest.raises(ValueError, match="stores 1100 rows"):
+        _load(model)
 
 
 def test_nvfp4_head_missing_block_scale_raises(tmp_path):
