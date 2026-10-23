@@ -220,13 +220,14 @@ def _twin(n: int) -> Graph:
 
 
 def _measure(db, graph, layout, ctx, pipeline):
-    """Record one perf row for the kernel ``graph`` forms under ``layout``."""
+    """Record one perf row for the kernel ``graph`` forms under ``layout``, kept whole and unsplit: pinned, so the
+    measured kernel is the one the layout arms leave, whatever a prior would pick at those forks."""
     from emmy.compiler.pipeline.search.bench_record import kernel_row
     from emmy.compiler.pipeline.search.db import PerfStats
     from emmy.compiler.pipeline.search.golden import evidence_scope
     from emmy.compiler.pipeline.search.pins import pinned_knobs
 
-    with evidence_scope([]), pinned_knobs({"PLACE": "fuse", "LAYOUT@w": layout}):
+    with evidence_scope([]), pinned_knobs({"PLACE": "fuse", "REDUCE": "", "LAYOUT@w": layout}):
         formed = pipeline.run(graph.copy(), ctx=ctx)
     node = next(node for node in formed.nodes.values() if isinstance(node.op, TileOp))
     kernel = kernel_row(node.op.with_io(formed, node), node.op.name)

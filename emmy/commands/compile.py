@@ -229,8 +229,8 @@ def resolve_golden_arg(args) -> None:
         args._golden_document, args._golden_scope = document, [document]
         return
     if (kernel_name := getattr(args, "kernel", None)) is not None:
-        # One kernel as the whole program: its stored body or its exact tile reconstructed from recorded cuts,
-        # so a schedule pin reaches it alone.
+        # One kernel as the whole program: its stored body, or its exact tile as its recorded decisions minted it,
+        # so its own cut, layout and split forks stay open beside its schedule.
         if not golden_file or args.code or args.input:
             logger.error("--kernel NAME selects a kernel inside --golden PATH and excludes --code / positional input")
             sys.exit(2)

@@ -3,8 +3,8 @@
 vLLM owns exactly one weight of this model, and its own strict "was everything loaded?" check
 waives any parameter whose quant method defines ``process_weights_after_loading`` — which
 ``ParallelLMHead``'s does. So an unsourced head is invisible to vLLM and the server would answer
-with noise while looking healthy. These tests pin the three sources (plain ``lm_head.weight``, the
-tied ``*embed_tokens.weight`` alias, an EXL3-coded head decoded from the checkpoint) and the loud
+with noise while looking healthy. These tests pin the plain ``lm_head.weight``, tied embedding
+alias, EXL3 head and NVFP4 head, and the loud
 failure when none of them applies, driving ``load_weights`` unbound against a light double —
 constructing the real model needs vLLM's engine config plus CUDA.
 """
@@ -153,6 +153,59 @@ def test_coded_head_shape_mismatch_raises(tmp_path):
     _write_coded_head(tmp_path, kt=8, nt=16, k_bits=2)  # in_features 128
     model, _ = _model(model_id=str(tmp_path), vocab=256, hidden=64)
     with pytest.raises(ValueError, match="in_features 128"):
+        _load(model)
+
+
+def _write_nvfp4_head(dirpath, rows):
+    """A checkpoint whose head is NVFP4: packed 0x21 holds 0.5 and 1.0, block scales 0.5 / 1.0, global scale 2."""
+    from safetensors.torch import save_file
+
+    scales = torch.full((rows, 2), 0.5).to(torch.float8_e4m3fn)
+    scales[:, 1] = 1.0
+    save_file(
+        {
+            "lm_head.weight": torch.full((rows, 16), 0x21, dtype=torch.uint8),
+            "lm_head.weight_scale": scales,
+            "lm_head.weight_scale_2": torch.tensor(2.0),
+        },
+        str(dirpath / "model.safetensors"),
+    )
+    (dirpath / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}))
+    return torch.tensor([0.5, 1.0] * 8 + [1.0, 2.0] * 8).repeat(rows, 1)
+
+
+@pytest.mark.parametrize("vocab", [1100, 1152])
+def test_nvfp4_head_decodes_scales_and_multiple_blocks(tmp_path, vocab):
+    """1100 rows span two decode blocks; a parameter padded past the stored vocab keeps its padding zero."""
+    expected = _write_nvfp4_head(tmp_path, rows=1100)
+    model, _ = _model(model_id=str(tmp_path), vocab=vocab, hidden=32)
+
+    def _explode():
+        raise AssertionError("the stream's lm_head.weight holds packed codes; the NVFP4 path must not walk it")
+
+    assert _load(model, (_explode() for _ in range(1))) == {"lm_head.weight"}
+    assert torch.equal(model.lm_head.weight[:1100], expected)
+    assert torch.count_nonzero(model.lm_head.weight[1100:]) == 0
+
+
+def test_nvfp4_head_with_more_rows_than_the_parameter_raises(tmp_path):
+    """An NVFP4 head stores exactly the vocab, unlike EXL3's rows rounded up to 128: extra rows are a mismatch."""
+    _write_nvfp4_head(tmp_path, rows=1100)
+    model, _ = _model(model_id=str(tmp_path), vocab=1088, hidden=32)
+    with pytest.raises(ValueError, match="stores 1100 rows"):
+        _load(model)
+
+
+def test_nvfp4_head_missing_block_scale_raises(tmp_path):
+    from safetensors.torch import save_file
+
+    save_file(
+        {"lm_head.weight": torch.zeros((256, 16), dtype=torch.uint8), "lm_head.weight_scale_2": torch.tensor(1.0)},
+        str(tmp_path / "model.safetensors"),
+    )
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}))
+    model, _ = _model(model_id=str(tmp_path), hidden=32)
+    with pytest.raises(ValueError, match="missing its packed weight or block scale"):
         _load(model)
 
 
