@@ -364,11 +364,11 @@ class Body(tuple[Stmt, ...], Wire):
                 if stmt in seen:
                     continue
                 seen.add(stmt)
-                if redeclared := _seeded_accumulators(stmt) & folded:
-                    kept = _seeded_accumulators(stmt) - redeclared
-                    if not kept:
+                accumulators = _seeded_accumulators(stmt)
+                if accumulators & folded:
+                    if accumulators <= folded:
                         continue
-                    stmt = replace(stmt, body=Body(stmt.body.backward_cone(kept).members))
+                    stmt = replace(stmt, body=Body(stmt.body.backward_cone(accumulators - folded).members))
             prior = out[-1] if out else None
             if (
                 isinstance(stmt, (Loop, StridedLoop))
