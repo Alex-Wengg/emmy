@@ -71,7 +71,10 @@ CTX_PREFIX = "H_"
 # coordinate, changing schedule eligibility without changing the stored computation or exact identity.
 # Version 11 is the Affine normal form: every sum, difference, negation and product with a literal in a stored body
 # is one ``Affine`` statement, counted here as its binary spelling. Earlier datasets and weights must be rebuilt.
-FEATURIZER_VERSION = 11
+# Version 12 lets a 1-byte scalar A pair with a 16-bit B through the converting shared-memory fill. Stored kernels
+# that read such an A (an FP8 weight against an f16 activation) can thereby gain a tensor-core schedule and change
+# S_warp_eligible without changing their exact kernel identity.
+FEATURIZER_VERSION = 12
 
 # The features that name a candidate's regime rather than describe it — the ``S_ext_n_symbolic_axis`` stamp a
 # masked-tile (symbolic-axis) kernel carries. The stamp VOCABULARY belongs here with the rest of the feature
