@@ -220,8 +220,11 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   into the program's input buffers: some GDN kernels read the old state after another one wrote the new state, so the
   program cannot read the block in place. The new state goes straight into the block: the state outputs compile as
   one-page paged buffers, and every width of a layer shares one page table, bound once at build and filled on the
-  device before each call with the block's addresses. The runner keeps no state between calls. `layer_meta(L)`
-  returns `None` for a GDN layer, and every `pre`/`post` tier holds `None`.
+  device before each call with the block's addresses. The tables of all layers are rows of one tensor, so a step that
+  runs one request alone fills every layer's table with one launch (`point_gdn_layers`). In such a step, a layer whose
+  token count is one program width returns that program's own output rows (views under capture, clones when eager)
+  instead of copying them into a step-wide tensor. The runner keeps no state between calls. `layer_meta(L)` returns
+  `None` for a GDN layer, and every `pre`/`post` tier holds `None`.
   Attention dims are **per layer** (`layer_meta(L)` → head_dim / num_heads / num_kv / scaling) — Gemma-4's global layers
   use a larger `global_head_dim` than its sliding ones, so each layer's `pre`/`post` compiles at its own width. The
   caller stitches between `pre` and `post` (a reference torch SDPA in the Phase-2 host stitch; vLLM paged `Attention`
@@ -275,7 +278,13 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   cannot alias two programs' buffers) — so the prefix upload self-copy-skips on pointer equality, dropping the
   attention→post seam copy
   from captured decode graphs and eager chunk steps alike.
-  **Post→pre chaining covers EVERY program family** (decode twins, M=1, symbolic, prefill-chunk — the vLLM
+  **The decode twins and the GDN width-1 programs alternate two hidden buffers**: layer j reads its input rows
+  from buffer j % 2 and writes its output into the other, so each layer's input is the previous layer's output
+  memory and the uploads between layers self-copy-skip under an outer capture. A post twin's residual input is its
+  pre twin's input buffer, which the post does not write, so the residual needs no protective copy; its gate input
+  is its pre twin's gate output. The two buffers belong to these programs only: a mixed step's GDN calls must not
+  write into the arena backing the other tiers' pre twins share.
+  **Post→pre chaining covers the other program families** (M=1, symbolic, prefill-chunk — the vLLM
   integration plan's Milestone A2): each family's post OUTPUT array is rewired at build onto its pre twins'
   shared hidden-INPUT backing, so the between-layer upload self-copy-skips on pointer equality. The skip pays
   where the caller holds a VIEW of the post output — under an outer capture (the no-clone branch) — so the seam
@@ -584,12 +593,18 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   generate and stock vLLM honor the list, and a degenerate text prompt can genuinely rank one top-1, which would
   decode to empty output). The trunk compute (embed + per-layer
   pre/post + final norm) is the `EmmyGenRunner`; the last vLLM stage owns the output-head boundary, and `load_weights`
-  sources it from one of
-  three places: `lm_head.weight` in the stream, the tied embed alias, or — on an **EXL3 checkpoint, which has no
-  `lm_head.weight` at all** — the coded `lm_head.{trellis,suh,svh}` read straight from the checkpoint. An eligible
+  sources it from `lm_head.weight` in the stream, the tied embed alias, or the checkpoint's coded head.
+  EXL3 checkpoints have no `lm_head.weight`; their coded `lm_head.{trellis,suh,svh}` tensors load directly. An eligible
   untied single-TP coded head remains compressed and runs the same factorized compiler algebra with fp32 logits;
   `LogitsProcessor(logits_as_input=True)` then applies scale/softcap. Unsupported coded heads decode in out-feature
   blocks (`decode_exl3_blocks`; the whole-tensor fold runs in float64, ~5 GiB for a vocab-sized head).
+  An NVFP4 head's `lm_head.weight` holds packed codes, so `load_weights` reads it, its raw e4m3 block scales and
+  its global scale directly from the checkpoint (at load time, not construction: only the decoded parameter is
+  kept) and decodes them in output-row blocks through the loader's existing NVFP4 math. It stores exactly the
+  vocab, so a row past the head parameter raises, where EXL3's rows past it are padding. Its device parameter stays
+  in the model dtype: Qwen3.8-27B's BF16 head occupies 2.37 GiB even when its checkpoint stores 0.67 GiB of NVFP4
+  codes and scales. Both decoded forms require single-TP output heads and release their coded host sources after
+  loading.
   Reading the checkpoint directly also skips a second full pass over the shards, which on a 2-bit MoE is ~29 GiB of
   expert codes this model owns none of. **An unsourced head raises**: vLLM's own strict weight-tracking check waives
   any parameter whose quant method defines `process_weights_after_loading`, which `ParallelLMHead`'s does, so nothing
@@ -1022,8 +1037,8 @@ list does not get the flooring treatment described above, so it can violate the 
 - `tests/serving/generation/test_gen_mtp_shim.py` — the spec-decode `.model.embed_tokens` shim (no GPU): pins the attribute
   contract vLLM's MTP drafter shares off the target, that it gathers from the table the runner gathers from, and that a
   scaled embedding must be the raw tied head. Imports vllm at module level, so it runs where vllm is installed (skips otherwise).
-- `tests/serving/generation/test_gen_lm_head.py` — where the one vLLM-owned weight comes from (no GPU): the three sources
-  (`lm_head.weight`, the tied embed alias, an EXL3-coded head decoded off a synthetic checkpoint) and the loud failure
+- `tests/serving/generation/test_gen_lm_head.py` — where the one vLLM-owned weight comes from (no GPU): the plain
+  weight, tied embed alias, EXL3 head and NVFP4 head, and the loud failure
   when none applies. Also pins that the coded path does NOT walk vLLM's weight stream.
 - `tests/serving/generation/test_gen_runner_gdn_gpu.py` — GDN layers through the runner, needs CUDA: prompt lengths
   on both sides of the static widths against the eager model, prefill followed by single-token steps, a request run

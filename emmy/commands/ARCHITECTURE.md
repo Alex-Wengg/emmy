@@ -407,14 +407,15 @@ counts as a failure, never as a time. A program with several scheduled kernels i
 them all. `--kernel NAME` (with `--golden PATH`) selects a file-local kernel reference (`Kernel.ref`, which
 can distinguish kernels sharing one C name) and runs that kernel alone. A formed kernel uses its stored body
 (`GoldenFile.executable`). A derived cut piece replays its recorded parent decisions through the shared golden
-restamp replay, then takes a single-node slice of the exact live TileOp. Missing or stale routes and missing or
-ambiguous exact identities are refused; relifting a derived body could tune a different kernel. The isolated rows
-file under the identity the layer's compile reads. Adding `--realization NAME` selects an exact row owned by that
-kernel and pins its sizes, input regime and schedule. Explicit regime or schedule pins may disambiguate repeated
-names; unresolved ambiguity is refused. `--record-greedy` then refreshes that proposal through the same guarded
-writer, preserving its name and equivalent stored precision pins. It records only the kernel measurement, never a
-whole-target latency; `--record` is refused for an isolated kernel. Unless evidence recording is off
-(`--no-record-evidence`, a non-deployable regime, a bench below the tune bench standard), its `--bench` re-benches
+restamp replay, then takes a single-node slice of the exact piece as those decisions minted it: its own cut, layout
+and split forks stay open, and what it inherited, such as a split piece's partitioned axis, stays. Missing or stale
+routes and missing or ambiguous exact identities are refused; relifting a derived body could tune a different kernel.
+The isolated rows file under the identity the layer's compile reads. Adding `--realization NAME` selects an exact
+row owned by that kernel and pins its sizes, input regime and schedule. Explicit regime or schedule pins may
+disambiguate repeated names; unresolved ambiguity is refused. `--record-greedy` then refreshes that proposal through
+the same guarded writer, preserving its name and equivalent stored precision pins. It records only the kernel
+measurement, never a whole-target latency; `--record` is refused for an isolated kernel. Unless evidence recording
+is off (`--no-record-evidence`, a non-deployable regime, a bench below the tune bench standard), its `--bench` re-benches
 the greedy pick in isolation, even with no pinned row beside it, and stores the kernel-set decisions the compile took
 into the tune DB, as a realization's bench does: a cut or split of the kernel itself, pinned with `EMMY_KNOBS`, becomes a
 routing row whose parent is that kernel, and a strict compile of its layer prices the kernel through it. A kernel can
