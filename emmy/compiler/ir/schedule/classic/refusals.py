@@ -328,6 +328,10 @@ def _atom_refusal(
 ) -> str | None:
     """Return why one otherwise available atom cannot bind this node."""
     converting = a_is_load and a_dtype is not None and a_dtype.logical_elems == 1 and a_dtype != atom.operand_dtype("a")
+    if converting and a_dtype.nbytes == 1 and (atom.is_wgmma or atom.fragment_layout == "m8n8k4"):
+        # The fill stages a 1-byte A verbatim and only the mma.sync fragment loads convert it: a wgmma
+        # descriptor would read the bytes as 16-bit values, and Volta's paired layouts hold 16-bit slabs.
+        return f"warp TILE: a 1-byte A stays a byte slab until its fragment loads convert it, which {atom.name} does not load"
     if a_is_load and not converting and (a_step is None or a_step[0] != 1 or (a_step[1] and a_step[1] % atom.atom_k)):
         motion = "unknown" if a_step is None else f"{a_step[0]} elements per column"
         return (

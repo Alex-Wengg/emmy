@@ -686,8 +686,10 @@ def converting_a(node: Fold, atom, inputs) -> bool:
     the CONVERTING smem compute fill's case (an erased ``.float()`` cast ahead of an f16
     projection): the synchronous fill evaluates the load per slab cell and the typed slab store
     performs the conversion. A byte transport moves raw bits and cannot, so such an edge takes the
-    fill or nothing. Byte loads widen through the same fill. ``False`` for computed edges (the
-    fill's native case), matching dtypes, and packed codes."""
+    fill or nothing. A byte load rides the same fill but stays a byte slab: the lowering keeps a 1-byte
+    operand's stored dtype and the ``mma.sync`` fragment loads convert it, which is why ``wgmma`` and the
+    Volta atom refuse such an A. ``False`` for computed edges (the fill's native case), matching dtypes,
+    and packed codes."""
     if node.operands[0].as_slab() is None or not inputs:
         return False
     if atom.operand_dtype("a").nbytes < 2:

@@ -154,9 +154,11 @@ compatibility all live in `ir/schedule`. The sites are the only source of choice
 nor filters them. `ir/schedule` may import other IR modules but never the pipeline layer. The pipeline retains only
 knob/pin reads (folded into the row), pool identity, sampling, and the generic lazy-Fork adapter.
 
-An FP8 A operand paired with a 16-bit B can use the existing converting shared-memory fill. Each byte is decoded
-into the atom's 16-bit slab before fragment loads; the weights remain stored as bytes in global memory. Matching
-FP8 operands retain their byte-atom choices. The conversion adds legal schedules, with evidence choosing among them.
+A 1-byte scalar A (either FP8 format, `u8`, `bool`) paired with a 16-bit B rides the shared-memory compute fill. The
+fill stages its bytes as they are stored, and the `mma.sync` fragment loads convert each one to the atom's 16-bit type,
+as they already do for a 1-byte B. A `wgmma` descriptor and Volta's paired layouts would read that slab as 16-bit
+values, so those atoms refuse such an A. Two 1-byte operands of one dtype keep their byte-atom choices. The new
+schedules sit beside the scalar ones, and evidence chooses among them.
 
 Fragment epilogue legality checks lowered work outside roots the binder can compute together, including boundary stores.
 A grid's free axes are already bound during that check, including a unit row that only an output store reads.
