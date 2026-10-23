@@ -170,6 +170,16 @@ Serving reads the cache regime back from the rows (`program_cold_cache` in
 - **Checkpoint keys.** Text-only Qwen3.5 keys `model.layers.N.*` can leave NVFP4 weights unspelled where serving
   expects `model.language_model.layers.N.*`; serving twins then lower differently.
 - **Packs.** No pack containing GDN programs has been saved and loaded. The old pack-hit detection bug is fixed.
+- **Serving test golden regen.** `python -m tests.serving.regen` does not cover the float16 hybrid of
+  `test_vllm_plugin_gdn_gpu.py`. #1243 recorded its three GDN programs (widths 1, 4, 16) in `serving_sm120` outside
+  the regen, with `PLACE` pins; a full regen drops those rows and the prior alone picks the slow kernels again. Add
+  the hybrid to `RUNNERS`, with its pins, or teach the regen to keep rows it does not recapture.
+- **Dead scratch at width 4.** One pin combination on the width-4 program made the cut pass create a piece whose
+  output nothing reads, and the runtime refused that buffer ("dead scratch"). #1243 dropped that pin instead of
+  fixing the cut pass.
+- **Prior skips the small GDN programs' cuts.** Since the placement prior's refit in #1217 it no longer offers the
+  cuts the tiny hybrid's GDN programs need: unpinned, each width keeps one kernel that runs as a single thread block
+  and recomputes the chunk's triangular solve per output element.
 
 ## NVFP4 compiler and harness gaps
 
