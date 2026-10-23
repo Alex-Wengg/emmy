@@ -156,6 +156,39 @@ def test_coded_head_shape_mismatch_raises(tmp_path):
         _load(model)
 
 
+@pytest.mark.parametrize("vocab", [1088, 1100, 1152])
+def test_nvfp4_head_decodes_scales_and_multiple_blocks(tmp_path, vocab):
+    from safetensors.torch import save_file
+
+    packed = torch.full((1100, 16), 0x21, dtype=torch.uint8)
+    scales = torch.full((1100, 2), 0.5).to(torch.float8_e4m3fn)
+    scales[:, 1] = 1.0
+    save_file(
+        {"lm_head.weight": packed, "lm_head.weight_scale": scales, "lm_head.weight_scale_2": torch.tensor(2.0)},
+        str(tmp_path / "model.safetensors"),
+    )
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}))
+    model, _ = _model(model_id=str(tmp_path), vocab=vocab, hidden=32)
+    assert _load(model) == {"lm_head.weight"}
+    # Packed 0x21 holds 0.5 and 1.0; block scales 0.5 / 1.0, global scale 2.
+    expected = torch.tensor([0.5, 1.0] * 8 + [1.0, 2.0] * 8).repeat(min(vocab, 1100), 1)
+    assert torch.equal(model.lm_head.weight[:1100], expected)
+    assert torch.count_nonzero(model.lm_head.weight[1100:]) == 0
+
+
+def test_nvfp4_head_missing_block_scale_raises(tmp_path):
+    from safetensors.torch import save_file
+
+    save_file(
+        {"lm_head.weight": torch.zeros((256, 16), dtype=torch.uint8), "lm_head.weight_scale_2": torch.tensor(1.0)},
+        str(tmp_path / "model.safetensors"),
+    )
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}))
+    model, _ = _model(model_id=str(tmp_path), hidden=32)
+    with pytest.raises(ValueError, match="missing its packed weight or block scale"):
+        _load(model)
+
+
 def test_plain_checkpoint_is_not_probed_as_coded(tmp_path):
     """An unquantized checkpoint keeps the ordinary stream path — no checkpoint re-open."""
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "test"}))

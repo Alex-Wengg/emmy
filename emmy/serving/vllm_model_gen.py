@@ -227,7 +227,7 @@ _CODED_HEAD_LEAVES = ("trellis", "suh", "svh", "mcg", "mul1")
 
 
 def _coded_lm_head_source(model_id: str) -> dict | None:
-    """The EXL3 head's sibling tensors as numpy, or ``None`` when this checkpoint has a plain
+    """The EXL3 or NVFP4 head's sibling tensors as numpy, or ``None`` when this checkpoint has a plain
     ``lm_head.weight`` for the ordinary weight stream to load.
 
     An EXL3 checkpoint quantizes the output head like any other linear (GLM-4.5-Air:
@@ -240,14 +240,20 @@ def _coded_lm_head_source(model_id: str) -> dict | None:
     qdir = quantized_checkpoint_dir(model_id)
     if qdir is None:
         return None
-    from emmy.compiler.loader.safetensors import load_sources_by_path
+    from emmy.compiler.loader.safetensors import _build_index, load_sources_by_path
 
+    index = _build_index(qdir)
+    if "lm_head.weight_scale_2" in index:
+        paths = [f"lm_head.{leaf}" for leaf in ("weight", "weight_scale", "weight_scale_2")]
+        if not set(paths) <= index.keys():
+            raise ValueError("NVFP4 lm_head is missing its packed weight or block scale")
+        return load_sources_by_path(str(qdir), paths, bits_paths={"lm_head.weight_scale"})
     src = load_sources_by_path(str(qdir), [f"lm_head.{leaf}" for leaf in _CODED_HEAD_LEAVES])
     return src if "lm_head.trellis" in src else None
 
 
 def _decode_lm_head_into(head: nn.Module, src: dict) -> None:
-    """Decode the EXL3 head into vLLM's ``lm_head.weight`` (``[vocab, hidden]``), block by block.
+    """Decode the EXL3 or NVFP4 head into vLLM's ``lm_head.weight``, block by block.
 
     The loader's orientation is ``(in, out)``, so each block transposes on the way in. Blocked
     because the Hadamard fold runs in float64: decoded whole, a vocab-sized head costs ~5 GiB of
@@ -255,22 +261,33 @@ def _decode_lm_head_into(head: nn.Module, src: dict) -> None:
     out extent to 128, vLLM's ``ParallelLMHead`` to 64) stay zero — the logits processor slices
     the logical vocab off the front either way."""
     from emmy.compiler.loader.exl3 import decode_exl3_blocks
+    from emmy.compiler.loader.quant import dequantize_nvfp4
 
     if getattr(head, "tp_size", 1) != 1:
         raise NotImplementedError("EmmyGenModel: a coded lm_head writes whole rows, so it is single-GPU only")
     param = head.weight
-    trellis, suh, svh = src["lm_head.trellis"], src["lm_head.suh"], src["lm_head.svh"]
-    hidden = trellis.shape[0] * 16
+    if "lm_head.trellis" in src:
+        trellis, suh, svh = src["lm_head.trellis"], src["lm_head.suh"], src["lm_head.svh"]
+        hidden = trellis.shape[0] * 16
+        blocks = ((lo, hi, block.T) for lo, hi, block in decode_exl3_blocks(
+            trellis, suh, svh, mcg=src.get("lm_head.mcg"), mul1=src.get("lm_head.mul1")
+        ))
+    else:
+        packed, scales, scale_2 = (src[f"lm_head.{leaf}"] for leaf in ("weight", "weight_scale", "weight_scale_2"))
+        hidden = packed.shape[1] * 2
+        blocks = (
+            (lo, lo + 1024, dequantize_nvfp4(packed[lo : lo + 1024], scales[lo : lo + 1024], scale_2))
+            for lo in range(0, packed.shape[0], 1024)
+        )
     if param.shape[1] != hidden:
         raise ValueError(f"coded lm_head has in_features {hidden}, but vLLM's head parameter is {tuple(param.shape)}")
     param.data.zero_()
-    blocks = decode_exl3_blocks(trellis, suh, svh, mcg=src.get("lm_head.mcg"), mul1=src.get("lm_head.mul1"))
     for lo, hi, block in blocks:
-        hi = min(hi, param.shape[0])
+        hi = min(hi, lo + block.shape[0], param.shape[0])
         if lo >= hi:
             break
-        param.data[lo:hi].copy_(torch.from_numpy(np.ascontiguousarray(block[:, : hi - lo].T)))
-    logger.info("[EmmyGenModel] decoded the EXL3 lm_head (%d x %d) from the checkpoint", param.shape[0], param.shape[1])
+        param.data[lo:hi].copy_(torch.from_numpy(np.ascontiguousarray(block[: hi - lo])))
+    logger.info("[EmmyGenModel] decoded the lm_head (%d x %d) from the checkpoint", param.shape[0], param.shape[1])
 
 
 def _fork_attention_key(name):
@@ -657,7 +674,7 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
         self._is_last_rank = self.end_layer == config.num_hidden_layers
         self._coded_head_source = _coded_lm_head_source(self._model_id) if self._is_last_rank else None
         self._coded_head_spec = None
-        if self._coded_head_source is not None:
+        if self._coded_head_source is not None and "lm_head.trellis" in self._coded_head_source:
             from emmy.serving.exl3_head import Exl3HeadSpec
 
             self._coded_head_spec = Exl3HeadSpec.from_source(
