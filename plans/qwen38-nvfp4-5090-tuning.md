@@ -72,6 +72,17 @@ in the fast-math lane), then end-to-end decode faster than stock vLLM.
   (`w1x8`, bf16 `f1x1/k8`, `d4/smem-tma`), pre16 `...a7efbb.m16.fm.83c0b7f74b51` (FP4 tile, `w1x4`, `d4/smem-tma`),
   gdn16 `0e5142` `...8105a48e7b21` (`d3/smem-tma`).
 
+- Serving test golden regen: `python -m tests.serving.regen` does not cover the float16 hybrid of
+  `test_vllm_plugin_gdn_gpu.py`. #1243 recorded its three GDN programs (widths 1, 4, 16) in `serving_sm120` outside
+  the regen, with `PLACE` pins; a full regen drops those rows and the prior alone picks the slow kernels again. Add
+  the hybrid to `RUNNERS`, with its pins, or teach the regen to keep rows it does not recapture.
+- Dead scratch at width 4: one pin combination on the tiny hybrid's width-4 GDN program made the cut pass create a
+  piece whose output nothing reads, and the runtime refused that buffer ("dead scratch"). #1243 dropped that pin
+  instead of fixing the cut pass.
+- The prior skips the small GDN programs' cuts: since the placement prior's refit in #1217 it no longer offers the
+  cuts the tiny hybrid's GDN programs need. Unpinned, each width keeps one kernel that runs as a single thread block
+  and recomputes the chunk's triangular solve per output element.
+
 ## Decisions
 
 - Trace reference: transformers 5.14.1. `pyproject.toml` pins 5.19 for the compile extras, the serving venv
