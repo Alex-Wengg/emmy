@@ -312,6 +312,27 @@ def test_isolated_derived_piece_can_take_its_own_cut(tmp_path):
     assert "cut" in arm.values() and len(pieces) > 1
 
 
+def test_isolated_split_piece_keeps_its_partition_receipt(tmp_path):
+    """Isolation starts at the piece's birth, but what its parent's split gave it stays: each piece's sliced axis
+    remains a partition, so the isolated piece is not offered the same split again."""
+    from emmy.commands.compile import resolve_golden_arg
+    from emmy.compiler.ir.tile import TileOp
+    from tests.compiler.realization import helpers as corpus
+
+    document = corpus.load_case(corpus.CASES_DIR / "attention/sdpa-gqa-decode-split-kv.json").document
+    pieces = [kernel for kernel in document.kernels if not kernel.formed]
+    assert len(pieces) == 2  # the partial and the finalize
+    path = tmp_path / "working.json"
+    document.dump(path)
+    for kernel in pieces:
+        args = _args(path, realization=None, kernel=kernel.ref)
+        resolve_golden_arg(args)
+        graph = args._golden_graph
+        [node] = [node for node in graph.nodes.values() if isinstance(node.op, TileOp)]
+        assert node.op.with_io(graph, node).identity_key(structural=False, with_io=True) == kernel.exact_identity
+        assert any(axis.window is not None and axis.window.partition for axis in node.op.axes), kernel.ref
+
+
 @pytest.mark.parametrize("selection", ["valid", "wrong_kernel", "substring", "bindings", "regime"])
 def test_kernel_row_selector_requires_one_exact_owned_row(tmp_path, monkeypatch, selection):
     from emmy.commands.compile import golden_regime, resolve_golden_arg, selected_decisions
