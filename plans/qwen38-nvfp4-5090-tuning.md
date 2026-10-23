@@ -70,8 +70,12 @@ in the fast-math lane), then end-to-end decode faster than stock vLLM.
   contractions and `STAGE=d2/smem-tma` on one, yet the CUDA runs those folds as serial per-cell loops with no shared
   memory. The binder accepts the stamps silently. Likely fix: offer a nested tile only where the binder realizes it,
   refuse the rest at the offer.
-- Restamp does not re-spell a joined key (`PLACE@<a>+<b>`): `golden/restamp._respelled` treats a key as one site path.
-  A change that moves either half likely drops the gdn1 route (not tested).
+- Restamp does not re-spell a joined key (`PLACE@<a>+<b>`): `golden/restamp._respelled` treats a key as one site path
+  and tries only the four nearest candidate keys. Observed on the corpus case `fused/gdn-conv-join-in-place-name.json`
+  when #1243's coalescer reordered the parent's regions: both halves moved two path segments, four other keys ranked
+  ahead, and the restamp dropped the route (the realization test reports the decision as not taken). The fork still
+  offered the arm under the moved spelling, and the case was re-keyed by hand. The gdn1 route of this golden stayed
+  in place because the coalescer moves no site on its parent.
 - 10 serving GPU tests (`test_gen_pack_gpu`, `test_gen_runner_gpu`, `test_attention_split_gpu`) stop with
   `EvidenceError: strict evidence: kernel 'k_linear_mean_reduce_af84cd' (node 'view_3') has no measured evidence for
   its 030_cut fork`. One of them, re-run on main fd9633b9, fails the same way; the cause is not investigated.
