@@ -1,8 +1,8 @@
 # Qwen3.8-Flash-Next at RadixArk's NVFP4 on four V100 SXM3 32 GB (sm_70 Volta).
 #
 # An onboarding shell that holds Emmy's compiler work for this checkpoint, ahead of serving qualification:
-# serving-v100.env pins the serving shape and names the programs the golden must cover. The golden joins it as
-# golden/v100_sm70.json once every one of those programs has rows recorded on the card. Nothing runs it on a schedule:
+# serving-v100.env pins the serving shape and names the programs the golden must cover, and golden/v100_sm70.json
+# holds the rows recorded on the card for every one of them. Nothing runs it on a schedule:
 # its lifecycle is locked, so discovery leaves it out, and it proposes no deployment, so scheduled onboarding has no
 # setup to pick. A release adds the deployment and makes it a runnable recipe.
 tags:

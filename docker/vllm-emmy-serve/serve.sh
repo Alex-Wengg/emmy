@@ -22,12 +22,17 @@
 #                        unpinned revision there. Pin by commit sha, never a branch name: a
 #                        branch can be re-cut under the same name, and the offline boot
 #                        resolves snapshots/<sha> directly.
-#   SERVE_QUANT          the checkpoint's quantization method when vLLM has none for it
-#                        (`exl3` today; see _is_exl3_model). vLLM refuses the boot at config
-#                        parsing ("Unknown quantization method: exl3") though nothing in the
-#                        engine needs the method: emmy owns every coded weight and the one
+#   SERVE_QUANT          the coded scheme emmy's loader owns end to end (`exl3`, `awq`, `gptq`,
+#                        `mxfp4` or `nvfp4`; see engine_config_overrides). vLLM would refuse the
+#                        boot at config parsing ("Unknown quantization method: exl3") or stand up a
+#                        quantizer of its own over weights emmy already reads, though nothing in
+#                        the engine needs the method: emmy owns every coded weight and the one
 #                        vLLM-owned parameter (lm_head) is handled at load. So the override
 #                        tells vLLM the model is unquantized, which for vLLM's purposes it is.
+#   SERVE_ARCHITECTURE   the plugin class the override routes to: `EmmyGenModel` when unset,
+#                        `EmmyGenHybridModel` for a checkpoint with Gated DeltaNet layers, which
+#                        declares their per-request state to vLLM (what `emmy serve` reads off
+#                        the checkpoint's `layer_types`).
 #   SERVE_CAPTURE_SIZES  the cudagraph capture ladder, as a JSON list. An MoE model must cap
 #                        it (see _is_moe_model): at [1] on whole experts, at the decode bucket
 #                        where each tensor-parallel rank holds a slice of every expert. Those
@@ -76,9 +81,10 @@ fi
 
 # The architectures override is what routes the model to the plugin; the quantization arm
 # rides beside it. One spelling, shared with emmy/commands/serve.py's json.dumps output.
-OVERRIDES='{"architectures": ["EmmyGenModel"]}'
-if [ "${SERVE_QUANT:-}" = "exl3" ]; then
-    OVERRIDES='{"architectures": ["EmmyGenModel"], "quantization_config": null}'
+ARCHITECTURE="${SERVE_ARCHITECTURE:-EmmyGenModel}"
+OVERRIDES='{"architectures": ["'"$ARCHITECTURE"'"]}'
+if [ -n "${SERVE_QUANT:-}" ]; then
+    OVERRIDES='{"architectures": ["'"$ARCHITECTURE"'"], "quantization_config": null}'
 fi
 
 SIZES="${SERVE_CAPTURE_SIZES:-[1, 2, 4, 8, 16, 32, 64, 128, 256]}"

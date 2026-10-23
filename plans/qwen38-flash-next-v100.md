@@ -412,6 +412,17 @@ takes more as later rounds need it.
      runs 35 ms per call on the V100, about eager's. The working golden still matches main's lowering; a recipe golden
      must have a schedule on every row, so it joins the recipe with item 9;
   9. a golden recorded on the V100 for every twin at every width, then a boot under strict evidence.
+     *Done, 2026-10-23:* `recipes/Qwen3.8-Flash-Next-NVFP4/golden/v100_sm70.json` holds rows for all 12 twins, and
+     the release audit deploys every one from the golden alone. The prior's cold picks were unusable (post8 1.95 s,
+     the experts 33 ms to 1.4 s); what fixed them: a cut between the expert's gate/up and down projections, post4096's
+     route on the small post twins, and tunes on the slow pieces. The real model boots strict on four cards through
+     the release entrypoint, given the hybrid class by hand; `SERVE_ARCHITECTURE` now renders it from the config.
+     On eight greedy prompts, five match the fork for all 64 tokens and one through its natural stop; two diverge at
+     near-ties. Decode is 47 ms per token against the fork's 12.7, and the first token after 2,005 prompt tokens takes
+     8.9 s against 0.6 s. Most of that gap is one thing step 5 starts from: serving gives each weight one layout per
+     twin family, settled by the narrowest twin, while every twin was recorded alone, so pre4096 takes 1.6 ms alone
+     and 34 ms under pre8's layouts, and post4096 likewise. The audit checks that every fork has evidence, not that
+     it is fast under the shared layouts.
 - **Precision.** Volta has no BF16, so Emmy runs FP16 and keeps FP32 where range or accumulation needs it: the
   router (DeepSeek's router bias rounded to FP16 flipped expert picks), the gated residual's partial sums, the Gated
   DeltaNet state (the checkpoint asks for FP32) and the residual stream. Each is checked, not assumed.

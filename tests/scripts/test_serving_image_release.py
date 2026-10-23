@@ -156,6 +156,7 @@ OPTIONAL_KEYS = {
     "SERVE_WARM_SHAPES",
     "SERVE_REVISION",
     "SERVE_QUANT",
+    "SERVE_ARCHITECTURE",
     "SERVE_CAPTURE_SIZES",
     "SERVE_EXTRA_ARGS",
     "SERVE_EMBED_HOST",
@@ -307,7 +308,7 @@ def test_serve_sh_renders_the_shipped_invocation_unchanged(tmp_path):
     cache-key input: a spelling that drifts by one character invalidates a released image."""
     for path in sorted(SERVE_DIR.glob("models/*.env")):
         values = config_values(path)
-        if values.keys() & {"SERVE_REVISION", "SERVE_QUANT", "SERVE_CAPTURE_SIZES", "SERVE_EXTRA_ARGS"}:
+        if values.keys() & {"SERVE_REVISION", "SERVE_QUANT", "SERVE_ARCHITECTURE", "SERVE_CAPTURE_SIZES", "SERVE_EXTRA_ARGS"}:
             continue  # a config that opts in is covered by the EXL3/MoE case below
         assert render_serve_sh(tmp_path, values) == [
             "-m",
@@ -360,6 +361,18 @@ def test_serve_sh_renders_the_quantized_moe_invocation(tmp_path):
     assert argv[argv.index("--hf-overrides") + 1] == json.dumps({"architectures": ["EmmyGenModel"], "quantization_config": None})
     assert '"cudagraph_capture_sizes": [1],' in argv[argv.index("--compilation-config") + 1]
     assert argv[-2:] == ["--kv-cache-dtype", "fp8_e4m3"], "SERVE_EXTRA_ARGS must word-split into flags"
+
+
+def test_serve_sh_routes_a_gated_deltanet_nvfp4_checkpoint_to_the_hybrid_class(tmp_path):
+    """Qwen3.8-Flash-Next's pinned V100 config: Gated DeltaNet layers need the class that declares their state, and the
+    NVFP4 experts emmy's loader owns are presented as unquantized — the two overrides `emmy serve` derives from the
+    checkpoint, in its own spelling. The plain class refuses the checkpoint at model construction."""
+    config = {
+        key: value.strip('"')
+        for key, value in config_values(PROJECT_ROOT / "recipes" / "Qwen3.8-Flash-Next-NVFP4" / "serving-v100.env").items()
+    }
+    argv = render_serve_sh(tmp_path, config)
+    assert argv[argv.index("--hf-overrides") + 1] == json.dumps({"architectures": ["EmmyGenHybridModel"], "quantization_config": None})
 
 
 def test_serve_sh_renders_the_deepseek_v4_parallel_invocation(tmp_path):
