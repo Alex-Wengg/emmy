@@ -255,10 +255,9 @@ def _coded_lm_head_source(model_id: str) -> dict | None:
 def _decode_lm_head_into(head: nn.Module, src: dict) -> None:
     """Decode the EXL3 or NVFP4 head into vLLM's ``lm_head.weight``, block by block.
 
-    The loader's orientation is ``(in, out)``, so each block transposes on the way in. Blocked
-    because the Hadamard fold runs in float64: decoded whole, a vocab-sized head costs ~5 GiB of
-    host memory at the moment the expert store is already resident. Padding rows (EXL3 rounds the
-    out extent to 128, vLLM's ``ParallelLMHead`` to 64) stay zero — the logits processor slices
+    EXL3's loader orientation is ``(in, out)``, so its blocks transpose on the way in. NVFP4 blocks
+    already hold output rows. Blocking bounds the decoded host memory while the trunk is resident.
+    Padding rows (EXL3 rounds the out extent to 128, vLLM's ``ParallelLMHead`` to 64) stay zero — the logits processor slices
     the logical vocab off the front either way."""
     from emmy.compiler.loader.exl3 import decode_exl3_blocks
     from emmy.compiler.loader.quant import dequantize_nvfp4
@@ -269,9 +268,10 @@ def _decode_lm_head_into(head: nn.Module, src: dict) -> None:
     if "lm_head.trellis" in src:
         trellis, suh, svh = src["lm_head.trellis"], src["lm_head.suh"], src["lm_head.svh"]
         hidden = trellis.shape[0] * 16
-        blocks = ((lo, hi, block.T) for lo, hi, block in decode_exl3_blocks(
-            trellis, suh, svh, mcg=src.get("lm_head.mcg"), mul1=src.get("lm_head.mul1")
-        ))
+        blocks = (
+            (lo, hi, block.T)
+            for lo, hi, block in decode_exl3_blocks(trellis, suh, svh, mcg=src.get("lm_head.mcg"), mul1=src.get("lm_head.mul1"))
+        )
     else:
         packed, scales, scale_2 = (src[f"lm_head.{leaf}"] for leaf in ("weight", "weight_scale", "weight_scale_2"))
         hidden = packed.shape[1] * 2
@@ -1220,6 +1220,7 @@ class EmmyGenModel(nn.Module, SupportsPP, SupportsMRoPE):
             loaded.add("lm_head.weight")
         elif coded is not None:
             _decode_lm_head_into(self.lm_head, coded)
+            self._coded_head_source = None
             loaded.add("lm_head.weight")
         fork_attn = getattr(self, "fork_attn", None)
         fork_ple = getattr(self, "fork_ple", nn.ModuleDict())

@@ -3,8 +3,8 @@
 vLLM owns exactly one weight of this model, and its own strict "was everything loaded?" check
 waives any parameter whose quant method defines ``process_weights_after_loading`` — which
 ``ParallelLMHead``'s does. So an unsourced head is invisible to vLLM and the server would answer
-with noise while looking healthy. These tests pin the three sources (plain ``lm_head.weight``, the
-tied ``*embed_tokens.weight`` alias, an EXL3-coded head decoded from the checkpoint) and the loud
+with noise while looking healthy. These tests pin the plain ``lm_head.weight``, tied embedding
+alias, EXL3 head and NVFP4 head, and the loud
 failure when none of them applies, driving ``load_weights`` unbound against a light double —
 constructing the real model needs vLLM's engine config plus CUDA.
 """

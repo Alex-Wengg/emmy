@@ -583,12 +583,15 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   generate and stock vLLM honor the list, and a degenerate text prompt can genuinely rank one top-1, which would
   decode to empty output). The trunk compute (embed + per-layer
   pre/post + final norm) is the `EmmyGenRunner`; the last vLLM stage owns the output-head boundary, and `load_weights`
-  sources it from one of
-  three places: `lm_head.weight` in the stream, the tied embed alias, or — on an **EXL3 checkpoint, which has no
-  `lm_head.weight` at all** — the coded `lm_head.{trellis,suh,svh}` read straight from the checkpoint. An eligible
+  sources it from `lm_head.weight` in the stream, the tied embed alias, or the checkpoint's coded head.
+  EXL3 checkpoints have no `lm_head.weight`; their coded `lm_head.{trellis,suh,svh}` tensors load directly. An eligible
   untied single-TP coded head remains compressed and runs the same factorized compiler algebra with fp32 logits;
   `LogitsProcessor(logits_as_input=True)` then applies scale/softcap. Unsupported coded heads decode in out-feature
   blocks (`decode_exl3_blocks`; the whole-tensor fold runs in float64, ~5 GiB for a vocab-sized head).
+  An NVFP4 head loads its packed weight, raw e4m3 block scales and global scale directly from the checkpoint,
+  then decodes in output-row blocks through the loader's existing NVFP4 math. Its device parameter stays in the
+  model dtype: Qwen3.8-27B's BF16 head occupies 2.37 GiB even when its checkpoint stores 0.67 GiB of NVFP4 codes
+  and scales. Both decoded forms require single-TP output heads and release their coded host sources after loading.
   Reading the checkpoint directly also skips a second full pass over the shards, which on a 2-bit MoE is ~29 GiB of
   expert codes this model owns none of. **An unsourced head raises**: vLLM's own strict weight-tracking check waives
   any parameter whose quant method defines `process_weights_after_loading`, which `ParallelLMHead`'s does, so nothing
@@ -1021,8 +1024,8 @@ list does not get the flooring treatment described above, so it can violate the 
 - `tests/serving/generation/test_gen_mtp_shim.py` — the spec-decode `.model.embed_tokens` shim (no GPU): pins the attribute
   contract vLLM's MTP drafter shares off the target, that it gathers from the table the runner gathers from, and that a
   scaled embedding must be the raw tied head. Imports vllm at module level, so it runs where vllm is installed (skips otherwise).
-- `tests/serving/generation/test_gen_lm_head.py` — where the one vLLM-owned weight comes from (no GPU): the three sources
-  (`lm_head.weight`, the tied embed alias, an EXL3-coded head decoded off a synthetic checkpoint) and the loud failure
+- `tests/serving/generation/test_gen_lm_head.py` — where the one vLLM-owned weight comes from (no GPU): the plain
+  weight, tied embed alias, EXL3 head and NVFP4 head, and the loud failure
   when none applies. Also pins that the coded path does NOT walk vLLM's weight stream.
 - `tests/serving/generation/test_gen_runner_gdn_gpu.py` — GDN layers through the runner, needs CUDA: prompt lengths
   on both sides of the static widths against the eager model, prefill followed by single-token steps, a request run
