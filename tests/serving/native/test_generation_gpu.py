@@ -127,7 +127,7 @@ def test_cached_qwen3_logits_and_generation(tmp_path, monkeypatch):
                             chunked.append(result["token"])
                     assert chunked == selected
                     output = tmp_path / "generated.bin"
-                    await worker.run_job(
+                    result = await worker.run_job(
                         {
                             "op": "generate",
                             "prompt": str(path),
@@ -138,6 +138,8 @@ def test_cached_qwen3_logits_and_generation(tmp_path, monkeypatch):
                         wall_timeout_s=30,
                     )
                     assert np.fromfile(output, np.int64).tolist() == selected[:-1]
+                    # One time per token, since the request started: never decreasing.
+                    assert len(result["token_ms"]) == len(selected) - 1 and result["token_ms"] == sorted(result["token_ms"])
                 # Same seed resets the random stream, including when a graph survives requests.
                 sampled = []
                 for capture, seed in ((False, 81), (True, 81), (True, 19), (True, 81)):
@@ -349,7 +351,6 @@ def test_fp8_checkpoint_exports_its_coded_trunk(tmp_path):
     executable = shutil.which("emmy-runtime-worker")
     if not executable:
         pytest.skip("build native worker and add it to PATH")
-    from emmy.compiler.backend.cuda._bench_worker import _reference_precision
     from emmy.compiler.backend.plan import plan_from_dict
     from emmy.serving.native.prepare import load_model
     from tests.serving.helpers import fp8_block_checkpoint
@@ -373,6 +374,46 @@ def test_fp8_checkpoint_exports_its_coded_trunk(tmp_path):
         plan = plan_from_dict(json.loads((root / manifest["programs"][name]).read_text()))
         coded = [b for b in plan.buffers if b.role == "constant" and b.dtype.name == "f8e4m3"]
         assert sum(int(np.prod(b.resolve_shape({}))) for b in coded) == expected
+    _computes_the_dequantized_model(model, root, executable, tmp_path)
+
+
+@pytest.mark.parametrize("experts_gpu", [None, 4])
+def test_fp8_moe_checkpoint_exports_its_coded_experts(tmp_path, monkeypatch, experts_gpu):
+    """A dynamic block-FP8 Qwen3.5-MoE checkpoint exports its routed experts as the plugin's
+    fixed-slot program reads them, streamed from the shards: E-stacked e4m3 codes beside their block
+    scales, decoded in-graph. On the card they are constants of the step; four of eight per layer,
+    codes and scales alike are the pack's pages. Every step computes what the dequantized model
+    does, through a prefill chunk as well as the one-token program. Two attention layers, as in the
+    FP16 MoE gate above."""
+    executable = shutil.which("emmy-runtime-worker")
+    if not executable:
+        pytest.skip("build native worker and add it to PATH")
+    from emmy.compiler.backend.plan import plan_from_dict
+    from emmy.serving.native.prepare import load_model
+    from tests.serving.helpers import fp8_block_checkpoint
+
+    if experts_gpu is not None:
+        monkeypatch.setenv("EMMY_GEN_EXPERTS_GPU", str(experts_gpu))
+    model = qwen3_5_moe_model(max_position_embeddings=8, layer_types=["full_attention"] * 2).half()
+    model.config._attn_implementation = "eager"
+    fp8_block_checkpoint(model, tmp_path / "ckpt")
+    twin, ckpt = load_model(str(tmp_path / "ckpt"))
+    with gpu_lock():
+        root = export_model(twin, tmp_path / "pack", context_length=8, prefill_size=3, ckpt=ckpt)
+    manifest = json.loads((root / "manifest.json").read_text())
+    plan = plan_from_dict(json.loads((root / manifest["programs"]["decode"]).read_text()))
+    inputs = [f"layer{i}.{n}{part}" for i in range(2) for n in ("w_gate_up", "w_down") for part in ("", "_scale")]
+    buffers = {b.name: b for b in plan.buffers}
+    assert [buffers[name].dtype.name for name in inputs] == ["f8e4m3", "f32"] * 4
+    assert set(manifest.get("pages", ())) == (set() if experts_gpu is None else set(inputs))
+    _computes_the_dequantized_model(model, root, executable, tmp_path)
+
+
+def _computes_the_dequantized_model(model, root, executable, tmp_path):
+    """Every logit and greedy token of the pack at ``root`` is the eager model's, through the
+    one-token program and through prefill chunks."""
+    from emmy.compiler.backend.cuda._bench_worker import _reference_precision
+
     model.cuda()
 
     async def check():

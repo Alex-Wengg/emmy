@@ -2232,6 +2232,8 @@ def load_quantized_split(
     hosted_by_engine=False,
     config=None,
     mtp=False,
+    experts=True,
+    trunk=True,
 ):
     """Architecture twin + expert store for a quantized (MoE) checkpoint — SHARD-STREAMED.
 
@@ -2291,6 +2293,10 @@ def load_quantized_split(
     ``config`` replaces the checkpoint's own config for the twin. ``mtp=True`` loads the checkpoint's
     multi-token-prediction head instead of its trunk: ``config`` is a one-layer text config, the head's
     ``mtp.layers.0.`` and ``mtp.norm.`` leaves fill the twin's layer and final norm, and no trunk leaf is read.
+
+    ``experts=False`` reads no routed expert: they stay meta on the twin and the store holds none, for a caller
+    that streams them one layer at a time rather than holding every expert at once. ``trunk=False`` reads nothing
+    else, so a stream reads one layer's experts alone (``layer_range``).
 
     Returns ``(model, expert_store)`` with ``expert_store = {"fmt": "mxfp4" | "nvfp4" | "f8e4m3" | "exl3" | None,
     "layers": {layer_index: {input_name: tensor}}}`` (``fmt`` None = experts unquantized), plus
@@ -2411,6 +2417,7 @@ def load_quantized_split(
                     include_norm=include_norm,
                     hosted=hosted,
                 )
+                and (trunk if _expert_slot(rename(key)) is None else experts)
             ]
             if not owned_keys:
                 continue
@@ -2604,7 +2611,9 @@ def load_quantized_split(
     # checkpoint stores the source-layout ``mlp.experts`` spelling, translated above; check the
     # actual load result rather than the logical quantization sidecar (which need not list it).
     owned_missing = [
-        m for m in missing if _quantized_stage_owns(m, layer_range, include_embed=include_embed, include_norm=include_norm, hosted=hosted)
+        m
+        for m in missing
+        if trunk and _quantized_stage_owns(m, layer_range, include_embed=include_embed, include_norm=include_norm, hosted=hosted)
     ]
     missing_routing_biases = [m for m in owned_missing if m.endswith(".mlp.gate.e_score_correction_bias")]
     if missing_routing_biases:
