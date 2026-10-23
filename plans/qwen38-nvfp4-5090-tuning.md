@@ -111,6 +111,44 @@ in the fast-math lane), then end-to-end decode faster than stock vLLM.
   (`w1x8`, bf16 `f1x1/k8`, `d4/smem-tma`), pre16 `...a7efbb.m16.fm.83c0b7f74b51` (FP4 tile, `w1x4`, `d4/smem-tma`),
   gdn16 `0e5142` `...8105a48e7b21` (`d3/smem-tma`).
 
+## The whole model on one card
+
+Goal (2026-10-23): serve NVIDIA's `Qwen3.8-27B-NVFP4` checkpoint on one RTX 5090 with the MTP drafter on, the vision
+tower answering image requests, and the full context window, inside the card's 32 GB. #1241 serves it text-only with
+MTP off at 31.2 GiB after graph capture; the input embedding and the output head take 2.37 GiB each on the device,
+the head decoded to BF16 from 0.67 GiB of NVFP4 codes. The MTP drafter's tensors are 0.79 GiB and the vision tower's
+0.86 GiB in the checkpoint. The milestones below free about 4 GiB and spend it on those two; each is one PR, stacked
+on the one before it. The dev box (RTX 5090 on a PCIe x1 link, 60 GB RAM) is for the gates that need no link speed;
+the numbers come from a rented x16 5090 host (23 GB RAM, so the plugin boots with few compile workers).
+
+1. **The head stays coded.** The NVFP4 head runs compressed through the compiled head program the EXL3 head already
+   has (`emmy/serving/exl3_head.py`: the coded weight is the program's input, FP32 logits, the logits processor
+   applies scale and softcap), instead of decoding into vLLM's BF16 parameter. Gate: logits equal to the decoded
+   head's on the probe prompts within FP32 rounding, device usage 1.7 GiB lower after capture, TPOT unchanged.
+   Needs #1241.
+
+2. **The embedding table in mapped host memory.** The runner's `EMMY_GEN_EMBED_HOST` keeps the table pinned on the
+   host and gathers rows over the link inside the captured step; make the recipe use it and check the MTP drafter's
+   shared table follows (the drafter gathers from the runner's table). Gate: the same tokens, 2.37 GiB lower, and
+   the TPOT cost of the gather measured on the x16 host (about 10 KB per token, so it should not show).
+
+3. **The vision tower on demand.** Its weights live in pinned, mapped host memory like the embedding table and are
+   read over the link only when an image prefill runs, so the tower costs no device memory at rest; a text request
+   never touches them. The mapped read is the first form because an image prefill reads the tower once, about
+   0.86 GiB, which an x16 link moves in tens of milliseconds; the pager's device slots are the fallback if that read
+   proves too slow per image, with the tower's weights as pages the image prefill touches. Gate: an image request
+   answers correctly, device usage at rest unchanged, text TPOT unchanged.
+
+4. **The MTP drafter resident, the whole window.** With the memory the first three milestones free, boot with the
+   drafter (`--speculative-config` MTP, two draft tokens as the Qwen3.6 recipe does), the vision tower and the
+   recipe's context window, and record the verify programs' rows into the golden so the boot runs strict. The
+   drafter runs every step, so it stays on the device: on demand it would move 0.79 GiB per token over the link.
+   Gate: a healthy boot under 32 GiB after capture, greedy tokens equal to the no-MTP boot's, TPOT and acceptance
+   rate against the no-MTP boot, a recipe for NVIDIA's checkpoint with the final flags, and the full-window request
+   #1241 ran still completing.
+
+Milestone 2 does not need 1; 3 needs 2's mapped-memory form; 4 needs 1, 2 and 3.
+
 ## Decisions
 
 - Trace reference: transformers 5.14.1. `pyproject.toml` pins 5.19 for the compile extras, the serving venv
