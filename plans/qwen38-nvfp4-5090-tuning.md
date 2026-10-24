@@ -354,6 +354,37 @@ Native serves one request at a time throughout this plan; continuous batching is
    the plugin and native alike, with the same tokens as the dev-box boots, host memory pinned about 15 GB, and TPOT at
    x16 (the MoE plan's estimate is about 2 ms of copies a step where the dev box pays 29). Needs nothing.
 
+   State (2026-10-24, PR not yet opened: branch `feature/pager-resident-pages`): built; measured on the rented x16 RTX
+   5090 (port 11200, 23.5 GiB RAM, swap off). A paged buffer's budget of `B` pages is `min(B, L)` slots and the rest
+   resident (`config.paged_split`), `L` being the most pages one decode launch lists: a token's 8 picks for Qwen3.6's
+   experts (8 slots, 120 resident), one block for the tower, every page for the any-width embedding gather (nothing
+   resident). A resident page's `page_slot` is -1, which the decision program already reads as a hit, its age landing on
+   the spare entry, so no paging kernel changed and no row re-keyed. `Pager::declare` takes the two homes; the native
+   pack carries a resident count per buffer (format 9) and the worker reads those pages onto the device; the plugin
+   loads quantized experts as headers (`experts="meta"`) and reads and places one layer at a time after the compile.
+   Both boot with 16.0 GiB pinned. Plugin, from its pack (decode bucket 1 as the dev-box references ran): 0.5 GiB of
+   host memory left, 27.9 GiB on the device after capture at 0.85, TPOT 23.7 ms at 64 tokens and 23.2 at 256, TTFT 0.50
+   s, the dev box's tokens on two of four prompts and near ties on the others (token 49, gaps 0.375 and 0.125 the other
+   way; token 20, a tie). Native: strict export 24.5 min, 12.7 GB peak, 36 GB pack, load 28 s, 2.9 GiB of host memory
+   left, 19.6 GiB on the device, TPOT 20.6 ms at 64 and 20.1 at 256, TTFT 0.38 s, milestone 4's tokens on all nine
+   prompts; the 1,000-token prompt's first token after 17.9 s (287 ms a chunk: the 8 slots take 8 of a chunk's ~50 host
+   experts a layer, the rest are read in place). The plugin's first boot, which compiles, fit once the runner stopped
+   holding a heap copy of the token table: it now shares the twin's storage, read from the checkpoint, and keeps none
+   once the device holds the table. Before, the OOM killer took the engine after it placed the experts, with 6.3 GB of
+   heap beside the 16.0 GiB pinned; empty example experts took that to 4.5 GB, still too much, and not reading the
+   output head, which the engine loads itself, moved nothing. Cold, from no pack: up after 23.7 min (the compile about
+   19), 2.6 GB of heap before the placement and 4.0 GB after capture, 0.5 GiB of host memory left, the warm boot's
+   tokens on all four prompts, TPOT 23.6 and 23.8 ms at 64 tokens and 23.2 at 256, TTFT 0.50 s. The recipe's decode
+   bucket 4 boots cold too, after 57.6 min: its width-4 Gated DeltaNet programs have no rows (milestone 8's gap) and one
+   took 31 min to compile under the prior. It leaves 0.25 GiB of host memory, gives the dev box's tokens on two prompts
+   and near ties on the others (token 49, 0.375 against 0.25 the other way; token 58, a tie), TPOT 20.2 ms at 64 tokens
+   and 19.7 at 256, TTFT 1.15 s. The fixed set's cost, replayed over 1,273 decode steps of the model's routing: 86
+   experts copied a step against 25 for a cache over the whole budget (70 with 16 slots, 53 with 32), about 3 ms of TPOT
+   at x16; each more slot costs 120 MB of host memory, and the plugin has 0.25 to 0.5 GiB to spare here. Found on the
+   way: the native worker held prefill's copy of the constants it shares beside the pages (now dropped first);
+   `test_compiled_tower_matches_the_transformers_tower` fails on main on the dev box in the default fast-math lane (nvcc
+   rejects the patch embedding's `k_linear_36c1bf`).
+
 10. **The NVFP4 trunk in native.** `emmy serve --runner generate --native` prepares NVIDIA's checkpoint as it prepares
    Qwen3.6-35B-A3B-FP8: the W4A4 trunk from the coded weights the loader already spells, the coded NVFP4 head as the
    head program, the GDN layers whole through the state wrapper, and the embedding table a paged buffer at zero slots

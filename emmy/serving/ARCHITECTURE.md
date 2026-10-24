@@ -417,8 +417,9 @@ contract lives in [native/ARCHITECTURE.md](native/ARCHITECTURE.md); vLLM remains
   kernel. `_ensure_device` instantiates the group's plan once per layer over that layer's experts, binding the
   shared `[k]` int64 selector the router writes and the shared `[k, H]` partials (one layer runs at a time) and the
   layer's stacked tensors: resident, aliased as the plan's weight inputs; paged (`EMMY_GEN_EXPERTS_GPU` below the
-  expert count), declared to the runtime pager, which binds the page tables the kernels read through and the tables
-  the compiler-spliced paging program keeps (backend ARCHITECTURE, "Paging"). Bound once, so per-layer cached graphs
+  expert count), the first experts on the device and the rest in pinned host memory, declared to the runtime pager,
+  which binds the page tables the kernels read through and the tables the compiler-spliced paging program keeps
+  (backend ARCHITECTURE, "Paging"). Bound once, so per-layer cached graphs
   and the whole-step capture bake fixed pointers. `_moe_combine_slots` runs the router, writes the picks into the
   selector (one fixed-shape device write — no `unique()`/`.tolist()`/host sync, no per-step weight staging), runs
   the layer's program and combines the partials with one score matmul, so vLLM's whole-step decode graph records it
@@ -1042,20 +1043,21 @@ shape at all — it is `vocab x hidden` in the trunk dtype, over a GiB on a mode
 second full-size resident, and on a card the weights already fill it is competing directly with the KV
 cache.
 
-**`EMMY_GEN_EMBED_GPU` pages it**, as `EMMY_GEN_EXPERTS_GPU` pages the routed experts (below). It is how many
-pages of the table the device holds, a page being 256 rows. Unset, or at the table's page count, the table sits in
-device memory and torch gathers from it. Below that the table is a paged buffer (runtime `ARCHITECTURE.md`,
-"Paging"): its home is pinned host memory mapped into the device's address space, a mapping of its own at the
-table's size registered with the driver (`cudaHostRegister`), as the expert pages are; torch's pinned allocator
-would round it up to a power of two, 4 GiB for a 2.37 GiB table. The gather is one compiled program, torch's
-indexing traced as native generation's embedding is, which reads each row through the page table. The pager moves
-the pages a step touches into the device slots and reads a page that gets no slot in place over the link. **Zero
-holds no page**: nothing can move, so the plan has no inspector and no paging program, and the pager binds a page
-table that points every page at its home, once. Either way the gather is a device-side launch, so whole-step decode
-capture records it. Host memory does not double: the numpy table the oracle and the prefill fallback read is
-rebound to a view of the pinned home. vLLM's MTP drafter gathers from that home too, because its proposer shares
-the target's `embed_tokens` (`_SharedRawEmbedding`), which reads the runner's table; the home holds the table's
-rows wherever the pager also keeps a copy.
+**`EMMY_GEN_EMBED_GPU` pages it**, as `EMMY_GEN_EXPERTS_GPU` pages the routed experts (below). It is how many pages of
+the table the device holds, a page being 256 rows. Unset, or at the table's page count, the table sits in device memory,
+torch gathers from it, and the host keeps no copy (the host gather reads the device table). Below that the table is a
+paged buffer (runtime `ARCHITECTURE.md`, "Paging"): its home is pinned host memory mapped into the device's address
+space, a mapping of its own at the table's size registered with the driver (`cudaHostRegister`), as the expert pages
+are; torch's pinned allocator would round it up to a power of two, 4 GiB for a 2.37 GiB table. The gather is one
+compiled program, torch's indexing traced as native generation's embedding is, which reads each row through the page
+table. The pager moves the pages a step touches into the device slots and reads a page that gets no slot in place over
+the link. The gather takes any number of rows, so one launch may list every page, and every page of the budget is a
+slot: none is resident, and the home holds the whole table. **Zero holds no page**: nothing can move, so the plan has no
+inspector and no paging program, and the pager binds a page table that points every page at its home, once. Either way
+the gather is a device-side launch, so whole-step decode capture records it. Host memory does not double: the numpy
+table the oracle and the prefill fallback read is rebound to a view of the pinned home. vLLM's MTP drafter gathers from
+that home too, because its proposer shares the target's `embed_tokens` (`_SharedRawEmbedding`), which reads the runner's
+table; the home holds the table's rows wherever the pager also keeps a copy.
 
 A page is a block of rows, not one, because the paging program ranks every page against every other on each step:
 NVIDIA's Qwen3.8-27B-NVFP4 table (248,320 x 5,120 BF16) is 970 pages of 2.5 MiB, with tables of a few KB.
@@ -1103,7 +1105,8 @@ through that block's entry of the pool's page table. The blocks run in order, so
 itself: before a block, one run of the pager's step over every pool (`paging.listed_paging`) moves the block's pages
 into the slots of the least recently used ones. An image reads the tower over the link once, and a text request
 never touches it. Every image runs the blocks in the same cycle, which never hits what the last image left in the
-slots, so one slot is the budget. Zero reads every block in place, where a matmul reads its weight again for every
+slots, so one block of the budget is the slot and the rest are the first blocks, resident: they never move and their
+pools' homes do not hold them. Zero reads every block in place, where a matmul reads its weight again for every
 tile of rows: vLLM's tower read that way took 1.4 s for a 1,024-token image.
 
 A paged weight cannot feed a TMA descriptor, which holds a fixed address, so the paged programs stage their weights
@@ -1130,15 +1133,21 @@ and the spare page the paging program stores a dropped copy into, per pool). Hos
 home.
 
 **`EMMY_GEN_EXPERTS_GPU` pages the routed experts.** It is how many experts per MoE layer the device holds at once.
-Below the layer's expert count, every expert's weights live in pinned host memory as one page per expert, and the
-device holds that many pages per layer as the pager's slots. The fixed-slot decode program reads the E-stacked
-expert tensors through page tables, and the compiler splices the paging program ahead of its launches: a routed
-expert already in a slot is a hit, a miss moves into the least recently used slot that no pick of the step holds,
-and when no slot is free the page is read in place over the link (runtime `ARCHITECTURE.md`, "Paging"). Every
-write a hit would make lands on a spare entry past the end of each table, so a step is a fixed launch set and the
-whole-step decode graph records it. Tokens do not change. Prefill reads every expert of a paged layer in place
-from host memory. With the budget at or above the expert count nothing is paged: the stacked tensors sit in device
-memory and the same program gathers from them directly. Native preparation reads the same budget
+Below the layer's expert count the budget splits (`config.paged_split`): a token's picks of it are the pager's slots,
+and the rest are resident experts, the layer's first ones, which stay on the device and have no host copy. Every other
+expert lives in pinned host memory as one page per expert. The fixed-slot decode program reads the E-stacked expert
+tensors through page tables, and the compiler splices the paging program ahead of its launches: a resident expert, or a
+routed one already in a slot, is a hit; a miss moves into the least recently used slot that no pick of the step holds;
+and when no slot is free the page is read in place over the link (runtime `ARCHITECTURE.md`, "Paging"). A decode launch
+lists a token's picks at most, so the slots always take its misses. Every write a hit would make lands on a spare entry
+past the end of each table, so a step is a fixed launch set and the whole-step decode graph records it. Tokens do not
+change. Prefill reads each expert of a paged layer at its home: a resident one on the device, the others in place from
+host memory. A quantized checkpoint's experts stream in under a budget: the load reads their headers alone
+(`load_quantized_split(experts="meta")`), the compile sees each layer's tensors on the meta device, and `_ensure_device`
+reads one layer's values after the compile and places it, resident experts on the device and the rest in pinned memory,
+before it reads the next. The host never holds every expert, nor the pinned pages beside the compile's workers. With the
+budget at or above the expert count nothing is paged: the stacked tensors sit in device memory and the same program
+gathers from them directly. Native preparation reads the same budget
 ([`native/ARCHITECTURE.md`](native/ARCHITECTURE.md)).
 
 ### The attention workspace is invisible to the KV budget

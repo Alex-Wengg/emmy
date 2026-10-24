@@ -302,6 +302,17 @@ def _pinned(tensor, nbytes=0):
     return raw, device_view(raw)
 
 
+def _place_experts(tensors, paging):
+    """One MoE layer's E-stacked expert tensors where the expert budget puts them, each entry of ``tensors`` replaced
+    as it lands, so the host holds one loaded tensor at most beside the pinned pages: on the device whole when
+    ``paging`` is ``None``, else, under its ``(slots, resident)`` split (``config.gen_expert_slots``), as ``(the first
+    resident experts on the device, the rest's pinned bytes, those bytes' device view)``."""
+    for n in list(tensors):
+        t = tensors[n]
+        tensors[n] = t.cuda() if paging is None else (t[: paging[1]].cuda(), *_pinned(t[paging[1] :]))
+    return tensors
+
+
 def _combine_slot_partials(scores, partials, output_dtype, *, accumulate_float32=False):
     """Weighted fixed-slot sum with the same optional precision contract as the routed path."""
     if accumulate_float32:
@@ -868,7 +879,7 @@ class _PagedTable:
         with gpu_lock():
             program = CompiledProgram.build_from_plan(plan, {"ids": np.zeros(capacity, dtype=np.int64)})
             self.pager = emmy_runtime.Pager()
-            self.pager.declare(device(), "weight", self.pinned.data_ptr(), (pages, page_bytes, slots))
+            self.pager.declare(device(), "weight", (0, self.pinned.data_ptr()), (pages, page_bytes, slots, 0))
             self.pager.bind(program.executor, "weight")
         self.gather = _Program(program, ["ids"], list(plan.outputs))
         logger.info("[gen_runner] embed table (%.3f GiB) paged: %d of its %d pages on the device", nbytes / 2**30, slots, pages)
@@ -1165,6 +1176,9 @@ class EmmyGenRunner:
         if qdir is not None:
             # EXL3, AWQ, NVFP4 and FP8 keep the TRUNK coded too: expanding the checkpoint before
             # compile gives back most of its memory savings.
+            from functools import partial
+
+            from emmy import config as emmy_config
             from emmy.compiler.loader.quant import checkpoint_quant_digest, checkpoint_quant_summary
             from emmy.compiler.trace.huggingface import load_quantized_split
 
@@ -1181,6 +1195,10 @@ class EmmyGenRunner:
                 checkpoint_quant_summary(qdir),
                 checkpoint_quant_digest(qdir),
             )
+            # Under an expert budget the load reads the experts' shapes alone, and the device path reads each layer's
+            # values after the compile, placing it before it reads the next: the host never holds every expert, and
+            # never holds them beside the compile's workers.
+            stream = emmy_config.gen_experts_gpu() is not None
             model, expert_store = load_quantized_split(
                 qdir,
                 getattr(torch, dtype_str),
@@ -1190,7 +1208,11 @@ class EmmyGenRunner:
                 include_norm=include_norm,
                 expert_slice=expert_slice,
                 hosted_by_engine=True,  # the runner never runs a hyper-connection layer's attention or PLE
+                experts="meta" if stream else True,
             )
+            if stream:
+                dtype = getattr(torch, dtype_str)
+                expert_store["read"] = partial(load_quantized_split, qdir, dtype, trunk=False, expert_slice=expert_slice)
             with torch.device("cpu"):
                 return cls.from_model(
                     model,
@@ -1696,10 +1718,11 @@ class EmmyGenRunner:
                     from emmy import config as emmy_config
 
                     num_e = next(iter(einputs.values())).shape[0]
-                    slots_per_layer = emmy_config.gen_expert_slots(num_e)
-                    stacked_w = [torch.zeros(num_e, *logical[n], dtype=dtype) for n in w_names]
+                    paging = emmy_config.gen_expert_slots(num_e, moe_top_k)
+                    # Shape carriers as large as every expert of a layer: never written, so their pages cost no host memory.
+                    stacked_w = [torch.empty(num_e, *logical[n], dtype=dtype) for n in w_names]
                     if quant_specs:
-                        stacked_w += [torch.zeros(*einputs[f"{n}_scale"].shape, dtype=torch.float32) for n in ("w_gate_up", "w_down")]
+                        stacked_w += [torch.empty(*einputs[f"{n}_scale"].shape, dtype=torch.float32) for n in ("w_gate_up", "w_down")]
                     stacked_kw = {
                         "quant_specs": {n: (fmt, tuple(einputs[f"{n}_scale"].shape), dt) for n, (fmt, _, dt) in quant_specs.items()}
                         if quant_specs
@@ -1730,7 +1753,7 @@ class EmmyGenRunner:
                                 compiler_dtype,
                                 plan=stored(pre + "slots"),
                                 plan_cache=plan_cache,
-                                paged_inputs=tuple((n, slots_per_layer) for n in ind_names) if slots_per_layer is not None else None,
+                                paged_inputs=tuple((n, paging[0]) for n in ind_names) if paging is not None else None,
                                 arena=slot_arena,
                                 **stacked_kw,
                             )
@@ -1743,7 +1766,7 @@ class EmmyGenRunner:
                             "weight_inputs": ind_names,
                             "dtype": compiler_dtype,
                             "arena": slot_arena,
-                            "paged": slots_per_layer,
+                            "paged": paging,
                         }
                         plans[pre + "slots"] = slot_plan
                     except Exception as ex:  # noqa: BLE001 — any compile failure → routed fallback, loudly
@@ -1849,6 +1872,8 @@ class EmmyGenRunner:
                     # learned gate only weights them. Its call needs the step's token ids.
                     "hash": getattr(gate, "tid2eid", None) is not None,
                     "inputs": einputs,
+                    # A streamed load holds their shapes alone, and this reads their values (``load_quantized_split``).
+                    "read": (expert_store or {}).get("read"),
                     "local_layer": local_i,
                     "layer": i,
                     "num_experts": int(next(iter(einputs.values())).shape[0]),
@@ -2197,14 +2222,15 @@ class EmmyGenRunner:
         if include_embed:
             from emmy.compiler.dtype import encode_bf16
 
-            embed_weight = trunk.embed_tokens.weight.detach().cpu().to(torch.float32).numpy()
+            twin_table = trunk.embed_tokens.weight.detach().cpu()
             embed_scale = float(getattr(trunk.embed_tokens, "embed_scale", 1.0))
-            if compiler_dtype.name == "bf16":
-                if embed_scale != 1.0:
-                    embed_weight = embed_weight * np.float32(embed_scale)
-                embed_weight = encode_bf16(embed_weight)
+            if embed_scale == 1.0 and twin_table.dtype == dtype:
+                # Nothing to fold: the table is the twin's own storage, so the host holds it once.
+                embed_weight = twin_table.view(torch.int16).numpy().view(np.uint16) if dtype == torch.bfloat16 else twin_table.numpy()
+            elif compiler_dtype.name == "bf16":
+                embed_weight = encode_bf16(twin_table.to(torch.float32).numpy() * np.float32(embed_scale))
             else:
-                embed_weight = embed_weight.astype(np_dtype, copy=False)
+                embed_weight = twin_table.to(torch.float32).numpy().astype(np_dtype, copy=False)
                 if embed_scale != 1.0:
                     embed_weight = embed_weight * np_dtype.type(embed_scale)
         attn_layers = gdn_programs.count(None)
@@ -2308,6 +2334,7 @@ class EmmyGenRunner:
         runner._hc_mult = carrier // hidden
         runner._expert_slices = expert_slices
         runner._lora_rank = lora_rank
+        del embed_weight  # the runner holds the table; ``_ensure_device`` may move it off the host
         if runner.has_device_decode or (max_tokens is not None and runner._moe is not None):
             # EAGER, not lazy: vLLM sizes its KV cache from a profiling pass that runs
             # after model construction — anything allocated later (the embed table is
@@ -2369,12 +2396,22 @@ class EmmyGenRunner:
         return runner
 
     def embed(self, input_ids):
-        """``input_ids``: list/1-D of ints → ``[T, H]`` numpy in the runner dtype."""
+        """``input_ids``: list/1-D of ints → ``[T, H]`` numpy in the runner dtype, from the host table, or from the
+        device's when the device holds the only copy, its embed scale applied as :meth:`embed_device` does."""
         import numpy as np
+        import torch
 
-        if self._embed_weight is None:
+        ids = np.asarray(input_ids, dtype=np.int64)
+        if self._embed_weight is not None:
+            rows = self._embed_weight[ids]
+        elif (table := getattr(self, "_embed_weight_dev", None)) is not None:
+            rows = table[torch.from_numpy(ids).to(table.device)]
+            if (scale := getattr(self, "_embed_dev_scale", 1.0)) != 1.0:
+                rows = (rows.float() * scale).to(table.dtype)
+            rows = rows.cpu()
+            rows = rows.view(torch.int16).numpy().view(np.uint16) if rows.dtype == torch.bfloat16 else rows.numpy()
+        else:
             raise RuntimeError("this pipeline stage does not own the token embedding")
-        rows = self._embed_weight[np.asarray(input_ids, dtype=np.int64)]
         return rows.astype(np.float32) if self._residual_float32 else rows
 
     def forward_layer_pre(self, layer, hidden, positions=None):
@@ -2469,15 +2506,18 @@ class EmmyGenRunner:
             table = torch.from_numpy(host)
             if self._activation_dtype == torch.bfloat16:
                 table = table.view(torch.bfloat16)
-            slots = emmy_config.gen_embed_slots(-(-table.shape[0] // EMBED_PAGE_ROWS))
-            if slots is None:
-                self._embed_weight_dev = table.cuda()
+            paging = emmy_config.gen_embed_slots(-(-table.shape[0] // EMBED_PAGE_ROWS))
+            if paging is None:
+                # The device holds the table: the host keeps no copy, and ``embed`` gathers on the device.
+                self._embed_weight_dev, self._embed_weight = table.cuda(), None
             else:
                 # As wide as a step: the plugin refuses a scheduler budget past prefill capacity plus the decode bucket.
-                self._embed_pages = _PagedTable(table, slots, max(1, self.prefill_capacity + self._decode_bucket))
+                # The gather may list every page, so every page of the budget is a slot and the home is the whole table.
+                self._embed_pages = _PagedTable(table, paging[0], max(1, self.prefill_capacity + self._decode_bucket))
                 # The host gather (the oracle, the prefill fallback) reads the pinned home: the host holds one copy.
                 self._embed_weight = self._embed_pages.pinned[: host.nbytes].numpy().view(host.dtype).reshape(host.shape)
                 self._embed_weight_dev = self._embed_pages.view
+            del host, table  # the table's old host copy goes before the experts take the host
         if self._norm is not None:
             self._norm_dev = copy.deepcopy(self._norm).to("cuda")
         if self._hc_head is not None and not getattr(self, "_hc_head_on_device", False):
@@ -2510,20 +2550,25 @@ class EmmyGenRunner:
                     m["gate"] = m["gate"].to("cuda")
                     num_e = m["num_experts"]
                     sizes = m["bytes"] = {n: t[0].numel() * t.element_size() for n, t in m["inputs"].items()}
-                    slots_per_layer = emmy_config.gen_expert_slots(num_e)
-                    if slots_per_layer is not None:
-                        # Paged: every expert's page lives in pinned, mapped host memory; the device holds
-                        # ``slots_per_layer`` of them in the pager's slots (bound below). The routed path
-                        # reads an expert in place from host memory over the link.
-                        # In place: the store the loader built shares this dict, so replacing an entry drops the
-                        # loaded tensor as its pinned copy lands, and the host holds one copy plus one tensor,
-                        # never two copies of every expert.
-                        for n in list(m["inputs"]):
-                            m["inputs"][n] = _pinned(m["inputs"][n])
-                        m["addrs"] = {n: [view.data_ptr() + e * sizes[n] for e in range(num_e)] for n, (_, view) in m["inputs"].items()}
-                        m["slots_per_layer"] = slots_per_layer
+                    paging = emmy_config.gen_expert_slots(num_e, m["top_k"])
+                    # Paged: the first ``resident`` experts on the device for good, the rest in pinned, mapped host
+                    # memory, and ``slots`` device slots the paging program moves those into (bound below); the
+                    # routed path reads each expert at its home, a host one in place over the link. In place: the
+                    # store the loader built shares this dict, so replacing an entry drops the loaded tensor as it
+                    # lands, and the host holds the pinned pages plus one tensor, never two copies of every expert.
+                    # A streamed load read the layer's shapes alone: its values are read now, one layer at a time.
+                    if (read := m.pop("read", None)) is not None:
+                        m["inputs"] = read(layer_range=(m["layer"], m["layer"] + 1))[1]["layers"][m["layer"]]
+                    m["inputs"] = _place_experts(m["inputs"], paging)
+                    if paging is not None:
+                        resident = paging[1]
+                        m["addrs"] = {
+                            n: [on_device.data_ptr() + e * sizes[n] for e in range(resident)]
+                            + [view.data_ptr() + e * sizes[n] for e in range(num_e - resident)]
+                            for n, (on_device, _, view) in m["inputs"].items()
+                        }
+                        m["paging"] = paging
                     else:
-                        m["inputs"] = {n: t.cuda() for n, t in m["inputs"].items()}
                         m["addrs"] = {n: [t.data_ptr() + e * sizes[n] for e in range(num_e)] for n, t in m["inputs"].items()}
                     # Each expert's slice of every E-leading tensor as (input, address, bytes): the routed path's
                     # pointer swaps.
@@ -2554,7 +2599,8 @@ class EmmyGenRunner:
                         if m is None:
                             continue
                         slots = self._expert_tiers[m["group"]]["slots"]
-                        if (slots["paged"] is not None) != ("slots_per_layer" in m):
+                        # A plan from a serving pack keeps the slots it was compiled with.
+                        if {spec[2] for spec in slots["plan"].paged.values()} != ({m["paging"][0]} if "paging" in m else set()):
                             raise RuntimeError("the fixed-slot program was compiled for another expert budget than the device holds")
                         prog, _ = _compile_split(
                             slots["wrapper"],
@@ -2569,10 +2615,11 @@ class EmmyGenRunner:
                         p = prog.program
                         p.alias_buffer("sel", self._slot_sel)
                         p.alias_buffer(prog.output_names[0], self._slot_partials)
-                        if "slots_per_layer" in m:
+                        if "paging" in m:
                             pager = emmy_runtime.Pager()
-                            for name, (raw, _) in m["inputs"].items():
-                                pager.declare(device(), name, raw.data_ptr(), (m["num_experts"], m["bytes"][name], m["slots_per_layer"]))
+                            for name, (on_device, raw, _) in m["inputs"].items():
+                                homes = (on_device.data_ptr(), raw.data_ptr())
+                                pager.declare(device(), name, homes, (m["num_experts"], m["bytes"][name], *m["paging"]))
                                 pager.bind(p.executor, name)
                             m["pager"] = pager
                         else:
