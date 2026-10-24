@@ -159,7 +159,7 @@ OPTIONAL_KEYS = {
     "SERVE_ARCHITECTURE",
     "SERVE_CAPTURE_SIZES",
     "SERVE_EXTRA_ARGS",
-    "SERVE_EMBED_HOST",
+    "SERVE_EMBED_GPU",
     "SERVE_PREFILL_CAPACITY",
     "SERVE_PREFILL_BUCKET",
     "SERVE_M1_TIER",
@@ -286,7 +286,7 @@ def render_serve_runner_env(tmp_path: Path, env: dict[str, str]) -> list[str]:
     stub = stub_dir / "python3"
     stub.write_text(
         "#!/bin/sh\n"
-        "for name in EMMY_GEN_EMBED_HOST EMMY_GEN_PREFILL_CAPACITY EMMY_GEN_PREFILL_BUCKET EMMY_GEN_M1_TIER "
+        "for name in EMMY_GEN_EMBED_GPU EMMY_GEN_PREFILL_CAPACITY EMMY_GEN_PREFILL_BUCKET EMMY_GEN_M1_TIER "
         "VLLM_USE_V2_MODEL_RUNNER; do\n"
         '  value=$(printenv "$name") && printf "%s=%s\\n" "$name" "$value" || printf "%s=UNSET\\n" "$name"\n'
         "done\n"
@@ -430,7 +430,7 @@ def test_warm_shape_env_keeps_runner_memory_lane_and_prefill_override_wins():
     env = {
         "SERVE_DECODE_BUCKET": "32",
         "SERVE_MAX_NUM_BATCHED_TOKENS": "64",
-        "SERVE_EMBED_HOST": "1",
+        "SERVE_EMBED_GPU": "0",
         "SERVE_PREFILL_CAPACITY": "64",
         "SERVE_PREFILL_BUCKET": "0",
         "SERVE_M1_TIER": "1",
@@ -439,7 +439,7 @@ def test_warm_shape_env_keeps_runner_memory_lane_and_prefill_override_wins():
     override = render_warm_shape_env("8:2048:2056", env)
     assert pinned == [
         "-e",
-        "EMMY_GEN_EMBED_HOST=1",
+        "EMMY_GEN_EMBED_GPU=0",
         "-e",
         "EMMY_GEN_PREFILL_CAPACITY=64",
         "-e",
@@ -463,13 +463,13 @@ def test_serve_sh_unsets_empty_optional_runner_envs(tmp_path):
         "SERVE_MAX_MODEL_LEN": "128",
         "SERVE_MAX_NUM_BATCHED_TOKENS": "64",
         "SERVE_GPU_MEM_UTIL": "0.9",
-        "EMMY_GEN_EMBED_HOST": "",
+        "EMMY_GEN_EMBED_GPU": "",
         "EMMY_GEN_PREFILL_CAPACITY": "",
         "EMMY_GEN_PREFILL_BUCKET": "",
         "EMMY_GEN_M1_TIER": "",
     }
     assert render_serve_runner_env(tmp_path, env) == [
-        "EMMY_GEN_EMBED_HOST=UNSET",
+        "EMMY_GEN_EMBED_GPU=UNSET",
         "EMMY_GEN_PREFILL_CAPACITY=UNSET",
         "EMMY_GEN_PREFILL_BUCKET=UNSET",
         "EMMY_GEN_M1_TIER=UNSET",
@@ -494,7 +494,7 @@ def test_runner_memory_config_is_warm_bake_verify_cache_parity():
     dockerfile = (SERVE_DIR / "Dockerfile").read_text()
     verify = (SERVE_DIR / "verify.sh").read_text()
     mappings = {
-        "SERVE_EMBED_HOST": ("EMBED_HOST", "EMMY_GEN_EMBED_HOST"),
+        "SERVE_EMBED_GPU": ("EMBED_GPU", "EMMY_GEN_EMBED_GPU"),
         "SERVE_PREFILL_CAPACITY": ("PREFILL_CAPACITY", "EMMY_GEN_PREFILL_CAPACITY"),
         "SERVE_PREFILL_BUCKET": ("PREFILL_BUCKET", "EMMY_GEN_PREFILL_BUCKET"),
         "SERVE_M1_TIER": ("M1_TIER", "EMMY_GEN_M1_TIER"),
@@ -641,6 +641,22 @@ def test_release_config_reads_the_tensor_parallel_width(tmp_path):
     assert load_serving_config(config).tensor_parallel_size == 1
     config.write_text(config.read_text() + 'SERVE_EXTRA_ARGS="--enforce-eager --tensor-parallel-size=x"\n')
     with pytest.raises(ValueError, match="positive integer"):
+        load_serving_config(config)
+
+
+def test_release_config_reads_the_embedding_page_budget(tmp_path):
+    """``SERVE_EMBED_GPU`` is a page count, zero included (every row read in place); absent, the table is whole."""
+    config = tmp_path / "model.env"
+    base = (
+        f"SERVE_MODEL=org/model\nSERVE_GPU=NVIDIA-Test\nSERVE_GOLDEN_FILE={tmp_path / 'golden.json'}\n"
+        "SERVE_MAX_NUM_BATCHED_TOKENS=32\nSERVE_DECODE_BUCKET=32\n"
+    )
+    config.write_text(base)
+    assert load_serving_config(config).embed_gpu is None
+    config.write_text(base + "SERVE_EMBED_GPU=0\n")
+    assert load_serving_config(config).embed_gpu == 0
+    config.write_text(base + "SERVE_EMBED_GPU=-1\n")
+    with pytest.raises(ValueError, match="SERVE_EMBED_GPU"):
         load_serving_config(config)
 
 

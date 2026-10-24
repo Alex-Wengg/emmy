@@ -187,7 +187,7 @@ class ExecutionPlan:
     # Buffers that are a table of equal-sized pages rather than one allocation:
     # ``name -> (axis, page_size, slots)``. The runtime reaches them through the page table bound
     # under ``<name>__pages``; ``slots`` is how many pages its device slots hold at once, ``None``
-    # for every page. Empty for every ordinary program.
+    # for every page, ``0`` for none. Empty for every ordinary program.
     paged: dict[str, tuple[int, int, int | None]] = field(default_factory=dict)
     symbolic_bindings: dict[str, tuple[str, int]] = field(default_factory=dict)
     symbolic_hints: dict[str, int] = field(default_factory=dict)
@@ -280,7 +280,7 @@ def plan_from_graph(graph: Graph) -> ExecutionPlan:
         symbolic_hints=graph.symbolic_hints(),
         symbolic_caps={},
     )
-    # A paged buffer with fewer slots than pages takes the pager's step ahead of every launch touching it.
+    # A paged buffer with slots, fewer than its pages, takes the pager's step ahead of every launch touching it.
     from emmy.compiler.backend.paging import with_paging  # noqa: PLC0415 — paging compiles programs through this module
 
     return with_paging(plan, graph)
@@ -307,7 +307,9 @@ def splice(plan: ExecutionPlan, sub: ExecutionPlan, *, prefix: str, renames: dic
     redeclared; the rest enter as constants or scratch, with their constants, weights, paging and kernels
     (:func:`merge_kernels`). ``sizes`` gives ``sub``'s symbolic sizes their values, in its buffers and launch grids. A
     runtime argument with a value — from ``sizes`` or ``sub``'s hints — enters ``plan`` as a hint under ``prefix``,
-    which the runtime passes as the kernel's argument. ``zero`` names buffers each launch clears first."""
+    which the runtime passes as the kernel's argument, unless it is a size of ``plan``'s own that ``sizes`` leaves
+    alone (an inspector's, cut from the plan's kernel): that one stays the plan's. ``zero`` names buffers each launch
+    clears first."""
     sizes = sizes or {}
     names = {b.name: renames.get(b.name, f"{prefix}.{b.name}") for b in sub.buffers}
     existing = {b.name for b in plan.buffers}
@@ -335,7 +337,9 @@ def splice(plan: ExecutionPlan, sub: ExecutionPlan, *, prefix: str, renames: dic
     for launch in sub.launches:
         # A descriptor argument keeps its name, which is local to its launch; its source follows the buffer.
         descriptors = {t.name for t in launch.tma_descriptors}
-        hinted = [a for a in launch.runtime_args if a in values and a not in dict(launch.serial)]
+        hinted = [
+            a for a in launch.runtime_args if a in values and a not in dict(launch.serial) and (a in sizes or a not in plan.symbolic_hints)
+        ]
         plan.symbolic_hints.update({f"{prefix}.{a}": values[a] for a in hinted})
         resolved = {axes: tuple((resolve_dim(d, sizes),) for d in getattr(launch, axes)) for axes in ("grid", "block")} if sizes else {}
         launches.append(
