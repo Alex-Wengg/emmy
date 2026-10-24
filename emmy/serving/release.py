@@ -7,7 +7,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from emmy.compiler.pipeline.search.space import COLD_CACHE
+from emmy.compiler.pipeline.search.space import COLD_CACHE, FAST_MATH
 from emmy.compiler.trace.dynamic import DYNAMIC_DIM_MAX
 from emmy.publish import model_slug
 
@@ -55,6 +55,14 @@ class ServingConfig:
     verify_width: int = 0
     #: Whether the golden also covers native generation's programs (``SERVE_NATIVE=1``): the twins then include them.
     native: bool = False
+    #: The width the plugin runs a one-token decode step at (``SERVE_DECODE_BUCKET`` without the M=1 tier, else 1) and
+    #: its static prefill chunk (``SERVE_PREFILL_BUCKET``, 0 for none): native generation's trunk is the plugin's
+    #: programs at these widths.
+    decode_width: int = 1
+    prefill_width: int = 0
+    #: Whether the server runs the fast-math lane (``SERVE_ENV`` sets ``EMMY_FAST_MATH=1``), the one lane native
+    #: generation compiles in.
+    fast_math: bool = False
     #: How many routed experts per MoE layer the device holds (``SERVE_EXPERTS_GPU``, the boot's
     #: ``EMMY_GEN_EXPERTS_GPU``); ``None`` holds them all. Native generation's expert programs read them as paged inputs
     #: below it, so its twins are traced at it.
@@ -93,13 +101,15 @@ class ServingConfig:
         twin at width 1 carries an M=1 row in every lane: a gated DeltaNet layer has no any-width
         program, so every lane builds its width-1 program; so does a ``verify`` twin, a verify program every lane
         builds at its own width, and a ``tower`` twin, a vision tower program at one of the tower's own widths.
-        A ``native`` twin carries its width's row in the standard lane only: native
-        generation compiles every program at its own width, in the one regime its golden's rows were recorded in."""
+        A ``native`` twin carries its width's row in the server's lane only: native generation compiles every
+        program at its own width, in the one regime the server runs."""
         rows = tuple(row for row in self.realizations if (dict(row.bindings).get("num_tokens") if row.bindings else None) == width)
         [standard] = {row.pins for row in self.realizations if not dict(row.pins).get("FAST_MATH")}
         if native:
-            return tuple(row for row in rows if row.pins == standard) or (
-                ServingRealization(name=f"m{width}", bindings=(("num_tokens", width),), pins=standard),
+            lane = tuple(sorted({**dict(standard), "FAST_MATH": self.fast_math}.items()))
+            name = f"m{width}.fm" if self.fast_math else f"m{width}"
+            return tuple(row for row in rows if row.pins == lane) or (
+                ServingRealization(name=name, bindings=(("num_tokens", width),), pins=lane),
             )
         if expert and width == 1 and not rows:
             return (ServingRealization(name="m1", bindings=(("num_tokens", 1),), pins=standard),)
@@ -164,18 +174,19 @@ def _integer(values: dict[str, str], field: str, *, default: int | None = None, 
     return value
 
 
-def _cache_regime(values: dict[str, str], source: Path) -> dict[str, bool]:
-    """The cache regime ``SERVE_ENV`` declares: ``serve.sh`` exports its words before the server starts, so an
-    ``EMMY_COLD_CACHE`` among them is the regime every lane compiles in and records its rows under. The value is
-    read through the knob's own parser, so the spelling is the knob's."""
+def _serve_env_flag(values: dict[str, str], source: Path, knob) -> bool:
+    """Whether ``SERVE_ENV`` sets ``knob``: ``serve.sh`` exports its words before the server starts, so an
+    ``EMMY_COLD_CACHE`` among them is the regime every lane compiles in and records its rows under, and an
+    ``EMMY_FAST_MATH`` the lane the server runs. The value is read through the knob's own parser, so the spelling is
+    the knob's."""
     for word in values.get("SERVE_ENV", "").split():
         name, _, raw = word.partition("=")
-        if name == COLD_CACHE.env:
+        if name == knob.env:
             try:
-                return {COLD_CACHE.name: True} if COLD_CACHE.parse(raw) else {}
+                return bool(knob.parse(raw))
             except ValueError as exc:
                 raise ValueError(f"{source}: SERVE_ENV: {exc}") from exc
-    return {}
+    return False
 
 
 def _root(source: Path) -> Path:
@@ -230,7 +241,7 @@ def _realizations(values: dict[str, str], source: Path, *, static_only: bool) ->
     if m1_value not in {0, 1}:
         raise ValueError(f"{source}: SERVE_M1_TIER must be 0 or 1")
     m1 = bool(m1_value)
-    regime = _cache_regime(values, source)
+    regime = {COLD_CACHE.name: True} if _serve_env_flag(values, source, COLD_CACHE) else {}
     lane_pins = {fast: tuple(sorted({**regime, "FAST_MATH": fast}.items())) for fast in (False, True)}
     lanes = [(pinned_decode, pinned_prefill, max_tokens, lane_pins[False])]
     for spec in values.get("SERVE_WARM_SHAPES", "").split():
@@ -310,6 +321,9 @@ def load_serving_config(path: str | Path) -> ServingConfig:
         verify_width=_verify_width(values.get("SERVE_EXTRA_ARGS", ""), source),
         lora_rank=_integer(values, "SERVE_LORA_RANK", minimum=1) if values.get("SERVE_LORA_RANK") else None,
         native=values.get("SERVE_NATIVE") == "1",
+        decode_width=1 if _integer(values, "SERVE_M1_TIER", default=1) else max(1, _integer(values, "SERVE_DECODE_BUCKET", minimum=0)),
+        prefill_width=_integer(values, "SERVE_PREFILL_BUCKET", default=0, minimum=0),
+        fast_math=_serve_env_flag(values, source, FAST_MATH),
         experts_gpu=_integer(values, "SERVE_EXPERTS_GPU", minimum=1) if values.get("SERVE_EXPERTS_GPU") else None,
         embed_gpu=_integer(values, "SERVE_EMBED_GPU", minimum=0) if values.get("SERVE_EMBED_GPU") else None,
         images=_images(values.get("SERVE_EXTRA_ARGS", ""), source),
