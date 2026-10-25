@@ -32,17 +32,19 @@ programs compute row by row and nothing reads, as the plugin pads one token into
 wrappers compiles its programs in one layout scope (`twins.LayoutScope`), decode first, so a weight takes one layout and
 one device copy for both programs, as the plugin builds a wrapper's twins narrowest first.
 
-The glue between the projections is compiled too, from small traced modules in `prepare.py`: a select program
-picks the prompt's token at this position while the prompt lasts and the previous step's selection after it, which the
-plugin's gather (`gen_runner.embed_gather_graph`) embeds; the rotary module rotates q and k at this position and
-scatters k and v into the cache pages at that position, and attention runs causal grouped-query attention over the
-whole cache with every position past this one masked. All three read the
-position from device memory, including the cache write, whose rows land at an index computed from the `position` input
-rather than a host symbol, so a token step is one launch sequence at every position and replays as one graph. Nothing the device runs is
+The glue between the projections is compiled too, from small traced modules in `prepare.py`. The host uploads the
+tokens a step embeds with its position: the prompt's while it lasts, then the previous step's selection, which the
+plugin's gather (`gen_runner.embed_gather_graph`) embeds. The rotary module rotates q and k at this position and
+scatters k and v into the cache at that position, and attention runs causal grouped-query attention over the cache's
+leading window with every position past this one masked. Both read the position from device memory, including the
+cache write, whose rows land at an index computed from the `position` input rather than a host symbol, so a token step
+is one launch sequence at every position of a window and replays as one graph. Nothing the device runs is
 hand-written: the step ends at the FP32 logits and the greedy token, a compiled reduction over them, and the runtime
 samples on the host only at positive temperature (below), so the same export serves any device the compiler targets.
-Attention keeps dot products, scores, probabilities, and value accumulation in FP32, rounding only its output to the
-model dtype. This avoids losing near-tied scores at large magnitudes. Rotary constants come
+Attention keeps its dot products, scores and softmax in FP32, which avoids losing near-tied scores at large
+magnitudes. Each query head reads its key-value head's cache. The probabilities are rounded to the model dtype for the
+value expectation, which accumulates in FP32, as attention in the model dtype rounds them, so both products are 16-bit
+contractions; the output is rounded to the model dtype. Rotary constants come
 from the checkpoint's own module in FP32. Rotation also uses FP32 intermediates and rounds only the query/key outputs
 to the model dtype. The final norm is a program of its own, ahead of the head. The existing standalone exporter
 bundles all binaries and weight bytes, each constant read from its source as the pack writes it, so the exporting
@@ -153,38 +155,43 @@ and nothing past the loader knows the format. Transformers' quantizer never runs
 checkpoint's quantization declaration is rejected.
 
 Preparation rejects other model families, sliding attention, non-default rotary schemes, training mode, and parameters
-that are not all FP16 or all BF16, or not on the CPU. Context capacity must fit both the model and the current
-4,096-token limit. Compiler evidence uses the existing golden and strict-evidence controls; an export from a golden file
-(`--golden`) runs in the precision regime its rows were recorded in, as the plugin's boot does, since a row is evidence
-only there, and refuses an environment pin at another value. A successfully exported artifact has not, by itself,
-established numerical correctness or fast schedules.
+that are not all FP16 or all BF16, or not on the CPU. Context capacity defaults to the checkpoint's window
+(`max_position_embeddings`) and must fit both it and native's 262,144-token limit. Compiler evidence uses the existing
+golden and strict-evidence controls; an export from a golden file (`--golden`) runs in the precision regime its rows
+were recorded in, as the plugin's boot does, since a row is evidence only there, and refuses an environment pin at
+another value. A successfully exported artifact has not, by itself, established numerical correctness or fast
+schedules.
 
 ## Execution and state
 
-The prompt is uploaded once. Prefill processes all but its final token in fixed-width chunks, defaulting to the
-plugin's prefill chunk (`EMMY_GEN_PREFILL_BUCKET`), else 16 rows.
-Each layer writes the chunk's keys and values at their absolute positions through the page tables before attention
-reads each query's causal prefix; a row past the prompt's last token embeds the previous selection, computes alongside
-the others and writes cache rows that decode overwrites when it reaches them, so a chunk is dispatched only where all
-of its rows fit the context and the decode program covers the rest. The last layer only writes its cache; its
-attention and post-attention fragment are unnecessary. The final prompt token runs through the one-token decode
-program, including the output head, which yields the first generated token. Later decode steps embed the previous
-step's token, which the runtime read back from the program or sampled from its logits, and uploaded with the position
-scalar. Prefill chunks execute no head and download nothing.
+The prompt stays on the host; each step uploads the tokens it embeds. Prefill processes all but its final token in
+fixed-width chunks, defaulting to the plugin's prefill chunk (`EMMY_GEN_PREFILL_BUCKET`), else 16 rows. Each layer
+writes the chunk's keys and values at their absolute positions before attention reads each query's causal prefix; a
+row past the prompt's last token embeds the previous selection, computes alongside the others and writes cache rows
+that decode overwrites when it reaches them, so a chunk is dispatched only where all of its rows fit the context and
+the decode program covers the rest. The last layer only writes its cache; its attention and post-attention fragment
+are unnecessary. The final prompt token runs through the one-token decode program, including the output head, which
+yields the first generated token. Later decode steps embed the previous step's token, which the runtime read back from
+the program or sampled from its logits, and uploads with the position scalar. Prefill chunks execute no head and
+download nothing.
 
-The cache is one paged K buffer per layer, shaped `[1, kv_heads, context, head_dim]`, and one paged V buffer, shaped
-`[1, kv_heads, head_dim, context]` so the value expectation reads each head dimension's positions in one sweep, both
-paged along the token axis with `page_tokens` tokens per page (`export_model(page_tokens=…)`, `emmy generate
---page-tokens`). The rotary
-program writes a chunk of each through the page tables at `position`, the attention program reads all of them through
-the same tables, and the runtime allocates every page at load and binds the tables (see the runtime's paged-buffer
-contract). The default page spans the whole context, so the table has one entry and the addressing is that of the
-contiguous array it replaces; a smaller page changes only the addressing, never the tokens generated. A new request
+The cache is one K and one V buffer per attention layer, token-major (`[context, kv_heads, head_dim]`) and allocated
+for the whole context at load. It holds the model dtype, or FP8 e4m3 under `--kv-cache-dtype fp8` (a recipe names it
+in `SERVE_EXTRA_ARGS`, which the plugin's boot reads too); an FP8 store has no scale and saturates to e4m3's largest
+finite value, as vLLM's does. The rotary program writes a chunk of each at `position` and names the whole cache, since
+a scatter into a windowed buffer leaves its store no grid. The attention program reads only the cache's leading
+`cache_tokens` positions, a symbolic size the runtime sets per step to the positions read, rounded up to 4,096 (runtime
+`ARCHITECTURE.md`, "Cached generation"), so a step's attention costs what its window holds rather than the whole
+context. Its programs compile once with the window symbolic, and their golden rows bench at the symbol's hint. The
+cache is paged along its positions only when a page (`export_model(page_tokens=…)`, `emmy generate --page-tokens`) is
+shorter than the context; the runtime then allocates every page at load and binds the tables (see the runtime's
+paged-buffer contract). The default page spans the context, which is the flat buffer; a smaller page changes only the
+addressing, never the tokens generated. A new request
 resets the position and prompt length. Attention can only read positions already overwritten by that request, so
 clearing the entire cache is unnecessary. Decode owns the shared inputs, cache pages and constants. Prefill loads with
-the same inputs and constants lent through the runtime's region interface, takes the same cache through its page tables,
-and retains a separate scratch slab; scratch is packed by liveness within each program. The borrower drops before the
-owner. Only the cache pages are allocated twice at load, until prefill takes decode's tables. The embedding and tied
+the same inputs and constants lent through the runtime's region interface, takes the same cache, and retains a
+separate scratch slab; scratch is packed by liveness within each program. The borrower drops before the owner. Only a
+paged cache's pages are allocated twice at load, until prefill takes decode's tables. The embedding and tied
 output-head copies within decode remain separate.
 
 The state is updated in place. The next state reads whole columns of the old one, so the kernel that stores it over
@@ -215,16 +222,16 @@ returns the advanced position; intermediate chunks return no token or logits.
 
 ## Sampling contract
 
-Generation artifact version 10 ends the decode step at the FP32 logits and the greedy token, adds the prefill width,
-with a separate prefill program when that width exceeds one, lists the buffers a step carries, empty for dense
-Qwen3, and reads the pages of every buffer the pager holds from the pack. The decode program's inputs are the
-prompt, its length, the position and the previous step's token; its outputs are the logits and the lowest token ID
-among their maxima, which a compiled reduction selects on the device. At temperature zero the runtime downloads
-that token alone; at positive temperature it downloads the logits — one vocabulary-sized FP32 transfer per
-generated token, none during prefill — and samples on the host. The head keeps its scores in FP32, so 16-bit
-rounding cannot create a false maximum tie. Older generation artifacts must be exported again; the underlying
-execution-plan format is unchanged. Temperature must be finite and nonnegative, and top-p must lie in `(0, 1]`.
-Nonfinite logits fail the request. Top-k is unsupported.
+Generation artifact version 11 ends the decode step at the FP32 logits and the greedy token, adds the prefill width,
+with a separate prefill program when that width exceeds one, lists the buffers a step carries, empty for dense Qwen3,
+reads the pages of every buffer the pager holds from the pack, and reads the cache to the `cache_tokens` window. Every
+program's inputs are the position and the tokens it embeds; the decode program's outputs are the logits and the lowest
+token ID among their maxima, which a compiled reduction selects on the device. At temperature zero the runtime
+downloads that token alone; at positive temperature it downloads the logits — one vocabulary-sized FP32 transfer per
+generated token, none during prefill — and samples on the host. The head keeps its scores in FP32, so 16-bit rounding
+cannot create a false maximum tie. Older generation artifacts must be exported again; the underlying execution-plan
+format is unchanged. Temperature must be finite and nonnegative, and top-p must lie in `(0, 1]`. Nonfinite logits fail
+the request. Top-k is unsupported.
 
 Greedy selection is a traced module the compiler lowers with the reductions it has: the peak of the logits, then the
 largest negated token ID among the tokens at the peak, so ties resolve to the lowest ID. A nonfinite logit leaves no
@@ -330,15 +337,15 @@ GB of host memory. The pack is 34 GB, 31 GB of it pages; loaded, the worker pins
 (8 slots and 120 resident experts per layer) and loads the rest onto the device, so it fits a 23 GB host. The recipe
 golden's rows were recorded with fast math off, so the export runs in that regime, as the plugin's boot does. The
 trunk's programs are the plugin's at its decode bucket (4) and chunk, and read their rows. The recipe's serving env
-sets `SERVE_NATIVE=1`, so native's own programs (select, carry, router, combine, rotary, attention, final norm, head
+sets `SERVE_NATIVE=1`, so native's own programs (carry, router, combine, rotary, attention, final norm, head
 and greedy selection, and the plugin's `embed-sym` gather) are twins too (`emmy/serving/ARCHITECTURE.md`), and the
 golden holds a measured kernel set for each of them at one row and at the 64-row chunk; `emmy eval golden` deploys
 every native twin from the file's rows. Most are the prior's picks, measured; a few took a cut or a split a pinned
 measurement found faster: the router's gate linear and softmax statistics (7.5 ms in one block), attention's scores
 (31 ms with one block per head), and greedy selection's peak and a 128-way split over the logits (29 ms in one block).
-The chunk's fixed-slot expert program has no row: the prior's pick takes over a minute a launch and its schedule space
-offers no tensor-core tile, so this export prefills one token a step. The prefill attention piece that reads the paged
-cache is recorded with asynchronous copies, since no TMA descriptor may read a page. The pager's own kernels are the
+The chunk's fixed-slot expert program had no row then, so that export prefilled one token a step (the full window
+below records one). The prefill attention piece that read the paged cache was recorded with asynchronous copies, since
+no TMA descriptor may read a page. The pager's own kernels are the
 only ones the strict export compiles without a row: they are compiled at `paging.HINTS` whatever the geometry, where
 the card's hardware golden holds their rows, and at 256 pages their decision kernel builds a single schedule (one
 CTA), so no row could change it.
@@ -365,7 +372,7 @@ one token a step, gets its first token after 19.0 s.
 NVIDIA's Qwen3.8-27B-NVFP4 on one rented x16 RTX 5090 (2026-10-24: context 4,096, decode bucket 16 with the M=1 tier
 off, the 64-row chunk, fast math as the recipe's server runs) is the first coded-W4A4 export. Its trunk is the
 plugin's twins over the codes the loader spells, the coded head its `head-sym` program, and the embedding table pages
-at zero slots (`SERVE_EMBED_GPU=0`), gathered by its `embed-sym` program. Native's own twins are select, carry,
+at zero slots (`SERVE_EMBED_GPU=0`), gathered by its `embed-sym` program. Native's own twins are carry,
 rotary, attention, final norm and greedy selection at one row and at 64; greedy selection takes the Qwen3.6 recipe's
 split (8.3 us; the prior's one-block pick takes 24 ms) and attention the scores cut (39 us a layer at one row, 1.2 ms
 at 64, from 249 us and 15.6 ms before the cache stored values by head dimension). The strict export from the recipe
@@ -382,6 +389,16 @@ programs; what differs is what native runs instead of vLLM: attention over its c
 selection. A chunk of a model with carried Gated DeltaNet state holds only prompt tokens before the last, so these
 prompts of 8 to 13 tokens prefill one token a step, and the first token waits for each.
 
+Both recipes serve the full window too (2026-10-24, same host): `--kv-cache-dtype fp8` at the checkpoint's 262,144
+tokens, prefilled in the plugin's 64-row chunks from their recipe goldens under strict evidence, and a full-window
+passkey prompt returns its key on each within 32 GiB of the device; the 4,096-token gates are unchanged. Qwen3.6's
+64-row expert program reads paged weights at the recipe's 128 slots, where the gate-up piece is offered no tensor-core
+tile and the down projection stages through shared memory without TMA; the twin a golden stores carries no paging and
+offers TMA, so its rows are recorded at the schedules the paged export offers. Long prompts reach their first token
+later than the plugin's on both models: NVIDIA's 64-row attention writes its scores and probabilities over the window
+and its value expectation runs far below bandwidth, and a Qwen3.6 chunk routes to more non-resident experts than the
+device slots hold, so its expert kernels read their pages over the link.
+
 ## Native HTTP launcher
 
 `emmy serve MODEL --runner generate --native` prepares the artifact in a fresh temporary directory and executes a
@@ -390,9 +407,10 @@ checkpoint, at the requested revision, with the existing golden and strict compi
 DIR` reuses an already prepared serving bundle; its recorded model, revision, and context must match. Preparation-only
 evidence flags are rejected when reusing a bundle.
 
-Native options are `--host`, `--port`, `--revision`, `--max-model-len`, `--page-tokens`, `--dtype`, and
-`--native-pack`, plus the existing Emmy preparation, dry-run, and benchmark controls. Context defaults to 4,096; the page
-size defaults to one page spanning it and, like the dtype and the compiler evidence flags, applies to preparation, not
+Native options are `--host`, `--port`, `--revision`, `--max-model-len`, `--page-tokens`, `--dtype`,
+`--kv-cache-dtype` (`auto` or `fp8`), and `--native-pack`, plus the existing Emmy preparation, dry-run, and benchmark
+controls. Context defaults to the checkpoint's window, up to 262,144 tokens, and a reused pack serves its own; the page
+size defaults to one page spanning it and, like the dtypes and the compiler evidence flags, applies to preparation, not
 to a reused pack. `--native`
 requires `--runner generate`, rejects `--stock`, and rejects unsupported engine arguments. vLLM forwarding stays
 unchanged without `--native`. Dry-run prints preparation settings and the native command without downloading,
